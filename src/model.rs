@@ -29,7 +29,8 @@ use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
-    parse_safetensors_header_with_limits, Dtype, QuantScheme, SafetensorsHeader, TensorRole,
+    parse_safetensors_header_with_limits, Dtype, QuantScheme, SafetensorsHeader, TensorEntry,
+    TensorRole,
 };
 use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
@@ -290,6 +291,91 @@ type DequantizedTensors = Vec<(String, Vec<u8>, Vec<usize>)>;
 /// to the `ParsedModel` borrow they were collected under.
 type PassthroughRefs<'a> = Vec<(&'a str, &'a [u8], &'a [usize])>;
 
+/// One passthrough tensor ref tagged with its original header index, so the
+/// parallel dequant can merge passthroughs back into header order deterministically.
+type IndexedPassthrough<'a> = (usize, (&'a str, &'a [u8], &'a [usize]));
+
+/// The dequantisation outcome for a single `TensorRole::Quantized` entry,
+/// produced by [`ParsedModel::dequantize_quantized_entry`]. Deliberately a pure
+/// value (no borrow of shared state) so it can be computed on a worker thread
+/// and moved back to the main thread for deterministic, index-ordered assembly.
+enum TensorDequant {
+    /// Owned dequantised output: `(output name, `BF16` bytes, output shape)`.
+    /// Every real dequant scheme produces this.
+    Owned(String, Vec<u8>, Vec<usize>),
+    /// The header scheme was `Unquantized` (a defensive edge case: a
+    /// `Quantized`-role tensor in an unquantized model). The orchestrator
+    /// resolves it to a passthrough reference on the main thread.
+    Passthrough,
+}
+
+/// Resolves an optional caller thread request to a concrete dequantisation
+/// worker budget.
+///
+/// `None` → `min(available_parallelism, 4)` — the measured scaling knee for
+/// bandwidth-bound dequant (`docs/perf-experiments.md` Experiment 11), leaving
+/// the rest of the host's cores free for the embedding process. `Some(n)` pins
+/// the budget to `n.max(1)`. The budget is derived only from hardware and the
+/// caller's request — **never** from any file-declared quantity — per the
+/// `CONVENTIONS.md` "caller owns the thread budget" rule.
+#[cfg(feature = "parallel")]
+pub(crate) fn resolve_thread_budget(threads: Option<usize>) -> usize {
+    match threads {
+        None => std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(4),
+        Some(n) => n.max(1),
+    }
+}
+
+/// Resolves an optional caller thread request to a concrete dequantisation
+/// worker budget.
+///
+/// With the `parallel` feature disabled the dequant path is always sequential,
+/// so the budget is fixed at 1 regardless of the request.
+#[cfg(not(feature = "parallel"))]
+pub(crate) fn resolve_thread_budget(_threads: Option<usize>) -> usize {
+    1
+}
+
+/// Caller-supplied options for the `remember` family of methods.
+///
+/// Currently carries only the per-tensor dequantisation thread budget; the
+/// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
+/// change. Construct with [`RememberOptions::default`] (the modest built-in
+/// default) or [`RememberOptions::with_threads`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct RememberOptions {
+    /// Number of worker threads for per-tensor dequantisation.
+    ///
+    /// `None` (the default) resolves to `min(available_parallelism, 4)` — the
+    /// measured scaling knee for bandwidth-bound dequant, leaving the host's
+    /// remaining cores free. `Some(n)` pins the budget to `n.max(1)`. With the
+    /// `parallel` Cargo feature disabled the budget is always 1 (fully
+    /// sequential) regardless of this field.
+    pub threads: Option<usize>,
+}
+
+impl RememberOptions {
+    /// Returns options requesting `n` dequantisation worker threads (clamped to
+    /// at least 1), overriding the `min(available_parallelism, 4)` default.
+    #[must_use]
+    pub fn with_threads(n: usize) -> Self {
+        Self {
+            threads: Some(n.max(1)),
+        }
+    }
+
+    /// Resolves the configured request to a concrete worker count (see
+    /// [`resolve_thread_budget`]). Consumes the options (the builder is spent
+    /// once its budget has been read).
+    #[must_use]
+    fn resolved_threads(self) -> usize {
+        resolve_thread_budget(self.threads)
+    }
+}
+
 impl ParsedModel {
     /// Returns inspection info (format, tensor counts, size estimates).
     ///
@@ -477,8 +563,35 @@ impl ParsedModel {
         output_path: impl AsRef<Path>,
         target: TargetDtype,
     ) -> crate::Result<()> {
+        self.remember_with_options(output_path, target, RememberOptions::default())
+    }
+
+    /// Dequantizes all quantized tensors and writes a standard `.safetensors`
+    /// file, with a caller-supplied [`RememberOptions`] (currently the dequant
+    /// thread budget).
+    ///
+    /// Behaves identically to [`remember`](Self::remember) — the output bytes
+    /// are byte-identical for any thread count — but lets the caller tune the
+    /// per-tensor dequantisation parallelism. The default
+    /// ([`RememberOptions::default`]) uses `min(available_parallelism, 4)`
+    /// workers (1 when the `parallel` feature is off).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
+    /// shapes are inconsistent, or if a dequant worker thread panics.
+    /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
+    /// is not yet implemented.
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    pub fn remember_with_options(
+        &self,
+        output_path: impl AsRef<Path>,
+        target: TargetDtype,
+        opts: RememberOptions,
+    ) -> crate::Result<()> {
+        let threads = opts.resolved_threads();
         match target {
-            TargetDtype::BF16 => self.remember_bf16(output_path.as_ref()),
+            TargetDtype::BF16 => self.remember_bf16(output_path.as_ref(), threads),
         }
     }
 
@@ -506,8 +619,9 @@ impl ParsedModel {
     where
         F: FnMut(),
     {
+        let threads = RememberOptions::default().resolved_threads();
         match target {
-            TargetDtype::BF16 => self.remember_bf16_inner(output_path.as_ref(), on_tensor),
+            TargetDtype::BF16 => self.remember_bf16_inner(output_path.as_ref(), threads, on_tensor),
         }
     }
 
@@ -542,8 +656,33 @@ impl ParsedModel {
     /// the streaming, peak-bounded `remember_to_writer` / `remember_to_sink`
     /// variants are planned for ROADMAP Phase 10.
     pub fn remember_to_bytes(&self, target: TargetDtype) -> crate::Result<Vec<u8>> {
+        self.remember_to_bytes_with_options(target, RememberOptions::default())
+    }
+
+    /// Dequantizes all quantized tensors and returns the standard `.safetensors`
+    /// bytes in memory, with a caller-supplied [`RememberOptions`] (currently the
+    /// dequant thread budget).
+    ///
+    /// The in-memory twin of [`remember_with_options`](Self::remember_with_options):
+    /// identical dequant and companion-grouping, byte-identical output for any
+    /// thread count, but returns the serialized `BF16` safetensors as a `Vec<u8>`
+    /// instead of writing a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
+    /// shapes are inconsistent, if a dequant worker thread panics, or if
+    /// serialization fails.
+    /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
+    /// is not yet implemented.
+    pub fn remember_to_bytes_with_options(
+        &self,
+        target: TargetDtype,
+        opts: RememberOptions,
+    ) -> crate::Result<Vec<u8>> {
+        let threads = opts.resolved_threads();
         match target {
-            TargetDtype::BF16 => self.remember_to_bytes_bf16(),
+            TargetDtype::BF16 => self.remember_to_bytes_bf16(threads),
         }
     }
 
@@ -565,8 +704,11 @@ impl ParsedModel {
     /// Allocates owned copies of **every** tensor — peak heap is one full
     /// dequantised model (`O(model)`, the hub itself). The end-to-end `convert`
     /// peak adds only the target writer's buffer; see the `convert` module docs.
-    pub(crate) fn hub_tensors(&self) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(|| {})?;
+    pub(crate) fn hub_tensors(
+        &self,
+        threads: usize,
+    ) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, || {})?;
 
         let dequantized = dequantized_data.len();
         let mut tensors = Vec::with_capacity(dequantized.saturating_add(passthrough_refs.len()));
@@ -608,458 +750,435 @@ impl ParsedModel {
     }
 
     /// Internal: dequantize to `BF16` and write (no progress callback).
-    fn remember_bf16(&self, output_path: &Path) -> crate::Result<()> {
-        self.remember_bf16_inner(output_path, || {})
+    fn remember_bf16(&self, output_path: &Path, threads: usize) -> crate::Result<()> {
+        self.remember_bf16_inner(output_path, threads, || {})
     }
 
-    /// Internal: run the per-scheme dequant for every tensor, returning the
-    /// owned `BF16` results plus the passthrough tensors (which borrow
-    /// `self.buffer`). Shared by `remember_bf16_inner` (→ file) and
-    /// `remember_to_bytes_bf16` (→ bytes); `on_tensor` fires after each
-    /// quantized tensor so callers can drive a progress bar.
+    /// Internal: dequantise one `TensorRole::Quantized` entry to owned `BF16`
+    /// output.
+    ///
+    /// A **pure function** of `&self` + `entry`: it reads only shared-immutable
+    /// header/buffer state and allocates its own output `Vec`, so it is safe to
+    /// call concurrently from disjoint worker threads (each call writes only its
+    /// own returned buffer — no shared mutable state). Every real scheme yields
+    /// [`TensorDequant::Owned`]; the `Unquantized`-scheme edge case (a
+    /// `Quantized`-role tensor in an unquantized model) yields
+    /// [`TensorDequant::Passthrough`], which the orchestrator resolves on the
+    /// main thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the entry's data or a required
+    /// companion tensor is malformed or missing, and
+    /// [`AnamnesisError::Unsupported`] if the scheme's Cargo feature is disabled.
+    fn dequantize_quantized_entry(&self, entry: &TensorEntry) -> crate::Result<TensorDequant> {
+        let weight_data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
+
+        let result = match self.header.scheme {
+            QuantScheme::FineGrainedFp8 => {
+                let scale_entry = self.header.find_scale_for(&entry.name).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: format!(
+                            "no scale tensor found for quantized weight `{}`",
+                            entry.name
+                        ),
+                    }
+                })?;
+                let scale_data =
+                    self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
+                let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
+                let bf16 =
+                    dequantize_fp8_to_bf16(weight_data, scale_data, rows, cols, scale_entry.dtype)?;
+                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+            }
+            QuantScheme::PerChannelFp8 => {
+                let scale_entry = self.header.find_scale_for(&entry.name).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: format!(
+                            "no scale tensor found for quantized weight `{}`",
+                            entry.name
+                        ),
+                    }
+                })?;
+                let scale_data =
+                    self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
+                let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
+                let bf16 = dequantize_per_channel_fp8_to_bf16(
+                    weight_data,
+                    scale_data,
+                    rows,
+                    cols,
+                    scale_entry.dtype,
+                )?;
+                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+            }
+            QuantScheme::PerTensorFp8 => {
+                // Look for a companion scale tensor; default to 1.0 if none.
+                let scale = if let Some(scale_entry) = self.header.find_scale_for(&entry.name) {
+                    let scale_data =
+                        self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
+                    Self::read_scalar_scale(scale_data, scale_entry.dtype, &entry.name)?
+                } else {
+                    1.0
+                };
+                let bf16 = dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?;
+                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+            }
+            #[cfg(feature = "gptq")]
+            QuantScheme::Gptq => {
+                let config = self
+                    .header
+                    .gptq_config
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("GPTQ config not available for `{}`", entry.name),
+                    })?;
+                let companions =
+                    self.header
+                        .find_gptq_companions(&entry.name)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("GPTQ companions not found for `{}`", entry.name),
+                        })?;
+
+                let scales_data = self.tensor_data(
+                    companions.scales.data_offsets.0,
+                    companions.scales.data_offsets.1,
+                )?;
+                let qzeros_data = self.tensor_data(
+                    companions.qzeros.data_offsets.0,
+                    companions.qzeros.data_offsets.1,
+                )?;
+                let g_idx_data = companions
+                    .g_idx
+                    .map(|e| self.tensor_data(e.data_offsets.0, e.data_offsets.1))
+                    .transpose()?;
+
+                // Derive in_features and out_features from qweight shape.
+                // qweight shape: [in_features/pack_factor, out_features]
+                let (packed_rows, out_features) = Self::shape_to_rows_cols(&entry.shape)?;
+                // CAST: u8 → usize, bits is 4 or 8
+                #[allow(clippy::as_conversions)]
+                let pack_factor = 32 / config.bits as usize;
+                let in_features =
+                    packed_rows
+                        .checked_mul(pack_factor)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: "in_features overflow".into(),
+                        })?;
+
+                let bf16_native = dequantize_gptq_to_bf16(
+                    weight_data,
+                    scales_data,
+                    qzeros_data,
+                    g_idx_data,
+                    in_features,
+                    out_features,
+                    config.group_size,
+                    config.bits,
+                    companions.scales.dtype,
+                )?;
+                // The kernel returns the GEMM-native
+                // [in_features, out_features] orientation (the
+                // canonical GPTQModel kernel layout the
+                // cross-validation fixtures anchor). A standard
+                // nn.Linear safetensors is [out, in] — apply the
+                // same boundary transpose GPTQModel's
+                // dequantize_model applies (`.T`).
+                let bf16_data = transpose_bf16(&bf16_native, in_features, out_features)?;
+
+                // Output tensor: strip ".qweight" suffix, use ".weight".
+                let output_name = entry
+                    .name
+                    .strip_suffix(".qweight")
+                    .map_or_else(|| entry.name.clone(), |base| format!("{base}.weight"));
+                let output_shape = vec![out_features, in_features];
+
+                TensorDequant::Owned(output_name, bf16_data, output_shape)
+            }
+            #[cfg(not(feature = "gptq"))]
+            QuantScheme::Gptq => {
+                return Err(AnamnesisError::Unsupported {
+                    format: "GPTQ".into(),
+                    detail: "GPTQ dequantization requires the `gptq` feature".into(),
+                });
+            }
+            #[cfg(feature = "awq")]
+            QuantScheme::Awq => {
+                let config = self
+                    .header
+                    .awq_config
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("AWQ config not available for `{}`", entry.name),
+                    })?;
+                let companions = self
+                    .header
+                    .find_awq_companions(&entry.name)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("AWQ companions not found for `{}`", entry.name),
+                    })?;
+
+                let scales_data = self.tensor_data(
+                    companions.scales.data_offsets.0,
+                    companions.scales.data_offsets.1,
+                )?;
+                let qzeros_data = self.tensor_data(
+                    companions.qzeros.data_offsets.0,
+                    companions.qzeros.data_offsets.1,
+                )?;
+
+                // Derive in_features and out_features from qweight + scales shapes.
+                // AWQ qweight: [in_features, out_features/pack_factor]
+                // scales: [num_groups, out_features]
+                let in_features =
+                    entry
+                        .shape
+                        .first()
+                        .copied()
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: "AWQ qweight has no first dimension".into(),
+                        })?;
+                let out_features = companions.scales.shape.last().copied().ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: "AWQ scales has no last dimension".into(),
+                    }
+                })?;
+
+                let bf16_native = dequantize_awq_to_bf16(
+                    weight_data,
+                    scales_data,
+                    qzeros_data,
+                    in_features,
+                    out_features,
+                    config.group_size,
+                    config.bits,
+                    companions.scales.dtype,
+                )?;
+                // The kernel returns the GEMM-native
+                // [in_features, out_features] orientation (the
+                // canonical AutoAWQ kernel layout the
+                // cross-validation fixtures anchor). A standard
+                // nn.Linear safetensors is [out, in] — transpose
+                // at the output-contract boundary, exactly as
+                // GPTQModel's dequantize_model does for its
+                // GEMM-native dequant (`.T`).
+                let bf16_data = transpose_bf16(&bf16_native, in_features, out_features)?;
+
+                // Output tensor: strip ".qweight" suffix, use ".weight".
+                let output_name = entry
+                    .name
+                    .strip_suffix(".qweight")
+                    .map_or_else(|| entry.name.clone(), |base| format!("{base}.weight"));
+                let output_shape = vec![out_features, in_features];
+
+                TensorDequant::Owned(output_name, bf16_data, output_shape)
+            }
+            #[cfg(not(feature = "awq"))]
+            QuantScheme::Awq => {
+                return Err(AnamnesisError::Unsupported {
+                    format: "AWQ".into(),
+                    detail: "AWQ dequantization requires the `awq` feature".into(),
+                });
+            }
+            #[cfg(feature = "bnb")]
+            QuantScheme::Bnb4 => {
+                let config = self
+                    .header
+                    .bnb_config
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("BnB config not available for `{}`", entry.name),
+                    })?;
+                let companions =
+                    self.header
+                        .find_bnb4_companions(&entry.name)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("BnB4 companions not found for `{}`", entry.name),
+                        })?;
+
+                let absmax_data = self.tensor_data(
+                    companions.absmax.data_offsets.0,
+                    companions.absmax.data_offsets.1,
+                )?;
+                let quant_map_data = self.tensor_data(
+                    companions.quant_map.data_offsets.0,
+                    companions.quant_map.data_offsets.1,
+                )?;
+
+                let total_elements =
+                    entry
+                        .byte_len()
+                        .checked_mul(2)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: "BnB4 total_elements overflow".into(),
+                        })?;
+
+                // Read the quant_state JSON blob once: the
+                // double-quant path needs `nested_offset` from it
+                // BEFORE dequantizing, and the shape recovery
+                // below needs `shape`.
+                let quant_state_data = companions
+                    .quant_state
+                    .map(|qs_entry| {
+                        self.tensor_data(qs_entry.data_offsets.0, qs_entry.data_offsets.1)
+                    })
+                    .transpose()?;
+
+                let bf16_data = if config.double_quant {
+                    let nested_absmax =
+                        companions
+                            .nested_absmax
+                            .ok_or_else(|| AnamnesisError::Parse {
+                                reason: format!(
+                                    "BnB4 double-quant: nested_absmax not found for `{}`",
+                                    entry.name
+                                ),
+                            })?;
+                    let nested_quant_map =
+                        companions
+                            .nested_quant_map
+                            .ok_or_else(|| AnamnesisError::Parse {
+                                reason: format!(
+                                    "BnB4 double-quant: nested_quant_map not found for `{}`",
+                                    entry.name
+                                ),
+                            })?;
+                    let nested_absmax_data = self
+                        .tensor_data(nested_absmax.data_offsets.0, nested_absmax.data_offsets.1)?;
+                    let nested_quant_map_data = self.tensor_data(
+                        nested_quant_map.data_offsets.0,
+                        nested_quant_map.data_offsets.1,
+                    )?;
+
+                    // Infer nested_block_size from absmax count / nested_absmax count
+                    let absmax_count = companions.absmax.num_elements();
+                    let nested_absmax_count = nested_absmax.num_elements();
+                    let nested_block_size = if nested_absmax_count > 0 {
+                        absmax_count.div_ceil(nested_absmax_count)
+                    } else {
+                        256
+                    };
+
+                    // The nested_offset is mandatory for the
+                    // double-quant absmax recovery; a DQ tensor
+                    // without a quant_state blob cannot be
+                    // decoded correctly.
+                    let nested_offset = match quant_state_data {
+                        Some(qs_data) => parse_bnb_quant_state_nested_offset(qs_data, &entry.name)?,
+                        None => {
+                            return Err(AnamnesisError::Parse {
+                                reason: format!(
+                                    "BnB4 double-quant: quant_state blob not found \
+                                                 for `{}` (required for nested_offset)",
+                                    entry.name
+                                ),
+                            })
+                        }
+                    };
+
+                    dequantize_bnb4_double_quant_to_bf16(
+                        weight_data,
+                        absmax_data,
+                        quant_map_data,
+                        nested_absmax_data,
+                        nested_quant_map_data,
+                        nested_offset,
+                        total_elements,
+                        config.block_size,
+                        nested_block_size,
+                    )?
+                } else {
+                    dequantize_bnb4_to_bf16(
+                        weight_data,
+                        absmax_data,
+                        quant_map_data,
+                        total_elements,
+                        config.block_size,
+                    )?
+                };
+
+                // BnB4 weights are stored flattened to [N, 1]. Recover the original
+                // 2D shape from the quant_state companion tensor (JSON blob with
+                // "shape" field), falling back to flat [total_elements] if absent.
+                let output_shape = if let Some(qs_data) = quant_state_data {
+                    parse_bnb_quant_state_shape(qs_data, total_elements, &entry.name)?
+                } else {
+                    vec![total_elements]
+                };
+
+                TensorDequant::Owned(entry.name.clone(), bf16_data, output_shape)
+            }
+            #[cfg(feature = "bnb")]
+            QuantScheme::BnbInt8 => {
+                let scb_entry = self.header.find_bnb_int8_scb(&entry.name).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: format!("BnB INT8 SCB companion not found for `{}`", entry.name),
+                    }
+                })?;
+                let scb_data =
+                    self.tensor_data(scb_entry.data_offsets.0, scb_entry.data_offsets.1)?;
+
+                // INT8 keeps its 2D shape [out_features, in_features].
+                let (out_features, in_features) = Self::shape_to_rows_cols(&entry.shape)?;
+
+                let bf16_data =
+                    dequantize_bnb_int8_to_bf16(weight_data, scb_data, out_features, in_features)?;
+
+                // Output tensor: keep name, keep shape.
+                TensorDequant::Owned(entry.name.clone(), bf16_data, entry.shape.clone())
+            }
+            #[cfg(not(feature = "bnb"))]
+            QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
+                return Err(AnamnesisError::Unsupported {
+                    format: "BnB".into(),
+                    detail: "BnB dequantization requires the `bnb` feature".into(),
+                });
+            }
+            QuantScheme::Unquantized => {
+                // Shouldn't have a quantized-role tensor in an
+                // unquantized model; the orchestrator resolves this
+                // to a passthrough on the main thread.
+                TensorDequant::Passthrough
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Internal: run the per-scheme dequant for every tensor, returning the owned
+    /// `BF16` results plus the passthrough tensors (which borrow `self.buffer`).
+    /// Shared by `remember_bf16_inner` (→ file) and `remember_to_bytes_bf16`
+    /// (→ bytes); `on_tensor` fires on the **main thread** after each quantized
+    /// tensor is dequantised so callers can drive a progress bar.
+    ///
+    /// `threads` is the resolved worker budget (see [`resolve_thread_budget`]).
+    /// The dequant runs **sequentially** when `threads <= 1`, when there is at
+    /// most one quantized tensor, or when the `parallel` feature is off;
+    /// otherwise the quantized entries are split into disjoint chunks across
+    /// scoped `std` threads. Output is **byte-identical for any thread count** —
+    /// results are reassembled in original header order before serialization.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::dequantize_quantized_entry`]'s errors, and returns
+    /// [`AnamnesisError::Parse`] if a dequant worker thread panics.
     fn dequantize_all<F>(
         &self,
+        threads: usize,
         mut on_tensor: F,
     ) -> crate::Result<(DequantizedTensors, PassthroughRefs<'_>)>
     where
         F: FnMut(),
     {
-        // Collect dequantized data (owned) for quantized tensors.
-        // Passthrough tensors borrow from self.buffer.
-        let mut dequantized_data: DequantizedTensors = Vec::new();
-        let mut passthrough_refs: PassthroughRefs<'_> = Vec::new();
+        // Classify every entry once, in header order. Quantized entries are
+        // collected with their original index so results can be reassembled
+        // deterministically; passthrough entries are resolved here on the main
+        // thread; companion tensors are consumed during dequant and skipped.
+        let mut quantized: Vec<(usize, &TensorEntry)> = Vec::new();
+        // (original index, ref) so both normal passthroughs and the
+        // `Unquantized`-scheme edge case can be merged back in header order.
+        let mut passthrough_indexed: Vec<IndexedPassthrough<'_>> = Vec::new();
 
-        for entry in &self.header.tensors {
+        for (idx, entry) in self.header.tensors.iter().enumerate() {
             match entry.role {
-                TensorRole::Quantized => {
-                    let weight_data =
-                        self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
-
-                    let bf16_bytes = match self.header.scheme {
-                        QuantScheme::FineGrainedFp8 => {
-                            let scale_entry =
-                                self.header.find_scale_for(&entry.name).ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: format!(
-                                            "no scale tensor found for quantized weight `{}`",
-                                            entry.name
-                                        ),
-                                    }
-                                })?;
-                            let scale_data = self.tensor_data(
-                                scale_entry.data_offsets.0,
-                                scale_entry.data_offsets.1,
-                            )?;
-                            let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
-                            dequantize_fp8_to_bf16(
-                                weight_data,
-                                scale_data,
-                                rows,
-                                cols,
-                                scale_entry.dtype,
-                            )?
-                        }
-                        QuantScheme::PerChannelFp8 => {
-                            let scale_entry =
-                                self.header.find_scale_for(&entry.name).ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: format!(
-                                            "no scale tensor found for quantized weight `{}`",
-                                            entry.name
-                                        ),
-                                    }
-                                })?;
-                            let scale_data = self.tensor_data(
-                                scale_entry.data_offsets.0,
-                                scale_entry.data_offsets.1,
-                            )?;
-                            let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
-                            dequantize_per_channel_fp8_to_bf16(
-                                weight_data,
-                                scale_data,
-                                rows,
-                                cols,
-                                scale_entry.dtype,
-                            )?
-                        }
-                        QuantScheme::PerTensorFp8 => {
-                            // Look for a companion scale tensor; default to 1.0 if none.
-                            let scale = if let Some(scale_entry) =
-                                self.header.find_scale_for(&entry.name)
-                            {
-                                let scale_data = self.tensor_data(
-                                    scale_entry.data_offsets.0,
-                                    scale_entry.data_offsets.1,
-                                )?;
-                                Self::read_scalar_scale(scale_data, scale_entry.dtype, &entry.name)?
-                            } else {
-                                1.0
-                            };
-                            dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?
-                        }
-                        #[cfg(feature = "gptq")]
-                        QuantScheme::Gptq => {
-                            let config =
-                                self.header
-                                    .gptq_config
-                                    .ok_or_else(|| AnamnesisError::Parse {
-                                        reason: format!(
-                                            "GPTQ config not available for `{}`",
-                                            entry.name
-                                        ),
-                                    })?;
-                            let companions = self
-                                .header
-                                .find_gptq_companions(&entry.name)
-                                .ok_or_else(|| AnamnesisError::Parse {
-                                    reason: format!(
-                                        "GPTQ companions not found for `{}`",
-                                        entry.name
-                                    ),
-                                })?;
-
-                            let scales_data = self.tensor_data(
-                                companions.scales.data_offsets.0,
-                                companions.scales.data_offsets.1,
-                            )?;
-                            let qzeros_data = self.tensor_data(
-                                companions.qzeros.data_offsets.0,
-                                companions.qzeros.data_offsets.1,
-                            )?;
-                            let g_idx_data = companions
-                                .g_idx
-                                .map(|e| self.tensor_data(e.data_offsets.0, e.data_offsets.1))
-                                .transpose()?;
-
-                            // Derive in_features and out_features from qweight shape.
-                            // qweight shape: [in_features/pack_factor, out_features]
-                            let (packed_rows, out_features) =
-                                Self::shape_to_rows_cols(&entry.shape)?;
-                            // CAST: u8 → usize, bits is 4 or 8
-                            #[allow(clippy::as_conversions)]
-                            let pack_factor = 32 / config.bits as usize;
-                            let in_features =
-                                packed_rows.checked_mul(pack_factor).ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: "in_features overflow".into(),
-                                    }
-                                })?;
-
-                            let bf16_native = dequantize_gptq_to_bf16(
-                                weight_data,
-                                scales_data,
-                                qzeros_data,
-                                g_idx_data,
-                                in_features,
-                                out_features,
-                                config.group_size,
-                                config.bits,
-                                companions.scales.dtype,
-                            )?;
-                            // The kernel returns the GEMM-native
-                            // [in_features, out_features] orientation (the
-                            // canonical GPTQModel kernel layout the
-                            // cross-validation fixtures anchor). A standard
-                            // nn.Linear safetensors is [out, in] — apply the
-                            // same boundary transpose GPTQModel's
-                            // dequantize_model applies (`.T`).
-                            let bf16_data =
-                                transpose_bf16(&bf16_native, in_features, out_features)?;
-
-                            // Output tensor: strip ".qweight" suffix, use ".weight".
-                            let output_name = entry.name.strip_suffix(".qweight").map_or_else(
-                                || entry.name.clone(),
-                                |base| format!("{base}.weight"),
-                            );
-                            let output_shape = vec![out_features, in_features];
-
-                            dequantized_data.push((output_name, bf16_data, output_shape));
-                            on_tensor();
-                            continue;
-                        }
-                        #[cfg(not(feature = "gptq"))]
-                        QuantScheme::Gptq => {
-                            return Err(AnamnesisError::Unsupported {
-                                format: "GPTQ".into(),
-                                detail: "GPTQ dequantization requires the `gptq` feature".into(),
-                            });
-                        }
-                        #[cfg(feature = "awq")]
-                        QuantScheme::Awq => {
-                            let config =
-                                self.header
-                                    .awq_config
-                                    .ok_or_else(|| AnamnesisError::Parse {
-                                        reason: format!(
-                                            "AWQ config not available for `{}`",
-                                            entry.name
-                                        ),
-                                    })?;
-                            let companions = self
-                                .header
-                                .find_awq_companions(&entry.name)
-                                .ok_or_else(|| AnamnesisError::Parse {
-                                    reason: format!(
-                                        "AWQ companions not found for `{}`",
-                                        entry.name
-                                    ),
-                                })?;
-
-                            let scales_data = self.tensor_data(
-                                companions.scales.data_offsets.0,
-                                companions.scales.data_offsets.1,
-                            )?;
-                            let qzeros_data = self.tensor_data(
-                                companions.qzeros.data_offsets.0,
-                                companions.qzeros.data_offsets.1,
-                            )?;
-
-                            // Derive in_features and out_features from qweight + scales shapes.
-                            // AWQ qweight: [in_features, out_features/pack_factor]
-                            // scales: [num_groups, out_features]
-                            let in_features = entry.shape.first().copied().ok_or_else(|| {
-                                AnamnesisError::Parse {
-                                    reason: "AWQ qweight has no first dimension".into(),
-                                }
-                            })?;
-                            let out_features =
-                                companions.scales.shape.last().copied().ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: "AWQ scales has no last dimension".into(),
-                                    }
-                                })?;
-
-                            let bf16_native = dequantize_awq_to_bf16(
-                                weight_data,
-                                scales_data,
-                                qzeros_data,
-                                in_features,
-                                out_features,
-                                config.group_size,
-                                config.bits,
-                                companions.scales.dtype,
-                            )?;
-                            // The kernel returns the GEMM-native
-                            // [in_features, out_features] orientation (the
-                            // canonical AutoAWQ kernel layout the
-                            // cross-validation fixtures anchor). A standard
-                            // nn.Linear safetensors is [out, in] — transpose
-                            // at the output-contract boundary, exactly as
-                            // GPTQModel's dequantize_model does for its
-                            // GEMM-native dequant (`.T`).
-                            let bf16_data =
-                                transpose_bf16(&bf16_native, in_features, out_features)?;
-
-                            // Output tensor: strip ".qweight" suffix, use ".weight".
-                            let output_name = entry.name.strip_suffix(".qweight").map_or_else(
-                                || entry.name.clone(),
-                                |base| format!("{base}.weight"),
-                            );
-                            let output_shape = vec![out_features, in_features];
-
-                            dequantized_data.push((output_name, bf16_data, output_shape));
-                            on_tensor();
-                            continue;
-                        }
-                        #[cfg(not(feature = "awq"))]
-                        QuantScheme::Awq => {
-                            return Err(AnamnesisError::Unsupported {
-                                format: "AWQ".into(),
-                                detail: "AWQ dequantization requires the `awq` feature".into(),
-                            });
-                        }
-                        #[cfg(feature = "bnb")]
-                        QuantScheme::Bnb4 => {
-                            let config =
-                                self.header
-                                    .bnb_config
-                                    .ok_or_else(|| AnamnesisError::Parse {
-                                        reason: format!(
-                                            "BnB config not available for `{}`",
-                                            entry.name
-                                        ),
-                                    })?;
-                            let companions = self
-                                .header
-                                .find_bnb4_companions(&entry.name)
-                                .ok_or_else(|| AnamnesisError::Parse {
-                                    reason: format!(
-                                        "BnB4 companions not found for `{}`",
-                                        entry.name
-                                    ),
-                                })?;
-
-                            let absmax_data = self.tensor_data(
-                                companions.absmax.data_offsets.0,
-                                companions.absmax.data_offsets.1,
-                            )?;
-                            let quant_map_data = self.tensor_data(
-                                companions.quant_map.data_offsets.0,
-                                companions.quant_map.data_offsets.1,
-                            )?;
-
-                            let total_elements =
-                                entry.byte_len().checked_mul(2).ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: "BnB4 total_elements overflow".into(),
-                                    }
-                                })?;
-
-                            // Read the quant_state JSON blob once: the
-                            // double-quant path needs `nested_offset` from it
-                            // BEFORE dequantizing, and the shape recovery
-                            // below needs `shape`.
-                            let quant_state_data = companions
-                                .quant_state
-                                .map(|qs_entry| {
-                                    self.tensor_data(
-                                        qs_entry.data_offsets.0,
-                                        qs_entry.data_offsets.1,
-                                    )
-                                })
-                                .transpose()?;
-
-                            let bf16_data = if config.double_quant {
-                                let nested_absmax = companions.nested_absmax.ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: format!(
-                                            "BnB4 double-quant: nested_absmax not found for `{}`",
-                                            entry.name
-                                        ),
-                                    }
-                                })?;
-                                let nested_quant_map =
-                                    companions.nested_quant_map.ok_or_else(|| {
-                                        AnamnesisError::Parse {
-                                            reason: format!(
-                                            "BnB4 double-quant: nested_quant_map not found for `{}`",
-                                            entry.name
-                                        ),
-                                        }
-                                    })?;
-                                let nested_absmax_data = self.tensor_data(
-                                    nested_absmax.data_offsets.0,
-                                    nested_absmax.data_offsets.1,
-                                )?;
-                                let nested_quant_map_data = self.tensor_data(
-                                    nested_quant_map.data_offsets.0,
-                                    nested_quant_map.data_offsets.1,
-                                )?;
-
-                                // Infer nested_block_size from absmax count / nested_absmax count
-                                let absmax_count = companions.absmax.num_elements();
-                                let nested_absmax_count = nested_absmax.num_elements();
-                                let nested_block_size = if nested_absmax_count > 0 {
-                                    absmax_count.div_ceil(nested_absmax_count)
-                                } else {
-                                    256
-                                };
-
-                                // The nested_offset is mandatory for the
-                                // double-quant absmax recovery; a DQ tensor
-                                // without a quant_state blob cannot be
-                                // decoded correctly.
-                                let nested_offset = match quant_state_data {
-                                    Some(qs_data) => {
-                                        parse_bnb_quant_state_nested_offset(qs_data, &entry.name)?
-                                    }
-                                    None => {
-                                        return Err(AnamnesisError::Parse {
-                                            reason: format!(
-                                                "BnB4 double-quant: quant_state blob not found \
-                                                 for `{}` (required for nested_offset)",
-                                                entry.name
-                                            ),
-                                        })
-                                    }
-                                };
-
-                                dequantize_bnb4_double_quant_to_bf16(
-                                    weight_data,
-                                    absmax_data,
-                                    quant_map_data,
-                                    nested_absmax_data,
-                                    nested_quant_map_data,
-                                    nested_offset,
-                                    total_elements,
-                                    config.block_size,
-                                    nested_block_size,
-                                )?
-                            } else {
-                                dequantize_bnb4_to_bf16(
-                                    weight_data,
-                                    absmax_data,
-                                    quant_map_data,
-                                    total_elements,
-                                    config.block_size,
-                                )?
-                            };
-
-                            // BnB4 weights are stored flattened to [N, 1]. Recover the original
-                            // 2D shape from the quant_state companion tensor (JSON blob with
-                            // "shape" field), falling back to flat [total_elements] if absent.
-                            let output_shape = if let Some(qs_data) = quant_state_data {
-                                parse_bnb_quant_state_shape(qs_data, total_elements, &entry.name)?
-                            } else {
-                                vec![total_elements]
-                            };
-
-                            dequantized_data.push((entry.name.clone(), bf16_data, output_shape));
-                            on_tensor();
-                            continue;
-                        }
-                        #[cfg(feature = "bnb")]
-                        QuantScheme::BnbInt8 => {
-                            let scb_entry =
-                                self.header.find_bnb_int8_scb(&entry.name).ok_or_else(|| {
-                                    AnamnesisError::Parse {
-                                        reason: format!(
-                                            "BnB INT8 SCB companion not found for `{}`",
-                                            entry.name
-                                        ),
-                                    }
-                                })?;
-                            let scb_data = self
-                                .tensor_data(scb_entry.data_offsets.0, scb_entry.data_offsets.1)?;
-
-                            // INT8 keeps its 2D shape [out_features, in_features].
-                            let (out_features, in_features) =
-                                Self::shape_to_rows_cols(&entry.shape)?;
-
-                            let bf16_data = dequantize_bnb_int8_to_bf16(
-                                weight_data,
-                                scb_data,
-                                out_features,
-                                in_features,
-                            )?;
-
-                            // Output tensor: keep name, keep shape.
-                            dequantized_data.push((
-                                entry.name.clone(),
-                                bf16_data,
-                                entry.shape.clone(),
-                            ));
-                            on_tensor();
-                            continue;
-                        }
-                        #[cfg(not(feature = "bnb"))]
-                        QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
-                            return Err(AnamnesisError::Unsupported {
-                                format: "BnB".into(),
-                                detail: "BnB dequantization requires the `bnb` feature".into(),
-                            });
-                        }
-                        QuantScheme::Unquantized => {
-                            // Shouldn't have quantized tensors in an unquantized model,
-                            // but treat as passthrough to be safe.
-                            passthrough_refs.push((&entry.name, weight_data, &entry.shape));
-                            continue;
-                        }
-                    };
-
-                    dequantized_data.push((entry.name.clone(), bf16_bytes, entry.shape.clone()));
-                    on_tensor();
-                }
+                TensorRole::Quantized => quantized.push((idx, entry)),
                 TensorRole::Scale
                 | TensorRole::ZeroPoint
                 | TensorRole::GroupIndex
@@ -1070,10 +1189,107 @@ impl ParsedModel {
                 }
                 TensorRole::Passthrough => {
                     let data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
-                    passthrough_refs.push((&entry.name, data, &entry.shape));
+                    passthrough_indexed.push((idx, (&entry.name, data, &entry.shape)));
                 }
             }
         }
+
+        // Dequantise the quantized entries, each tagged with its original index.
+        let mut dequants: Vec<(usize, TensorDequant)> = Vec::with_capacity(quantized.len());
+
+        #[cfg(feature = "parallel")]
+        if threads > 1 && quantized.len() > 1 {
+            let n_workers = threads.min(quantized.len());
+            let chunk_size = quantized.len().div_ceil(n_workers);
+
+            // PARALLEL: the index-ordered `quantized` list is split into disjoint,
+            // contiguous chunks; each scoped worker calls
+            // `dequantize_quantized_entry` — a pure fn of shared-immutable
+            // `&self` plus its own entries — and writes only its own freshly
+            // allocated output `Vec`s. No shared mutable state, no reduction.
+            // Handles are joined in spawn order and the collected results are
+            // sorted by original index below, so the assembled output bytes are
+            // identical for any thread count. `ParsedModel` is `Sync`, so sharing
+            // `&self` across the scope is safe; the scope borrows `quantized`.
+            std::thread::scope(|scope| -> crate::Result<()> {
+                let handles: Vec<_> = quantized
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut out: Vec<(usize, TensorDequant)> =
+                                Vec::with_capacity(chunk.len());
+                            for &(idx, entry) in chunk {
+                                out.push((idx, self.dequantize_quantized_entry(entry)?));
+                            }
+                            Ok::<Vec<(usize, TensorDequant)>, AnamnesisError>(out)
+                        })
+                    })
+                    .collect();
+
+                // Join on the main thread, in spawn order; fire `on_tensor` per
+                // owned result so `F: FnMut()` never crosses to a worker.
+                for handle in handles {
+                    let chunk_out = handle.join().map_err(|_| AnamnesisError::Parse {
+                        reason: "dequant worker thread panicked".into(),
+                    })??;
+                    for (idx, dq) in chunk_out {
+                        if matches!(dq, TensorDequant::Owned(..)) {
+                            on_tensor();
+                        }
+                        dequants.push((idx, dq));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        // With the `parallel` feature off the budget is never consulted.
+        #[cfg(not(feature = "parallel"))]
+        let _ = threads;
+
+        // Sequential path: runs whenever the parallel fast path did not (feature
+        // off, budget <= 1, or a single quantized tensor). `dequants` is
+        // non-empty iff the parallel path already ran, so this fills it exactly
+        // once and never double-counts.
+        if dequants.is_empty() && !quantized.is_empty() {
+            for &(idx, entry) in &quantized {
+                let dq = self.dequantize_quantized_entry(entry)?;
+                if matches!(dq, TensorDequant::Owned(..)) {
+                    on_tensor();
+                }
+                dequants.push((idx, dq));
+            }
+        }
+
+        // Determinism: reassemble in original header order regardless of how the
+        // work was chunked across threads.
+        dequants.sort_by_key(|&(idx, _)| idx);
+
+        let mut dequantized_data: DequantizedTensors = Vec::with_capacity(dequants.len());
+        for (idx, dq) in dequants {
+            match dq {
+                TensorDequant::Owned(name, data, shape) => {
+                    dequantized_data.push((name, data, shape));
+                }
+                TensorDequant::Passthrough => {
+                    let entry =
+                        self.header
+                            .tensors
+                            .get(idx)
+                            .ok_or_else(|| AnamnesisError::Parse {
+                                reason: "dequant result index out of bounds for header".into(),
+                            })?;
+                    let data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
+                    passthrough_indexed.push((idx, (&entry.name, data, &entry.shape)));
+                }
+            }
+        }
+
+        // Merge normal passthroughs with any `Unquantized`-scheme edge cases in
+        // header order, matching the original single-pass ordering exactly.
+        passthrough_indexed.sort_by_key(|&(idx, _)| idx);
+        let passthrough_refs: PassthroughRefs<'_> =
+            passthrough_indexed.into_iter().map(|(_, r)| r).collect();
 
         Ok((dequantized_data, passthrough_refs))
     }
@@ -1123,11 +1339,16 @@ impl ParsedModel {
     }
 
     /// Internal: dequantize to `BF16` and write, with optional progress callback.
-    fn remember_bf16_inner<F>(&self, output_path: &Path, on_tensor: F) -> crate::Result<()>
+    fn remember_bf16_inner<F>(
+        &self,
+        output_path: &Path,
+        threads: usize,
+        on_tensor: F,
+    ) -> crate::Result<()>
     where
         F: FnMut(),
     {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(on_tensor)?;
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, on_tensor)?;
         let views = self.build_views(&dequantized_data, &passthrough_refs)?;
 
         // Serialize to file. The safetensors writer streams tensor bodies one at
@@ -1150,8 +1371,8 @@ impl ParsedModel {
     }
 
     /// Internal: dequantize to `BF16` and return the serialized safetensors bytes.
-    fn remember_to_bytes_bf16(&self) -> crate::Result<Vec<u8>> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(|| {})?;
+    fn remember_to_bytes_bf16(&self, threads: usize) -> crate::Result<Vec<u8>> {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, || {})?;
         let views = self.build_views(&dequantized_data, &passthrough_refs)?;
 
         let metadata = self.header.metadata.clone();
@@ -1508,5 +1729,112 @@ mod tests {
     #[test]
     fn target_dtype_display() {
         assert_eq!(TargetDtype::BF16.to_string(), "BF16");
+    }
+
+    /// Builds a raw per-tensor-FP8 safetensors fixture with `n_weights` distinct
+    /// quantized weights (each a 2×2 `F8_E4M3` block with its own scalar `F32`
+    /// scale) plus one `BF16` passthrough norm. Each weight carries different
+    /// FP8 bytes and a different scale, so a mis-ordered parallel reassembly
+    /// would corrupt the output — making this a sharp determinism probe. With
+    /// `n_weights > 1` the multi-threaded dequant path is genuinely exercised.
+    fn build_multi_fp8_fixture(n_weights: usize) -> Vec<u8> {
+        let mut header_map = serde_json::Map::new();
+        let mut data = Vec::new();
+
+        for i in 0..n_weights {
+            // Distinct FP8 payload per weight: E4M3 values 0x38 (1.0), 0x40
+            // (2.0), 0x48 (4.0)… cycled so no two adjacent weights match.
+            // INDEX: fixed small table, index is `i % 3` in bounds.
+            let fp8_byte = [0x38u8, 0x40, 0x48][i % 3];
+            let w_off = data.len();
+            data.extend_from_slice(&[fp8_byte; 4]); // 2×2
+
+            let mut w_info = serde_json::Map::new();
+            w_info.insert("dtype".into(), "F8_E4M3".into());
+            w_info.insert("shape".into(), serde_json::json!([2, 2]));
+            w_info.insert(
+                "data_offsets".into(),
+                serde_json::json!([w_off, data.len()]),
+            );
+            header_map.insert(format!("layer.{i}.weight"), w_info.into());
+
+            // Distinct scale per weight.
+            // CAST: usize → f32 for a small test scale value; exact.
+            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            let scale = 1.0_f32 + i as f32;
+            let s_off = data.len();
+            data.extend_from_slice(&scale.to_le_bytes());
+            let mut s_info = serde_json::Map::new();
+            s_info.insert("dtype".into(), "F32".into());
+            s_info.insert("shape".into(), serde_json::json!([1]));
+            s_info.insert(
+                "data_offsets".into(),
+                serde_json::json!([s_off, data.len()]),
+            );
+            header_map.insert(format!("layer.{i}.weight_scale"), s_info.into());
+        }
+
+        // One BF16 passthrough norm.
+        let n_off = data.len();
+        data.extend_from_slice(&[0x80, 0x3F]); // BF16 1.0
+        let mut n_info = serde_json::Map::new();
+        n_info.insert("dtype".into(), "BF16".into());
+        n_info.insert("shape".into(), serde_json::json!([1]));
+        n_info.insert(
+            "data_offsets".into(),
+            serde_json::json!([n_off, data.len()]),
+        );
+        header_map.insert("norm.weight".into(), n_info.into());
+
+        let header_json = serde_json::to_string(&header_map).unwrap();
+        let header_bytes = header_json.as_bytes();
+        // CAST: usize → u64, header length fits in u64.
+        #[allow(clippy::as_conversions)]
+        let header_len = header_bytes.len() as u64;
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&header_len.to_le_bytes());
+        file_bytes.extend_from_slice(header_bytes);
+        file_bytes.extend_from_slice(&data);
+        file_bytes
+    }
+
+    /// The thread count is a performance knob, never a correctness variable:
+    /// `remember_to_bytes_with_options` must produce **byte-identical** output
+    /// for every thread budget. Exercises the multi-tensor parallel dequant path
+    /// (8 distinct FP8 weights) across `n ∈ {1, 2, 4}` and asserts the serialized
+    /// bytes match the single-threaded baseline exactly.
+    #[test]
+    fn remember_bytes_deterministic_across_thread_counts() {
+        let file_bytes = build_multi_fp8_fixture(8);
+        let tmp_in = std::env::temp_dir().join("test_multi_fp8_determinism.safetensors");
+        std::fs::write(&tmp_in, &file_bytes).unwrap();
+
+        let model = parse(&tmp_in).unwrap();
+        assert_eq!(model.header.scheme, QuantScheme::PerTensorFp8);
+        assert_eq!(model.inspect().quantized, 8, "8 quantized weights expected");
+
+        let baseline = model
+            .remember_to_bytes_with_options(TargetDtype::BF16, RememberOptions::with_threads(1))
+            .unwrap();
+
+        for n in [1usize, 2, 4] {
+            let out = model
+                .remember_to_bytes_with_options(TargetDtype::BF16, RememberOptions::with_threads(n))
+                .unwrap();
+            assert_eq!(
+                out, baseline,
+                "output must be byte-identical for thread count {n}"
+            );
+        }
+
+        // The default (env-resolved) budget must also match the baseline.
+        let default_out = model.remember_to_bytes(TargetDtype::BF16).unwrap();
+        assert_eq!(
+            default_out, baseline,
+            "default thread budget must match the single-threaded baseline"
+        );
+
+        std::fs::remove_file(&tmp_in).ok();
     }
 }

@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Multi-threaded per-tensor dequantisation** (Phase 7) behind a new
+  **`parallel`** Cargo feature (default-**on**, zero third-party dependency —
+  `std::thread::scope` over disjoint per-tensor chunks). `ParsedModel::remember`
+  / `remember_to_bytes` now dequantise the quantised tensors across a small pool
+  of worker threads. The kernels are embarrassingly parallel per tensor; the
+  measured win is **~3–4×** on a real fixture (`docs/perf-experiments.md`
+  Experiment 11), bounded by DRAM bandwidth rather than core count.
+  - New **`RememberOptions`** (re-exported at the crate root) plus
+    `ParsedModel::remember_with_options` / `remember_to_bytes_with_options`
+    carry a caller-owned, hardware-bounded thread budget: `None` →
+    `min(available_parallelism, 4)` (the measured scaling knee, leaving the
+    host's other cores free), `Some(n)` → `n.max(1)`. With the `parallel`
+    feature off the path is always sequential. The budget is derived only from
+    hardware and the caller — never from any file-declared count.
+  - `ConvertOptions` gains a matching `threads` field / `with_threads` builder;
+    the safetensors input path (which reuses the model dequant) is parallelised
+    for free.
+  - **Determinism is guaranteed**: output bytes are byte-identical for any thread
+    count (results reassembled in original header order), pinned by a new
+    determinism test across `n ∈ {1, 2, 4}`. The existing bit-exact
+    cross-validation suite versus PyTorch is unchanged. Existing `remember` /
+    `remember_to_bytes` / `remember_with_progress` signatures are unchanged.
+
 ## [0.6.9] - 2026-07-22
 
 ### Added

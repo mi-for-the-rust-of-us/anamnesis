@@ -363,7 +363,7 @@ pub use lethe::{
 pub use limits::ParseLimits;
 pub use model::{
     parse, parse_bytes, parse_bytes_with_limits, parse_from_reader, parse_from_reader_with_limits,
-    parse_with_limits, ParsedModel, TargetDtype,
+    parse_with_limits, ParsedModel, RememberOptions, TargetDtype,
 };
 #[cfg(feature = "ollama")]
 pub use parse::resolve_ollama_model;

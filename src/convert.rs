@@ -115,6 +115,13 @@ pub struct ConvertOptions {
     /// Resource budget applied to the *input* parse. Defaults to
     /// [`ParseLimits::default`] (unbounded beyond the permanent per-format caps).
     pub limits: ParseLimits,
+    /// Per-tensor dequantisation thread budget, with the same semantics as
+    /// [`RememberOptions::threads`](crate::RememberOptions): `None` (the default)
+    /// resolves to `min(available_parallelism, 4)`, `Some(n)` pins it to
+    /// `n.max(1)`, and it is always 1 when the `parallel` feature is off. Applies
+    /// only to the safetensors input path (which reuses the model dequant); other
+    /// readers are single-threaded.
+    pub threads: Option<usize>,
     /// Caller-supplied `GGUF` key/value metadata, written verbatim and merged
     /// **over** any KV carried from a `GGUF` source (the caller wins on a key
     /// collision). Empty by default.
@@ -142,6 +149,15 @@ impl ConvertOptions {
     #[must_use]
     pub fn with_limits(mut self, limits: ParseLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Sets the per-tensor dequantisation thread budget (clamped to at least 1).
+    /// Overrides the `min(available_parallelism, 4)` default; ignored when the
+    /// `parallel` feature is off (always sequential).
+    #[must_use]
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = Some(n.max(1));
         self
     }
 
@@ -469,8 +485,9 @@ pub fn convert(
 
 /// Parses `input` into the hub, dispatching on the detected format.
 fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
+    let threads = crate::model::resolve_thread_budget(options.threads);
     match detect_format(input)? {
-        Format::Safetensors => read_safetensors(input, &options.limits),
+        Format::Safetensors => read_safetensors(input, &options.limits, threads),
         #[cfg(feature = "pth")]
         Format::Pth => read_pth(input, &options.limits),
         #[cfg(feature = "npz")]
@@ -523,9 +540,9 @@ fn write_hub(
 /// Reads a safetensors file into the hub, dequantising quantised tensors to
 /// `BF16` and passing scalar tensors through in their original dtype. Carries
 /// the source `__metadata__`.
-fn read_safetensors(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
+fn read_safetensors(path: &Path, limits: &ParseLimits, threads: usize) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
-    let (tensors, dequantized) = model.hub_tensors()?;
+    let (tensors, dequantized) = model.hub_tensors(threads)?;
     Ok(Hub {
         tensors,
         st_metadata: model.header.metadata.clone(),

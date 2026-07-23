@@ -52,8 +52,14 @@ inherits = "release"
 panic = "unwind"
 
 [features]
-default = []
+default = ["parallel"]
 cli = ["dep:clap"]
+# Multi-threaded per-tensor dequantisation (Phase 7). Zero third-party
+# dependency: uses `std::thread::scope` over disjoint per-tensor chunks. The
+# thread budget is caller-owned and hardware-bounded (default `min(cores, 4)`);
+# with this feature off the dequant path is always sequential. See
+# `docs/perf-experiments.md` Experiment 11 for the measured ~3–4× scaling.
+parallel = []
 gptq = []
 awq = []
 bnb = []
