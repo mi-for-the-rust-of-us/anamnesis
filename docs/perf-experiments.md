@@ -37,6 +37,8 @@ perf-claim change**. This file catalogs what's been tested.
 | 7 | Sign-of-zero preservation rule (`BnB FP4` decode tweak) — *correctness experiment* | **"Impossible" was conditional, not absolute** — narrow tweak recovers byte-exact round-trip on 0.2 % of FP4 elements with no NF4/INT8 side-effect | Shipped commits `a5c452d` / `24cba42` / `ab4e735` (v0.5.0) |
 | 8 | Vendored `ZIP` reader: container-metadata footprint vs `zip::ZipArchive::new` | **337 → 41 B/entry resident, 8.07×** (3.12× peak) on a 50 001-entry archive — projected ~12×, ceiling was ~8.4× | Shipped (v0.6.7, Phase 6.12) |
 | 9 | `convert` copy-elimination pass (avoid hub-sized copies + one `O(P·N)` scan) | **Confirmed: peak −39 % (bnb), −25 % (gguf KV), −49.6 % (npz)** — each drop equals exactly the one eliminated copy | Shipped (v0.6.9, Phase 6.14) |
+| 10 | Phase 7 SIMD exhaustion — is explicit AVX2 worth it anywhere in the dequant kernels? | **No. Bit-exact hand-written AVX2 `f32x8_to_bf16x8` gains 1.02×/1.04× (null) — writer is bandwidth-bound. FP8 already auto-AVX2 yet compute-bound; GPTQ/AWQ arithmetic already vectorizes; slowest kernels (IQ2/IQ3) are gather-bound (AVX2 gather slow on Zen 3). Compiler already captures the SIMD; limits are memory bandwidth + codebook gathers. Real headroom = multi-threading (single-threaded on 16 cores)** | SIMD exhausted with evidence, no product `unsafe` shipped (branch `phase-7-cpu-simd`); bench harness kept as proof; next = multi-threaded dequant |
+| 11 | Phase 7 multi-threaded dequant — prototype scaling (`std::thread::scope`) | **Real but bounded, ~3–4× (not core-count-linear): FP8 (memory-heavy) 2.9×, IQ3_S (compute/gather-heavy) 4.0× at 16 threads — both plateau (bandwidth + all-core-clock ceilings). Per-thread `Vec` alloc caps FP8 at 2.2×; the disjoint `split_at_mut` output pattern (no alloc, no zero-fill) recovers it to 2.9×** | Prototype (branch `phase-7-cpu-simd`) — confirms multi-threading is the real lever and that the disjoint-output-slice pattern matters; corrects an earlier "4–16×" over-estimate |
 
 ---
 
@@ -809,3 +811,205 @@ later: the hub is still materialised in full (`O(model)`; streaming it down to
 `O(largest tensor)` is Phase 10), and the reader-side GGUF KV clone in
 `read_gguf` (necessary because the hub outlives the mmap-backed parse) could be
 moved rather than cloned if `ParsedGguf` gained an `into_metadata()`.
+
+---
+
+## Experiment 10 — Phase 7 Stage-0 SIMD roofline (which loops are worth vectorizing?)
+
+**Scope note:** This is the measurement-first Stage 0 of Phase 7 (CPU SIMD). The
+ROADMAP's Phase-7 thesis was *"replace the scalar pass-2 `f32 → BF16` writer with
+runtime-dispatched AVX2/NEON for a 4–8× speedup on the hot path."* Before writing any
+`unsafe` intrinsic, Stage 0 asks the two questions that decide whether that thesis
+holds: **(1)** is the shared pass-2 writer compute-bound (SIMD can help) or
+bandwidth-bound (SIMD cannot beat DRAM)? and **(2)** what does the compiler already
+auto-vectorize today?
+
+**Method:**
+
+- **Roofline bench** — [`tests/bench_pass2_adhoc.rs`](../tests/bench_pass2_adhoc.rs)
+  (`#[ignore]`), best-of-9 median **and min-time** (the min is the least-perturbed
+  sample — the honest ceiling on an interactive box), 3-iteration warmup, ~45 M-element
+  (Llama-FFN-sized) synthetic fixtures. Two builds of the same binary:
+  `-C target-cpu=native` (the local CLAUDE.md perf-gate baseline) and
+  `-C target-cpu=x86-64` (SSE2 — the default-PyPI-wheel baseline). `bench_memcpy_ceiling`
+  establishes the practical single-core streaming ceiling; each kernel's GB/s is compared
+  against it. Traffic counted as read + write bytes per element.
+- **asm audit** — `cargo asm --release` (cargo-show-asm 0.2.62) on each public dequant
+  entry, counting packed (`vmulps`/`ymm`) vs scalar (`vmulss`) float arithmetic.
+- **Machine:** AMD Ryzen 9 5950X (Zen 3 — AVX2 + FMA, no AVX-512),
+  `x86_64-pc-windows-msvc`, warmed working set.
+
+**Result — roofline (min-time GB/s, read+write traffic):**
+
+| Kernel | native | SSE2 | fraction of memcpy ceiling | classification |
+|---|---:|---:|---:|---|
+| `memcpy_ceiling` | 9.7 | 11.3 | 1.00 | (the ceiling) |
+| **pure pass-2 writer** (isolated `write_scratch_to_bf16` loop) | 8.4 | 9.4 | **0.83–0.87** | **bandwidth-bound** |
+| GGUF `Q8_0` (light unpack) | 3.3 | 5.2 | 0.34–0.46 | compute-bound |
+| GGUF `Q4_0` (nibble unpack) | 2.7 | 3.5 | 0.28–0.31 | compute-bound |
+| FP8 per-tensor (fused decode) | 3.2 | 3.3 | 0.29–0.33 | compute-bound |
+
+**Result — asm audit (`-C target-cpu=native`, per-kernel arithmetic in the loop body):**
+
+Read via `cargo asm --release "<fn>" 0` — selecting the **function body by index** is
+required: bare `cargo asm "<fn>"` prints a *candidate list* (the function plus its iterator
+closures) that a naive `grep` mistakes for disassembly. The first pass of this experiment
+made exactly that error and briefly recorded "0 `ymm`, fully scalar" for AWQ/GPTQ; the
+corrected readings below select index 0.
+
+| Kernel loop | Packed AVX2 arithmetic? | Evidence (index-0 body) |
+|---|---|---|
+| FP8 per-tensor fused kernel | **yes, main loop** | `vmulps` (vectorized body) + `vmulss` (scalar tail) |
+| GPTQ pass-2 `(qw−zero)×scale → bf16` | **yes, partial** | 3×`vsubps`/`vmulps` + 5×`vsubss`/`vmulss` (scalar tails / loop versions) |
+| AWQ pass-2 (same shape) | **yes, partial** | 3×`vsubps`/`vmulps` + 5×`vsubss`/`vmulss` |
+
+So the decode arithmetic is **already partially auto-vectorized in all three kernels** — the
+premise that the four-way `Zip` chain leaves it fully scalar is **false**. A naive fission
+of AWQ's pass-2 into a separate indexed arithmetic loop *removed* the packed ops (dropped to
+`1×vsubss`/`1×vmulss`) — a regression — and was reverted.
+
+**Why the ROADMAP's thesis does not hold as stated (and where the headroom actually is):**
+
+1. **The isolated pass-2 writer is bandwidth-bound** — 83–87 % of the memcpy ceiling on both
+   builds. It reads 4 B (f32) and writes 2 B (BF16) per element with trivial compute; an AVX2
+   rewrite cannot exceed DRAM bandwidth. Replacing *only* the shared writer (the ROADMAP's
+   marquee `f32x8_to_bf16x8` helper) yields ~0 on a `native` build. Its remaining value is
+   narrow but real and distribution-side: the Phase 8 **SSE2-fallback wheel** cannot use
+   `target-cpu=native`, so a runtime AVX2 dispatcher keeps that wheel fast on capable CPUs.
+2. **The decode kernels are compute-bound (0.3–0.46× ceiling), but not because the arithmetic
+   is scalar** — it is already vectorized. The cost lives in the parts that *don't* vectorize:
+   the per-element **unpack** (byte/nibble extraction; AWQ additionally scatters through
+   `AWQ_ORDER`) and the **f32→BF16 convert + 2-byte strided store** (`.to_bits()` → integer
+   RNE → `to_le_bytes()` → `chunks_exact_mut(2)`), plus scalar remainder loops. Squeezing
+   these is genuinely harder than "refactor a scalar zip-chain" — it needs either careful
+   restructuring that survives asm verification, or explicit `#[target_feature]` intrinsics.
+3. The inversions where the SSE2 build **beats** native on bandwidth-bound loops (writer 9.4
+   vs 8.4; `Q8_0` 5.2 vs 3.3) reinforce point 1: on Zen 3, wider AVX2 codegen buys nothing
+   when the loop is memory-bound.
+
+**Disposition:** the **roofline conclusion stands** (writer bandwidth-bound; decode
+compute-bound), but the Stage-1 plan built on the erroneous "decode arithmetic is scalar"
+reading is **withdrawn** — the arithmetic already vectorizes, so there is no free
+zip-chain-refactor win, and one such attempt regressed the asm. Direction for Phase 7 is
+re-opened with the corrected evidence: the realistic levers are (a) vectorizing the
+**convert + strided store** and/or the **unpack** (harder; needs measured, asm-verified
+restructuring or explicit intrinsics), and (b) the runtime-dispatched writer for the SSE2
+wheel (small, distribution-motivated). No source change ships from Stage 0; the only Stage-0
+artifact is `tests/bench_pass2_adhoc.rs` (the committed roofline harness).
+
+**Re-attempting this requires:** N/A for the roofline — it is the gating measurement. Any
+future kernel-vectorization claim must (i) read asm via the **index-0 selector**, (ii) hold
+0 ULP against the PyTorch cross-validation fixtures, and (iii) show a best-of-N release
+median win on a real fixture, or be reverted and logged here.
+
+### Part 2 — explicit-AVX2 exhaustion (the ROADMAP centerpiece, measured)
+
+**Question:** with the roofline saying the writer is bandwidth-bound, does a *real*
+hand-written AVX2 `f32x8_to_bf16x8` — the ROADMAP's marquee helper — beat the (already
+auto-vectorized) scalar writer? This is the definitive test before committing any product
+`unsafe`.
+
+**Method:** [`tests/bench_pass2_adhoc.rs`](../tests/bench_pass2_adhoc.rs) —
+`avx2_write_bf16` (RNE via the same `0x7FFF + lsb` bias, `_mm256_packus_epi32` +
+`permute4x64` pack), **validated 0-ULP** against the scalar oracle over 100 003 elements
+(prime → exercises the scalar tail) in `avx2_writer_is_bit_exact`. Timed **within one job on
+one buffer** (scalar then AVX2 back-to-back → the ratio cancels the runner-CPU confound),
+best-of-9 min-time, under `-C target-cpu=native` and `-C target-cpu=x86-64` (SSE2).
+
+**Result:**
+
+| Build | scalar | AVX2 | AVX2 speedup |
+|---|---:|---:|---:|
+| `native` (scalar already auto-AVX2) | 20.2 GB/s | 20.5 GB/s | **1.02×** |
+| `x86-64` / SSE2 (scalar has no AVX2 — the wheel case) | 19.9 GB/s | 20.7 GB/s | **1.04×** |
+
+**Verdict: null.** A bit-exact explicit AVX2 writer gains ~2–4 %, inside the noise, on both
+builds. The writer is bandwidth-bound, so even the SSE2 case — where the scalar path cannot
+auto-vectorize — sees no benefit, which also **undercuts the SSE2-wheel rationale** for the
+helper. The ROADMAP's "SIMD the pass-2 writer for 4–8×" is disproven with a real intrinsic.
+
+**Corroborating evidence that explicit SIMD is exhausted across the kernel set:**
+
+- **FP8 fused kernel** already carries `// VECTORIZED: confirmed ... AVX2 vmulps+vpackusdw`
+  ([`src/remember/fp8.rs`](../src/remember/fp8.rs)) — the compiler already emits AVX2 — yet it
+  stays compute-bound (3.2 GB/s), so the cost is the ~dozen-op-per-element E4M3 decode, not a
+  missing vectorization intrinsics could add.
+- **GPTQ/AWQ** pass-2 arithmetic already partially vectorizes (`vsubps`/`vmulps`, Part 1).
+- **GGUF kernel sweep** (`bench_gguf_kernel_sweep`, 8.4 M elems, BF16-output MB/s): the slow
+  kernels are the **IQ2/IQ3 lattice codebooks** (IQ2_XS 2.1, IQ3_S 2.1 GB/s vs ~5 for
+  legacy/K-quants) — they are **gather-bound**, and AVX2 gather (`vpgatherdd`) is slow on
+  Zen 3, so SIMD does not help the slowest kernels either.
+
+**Disposition: SIMD conclusively exhausted; no product `unsafe` shipped** (per CLAUDE.md
+"no measured win → no commit"). The AVX2 prototype stays in the `#[ignore]` bench as the
+reproducible exhaustion proof, not in the library. The measured headroom lives elsewhere:
+the kernels are **single-threaded on a 16-core CPU** and embarrassingly parallel — the next
+investigation (multi-threaded dequant) targets that.
+
+**Re-attempting this requires:** a kernel that is measured compute-bound AND *not* already
+auto-vectorized AND *not* gather-bound — none found in the current dequant set.
+
+---
+
+## Experiment 11 — multi-threaded dequant, prototype scaling
+
+**Question:** Experiment 10 identified multi-threading as the real lever (kernels are
+single-threaded on a 16-core 5950X, embarrassingly parallel). How far does it actually
+scale — is it the "4–16×" a naive core-count argument suggests?
+
+**Method:** [`tests/bench_pass2_adhoc.rs`](../tests/bench_pass2_adhoc.rs), `std::thread::scope`
+(no dependency), best-of-9 median, `-C target-cpu=native`, 5950X. Two kernels bracketing the
+arithmetic-intensity range, plus a deliberate allocation-strategy contrast:
+
+- **FP8 per-tensor** (memory-heavy: 1 B in → 2 B out, light compute) — two variants: one
+  where each thread allocates its own output `Vec` (the naive API-per-chunk shape), and one
+  where a single output buffer is **pre-allocated and split via `split_at_mut`** (the
+  `CONVENTIONS.md` disjoint-output-region pattern — no per-thread alloc, no zero-fill).
+- **IQ3_S** (compute/gather-heavy: lattice-codebook lookups) via the public Vec API.
+
+Determinism is asserted (8-way parallel concat == sequential bytes) before timing.
+
+**Result (speedup vs 1 thread, median):**
+
+| threads | FP8, `Vec`-per-thread | FP8, disjoint slices | IQ3_S (compute/gather) |
+|---:|---:|---:|---:|
+| 1 | 1.00× (30.6 ms) | 1.00× (20.6 ms) | 1.00× (8.3 ms) |
+| 2 | 1.79× | 1.93× | 1.75× |
+| 4 | 1.70× | 2.72× | 3.11× |
+| 8 | 1.79× | 2.86× | 3.86× |
+| 16 | 2.23× | **2.92×** | **4.02×** |
+
+**Findings:**
+
+1. **The realistic win is ~3–4×, not core-count-linear.** Both kernels plateau far below 16
+   threads — FP8 (memory-heavy) at ~4 threads (aggregate memory bandwidth ~19 GB/s here),
+   IQ3_S (compute-heavy) a bit higher at ~8 threads (~4×). Aggregate DRAM bandwidth and the
+   all-core turbo-clock drop are the ceilings, not the core count. This **corrects an earlier
+   "4–16×" over-estimate** — the honest figure is **~3× (memory-bound) to ~4× (compute-bound)**.
+   Still a large, worthwhile win versus SIMD's measured 1.0×.
+   - **The limiting resource is DRAM bandwidth, not disk or ALU** — the buffers are in-RAM
+     (no I/O in the timed loop) and larger than the 64 MB L3, so every element round-trips to
+     main memory. On this 5950X the ceiling is dual-channel DDR4 through one memory controller,
+     amplified by write read-for-ownership (each output store ≈ 2× bus traffic). It is therefore
+     **host-dependent**: an 8-channel DDR5 server has 5–10× the bandwidth and would scale
+     further — the reason the thread budget is a caller-tunable default (`min(cores, 4)`), not a
+     hard-coded core count. **Design implication:** 4 threads captures ~90 % of the desktop win
+     while leaving the host's other cores free — a good-citizen default for an embeddable library.
+2. **The allocation strategy matters — the `CONVENTIONS.md` disjoint-slice rule is load-bearing.**
+   Naive `Vec`-per-thread caps FP8 at **2.23×** (each thread `vec![0; n]` zero-fills its output,
+   double-writing memory and serializing on the allocator); pre-allocating once and writing
+   disjoint `split_at_mut` slices lifts it to **2.92×** and drops the 1-thread time 30.6→20.6 ms
+   (no zero-fill). A real implementation must write into caller-provided disjoint output
+   regions, not allocate per task.
+3. **Compute-heavier kernels scale better** (IQ3_S 4.0× > FP8 2.9×), as predicted: lower memory
+   traffic per unit work means they hit the bandwidth wall later.
+
+**Disposition:** prototype only — no product code yet. Confirms multi-threading is the
+worthwhile Phase-7 lever (~3–4×) and validates the disjoint-output-slice design the new
+[`CONVENTIONS.md`](../CONVENTIONS.md) "When Parallelizing Work" section mandates. A product
+implementation needs a slice-writing (not `Vec`-returning) internal dequant entry, a
+caller-controlled thread budget (never derived from file-declared counts), and a
+thread-count-invariant determinism test.
+
+**Re-attempting this requires:** N/A — this is the gating prototype. The product
+implementation's per-kernel scaling lands here as measured, against the sequential baseline.

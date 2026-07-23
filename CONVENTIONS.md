@@ -22,6 +22,7 @@ the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/
 | Write a `match` or `if let` | [Control-flow rules](#if-let-vs-match), [`// EXPLICIT:`](#explicit-annotation) if no-op arm |
 | Write bit manipulation for (de)quantization | [`// BITWISE:`](#bitwise-annotation) |
 | Write a bulk conversion loop | [`// VECTORIZED:`](#vectorized-annotation), [SIMD-friendly loop rules](#when-writing-simd-friendly-loops) |
+| Spawn threads or write a parallel loop | [`// PARALLEL:`](#parallel-annotation), [parallelizing work rules](#when-parallelizing-work) |
 | Write error strings | [Error message wording](#error-message-wording) |
 | Batch operations by key | [HashMap grouping idiom](#hashmap-grouping-idiom) |
 | Parse a header, archive, or stream from caller input | [Untrusted input invariants](#when-parsing-untrusted-input) |
@@ -45,7 +46,7 @@ is what makes the code build under `#![deny(warnings)]`.
 | `// INDEX:` | `#[allow(clippy::indexing_slicing)]` |
 | `// EXHAUSTIVE:` | `#[allow(clippy::wildcard_enum_match_arm)]` or `#[allow(clippy::exhaustive_enums)]` |
 | `// SAFETY:` | `#[allow(unsafe_code)]` (at item or block scope) |
-| `// BITWISE:`, `// VECTORIZED:`, `// BORROW:`, `// TRAIT_OBJECT:`, `// EXPLICIT:` | none — these are documentation-only |
+| `// BITWISE:`, `// VECTORIZED:`, `// PARALLEL:`, `// BORROW:`, `// TRAIT_OBJECT:`, `// EXPLICIT:` | none — these are documentation-only |
 
 ### Per-site vs block-scope
 
@@ -765,3 +766,113 @@ despite following the rules above, escalate in this order:
    Adds a dependency but avoids hand-written intrinsics.
 3. **Hand-written intrinsics with `#[cfg(target_arch)]`** — last resort.
    Must include a scalar fallback for non-x86/non-ARM targets.
+
+> **Empirical note (Phase 7, `docs/perf-experiments.md` Experiment 10):** explicit
+> SIMD was *measured* to add nothing to anamnesis's dequant kernels — the shared
+> pass-2 `f32 → BF16` writer is bandwidth-bound (a bit-exact hand-written AVX2
+> `f32x8_to_bf16x8` scored 1.02×), the compiler already auto-vectorizes the
+> arithmetic, and the slowest kernels (IQ2/IQ3) are gather-bound. The largest
+> measured lever is **multi-threading**, governed by the section below. Reach for
+> the escalation ladder above only after a roofline says a loop is compute-bound
+> *and* not already vectorized *and* not gather-bound.
+
+---
+
+## When Parallelizing Work
+
+anamnesis dequantizes billions of elements; the kernels are embarrassingly
+parallel (each output element depends only on its own input block — no
+cross-element state) yet run single-threaded today. Multi-threading is the
+largest *measured* performance lever (`docs/perf-experiments.md` Experiment 10).
+Concurrency has nastier failure modes than SIMD — data races, non-determinism,
+DoS amplification — so the discipline is codified here before the code, exactly
+as the SIMD rules were.
+
+### Parallelize only when all of these hold
+
+1. **Provable independence.** Each task writes a **disjoint** output region and
+   reads only shared-**immutable** input. No shared mutable state, no lock in the
+   hot path, no cross-task reduction. Dequant qualifies: output element `i`
+   depends only on input block `⌊i / block_size⌋` and its scale.
+2. **A measured win.** A release-mode best-of-N median on a real fixture shows a
+   scaling win past the thread spawn/join overhead — the same
+   "no measured win → no commit" gate every perf claim obeys
+   ([`CLAUDE.md`](CLAUDE.md) § Performance Changes). Record it in
+   `docs/perf-experiments.md` against the sequential baseline.
+3. **Above a size threshold.** Below a named `*_MIN_PARALLEL_*` element/tensor
+   count, spawn+join cost dominates and the **sequential path** runs instead.
+   Document the threshold's calibration.
+
+### Determinism is mandatory — bit-exact and thread-count-invariant
+
+The crate's entire value is 0-ULP dequant validated against PyTorch. Parallelism
+must **never** change an output byte:
+
+- **Partition by disjoint output region** (row/tensor ranges via `split_at_mut` /
+  `chunks_mut`); each task writes only its own slice. Output bytes are then
+  independent of how the work was split.
+- **Never parallelize a floating-point reduction.** `f32`/`f64` addition is
+  non-associative, so a parallel sum reorders rounding and changes the result.
+  Dequant has no reductions — keep it that way; if one is ever needed, it runs
+  sequentially or uses a fixed, order-preserving tree.
+- **A determinism test is required**: assert byte-identical output across thread
+  counts `{1, 2, N}` for every parallelized path. Thread count is a performance
+  knob, never a correctness variable.
+
+### Mechanism: scoped `std` threads by default; `rayon` only behind a feature
+
+- Default to **`std::thread::scope` + manual disjoint chunking** — **zero
+  dependency**, matching the crate's minimal-dependency posture (the vendored ZIP
+  reader exists precisely to keep `zip` out of the runtime tree). Scoped threads
+  borrowing `split_at_mut` slices are **safe Rust** — parallelism adds **no
+  `unsafe`** (unlike SIMD). Never reach for manual `Send`/`Sync` impls or raw
+  pointer sharing to parallelize.
+- If `rayon`'s ergonomics are wanted later, gate it behind a **`rayon` feature
+  flag** so the default build pulls no new dependency, and keep the sequential
+  path as the always-available fallback.
+
+### The caller owns the thread budget — never the input file
+
+- **Caller-controllable, and modest by default.** Thread count is an explicit
+  parameter, and the sequential path is always reachable. The **default is
+  deliberately small — the scaling knee, not the core count**: `min(available_parallelism, 4)`.
+  Dequant throughput is memory-bandwidth-bound and plateaus at ~3–4× by ~4 threads
+  (`docs/perf-experiments.md` Experiment 11), so 4 captures ~90 % of the win while
+  leaving the rest of the host's cores free for the caller's own work. A library
+  must never unilaterally saturate the machine: grabbing all cores buys nothing
+  past the plateau and actively harms the host process that embeds it. The cap is
+  a **default, not a ceiling** — because the limiting resource is DRAM bandwidth,
+  a memory-rich host (many-channel DDR5 server) can profitably raise it through
+  the caller parameter; hard-coding the core count would be wrong in both
+  directions.
+- **Bounded by hardware, never by the input.** Thread/task count derives from
+  hardware parallelism, **never** from any file-declared quantity (tensor count,
+  shape, block count). A malicious archive declaring 10⁹ tensors must not spawn
+  10⁹ threads — this extends the [untrusted-input](#when-parsing-untrusted-input)
+  DoS invariant to concurrency. Partition into a fixed, hardware-sized set of
+  chunks; never spawn per file-entity.
+- **Not on parse/inspect paths.** Never spawn threads while interpreting an
+  untrusted header. Parallelism belongs on the compute-heavy transform paths
+  (`remember`/`forget`/`convert`) operating on already-validated data.
+
+### PARALLEL Annotation
+
+`// PARALLEL: <partition strategy + independence/determinism invariant>` —
+required at every site that spawns threads or drives a parallel iterator.
+Documents what makes the partition race-free and the output deterministic,
+mirroring the `// VECTORIZED:` discipline.
+
+> Example: `// PARALLEL: output rows split via chunks_mut(rows_per_thread) into`
+> `disjoint slices; each thread reads shared-immutable qweight/scales, writes only`
+> `its own rows — no reduction, byte-identical to the sequential path`
+
+### Verify parallelism
+
+Like vectorization, **verify** — do not assume:
+
+1. The determinism test (byte-identical across thread counts incl. 1) is green.
+2. The scaling win is measured (best-of-N, real fixture) and recorded in
+   `docs/perf-experiments.md` with the sequential baseline.
+3. Where the platform supports it, the parallelized path is exercised under a
+   race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
+   the disjoint-slice design is race-free by construction, so this is a backstop).
