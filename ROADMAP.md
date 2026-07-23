@@ -795,6 +795,8 @@ Per [`CONVENTIONS.md`](CONVENTIONS.md)'s accepted-unsafe table, all of the follo
 3. The module is gated behind `#[cfg(feature = "simd")]` — users who don't enable the feature get `#![forbid(unsafe_code)]` unchanged.
 4. The safe scalar fallback exists and is tested identically to the SIMD path.
 
+> **The 8 checkboxes below are the SUPERSEDED SIMD plan** — retained as the tested record (measured null, see the banner and Experiment 10); **not pursued, no `unsafe` shipped.** The plan that actually shipped is "Phase 7 as shipped" after the deliverable.
+
 - [ ] **`simd` feature flag + `remember::simd` module scaffold** — new `Cargo.toml` entry, `#[cfg(feature = "simd")] pub mod simd;` in `remember/mod.rs`, `cfg_attr(feature = "simd", allow(unsafe_code))` in `lib.rs`, and a new row in the `CONVENTIONS.md` accepted-unsafe table — **commit**
 - [ ] **`f32x8_to_bf16x8` AVX2 intrinsic** — 8-wide round-to-nearest-even `f32 → BF16` lane-for-lane equivalent to the scalar `f32_bits_to_bf16_bits`. Bit-exact against the scalar reference (golden-vector test) — **commit**
 - [ ] **`f32x4_to_bf16x4` NEON intrinsic** — ARM64 equivalent for Apple Silicon and AWS Graviton. Same bit-exactness requirement as the AVX2 path — **commit**
@@ -807,6 +809,22 @@ Per [`CONVENTIONS.md`](CONVENTIONS.md)'s accepted-unsafe table, all of the follo
 **Deliverable:** `anamnesis` v0.7.0 — `BF16`-writing pass 2 runs 4–8× faster on AVX2 and NEON CPUs, scalar fallback preserved for `forbid(unsafe_code)` users, with cross-kernel consistency (FP8 / GPTQ / AWQ / BnB / GGUF all benefit from the same single-source-of-truth SIMD helper), and a runtime dispatcher that lets the [Phase 8](#phase-8-python-bindings-pyo3) wheels deliver AVX2 throughput without a `target-cpu=native` build. — **PUSH + tag `v0.7.0`**
 
 **New dependencies:** None at runtime — uses `std::arch` intrinsics directly. Optional dev-dependency on `criterion` for the bench harness.
+
+---
+
+#### Phase 7 as shipped: multi-threaded per-tensor dequant
+
+Replacing the null SIMD plan above with the **measured** lever (~3–4×, [`docs/perf-experiments.md`](docs/perf-experiments.md) Experiment 11). No `unsafe`, no new runtime dependency.
+
+- [x] **Measurement-first investigation** — roofline + `cargo asm` audit + GGUF kernel sweep + a bit-exact hand-written AVX2 `f32x8_to_bf16x8` prototype proving explicit SIMD is null (1.02×/1.04×); harness `tests/bench_pass2_adhoc.rs`, Experiments 10–11 — **commit `ae619aa`**
+- [x] **`CONVENTIONS.md` "When Parallelizing Work"** — determinism mandatory, disjoint outputs, caller-owned thread budget bounded by hardware (never file-declared counts), `// PARALLEL:` annotation — **commit `ae619aa`**
+- [x] **`parallel` Cargo feature (default-ON) + `RememberOptions` / `with_threads`** + `remember_with_options` / `remember_to_bytes_with_options`; existing `remember` signatures unchanged; budget `None → min(available_parallelism, 4)`, `Some(n) → n.max(1)` — **commit `934bf81`**
+- [x] **Parallel `ParsedModel::dequantize_all`** — per-tensor `std::thread::scope` over disjoint chunks, results sorted by header index → **byte-identical for any thread count**; determinism test across `{1, 2, 4}` (feature on and off); kernels untouched, bit-exact-vs-PyTorch suite green — **commit `934bf81`**
+- [x] **`ConvertOptions.threads` / `with_threads`** — the safetensors input path parallelises for free (reuses the model dequant) — **commit `934bf81`**
+- [ ] **GGUF-reader parallelisation** — *deferred follow-up:* `read_gguf`'s own per-tensor loop over mmap-borrowed `ParsedGguf` needs `ParsedGguf: Sync` + a loop restructure before it can join the scoped-thread pool
+- [ ] **README / docs throughput note + release** — document the `parallel` feature and the `min(cores, 4)` default; then the release checklist — **PUSH + tag `v0.7.0`**
+
+**Deliverable:** `anamnesis` v0.7.0 — whole-model `remember` / `convert` dequantise **~3–4× faster** on multi-core CPUs (DRAM-bandwidth-bound, so a modest `min(cores, 4)` default captures ~90 % of the win while leaving the host's cores free), **byte-identical output at any thread count**, opt-out via `default-features = false` for sequential/wasm builds. Explicit SIMD was measured and rejected — no product `unsafe`. — **PUSH + tag `v0.7.0`**
 
 ### Phase 8: Python Bindings (PyO3)
 
