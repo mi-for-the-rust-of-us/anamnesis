@@ -54,7 +54,12 @@
     clippy::indexing_slicing,
     // The `*const f32 -> *const __m256i` cast feeds `_mm256_loadu_si256`, an
     // UNALIGNED load — the higher alignment the lint warns about is never required.
-    clippy::cast_ptr_alignment
+    clippy::cast_ptr_alignment,
+    // This dev-only harness's module doc is prose (PowerShell commands, run
+    // recipes). MSRV-1.88 clippy's `doc_markdown` allowlist lacks terms newer
+    // clippy accepts (e.g. "PowerShell"), so allow it here rather than backtick
+    // every prose word to satisfy the oldest toolchain.
+    clippy::doc_markdown
 )]
 
 use std::time::Instant;
