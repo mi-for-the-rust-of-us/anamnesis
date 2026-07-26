@@ -256,5 +256,6 @@ or [MIT License](LICENSE-MIT) at your option.
 
 ## Development
 
-- Exclusively developed with [Claude Code](https://claude.com/product/claude-code) (dev) and [Augment Code](https://www.augmentcode.com/) (review)
+- Exclusively developed with [Claude Code](https://claude.com/product/claude-code)
+- Continuous performance benchmarking with [CodSpeed](https://codspeed.io/)
 - Git workflow managed with [Fork](https://fork.dev/)
