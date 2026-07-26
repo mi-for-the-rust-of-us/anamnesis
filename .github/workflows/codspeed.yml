@@ -1,0 +1,51 @@
+# Continuous performance tracking via CodSpeed (https://codspeed.io).
+#
+# Instrument: SIMULATION (CPU-instruction model) — runs on the free shared
+# `ubuntu-latest` runner and works on a personal GitHub account. It is a
+# deterministic *complexity* tripwire (catches "this refactor added N% more
+# instructions"), NOT a wall-clock verdict.
+#
+# IMPORTANT (see docs/perf-experiments.md Experiment 10): anamnesis's dequant
+# kernels are memory-bandwidth- and gather-bound, where the simulation model can
+# disagree with real time (it would have shown the null Phase-7 SIMD change as a
+# "win"). So simulation numbers here must NOT gate a perf decision — the local
+# best-of-N wall-clock protocol in CLAUDE.md remains the authority. The accurate
+# CI signal is the WALLTIME instrument, which needs CodSpeed *macro runners*
+# (`runs-on: codspeed-macro`) — those require a GitHub *organization* (they do
+# not work on personal accounts). Flip `runs-on` + `mode` once the ecosystem
+# lives under an org.
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC auth to CodSpeed — no CODSPEED_TOKEN secret needed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain, cache, and cargo-codspeed
+        uses: moonrepo/setup-rust@v0
+        with:
+          channel: stable
+          cache-target: release
+          bins: cargo-codspeed
+
+      # `--all-features` satisfies the benches' required-features
+      # (dequant: gptq/awq/bnb/gguf; parsing: npz/pth/gguf).
+      - name: Build the benchmark targets
+        run: cargo codspeed build --all-features
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: cargo codspeed run
