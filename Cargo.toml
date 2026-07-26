@@ -108,9 +108,14 @@ required-features = ["cli"]
 # `cargo bench` behaves exactly like upstream criterion, while under
 # `cargo codspeed` it emits CodSpeed measurements for CI regression tracking.
 # The bench `.rs` sources keep their `use criterion::…` imports unchanged. See
-# `.github/workflows/codspeed.yml` (simulation instrument today; walltime needs
-# a GitHub org for CodSpeed macro runners).
-criterion = { package = "codspeed-criterion-compat", version = "2" }
+# `.github/workflows/codspeed.yml`.
+#
+# The MAJOR version MUST match the `cargo-codspeed` binary the CI installs
+# (currently v5): the *walltime* instrument fails to collect results on a
+# major-version mismatch (it errors "Failed to collect walltime results ...
+# same major version as cargo-codspeed"). Simulation tolerates a mismatch;
+# walltime does not. Keep this bumped in lockstep with the CI's cargo-codspeed.
+criterion = { package = "codspeed-criterion-compat", version = "5" }
 # Phase 6.5 dev-only peak-heap profiler. The `tests/peak_heap_*.rs`
 # binaries (and only there) declare `dhat::Alloc` as their
 # `#[global_allocator]`, so every allocation in those binaries is
