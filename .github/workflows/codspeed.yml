@@ -1,19 +1,18 @@
 # Continuous performance tracking via CodSpeed (https://codspeed.io).
 #
-# Instrument: SIMULATION (CPU-instruction model) — runs on the free shared
-# `ubuntu-latest` runner and works on a personal GitHub account. It is a
-# deterministic *complexity* tripwire (catches "this refactor added N% more
-# instructions"), NOT a wall-clock verdict.
+# Instrument: WALLTIME (real elapsed time) on CodSpeed *macro runners*
+# (`runs-on: codspeed-macro`) — bare-metal, low-noise, isolated. This is the
+# accurate signal that CAN gate perf decisions: it reflects real time, so it
+# captures the memory-bandwidth and multi-thread effects the CPU-simulation
+# instrument misses (simulation would have shown the null Phase-7 SIMD change as
+# a "win" — see docs/perf-experiments.md Experiment 10).
 #
-# IMPORTANT (see docs/perf-experiments.md Experiment 10): anamnesis's dequant
-# kernels are memory-bandwidth- and gather-bound, where the simulation model can
-# disagree with real time (it would have shown the null Phase-7 SIMD change as a
-# "win"). So simulation numbers here must NOT gate a perf decision — the local
-# best-of-N wall-clock protocol in CLAUDE.md remains the authority. The accurate
-# CI signal is the WALLTIME instrument, which needs CodSpeed *macro runners*
-# (`runs-on: codspeed-macro`) — those require a GitHub *organization* (they do
-# not work on personal accounts). Flip `runs-on` + `mode` once the ecosystem
-# lives under an org.
+# Macro runners require a GitHub *organization* (not a personal account) and draw
+# from the org's monthly macro-runner minutes. To fall back to the free,
+# always-on CPU-simulation instrument, set `runs-on: ubuntu-latest` and
+# `mode: simulation` (a deterministic *complexity* tripwire, not a wall-clock
+# verdict). Even with walltime, the local best-of-N protocol in CLAUDE.md remains
+# the release-gating authority; CI walltime is the continuous regression signal.
 name: CodSpeed
 
 on:
@@ -25,7 +24,7 @@ on:
 jobs:
   benchmarks:
     name: Run benchmarks
-    runs-on: ubuntu-latest
+    runs-on: codspeed-macro
     permissions:
       contents: read
       id-token: write # OIDC auth to CodSpeed — no CODSPEED_TOKEN secret needed
@@ -47,5 +46,5 @@ jobs:
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:
-          mode: simulation
+          mode: walltime
           run: cargo codspeed run
