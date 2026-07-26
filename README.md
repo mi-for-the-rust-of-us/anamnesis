@@ -215,8 +215,10 @@ Representative measured results (release build, `target-cpu=native`, best-of-5):
 - **Dequantization:** 2.7–54× faster than the reference Python/PyTorch path, bit-exact (0 ULP) across FP8 / GPTQ / AWQ / BnB / 22 GGUF block types.
 - **PyTorch `.pth` parsing:** **11–31× faster** than `torch.load()` on torchvision models; **NPZ** at **3.6 GB/s** (17.7× the `npyz` crate).
 - **Conversion:** `npz → safetensors` 6.75×, `pth → safetensors` 5.18×, `safetensors → BnB-NF4` 2.67× vs the Python ecosystem default.
+- **Multi-threaded dequant:** whole-model `remember` / `convert` run **~3–4× faster** across CPU cores via the default-on `parallel` feature (`std::thread::scope`, no new dependency) — byte-identical output at any thread count, with a modest `min(cores, 4)` default (opt out with `default-features = false`).
 
-These are guarded against regression by dev-only tracks — [Criterion runtime
+These are guarded against regression by [CodSpeed](https://codspeed.io/) continuous
+benchmarking in CI, plus dev-only tracks — [Criterion runtime
 benchmarks](benches/README.md), [`dhat-rs` peak-heap assertions](tests/peak_heap_README.md)
 that hold each kernel to its documented `# Memory` ceiling, and an Ollama
 cross-validation — none of which ship in the published crate.
