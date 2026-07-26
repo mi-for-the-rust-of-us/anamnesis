@@ -103,7 +103,14 @@ required-features = ["cli"]
 # generation, and regression detection across runs. The `html_reports`
 # feature is left at its default — Criterion's reports live in
 # `target/criterion/` and are never published.
-criterion = "0.5"
+#
+# Aliased to `codspeed-criterion-compat` (a drop-in for criterion 0.5): a plain
+# `cargo bench` behaves exactly like upstream criterion, while under
+# `cargo codspeed` it emits CodSpeed measurements for CI regression tracking.
+# The bench `.rs` sources keep their `use criterion::…` imports unchanged. See
+# `.github/workflows/codspeed.yml` (simulation instrument today; walltime needs
+# a GitHub org for CodSpeed macro runners).
+criterion = { package = "codspeed-criterion-compat", version = "2" }
 # Phase 6.5 dev-only peak-heap profiler. The `tests/peak_heap_*.rs`
 # binaries (and only there) declare `dhat::Alloc` as their
 # `#[global_allocator]`, so every allocation in those binaries is
