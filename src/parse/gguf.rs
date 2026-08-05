@@ -880,10 +880,13 @@ impl GgufMetadataArray {
 
 /// Metadata for a single tensor in a `GGUF` file.
 ///
-/// Produced during [`parse_gguf`]. `data_offset` is the **absolute** byte
-/// offset inside the memory-mapped file (not the relative offset stored in
-/// the `gguf_tensor_info_t` on disk — the parser has already added the
-/// tensor-data section start).
+/// Produced by every `GGUF` parsing entry point: the memory-mapped
+/// [`parse_gguf`], the owned-buffer [`parse_gguf_bytes`] /
+/// [`parse_gguf_from_reader`], and the reader-generic
+/// [`parse_gguf_front_matter_from_reader`]. `data_offset` is the
+/// **absolute** byte offset from the start of the source — whatever that
+/// source is — not the relative offset stored in the `gguf_tensor_info_t`
+/// on disk; the parser has already added the tensor-data section start.
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
     /// Tensor name (e.g., `"blk.0.attn_q.weight"`).
@@ -895,9 +898,10 @@ pub struct GgufTensorInfo {
     pub shape: Vec<usize>,
     /// Element / block data type.
     pub dtype: GgufType,
-    /// Absolute byte offset of the tensor data inside the memory-mapped
-    /// file. Equal to `tensor_data_section_start + relative_offset` where
-    /// `relative_offset` is the `u64` stored in the file.
+    /// Absolute byte offset of the tensor data from the start of the source
+    /// (mapped file, owned buffer, or caller-supplied reader). Equal to
+    /// `tensor_data_section_start + relative_offset` where `relative_offset`
+    /// is the `u64` stored in the file.
     pub data_offset: u64,
     /// Total byte length of the tensor data, or `None` when
     /// [`GgufType::type_size`] is not yet tabulated for this dtype.
@@ -2526,7 +2530,8 @@ const fn metadata_type_name(value: &GgufMetadataValue) -> &'static str {
 /// Rounds `offset` up to the next multiple of `alignment`.
 ///
 /// `alignment` must be non-zero; the caller guarantees this by substituting
-/// `DEFAULT_ALIGNMENT` whenever the metadata key is absent or zero.
+/// `DEFAULT_ALIGNMENT` when `general.alignment` is absent, and by rejecting
+/// the file outright when the key is present but zero.
 ///
 /// `pub(crate)` so the sibling [`gguf_write`](super::gguf_write) module can
 /// reuse the same alignment helper the parser uses — keeping the read and

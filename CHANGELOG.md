@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guarding the full-tensor-list path against a regression the existing
   summary-only benchmark wouldn't catch.
 
+### Fixed
+
+- **Two inaccurate `GGUF` doc comments** (`src/parse/gguf.rs`) — documentation
+  only, no behaviour change. `GgufTensorInfo` described `data_offset` as an
+  offset "inside the memory-mapped file", but the type has been reachable
+  through non-mmap paths since `parse_gguf_bytes` / `parse_gguf_from_reader`
+  and is now also returned by `parse_gguf_front_matter_from_reader` over a
+  caller-supplied reader; it now reads as an absolute offset from the start
+  of the source, whatever that source is. Separately, the internal `align_up`
+  helper claimed the parser substitutes the default alignment when
+  `general.alignment` is "absent or zero" — in fact a present-but-zero
+  `general.alignment` is rejected outright (`GGUF: general.alignment is
+  zero`); only an absent key falls back to the 32-byte default.
+
 ## [0.7.0] - 2026-07-26
 
 ### Added
