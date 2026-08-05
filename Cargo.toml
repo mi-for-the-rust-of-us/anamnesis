@@ -1,6 +1,6 @@
 [package]
 name = "anamnesis"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ/BnB dequantization, NPZ parsing, and PyTorch .pth conversion for Rust"
