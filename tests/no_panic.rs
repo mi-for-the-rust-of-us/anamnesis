@@ -244,7 +244,9 @@ fn safetensors_entry_points_never_panic() {
 fn gguf_entry_points_never_panic() {
     use anamnesis::{
         inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
-        parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits,
+        parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
+        parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
+        parse_gguf_with_limits,
     };
     use std::io::Cursor;
 
@@ -270,6 +272,17 @@ fn gguf_entry_points_never_panic() {
         assert_no_panic(&format!("gguf inspect_from_reader / {label}"), || {
             inspect_gguf_from_reader(Cursor::new(bytes.clone()))
         });
+        // The full-detail sibling of `inspect_gguf_from_reader` (v0.7.1): same
+        // core, but every parsed string and array is handed back to the caller
+        // rather than reduced to counts, so it gets its own coverage here.
+        assert_no_panic(
+            &format!("gguf parse_gguf_front_matter_from_reader / {label}"),
+            || parse_gguf_front_matter_from_reader(Cursor::new(bytes.clone())),
+        );
+        assert_no_panic(
+            &format!("gguf parse_gguf_front_matter_from_reader_with_limits[tight] / {label}"),
+            || parse_gguf_front_matter_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
         stage(path, &bytes);
         assert_no_panic(&format!("gguf parse_gguf(path) / {label}"), || {
             parse_gguf(path)
