@@ -40,7 +40,7 @@ A living list of the questions we and our early users have actually run into. If
   - [Why can't I just load a quantized model in candle or burn?](#why-cant-i-just-load-a-quantized-model-in-candle-or-burn)
   - [Why are there two binary names, `anamnesis` and `amn`?](#why-are-there-two-binary-names-anamnesis-and-amn)
   - [What do "remember", "forget", and "Lethe" mean?](#what-do-remember-forget-and-lethe-mean)
-  - [Is it stable? What does a `0.6.x` version mean?](#is-it-stable-what-does-a-06x-version-mean)
+  - [Is it stable? What does a `0.7.x` version mean?](#is-it-stable-what-does-a-07x-version-mean)
 - [Installation](#installation)
   - [How do I install the CLI? What is the Minimum Rust Version?](#how-do-i-install-the-cli-what-is-the-minimum-rust-version)
   - [Which feature flags do I need?](#which-feature-flags-do-i-need)
@@ -77,9 +77,11 @@ They are the same binary — `amn` is just a short alias for the people who type
 
 They are the project's names for the two directions of precision change. **Remember** recovers precision (dequantize — the FP8/GPTQ/AWQ/BnB/GGUF → `BF16` path); **forget** (a.k.a. Lethe, after the river of forgetting) reduces it (quantize). The CLI subcommand is `amn remember` (alias `amn dequantize`); `amn inspect` reports how much precision "Lethe took" when a model was quantized.
 
-### Is it stable? What does a `0.6.x` version mean?
+### Is it stable? What does a `0.7.x` version mean?
 
-`0.6.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The `0.6.x` line centered on a security-hardening pass for untrusted input, capped by the convert-matrix completion in `0.6.9`; the next major track — a CPU SIMD pass — lands at `0.7.0`. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
+`0.7.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The preceding `0.6.x` line centered on a security-hardening pass for untrusted input, capped by the convert-matrix completion in `0.6.9`. The `0.7.x` line is about throughput and API polish ahead of the Python bindings: `0.7.0` made whole-model dequantisation **multi-threaded** (~3–4×, byte-identical at any thread count), and `0.7.1` added reader-generic full `GGUF` front matter. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
+
+Note that `0.7.0` was originally planned as a CPU **SIMD** pass. It shipped as multi-threading instead: explicit SIMD was prototyped, measured, and *rejected* — a bit-exact hand-written AVX2 `f32x8_to_bf16x8` scored 1.02×, because the shared `f32 → BF16` writer is memory-bandwidth-bound rather than compute-bound. The measurements are in [`perf-experiments.md`](perf-experiments.md) (Experiments 10–11).
 
 ## Installation
 
@@ -169,4 +171,4 @@ No. No public parse/inspect entry point panics or aborts on any input — a malf
 
 ### Is there a `pip install anamnesis`?
 
-Not yet — Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after a runtime-dispatched SIMD pass (v0.7.0) so the published wheels actually deliver the advertised throughput. When they land, this FAQ gains a Python section (installation, the wheel's AVX2 requirement, the exception hierarchy, and how to get a `bf16` NumPy array). Until then, use the CLI or the Rust library.
+Not yet — Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after the throughput work in the `0.7.x` line so the published wheels actually deliver the advertised speed. That ordering is why `0.7.0` ships **multi-threading** rather than the SIMD pass originally planned: threads work regardless of the wheel's `target-cpu`, whereas compile-time SIMD would have been left on the table by any generic wheel a user `pip install`s. When the bindings land, this FAQ gains a Python section (installation, the exception hierarchy, and how to get a `bf16` NumPy array). Until then, use the CLI or the Rust library.

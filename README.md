@@ -97,7 +97,7 @@ The `ollama:` scheme (built with `--features ollama`) resolves
 
 ```toml
 [dependencies]
-anamnesis = { version = "0.6", features = ["gguf", "pth"] }
+anamnesis = { version = "0.7", features = ["gguf", "pth"] }
 ```
 
 Inspect any format header-only (no weight data loaded):
@@ -236,7 +236,7 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
 ## What's next
 
-- **Phase 7 — CPU SIMD pass (v0.7.0):** runtime AVX2/NEON dispatch on the shared `BF16` writer, so a distributed wheel delivers AVX2 throughput without a `target-cpu=native` build.
+- **Phase 7.2 — GGUF-reader parallelisation + fine-tuning (v0.7.2):** bring the `convert` GGUF-*input* path under the same per-tensor thread pool the safetensors path already uses, plus a stabilisation pass on `RememberOptions` / `ConvertOptions` so the bindings freeze a settled API.
 - **Phase 8 — Python bindings (v0.8.0):** `pip install anamnesis` — typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).

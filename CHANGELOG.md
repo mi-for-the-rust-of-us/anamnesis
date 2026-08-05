@@ -46,6 +46,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `general.alignment` is "absent or zero" — in fact a present-but-zero
   `general.alignment` is rejected outright (`GGUF: general.alignment is
   zero`); only an absent key falls back to the 32-byte default.
+- **Panic-freedom coverage extended to the new entry points**
+  (`tests/no_panic.rs`). The `catch_unwind` battery drives every re-exported
+  parse/inspect entry point over a corpus of adversarial inputs, under both
+  `ParseLimits::default()` and a hostile tight budget;
+  `parse_gguf_front_matter_from_reader` and its `_with_limits` variant now
+  join it, so the "no public parse/inspect entry point panics" invariant is
+  evidenced across the whole public surface again rather than all-but-two of
+  it.
+- **Documentation brought back in line with what shipped.** The crate-root
+  docs advertised "four reader-generic entry points" and described the
+  reader-generic `GGUF` path as returning "just the `GgufInspectInfo`
+  summary" — the precise limitation this release removes; both are corrected
+  and the runnable example now shows the full-detail path.
+  `docs/validation.md`'s per-format reader table lists GGUF's second entry
+  point. Separately, three documents (`README.md`, `docs/FAQ.md` ×2) still
+  billed `0.7.0` as a runtime-dispatched **SIMD** pass; it shipped as
+  multi-threading, because explicit SIMD was prototyped, measured at 1.02×,
+  and rejected (`docs/perf-experiments.md`, Experiments 10–11). The `README`
+  dependency snippet still pinned `version = "0.6"`, `ROADMAP.md`'s status
+  header still read "v0.6.8 released", and `fuzz/README.md`'s target table
+  omitted `fuzz_gguf_front_matter`.
 
 ## [0.7.0] - 2026-07-26
 

@@ -26,6 +26,7 @@ uploads through.
 | `fuzz_safetensors` | `parse_safetensors_header_from_reader` | safetensors header parse + cap |
 | `fuzz_npz` | `inspect_npz_from_reader` | ZIP central-directory walk + NPY header parser (`NPY_MAX_HEADER_BYTES`) |
 | `fuzz_gguf` | `inspect_gguf_from_reader` | metadata KV / typed-array readers + `read_bytes`/`ensure_remaining` |
+| `fuzz_gguf_front_matter` | `parse_gguf_front_matter_from_reader` | the **full-detail** GGUF front-matter path (v0.7.1) — same core as `fuzz_gguf`, but the parsed tensor names and metadata values are handed to the caller instead of reduced to counts, so every string/array survives the call |
 | `fuzz_pth` | `inspect_pth_from_reader` | **ZIP walk + the pickle VM** (opcodes, `GLOBAL` allowlist, memo/mark stacks, recursion) — the highest-value target |
 | `fuzz_zip` | `parse_pth` + `parse_npz` + `inspect_pth_from_reader` | the **vendored ZIP central-directory reader** (Phase 6.12): EOCD scan, `ZIP64` resolution, local-header data-offset, per-entry caps — over both mmap and reader substrates. Index-level differential vs the `zip` crate lives in the in-crate unit tests |
 | `fuzz_npz_parse` | `parse_npz` (via temp file) | the **data-extraction path**: `read_array_data` + the `entry.size()` cross-check |

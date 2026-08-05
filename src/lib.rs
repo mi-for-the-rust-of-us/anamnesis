@@ -198,15 +198,17 @@
 //! `Cursor`, `HTTP`-range-backed adapter, custom transport). The example
 //! below uses a `std::fs::File`; an `HTTP`-range adapter from a
 //! downstream crate (e.g. `hf-fm`'s `HttpRangeReader`) plugs in
-//! identically — anamnesis itself stays HTTP-free. Four reader-generic
-//! entry points cover the supported tensor formats:
+//! identically — anamnesis itself stays HTTP-free. One reader-generic
+//! entry point covers each supported tensor format, plus a full-detail
+//! `GGUF` variant (see below):
 //!
 //! ```rust,no_run
 //! # #[cfg(all(feature = "npz", feature = "pth", feature = "gguf"))]
 //! # fn run() -> anamnesis::Result<()> {
 //! use anamnesis::{
 //!     inspect_gguf_from_reader, inspect_npz_from_reader,
-//!     inspect_pth_from_reader, parse_safetensors_header_from_reader,
+//!     inspect_pth_from_reader, parse_gguf_front_matter_from_reader,
+//!     parse_safetensors_header_from_reader,
 //! };
 //!
 //! let st_header = parse_safetensors_header_from_reader(
@@ -215,6 +217,15 @@
 //! let npz_info = inspect_npz_from_reader(std::fs::File::open("weights.npz")?)?;
 //! let gguf_info = inspect_gguf_from_reader(std::fs::File::open("model.gguf")?)?;
 //! let pth_info = inspect_pth_from_reader(std::fs::File::open("model.pth")?)?;
+//!
+//! // Aggregate summary not enough? Take the full per-tensor table instead,
+//! // still without reading the data segment (0.7.1):
+//! let gguf_front = parse_gguf_front_matter_from_reader(
+//!     std::fs::File::open("model.gguf")?,
+//! )?;
+//! for t in &gguf_front.tensor_infos {
+//!     println!("{} {:?} {:?}", t.name, t.shape, t.dtype);
+//! }
 //! # let _ = (st_header, npz_info, gguf_info, pth_info);
 //! # Ok(()) }
 //! ```
@@ -245,13 +256,19 @@
 //!   substrate (in-memory `Cursor`, HTTP-range-backed adapter, …) so callers
 //!   can extract tensor metadata without materialising the data segment
 //!   (requires `npz` feature)
-//! - `parse_gguf()` / `inspect_gguf_from_reader()` — `GGUF` parsing /
-//!   inspection. The path-based variant memory-maps the file and returns a
-//!   `ParsedGguf` with zero-copy tensor views; the reader-generic variant
-//!   accepts any `Read + Seek` substrate and returns just the
-//!   `GgufInspectInfo` summary, so a multi-GB quantised `GGUF`'s metadata
-//!   can be inspected in a few range fetches over the front-loaded header
-//!   without downloading the data section (requires `gguf` feature)
+//! - `parse_gguf()` / `inspect_gguf_from_reader()` /
+//!   `parse_gguf_front_matter_from_reader()` — `GGUF` parsing / inspection.
+//!   The path-based variant memory-maps the file and returns a `ParsedGguf`
+//!   with zero-copy tensor views. Both reader-generic variants accept any
+//!   `Read + Seek` substrate and read only the front-loaded header, so a
+//!   multi-GB quantised `GGUF`'s metadata can be inspected in a few range
+//!   fetches without downloading the data section — they differ in what they
+//!   return: `inspect_gguf_from_reader` reduces to the aggregate
+//!   `GgufInspectInfo` (the cheap inspect-before-parse policy gate), while
+//!   `parse_gguf_front_matter_from_reader` (0.7.1) returns the full
+//!   `GgufFrontMatter` — the complete metadata table and per-tensor list
+//!   (name, shape, dtype, offset), matching what `ParsedGguf` exposes for
+//!   the mmap-backed path (requires `gguf` feature)
 //! - `parse_pth()` / `inspect_pth_from_reader()` — `PyTorch` `.pth` parsing
 //!   / inspection. The path-based variant memory-maps the file and returns
 //!   a `ParsedPth` with zero-copy `tensors()`; the reader-generic variant

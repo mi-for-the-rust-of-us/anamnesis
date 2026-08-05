@@ -158,8 +158,10 @@ Header-only **inspection** ships for every format — read the declared tensor m
 |---|---|---|---|
 | safetensors | `parse(path)` | `parse_safetensors_header_from_reader<R: Read>` | **`Read`** — layout is prefix-then-JSON, two contiguous reads, never seek-back |
 | NPZ | `inspect_npz(path)` | `inspect_npz_from_reader<R: Read + Seek>` | **`Read + Seek`** — ZIP central directory lives at end-of-file |
-| GGUF | `parse_gguf(path)` | `inspect_gguf_from_reader<R: Read + Seek>` | **`Read + Seek`** — tensor offsets resolved against a captured stream length |
+| GGUF | `parse_gguf(path)` | `inspect_gguf_from_reader<R: Read + Seek>` · `parse_gguf_front_matter_from_reader<R: Read + Seek>` | **`Read + Seek`** — tensor offsets resolved against a captured stream length |
 | `.pth` | `parse_pth(path)` | `inspect_pth_from_reader<R: Read + Seek>` | **`Read + Seek`** — ZIP central directory + seek-back to local headers |
+
+GGUF carries two reader-generic entry points because the two useful outputs differ in size, not in work: `inspect_gguf_from_reader` reduces to the aggregate `GgufInspectInfo` (version, arch, tensor count, totals, distinct dtypes) for the cheap inspect-before-parse policy gate, while `parse_gguf_front_matter_from_reader` (v0.7.1) keeps the whole `GgufFrontMatter` — the full metadata table plus the per-tensor name/shape/dtype/offset list, the same detail `parse_gguf(path)` exposes over mmap. Both delegate to one internal core over the same bytes, so they are substrate- and limits-equivalent by construction. The full-detail variant is what lets a remote consumer render a complete tensor table without downloading the data segment.
 
 See the rustdoc on each `*_from_reader` for the exact access pattern an adapter must satisfy.
 
