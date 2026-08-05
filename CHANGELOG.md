@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Reader-generic full `GGUF` front matter** (`src/parse/gguf.rs`) —
+  `parse_gguf_front_matter_from_reader<R: Read + Seek>` /
+  `parse_gguf_front_matter_from_reader_with_limits`, plus the newly-public
+  **`GgufFrontMatter`** type (`version`, `alignment`, the complete `metadata`
+  table, and the complete `tensor_infos` list). This is the full-detail
+  counterpart to the summary-only `inspect_gguf_from_reader` (0.4.5,
+  `GgufInspectInfo`): that type reports aggregate statistics for a cheap
+  inspect-before-parse policy gate but carries no per-tensor list, which
+  turned out to be insufficient for `hf-fm` v0.11.2's remote `GGUF` inspect
+  — that feature needs the same per-tensor name/shape/dtype/offset table the
+  mmap-backed `parse_gguf(path).tensor_info()` exposes, without downloading
+  the tensor-data segment. Implemented as a thin public wrapper over the
+  existing `read_gguf_structure` core (used internally by `parse_gguf` and
+  `inspect_gguf_from_reader` since 0.4.5) — no new parsing logic, so all
+  three entry points remain substrate-equivalent by construction. Adds
+  `GgufFrontMatter::inspect()` to cheaply reduce a full front matter to the
+  aggregate `GgufInspectInfo` summary. 5 new unit tests
+  (`front_matter_from_reader_*`, mirroring the existing
+  `inspect_from_reader_*` family) plus a new `fuzz_gguf_front_matter` target
+  and a `bench_gguf_front_matter` CodSpeed benchmark
+  (`benches/parsing.rs`, sharing `bench_gguf_inspect`'s synthetic fixture)
+  guarding the full-tensor-list path against a regression the existing
+  summary-only benchmark wouldn't catch.
+
 ## [0.7.0] - 2026-07-26
 
 ### Added

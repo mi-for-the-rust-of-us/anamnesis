@@ -60,7 +60,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 
 use anamnesis::{
     inspect_gguf_from_reader, inspect_npz_from_reader, inspect_pth_from_reader,
-    parse_safetensors_header_from_reader, write_gguf, GgufType, GgufWriteTensor,
+    parse_gguf_front_matter_from_reader, parse_safetensors_header_from_reader, write_gguf,
+    GgufType, GgufWriteTensor,
 };
 
 // ---------------------------------------------------------------------------
@@ -311,6 +312,29 @@ fn bench_gguf_inspect(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sibling of [`bench_gguf_inspect`] over the same fixture: the full-detail
+/// [`parse_gguf_front_matter_from_reader`] entry point (v0.7.1) shares the
+/// [`read_gguf_structure`](anamnesis) core with `inspect_gguf_from_reader`,
+/// so this bench guards the full-tensor-list path against a regression the
+/// summary-only bench above wouldn't catch (e.g. a change that cheapens the
+/// summary reduction at the cost of the retained `Vec<GgufTensorInfo>` /
+/// `HashMap` construction).
+fn bench_gguf_front_matter(c: &mut Criterion) {
+    let (_dir, path) = build_gguf_fixture();
+    let total_bytes = std::fs::metadata(&path).expect("stat fixture").len();
+
+    let mut group = c.benchmark_group("parse_gguf_front_matter");
+    group.throughput(Throughput::Bytes(total_bytes));
+    group.bench_function("synthetic_128xF32_4096", |b| {
+        b.iter(|| {
+            let file = std::fs::File::open(black_box(&path)).expect("open gguf");
+            let front = parse_gguf_front_matter_from_reader(file).expect("parse gguf front matter");
+            let _ = black_box(front);
+        });
+    });
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Criterion plumbing
 // ---------------------------------------------------------------------------
@@ -322,5 +346,6 @@ criterion_group!(
     bench_npz_inspect,
     bench_pth_inspect,
     bench_gguf_inspect,
+    bench_gguf_front_matter,
 );
 criterion_main!(benches);

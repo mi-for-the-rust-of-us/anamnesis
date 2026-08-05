@@ -1017,7 +1017,8 @@ pub struct ParsedGguf {
     version: u32,
     /// Effective tensor-data alignment in bytes.
     alignment: u32,
-    /// Metadata key-value pairs in insertion order (backed by `HashMap`).
+    /// Metadata key-value pairs keyed by the full `GGUF` key. `HashMap`, so
+    /// iteration order is unspecified — not the file's key order.
     metadata: HashMap<String, GgufMetadataValue>,
     /// Per-tensor metadata with absolute byte offsets.
     tensor_infos: Vec<GgufTensorInfo>,
@@ -2091,14 +2092,50 @@ fn read_gguf_structure<R: Read + Seek>(
     })
 }
 
-/// Reader-generic core output: everything [`parse_gguf`] needs except the
-/// owning `memmap2::Mmap`. Internal-only type — both [`parse_gguf`] and
-/// [`inspect_gguf_from_reader`] consume it but neither exposes it.
-struct GgufFrontMatter {
-    version: u32,
-    alignment: u32,
-    metadata: HashMap<String, GgufMetadataValue>,
-    tensor_infos: Vec<GgufTensorInfo>,
+/// Full front matter of a parsed `GGUF` file — version, alignment, the
+/// complete metadata key-value table, and per-tensor info — read from any
+/// `Read + Seek` source without touching the tensor-data segment.
+///
+/// The full-detail counterpart to [`GgufInspectInfo`]: where that type
+/// reports aggregate statistics for a cheap inspect-before-parse policy
+/// gate, `GgufFrontMatter` carries the same per-tensor list and metadata
+/// table that [`ParsedGguf::tensor_info`] / [`ParsedGguf::metadata`] expose
+/// for the mmap-backed path — everything a caller needs to render a full
+/// tensor table (name, shape, dtype, offset) without ever reading tensor
+/// data. Reader-generic core output shared by [`parse_gguf`] (via a
+/// `Cursor` over its mmap) and [`inspect_gguf_from_reader`] /
+/// [`parse_gguf_front_matter_from_reader`] (via the caller-supplied reader).
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct GgufFrontMatter {
+    /// `GGUF` version read from the header (currently 2 or 3).
+    pub version: u32,
+    /// Effective alignment read from `general.alignment`, or the default of
+    /// 32 bytes if the metadata key is absent.
+    pub alignment: u32,
+    /// Metadata key-value pairs, keyed by the full `GGUF` key (e.g.
+    /// `general.architecture`). Iteration order is **unspecified** —
+    /// `HashMap` does not preserve the file's key order; sort by key for
+    /// deterministic rendering.
+    pub metadata: HashMap<String, GgufMetadataValue>,
+    /// Per-tensor metadata in file order, with `data_offset` resolved to an
+    /// absolute offset from the start of the source.
+    pub tensor_infos: Vec<GgufTensorInfo>,
+}
+
+impl GgufFrontMatter {
+    /// Reduces this front matter to the aggregate [`GgufInspectInfo`]
+    /// summary — the same output [`ParsedGguf::inspect`] and
+    /// [`inspect_gguf_from_reader`] produce, computed by the same shared
+    /// helper so all three stay substrate-equivalent. No I/O.
+    pub fn inspect(&self) -> GgufInspectInfo {
+        build_inspect_info(
+            self.version,
+            self.alignment,
+            &self.metadata,
+            &self.tensor_infos,
+        )
+    }
 }
 
 /// Inspects a `GGUF` file from any `Read + Seek` source, returning header,
@@ -2254,6 +2291,80 @@ pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<Gguf
         &front.metadata,
         &front.tensor_infos,
     ))
+}
+
+/// Parses full `GGUF` front matter from any `Read + Seek` source — the
+/// complete per-tensor list and metadata table, without materialising the
+/// tensor-data segment.
+///
+/// The full-detail counterpart to [`inspect_gguf_from_reader`]. Both are the
+/// [`ParseLimits::default`] (unbounded) special case of their `_with_limits`
+/// form, so the two are **limits-equivalent** — only the permanent `GGUF`
+/// caps bound this call. What differs is what survives the parse: the
+/// aggregate summary, or every tensor name and metadata value handed to the
+/// caller.
+///
+/// **Prefer [`parse_gguf_front_matter_from_reader_with_limits`] for
+/// untrusted input.** Because this entry point returns every parsed string
+/// and array instead of reducing them to counts, its exposure at a given
+/// budget is strictly larger than [`inspect_gguf_from_reader`]'s, and an
+/// explicit [`ParseLimits`] is the only thing that bounds it below the
+/// permanent caps. This mirrors [`parse_gguf_from_reader`] /
+/// [`parse_gguf_from_reader_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
+/// reader fails;
+/// [`AnamnesisError::Parse`] on malformed input;
+/// [`AnamnesisError::LimitExceeded`] if a declared string/array length,
+/// metadata-KV or tensor count, dimension, or element count exceeds a
+/// permanent `GGUF` cap (always-on — reachable even at default limits); or
+/// [`AnamnesisError::Unsupported`] for an unsupported `GGUF` variant.
+///
+/// # Memory
+///
+/// Same footprint as [`inspect_gguf_from_reader`]: `O(n_tensors + n_metadata_kv)`,
+/// independent of the file's data-segment size. No tensor data is read.
+pub fn parse_gguf_front_matter_from_reader<R: Read + Seek>(
+    reader: R,
+) -> crate::Result<GgufFrontMatter> {
+    parse_gguf_front_matter_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses full `GGUF` front matter from any `Read + Seek` source under a
+/// caller-supplied [`ParseLimits`] budget — the bounded, reader-generic
+/// full-detail path.
+///
+/// Wraps `reader` in the same 64 KiB `BufReader` as
+/// [`inspect_gguf_from_reader`] (see its `# Performance` section) and
+/// delegates to the same shared internal parsing core, so this function
+/// and [`inspect_gguf_from_reader`] are substrate- and limits-equivalent by
+/// construction — the only difference is which fields of the parsed front
+/// matter are kept.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if a `read` or `seek` on the supplied
+/// reader fails.
+/// Returns [`AnamnesisError::Parse`] on the malformed-input conditions of
+/// [`inspect_gguf_from_reader`].
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared string/array
+/// length, metadata-KV or tensor count, dimension, or element count exceeds
+/// `limits` or a permanent `GGUF` cap.
+/// Returns [`AnamnesisError::Unsupported`] for the `GGUF` variants listed in
+/// [`inspect_gguf_from_reader`]'s docs.
+///
+/// # Memory
+///
+/// Same footprint as [`inspect_gguf_from_reader`]: `O(n_tensors + n_metadata_kv)`,
+/// independent of the file's data-segment size. No tensor data is read.
+pub fn parse_gguf_front_matter_from_reader_with_limits<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<GgufFrontMatter> {
+    let buffered = BufReader::with_capacity(READER_BUF_SIZE, reader);
+    read_gguf_structure(buffered, limits)
 }
 
 /// Builds a [`GgufInspectInfo`] from the parsed front matter.
@@ -3310,5 +3421,177 @@ mod tests {
         // First-occurrence dtype order: F32 (twice), then Q4_0.
         assert_eq!(reader_info.dtypes, vec![GgufType::F32, GgufType::Q4_0]);
         assert_eq!(reader_info.architecture.as_deref(), Some("llama"));
+    }
+
+    // -----------------------------------------------------------------
+    // Reader-generic full front matter — substrate-equivalence tests
+    // -----------------------------------------------------------------
+
+    /// Asserts every field of a parsed [`GgufTensorInfo`] pair is equal.
+    fn assert_tensor_info_eq(path: &GgufTensorInfo, reader: &GgufTensorInfo) {
+        assert_eq!(path.name, reader.name);
+        assert_eq!(path.shape, reader.shape);
+        assert_eq!(path.dtype, reader.dtype);
+        assert_eq!(path.data_offset, reader.data_offset);
+        assert_eq!(path.byte_len, reader.byte_len);
+    }
+
+    /// `parse_gguf_front_matter_from_reader` over an in-memory `Cursor`
+    /// returns the same full tensor list and metadata table as
+    /// `parse_gguf(path)` over the same archive on disk. Locks the contract
+    /// that the reader-generic full-detail path and the mmap-backed path
+    /// are substrate-equivalent — this is the property `hf-fm`'s remote
+    /// `GGUF` inspect relies on for tensor-table parity with the cached path.
+    #[test]
+    fn front_matter_from_reader_matches_path_minimal() {
+        let bytes = build_minimal_gguf();
+        let tmp = write_temp_gguf(&bytes);
+
+        let path_parsed = parse_gguf(tmp.path()).unwrap();
+        let reader_front =
+            parse_gguf_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_eq!(path_parsed.version(), reader_front.version);
+        assert_eq!(path_parsed.alignment(), reader_front.alignment);
+        assert_eq!(path_parsed.metadata(), &reader_front.metadata);
+        assert_eq!(
+            path_parsed.tensor_info().len(),
+            reader_front.tensor_infos.len()
+        );
+        for (path_info, reader_info) in path_parsed
+            .tensor_info()
+            .iter()
+            .zip(&reader_front.tensor_infos)
+        {
+            assert_tensor_info_eq(path_info, reader_info);
+        }
+
+        // Spot-check the fixture's known-correct values, so this isn't just
+        // comparing two equal-but-wrong outputs.
+        assert_eq!(reader_front.version, 3);
+        assert_eq!(reader_front.tensor_infos.len(), 2);
+        assert_eq!(reader_front.tensor_infos[0].name, "tensor.a");
+        assert_eq!(reader_front.tensor_infos[0].shape, vec![2, 3]);
+        assert_eq!(reader_front.tensor_infos[0].dtype, GgufType::F32);
+        assert_eq!(reader_front.tensor_infos[1].name, "tensor.b");
+        assert_eq!(reader_front.tensor_infos[1].dtype, GgufType::Q4_0);
+    }
+
+    /// `parse_gguf_front_matter_from_reader` accepts a header-only file (no
+    /// tensors, no data section) — same as the path-based parser and as
+    /// [`inspect_gguf_from_reader`].
+    #[test]
+    fn front_matter_from_reader_accepts_header_only_file() {
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3);
+        b.push_u64(0);
+        b.push_u64(0);
+        let bytes = b.finish();
+
+        let front = parse_gguf_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        assert_eq!(front.version, 3);
+        assert!(front.tensor_infos.is_empty());
+        assert!(front.metadata.is_empty());
+        assert_eq!(front.alignment, 32);
+    }
+
+    /// `parse_gguf_front_matter_from_reader` propagates the same parse
+    /// errors as [`inspect_gguf_from_reader`] — both delegate to the same
+    /// [`read_gguf_structure`] core, so neither should swallow or
+    /// re-classify a rejection the other surfaces.
+    #[test]
+    fn front_matter_from_reader_propagates_parse_errors() {
+        let err = parse_gguf_front_matter_from_reader(std::io::Cursor::new(b"GGU".as_slice()))
+            .unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+
+        let err = parse_gguf_front_matter_from_reader(std::io::Cursor::new(
+            b"XXXX\x00\x00\x00\x00".as_slice(),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(b"GGML");
+        legacy.extend_from_slice(&[0u8; 100]);
+        let err = parse_gguf_front_matter_from_reader(std::io::Cursor::new(&legacy)).unwrap_err();
+        match err {
+            AnamnesisError::Unsupported { format, detail } => {
+                assert_eq!(format, "GGUF");
+                assert!(detail.contains("GGML"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Substrate-equivalence on the mixed-dtype, nested-array-metadata
+    /// fixture also used by [`inspect_from_reader_matches_path_mixed_dtypes`]
+    /// — the most adversarial-shape fixture in this module's test set,
+    /// exercising the full tensor list rather than just the aggregate
+    /// summary.
+    #[test]
+    fn front_matter_from_reader_matches_path_mixed_dtypes() {
+        let mut b = GgufBuilder::new();
+        b.push_bytes(b"GGUF");
+        b.push_u32(3);
+        b.push_u64(3);
+        b.push_u64(3);
+        b.push_kv_string("general.architecture", "llama");
+        b.push_kv_uint32("general.alignment", 32);
+        b.push_string("tokenizer.ggml.tokens");
+        b.push_u32(9); // ARRAY
+        b.push_u32(8); // STRING
+        b.push_u64(2); // length
+        b.push_string("<bos>");
+        b.push_string("<eos>");
+        b.push_tensor_info("a", &[4, 4], 0, 0);
+        b.push_tensor_info("b", &[2], 0, 64);
+        b.push_tensor_info("c", &[64], 2, 96);
+
+        b.pad_to_alignment(32);
+        b.push_bytes(&[0u8; 64]);
+        b.push_bytes(&[0u8; 8]);
+        b.pad_to_alignment(32);
+        b.push_bytes(&[0u8; 36]);
+
+        let bytes = b.finish();
+        let tmp = write_temp_gguf(&bytes);
+
+        let path_parsed = parse_gguf(tmp.path()).unwrap();
+        let reader_front =
+            parse_gguf_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_eq!(path_parsed.metadata(), &reader_front.metadata);
+        assert_eq!(
+            path_parsed.tensor_info().len(),
+            reader_front.tensor_infos.len()
+        );
+        for (path_info, reader_info) in path_parsed
+            .tensor_info()
+            .iter()
+            .zip(&reader_front.tensor_infos)
+        {
+            assert_tensor_info_eq(path_info, reader_info);
+        }
+
+        assert_eq!(reader_front.tensor_infos.len(), 3);
+        assert_eq!(reader_front.tensor_infos[2].name, "c");
+        assert_eq!(reader_front.tensor_infos[2].dtype, GgufType::Q4_0);
+    }
+
+    /// `GgufFrontMatter::inspect` reduces to the same [`GgufInspectInfo`] as
+    /// [`inspect_gguf_from_reader`] on identical bytes — ties the two
+    /// reader-generic entry points together via the shared
+    /// [`build_inspect_info`] helper.
+    #[test]
+    fn front_matter_inspect_matches_inspect_gguf_from_reader() {
+        let bytes = build_minimal_gguf();
+
+        let front = parse_gguf_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        let summary_via_front = front.inspect();
+        let summary_direct = inspect_gguf_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_inspect_eq(&summary_via_front, &summary_direct);
     }
 }

@@ -370,9 +370,11 @@ pub use parse::resolve_ollama_model;
 #[cfg(feature = "gguf")]
 pub use parse::{
     inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
-    parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits, write_gguf,
-    write_gguf_to_writer, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
-    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf,
+    parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
+    parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
+    parse_gguf_with_limits, write_gguf, write_gguf_to_writer, GgufFrontMatter, GgufInspectInfo,
+    GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType, GgufWriteTensor,
+    ParsedGguf,
 };
 #[cfg(feature = "npz")]
 pub use parse::{

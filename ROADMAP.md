@@ -43,7 +43,8 @@
   - [Phase 6.13: Python-Readiness Hardening](#phase-613-python-readiness-hardening)
   - [Phase 6.14: Convert-Matrix Completion (BF16 Hub)](#phase-614-convert-matrix-completion-bf16-hub)
   - [Phase 7: CPU SIMD Pass](#phase-7-cpu-simd-pass)
-  - [Phase 7.1: GGUF-Reader Parallelisation + Fine-Tuning](#phase-71-gguf-reader-parallelisation--fine-tuning)
+  - [Phase 7.1: GGUF Reader-Generic Full Front Matter](#phase-71-gguf-reader-generic-full-front-matter)
+  - [Phase 7.2: GGUF-Reader Parallelisation + Fine-Tuning](#phase-72-gguf-reader-parallelisation--fine-tuning)
   - [Phase 8: Python Bindings (PyO3)](#phase-8-python-bindings-pyo3)
   - [Phase 8.5: Lethe Encode Completion](#phase-85-lethe-encode-completion)
   - [Phase 9: Emerging Quantization Formats](#phase-9-emerging-quantization-formats)
@@ -822,22 +823,58 @@ Replacing the null SIMD plan above with the **measured** lever (~3–4×, [`docs
 - [x] **`parallel` Cargo feature (default-ON) + `RememberOptions` / `with_threads`** + `remember_with_options` / `remember_to_bytes_with_options`; existing `remember` signatures unchanged; budget `None → min(available_parallelism, 4)`, `Some(n) → n.max(1)` — **commit `934bf81`**
 - [x] **Parallel `ParsedModel::dequantize_all`** — per-tensor `std::thread::scope` over disjoint chunks, results sorted by header index → **byte-identical for any thread count**; determinism test across `{1, 2, 4}` (feature on and off); kernels untouched, bit-exact-vs-PyTorch suite green — **commit `934bf81`**
 - [x] **`ConvertOptions.threads` / `with_threads`** — the safetensors input path parallelises for free (reuses the model dequant) — **commit `934bf81`**
-- [x] **GGUF-reader parallelisation** — **moved to [Phase 7.1](#phase-71-gguf-reader-parallelisation--fine-tuning) (v0.7.1)**: `read_gguf`'s own per-tensor loop over mmap-borrowed `ParsedGguf` needs `ParsedGguf: Sync` + a loop restructure before it can join the scoped-thread pool. Deferred so v0.7.0 ships the done-and-verified parallel dequant now.
+- [x] **GGUF-reader parallelisation** — **moved to [Phase 7.2](#phase-72-gguf-reader-parallelisation--fine-tuning) (v0.7.2)**: `read_gguf`'s own per-tensor loop over mmap-borrowed `ParsedGguf` needs `ParsedGguf: Sync` + a loop restructure before it can join the scoped-thread pool. Deferred so v0.7.0 ships the done-and-verified parallel dequant now.
 - [x] **README threading note** — documented the `parallel` feature + `min(cores, 4)` default in the README "Performance & validation" section; the release checklist follows — **PUSH + tag `v0.7.0`**
 
 **Deliverable:** `anamnesis` v0.7.0 — whole-model `remember` / `convert` dequantise **~3–4× faster** on multi-core CPUs (DRAM-bandwidth-bound, so a modest `min(cores, 4)` default captures ~90 % of the win while leaving the host's cores free), **byte-identical output at any thread count**, opt-out via `default-features = false` for sequential/wasm builds. Explicit SIMD was measured and rejected — no product `unsafe`. — **PUSH + tag `v0.7.0`**
 
-### Phase 7.1: GGUF-Reader Parallelisation + Fine-Tuning
+### Phase 7.1: GGUF Reader-Generic Full Front Matter
 
-**Goal:** A focused fine-tuning release between the threading work ([Phase 7](#phase-7-cpu-simd-pass), v0.7.0) and the Python bindings ([Phase 8](#phase-8-python-bindings-pyo3), v0.8.0). Two threads:
+**Goal:** Unblock `hf-fm` v0.11.2 (remote `GGUF` inspect) with full tensor-table
+parity, not just the aggregate summary Phase 4.9's `inspect_gguf_from_reader`
+(0.4.5) provides.
+
+**Context.** `hf-fm`'s remote inspect for `NPZ` (v0.11.0) and safetensors
+(v0.11.1) both render a full per-tensor table (name/shape/dtype/offset),
+sourced from anamnesis's `inspect_npz_from_reader` / `parse_safetensors_header_from_reader`
+— both already return the complete tensor list, not just aggregate stats.
+`GgufInspectInfo` (the only reader-generic `GGUF` output that existed before
+this phase) is deliberately summary-only — version/arch/tensor_count/total_bytes/
+distinct-dtypes/alignment, no per-tensor list — because it was scoped as a
+cheap inspect-before-parse *policy gate*, not a rendering source. Wiring
+remote `GGUF` inspect on top of it alone would have made `hf-fm`'s `--tree`
+/ `--dtypes` / `--filter` / per-tensor listing silently degrade for `GGUF`
+specifically, the one format not at parity with its cached and sibling-remote
+counterparts.
+
+- [x] **`GgufFrontMatter`** promoted from an internal-only type to `pub`
+  (`version`, `alignment`, full `metadata` table, full `tensor_infos` list) —
+  the same shape `ParsedGguf::tensor_info()` / `::metadata()` expose for the
+  mmap-backed path, now available over any `Read + Seek` source.
+- [x] **`parse_gguf_front_matter_from_reader<R: Read + Seek>`** /
+  **`_with_limits`** — thin wrappers over the existing `read_gguf_structure`
+  core (no new parsing logic; substrate- and limits-equivalent with
+  `inspect_gguf_from_reader` by construction).
+- [x] **`GgufFrontMatter::inspect()`** — cheap reduction to the aggregate
+  `GgufInspectInfo`, via the same shared `build_inspect_info` helper.
+- [x] 5 new unit tests (`front_matter_from_reader_*`) + `fuzz_gguf_front_matter` target.
+
+**Deliverable:** `anamnesis` v0.7.1 — reader-generic full `GGUF` front
+matter, closing the parity gap `inspect_gguf_from_reader` left open. — **PUSH + tag `v0.7.1`**
+
+**New dependencies:** None.
+
+### Phase 7.2: GGUF-Reader Parallelisation + Fine-Tuning
+
+**Goal:** A focused fine-tuning release between the front-matter patch ([Phase 7.1](#phase-71-gguf-reader-generic-full-front-matter), v0.7.1) and the Python bindings ([Phase 8](#phase-8-python-bindings-pyo3), v0.8.0). Two threads:
 
 1. **GGUF-reader parallelisation** (deferred from Phase 7). The `convert` GGUF-*input* path (`read_gguf`) still dequantises tensors single-threaded: its per-tensor loop borrows the mmap-backed `ParsedGguf`, so joining the `std::thread::scope` pool that `remember` / safetensors-input `convert` already use needs `ParsedGguf: Sync` plus a loop restructure. Bring it under the same per-tensor parallel dispatch — same `ConvertOptions.threads` budget, same determinism contract (byte-identical across thread counts) — so GGUF→* conversions get the ~3–4× the safetensors path already enjoys.
 2. **Pre-bindings fine-tuning.** A deliberate stabilisation pass before the ~100× audience arrives at Phase 8: an ergonomics review of the `RememberOptions` / `ConvertOptions` surface, doc polish, and any small correctness/perf items surfaced by real use — so the Python bindings freeze a *settled* API rather than one still in motion.
 
 - [ ] `ParsedGguf: Sync` + parallel `read_gguf` dequant loop, determinism-tested across thread counts — **commit**
-- [ ] API/doc fine-tuning pass ahead of the bindings — **commit** — **PUSH + tag `v0.7.1`**
+- [ ] API/doc fine-tuning pass ahead of the bindings — **commit** — **PUSH + tag `v0.7.2`**
 
-**Deliverable:** `anamnesis` v0.7.1 — GGUF-input conversions parallelised to match the safetensors path, plus a settled `RememberOptions` / `ConvertOptions` API ahead of the Python bindings. — **PUSH + tag `v0.7.1`**
+**Deliverable:** `anamnesis` v0.7.2 — GGUF-input conversions parallelised to match the safetensors path, plus a settled `RememberOptions` / `ConvertOptions` API ahead of the Python bindings. — **PUSH + tag `v0.7.2`**
 
 **New dependencies:** None.
 

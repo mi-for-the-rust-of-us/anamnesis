@@ -41,9 +41,10 @@ pub(crate) mod utils;
 #[cfg(feature = "gguf")]
 pub use gguf::{
     inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
-    parse_gguf_from_reader, parse_gguf_from_reader_with_limits, parse_gguf_with_limits,
-    GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType,
-    ParsedGguf,
+    parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
+    parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
+    parse_gguf_with_limits, GgufFrontMatter, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue,
+    GgufTensor, GgufTensorInfo, GgufType, ParsedGguf,
 };
 #[cfg(feature = "gguf")]
 pub use gguf_write::{write_gguf, write_gguf_to_writer, GgufWriteTensor};

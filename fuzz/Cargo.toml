@@ -46,6 +46,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_gguf_front_matter"
+path = "fuzz_targets/fuzz_gguf_front_matter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_pth"
 path = "fuzz_targets/fuzz_pth.rs"
 test = false
