@@ -103,6 +103,23 @@ name = "amn"
 path = "src/bin/amn.rs"
 required-features = ["cli"]
 
+# ThreadSanitizer harness (dev-only in spirit; see the file's module docs).
+#
+# It is a *binary* rather than a test on purpose: TSan needs an instrumented
+# `std` (`-Zbuild-std`), and `-Zbuild-std` is unusable with `cargo test`
+# (rust-lang/cargo#13146) because `cargo test` also builds dev-dependencies,
+# several of which are crates `std` itself depends on — which collide as
+# "duplicate lang item in crate `core`". `cargo run --bin` builds no
+# dev-dependencies, so this target can be built the way the Unstable Book's own
+# sanitizer example is.
+#
+# `required-features = ["parallel"]` keeps it out of a sequential build, where
+# it would have nothing to check.
+[[bin]]
+name = "tsan-harness"
+path = "src/bin/tsan_harness.rs"
+required-features = ["parallel"]
+
 [dev-dependencies]
 # Phase 6.5 dev-only benchmark harness. Provides statistical-rigour
 # throughput measurement (Welch t-tests, bootstrap CIs), HTML report

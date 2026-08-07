@@ -134,35 +134,21 @@ jobs:
         with:
           key: tsan
 
-      # The whole unit-test suite rather than a name filter. Every thread the
-      # crate spawns is spawned from `src/`, so `--lib` covers the entire
-      # concurrent surface (the dispatch helper's own tests, the GGUF reader
-      # determinism sweep across budgets, and the safetensors remember sweep) —
-      # and running it unfiltered means a future parallelised path is covered the
-      # day it lands, with no filter to remember to update. The suite is fast
-      # enough that the ~10-20x instrumentation slowdown is affordable.
-      - name: Test under ThreadSanitizer
+      # THE BINARY ROUTE (attempt 7). `cargo run --bin` builds no
+      # dev-dependencies, which is where the std-shared crates that broke
+      # `-Zbuild-std` came from (`cfg-if` via the unconditional `flate2`
+      # dev-dep). That lets us build the way the Unstable Book's own sanitizer
+      # example does -- with an INSTRUMENTED std -- which is the only
+      # configuration in which this crate can be checked at all: without it,
+      # `std::thread::scope`'s own Arc teardown false-positives
+      # (rust-lang/rust#101206), and scoped threads are the mechanism under
+      # test.
+      #
+      # No -Cunsafe-allow-abi-mismatch here: with build-std working, everything
+      # in the graph is instrumented, so there is no ABI mixing to allow.
+      - name: Parallel dispatch under ThreadSanitizer (instrumented std)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -Zsanitizer=thread
-            -Cunsafe-allow-abi-mismatch=sanitizer
-          # `halt_on_error` makes the first detected race fail loudly instead of
-          # being buried in later output.
-          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt"
-          RUST_TEST_THREADS: "1"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: |
-          cargo +nightly test --release --all-features \
-            --target x86_64-unknown-linux-gnu \
-            --lib
-
-      - name: Test the parallel auto-trait contract under ThreadSanitizer
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -Zsanitizer=thread
-            -Cunsafe-allow-abi-mismatch=sanitizer
-          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt"
-          RUST_TEST_THREADS: "1"
-        run: |
-          cargo +nightly test --release --all-features \
-            --target x86_64-unknown-linux-gnu \
-            --test parallel_contract
+          cargo +nightly run --release             -Zbuild-std             --target x86_64-unknown-linux-gnu             --bin tsan-harness
