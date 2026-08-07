@@ -100,7 +100,7 @@ of the convention that does the most work, and the part most easily skipped:
 
 | File | Target | Status |
 |------|--------|--------|
-| [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146: `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Draft |
+| [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146: `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Posted |
 
 A second issue, `target.<triple>.rustflags` not reaching `-Zbuild-std` units,
 was drafted and **abandoned before filing**. The evidence was confounded (two
