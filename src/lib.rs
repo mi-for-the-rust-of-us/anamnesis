@@ -162,6 +162,53 @@
 //! Lossless `.pth` → `.safetensors` conversion. **11–31× faster** than
 //! `torch.load()` on torchvision models.
 //!
+//! # Multi-threaded dequantisation (Phase 7, v0.7.0; `GGUF` reader v0.7.2)
+//!
+//! Whole-model dequantisation runs across CPU cores by default. The `parallel`
+//! Cargo feature is **on by default** and adds **no third-party dependency**:
+//! it is `std::thread::scope` over disjoint per-tensor work. Build with
+//! `default-features = false` for a fully sequential crate (wasm, or an embedder
+//! that owns its own scheduling).
+//!
+//! **The output is byte-identical at any thread count.** Thread count is a
+//! performance knob, never a correctness variable: results are reassembled in
+//! input order before serialisation, so neither the budget nor the order in
+//! which workers happen to finish can change a single output byte. Even the
+//! *error* is stable — a malformed input reports the same lowest-indexed failure
+//! sequentially and in parallel.
+//!
+//! The budget is **caller-owned and hardware-bounded**, never derived from a
+//! file-declared quantity (a hostile archive declaring 10⁹ tensors must not
+//! spawn 10⁹ threads):
+//!
+//! ```rust
+//! use anamnesis::{ConvertOptions, RememberOptions};
+//!
+//! // Default: min(available_parallelism, 4) — the measured scaling knee.
+//! let default = RememberOptions::new();
+//! // Pin it: 1 is fully sequential, higher suits a memory-rich host.
+//! let pinned = RememberOptions::new().with_threads(8);
+//! // The same knob, same spelling, on the conversion pipeline.
+//! let convert = ConvertOptions::new().with_threads(8);
+//! # let _ = (default, pinned, convert);
+//! ```
+//!
+//! Which paths parallelise, and how much:
+//!
+//! | Path | Speedup at the default budget |
+//! |---|---|
+//! | [`ParsedModel::remember`] / `remember_to_bytes` (safetensors input) | ~3–4× |
+//! | [`convert()`] with a `GGUF` input (v0.7.2) | ~1.9× on the reader stage |
+//! | [`convert()`] with an `NPZ` / `.pth` input | sequential by nature — neither format is block-quantised, so there is no dequantisation to spread |
+//!
+//! Two honest caveats. Dequantisation is **memory-bandwidth bound**, so
+//! throughput plateaus well below the core count — which is why the default is a
+//! modest `min(cores, 4)` rather than "all of them"; a library that saturates the
+//! machine buys little past the plateau and harms the process embedding it.
+//! And below an internal 4 `MiB` input floor the sequential path runs regardless,
+//! because spawning a pool costs more than the work saves. Method and numbers:
+//! `docs/perf-experiments.md`, Experiments 11–12.
+//!
 //! # Panic safety
 //!
 //! No public parse/inspect entry point panics or aborts on **any** input — a
@@ -364,6 +411,10 @@ pub mod inspect;
 pub mod lethe;
 pub mod limits;
 pub mod model;
+// Shared per-item parallel dispatch (`map_indexed`) for the compute-heavy
+// transform paths. Crate-internal: callers steer it through the public thread
+// budget on `RememberOptions` / `ConvertOptions`, never by touching the helper.
+mod parallel;
 pub mod parse;
 pub mod remember;
 

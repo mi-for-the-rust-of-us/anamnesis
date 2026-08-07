@@ -49,10 +49,34 @@ use crate::remember::quant_utils::transpose_bf16;
 use crate::ParseLimits;
 
 /// Target dtype for dequantization output.
+///
+/// # Why only `BF16` today
+///
+/// `BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights
+/// in, and at 2 bytes per element it halves the memory traffic on a path that is
+/// bandwidth-bound end to end.
+///
+/// It is, however, **lossy relative to the exact dequantised value**, and that is
+/// worth stating plainly: a `Q8_0` value is an `f16` scale (11-bit significand)
+/// times an `int8`, needing up to ~18 bits, while `BF16` holds 8. Measured on
+/// `SmolLM2-135M-Q4_K_M`, only **3–20 %** of dequantised values are exactly
+/// `BF16`-representable; the rest are rounded, at up to half a `BF16` `ULP`
+/// (`2⁻⁸` ≈ 0.39 % relative). The crate's "bit-exact, 0 `ULP`" claim is therefore
+/// scoped to *the reference rounded to `BF16`* — which is how every fixture is
+/// built — not to the true value, which needs `F32`.
+///
+/// This enum has carried exactly one variant since the commit that introduced
+/// `remember`; the `#[non_exhaustive]` marker has been there just as long,
+/// because more variants were always intended. `ROADMAP.md` Phase 7.3 turns the
+/// output type into a caller-chosen parameter (`BF16` / `F32` / `F16`), which is
+/// cheap because every kernel already computes its values in `f32` and narrows
+/// only at the shared pass-2 writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TargetDtype {
-    /// `BF16` (bfloat16) — 2 bytes per element. The standard research/training dtype.
+    /// `BF16` (bfloat16) — 2 bytes per element. The standard research/training
+    /// dtype, and currently the only output width (see the type-level docs for
+    /// the precision trade-off this implies).
     BF16,
 }
 
@@ -342,8 +366,19 @@ pub(crate) fn resolve_thread_budget(_threads: Option<usize>) -> usize {
 ///
 /// Currently carries only the per-tensor dequantisation thread budget; the
 /// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
-/// change. Construct with [`RememberOptions::default`] (the modest built-in
-/// default) or [`RememberOptions::with_threads`].
+/// change. Construct with [`RememberOptions::new`] (or
+/// [`RememberOptions::default`], which is identical) and chain the setters:
+///
+/// ```rust
+/// use anamnesis::RememberOptions;
+///
+/// let opts = RememberOptions::new().with_threads(8);
+/// assert_eq!(opts.threads, Some(8));
+/// ```
+///
+/// The builder shape deliberately mirrors
+/// [`ConvertOptions`](crate::ConvertOptions), which carries the same `threads`
+/// knob: one spelling for one concept across the two option types.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct RememberOptions {
@@ -358,13 +393,35 @@ pub struct RememberOptions {
 }
 
 impl RememberOptions {
-    /// Returns options requesting `n` dequantisation worker threads (clamped to
-    /// at least 1), overriding the `min(available_parallelism, 4)` default.
+    /// Returns options with the built-in defaults (the
+    /// `min(available_parallelism, 4)` thread budget).
+    ///
+    /// `const`: the struct is a single `Option<usize>`, so there is nothing to
+    /// allocate.
     #[must_use]
-    pub fn with_threads(n: usize) -> Self {
-        Self {
-            threads: Some(n.max(1)),
-        }
+    pub const fn new() -> Self {
+        Self { threads: None }
+    }
+
+    /// Sets the per-tensor dequantisation thread budget (clamped to at least 1).
+    /// Overrides the `min(available_parallelism, 4)` default; ignored when the
+    /// `parallel` feature is off (always sequential).
+    ///
+    /// Chained from [`RememberOptions::new`] or
+    /// [`RememberOptions::default`] — the same builder shape
+    /// [`ConvertOptions::with_threads`](crate::ConvertOptions::with_threads)
+    /// uses:
+    ///
+    /// ```rust
+    /// use anamnesis::RememberOptions;
+    ///
+    /// let opts = RememberOptions::new().with_threads(2);
+    /// assert_eq!(opts.threads, Some(2));
+    /// ```
+    #[must_use]
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.threads = Some(n.max(1));
+        self
     }
 
     /// Resolves the configured request to a concrete worker count (see
@@ -619,7 +676,41 @@ impl ParsedModel {
     where
         F: FnMut(),
     {
-        let threads = RememberOptions::default().resolved_threads();
+        self.remember_with_progress_and_options(
+            output_path,
+            target,
+            RememberOptions::default(),
+            on_tensor,
+        )
+    }
+
+    /// Dequantizes all quantized tensors with per-tensor progress reporting **and**
+    /// a caller-supplied [`RememberOptions`].
+    ///
+    /// The two-knob form of [`remember_with_progress`](Self::remember_with_progress):
+    /// before v0.7.2 a caller had to choose between a progress bar and a thread
+    /// budget, because the progress variant pinned the budget to its default.
+    /// `on_tensor` still fires on the **calling** thread only, so an `FnMut`
+    /// closing over a progress bar never crosses a thread boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
+    /// shapes are inconsistent.
+    /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
+    /// is not yet implemented.
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    pub fn remember_with_progress_and_options<F>(
+        &self,
+        output_path: impl AsRef<Path>,
+        target: TargetDtype,
+        opts: RememberOptions,
+        on_tensor: F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(),
+    {
+        let threads = opts.resolved_threads();
         match target {
             TargetDtype::BF16 => self.remember_bf16_inner(output_path.as_ref(), threads, on_tensor),
         }
@@ -1148,16 +1239,17 @@ impl ParsedModel {
     /// (→ bytes); `on_tensor` fires on the **main thread** after each quantized
     /// tensor is dequantised so callers can drive a progress bar.
     ///
-    /// `threads` is the resolved worker budget (see [`resolve_thread_budget`]).
-    /// The dequant runs **sequentially** when `threads <= 1`, when there is at
-    /// most one quantized tensor, or when the `parallel` feature is off;
-    /// otherwise the quantized entries are split into disjoint chunks across
-    /// scoped `std` threads. Output is **byte-identical for any thread count** —
-    /// results are reassembled in original header order before serialization.
+    /// `threads` is the resolved worker budget (see [`resolve_thread_budget`]);
+    /// the quantized entries are handed to `parallel::map_indexed`, which decides
+    /// between the sequential loop and a scoped worker pool and guarantees
+    /// results come back in input order. Output is therefore **byte-identical
+    /// for any thread count** — the tensors are reassembled in original header
+    /// order before serialization no matter how the work was distributed.
     ///
     /// # Errors
     ///
-    /// Propagates [`Self::dequantize_quantized_entry`]'s errors, and returns
+    /// Propagates [`Self::dequantize_quantized_entry`]'s errors — deterministically,
+    /// the lowest-indexed failure, at any thread count — and returns
     /// [`AnamnesisError::Parse`] if a dequant worker thread panics.
     fn dequantize_all<F>(
         &self,
@@ -1194,76 +1286,36 @@ impl ParsedModel {
             }
         }
 
-        // Dequantise the quantized entries, each tagged with its original index.
-        let mut dequants: Vec<(usize, TensorDequant)> = Vec::with_capacity(quantized.len());
+        // Total on-disk span of the quantised weights, the size gate
+        // `parallel::map_indexed` consults before it spawns anything. The
+        // companion scale / zero-point tensors add a small constant fraction on
+        // top and are deliberately not counted — the threshold only has to
+        // separate "trivial" from "worth a thread pool".
+        let work_bytes: u64 = quantized.iter().fold(0u64, |acc, &(_, entry)| {
+            let (start, end) = entry.data_offsets;
+            acc.saturating_add(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX))
+        });
 
-        #[cfg(feature = "parallel")]
-        if threads > 1 && quantized.len() > 1 {
-            let n_workers = threads.min(quantized.len());
-            let chunk_size = quantized.len().div_ceil(n_workers);
-
-            // PARALLEL: the index-ordered `quantized` list is split into disjoint,
-            // contiguous chunks; each scoped worker calls
-            // `dequantize_quantized_entry` — a pure fn of shared-immutable
-            // `&self` plus its own entries — and writes only its own freshly
-            // allocated output `Vec`s. No shared mutable state, no reduction.
-            // Handles are joined in spawn order and the collected results are
-            // sorted by original index below, so the assembled output bytes are
-            // identical for any thread count. `ParsedModel` is `Sync`, so sharing
-            // `&self` across the scope is safe; the scope borrows `quantized`.
-            std::thread::scope(|scope| -> crate::Result<()> {
-                let handles: Vec<_> = quantized
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        scope.spawn(move || {
-                            let mut out: Vec<(usize, TensorDequant)> =
-                                Vec::with_capacity(chunk.len());
-                            for &(idx, entry) in chunk {
-                                out.push((idx, self.dequantize_quantized_entry(entry)?));
-                            }
-                            Ok::<Vec<(usize, TensorDequant)>, AnamnesisError>(out)
-                        })
-                    })
-                    .collect();
-
-                // Join on the main thread, in spawn order; fire `on_tensor` per
-                // owned result so `F: FnMut()` never crosses to a worker.
-                for handle in handles {
-                    let chunk_out = handle.join().map_err(|_| AnamnesisError::Parse {
-                        reason: "dequant worker thread panicked".into(),
-                    })??;
-                    for (idx, dq) in chunk_out {
-                        if matches!(dq, TensorDequant::Owned(..)) {
-                            on_tensor();
-                        }
-                        dequants.push((idx, dq));
-                    }
-                }
-                Ok(())
-            })?;
-        }
-
-        // With the `parallel` feature off the budget is never consulted.
-        #[cfg(not(feature = "parallel"))]
-        let _ = threads;
-
-        // Sequential path: runs whenever the parallel fast path did not (feature
-        // off, budget <= 1, or a single quantized tensor). `dequants` is
-        // non-empty iff the parallel path already ran, so this fills it exactly
-        // once and never double-counts.
-        if dequants.is_empty() && !quantized.is_empty() {
-            for &(idx, entry) in &quantized {
-                let dq = self.dequantize_quantized_entry(entry)?;
+        // Dequantise the quantized entries. `map_indexed` returns results in
+        // `quantized` order for any thread count (see `src/parallel.rs`), and
+        // `quantized` was built by walking the header in order, so re-zipping it
+        // with its original indices restores header order without a sort.
+        // `dequantize_quantized_entry` is a pure fn of shared-immutable `&self`
+        // plus its entry, and `ParsedModel` is `Sync`, so the closure is safe to
+        // share across workers; `on_tensor` stays on this thread.
+        let results = crate::parallel::map_indexed(
+            &quantized,
+            threads,
+            work_bytes,
+            |_, &(_, entry)| self.dequantize_quantized_entry(entry),
+            |dq| {
                 if matches!(dq, TensorDequant::Owned(..)) {
                     on_tensor();
                 }
-                dequants.push((idx, dq));
-            }
-        }
-
-        // Determinism: reassemble in original header order regardless of how the
-        // work was chunked across threads.
-        dequants.sort_by_key(|&(idx, _)| idx);
+            },
+        )?;
+        let dequants: Vec<(usize, TensorDequant)> =
+            quantized.iter().map(|&(idx, _)| idx).zip(results).collect();
 
         let mut dequantized_data: DequantizedTensors = Vec::with_capacity(dequants.len());
         for (idx, dq) in dequants {
@@ -1815,12 +1867,18 @@ mod tests {
         assert_eq!(model.inspect().quantized, 8, "8 quantized weights expected");
 
         let baseline = model
-            .remember_to_bytes_with_options(TargetDtype::BF16, RememberOptions::with_threads(1))
+            .remember_to_bytes_with_options(
+                TargetDtype::BF16,
+                RememberOptions::new().with_threads(1),
+            )
             .unwrap();
 
-        for n in [1usize, 2, 4] {
+        for n in [1usize, 2, 4, 8] {
             let out = model
-                .remember_to_bytes_with_options(TargetDtype::BF16, RememberOptions::with_threads(n))
+                .remember_to_bytes_with_options(
+                    TargetDtype::BF16,
+                    RememberOptions::new().with_threads(n),
+                )
                 .unwrap();
             assert_eq!(
                 out, baseline,
