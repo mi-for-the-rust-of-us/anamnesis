@@ -1,0 +1,13 @@
+{
+  "path_label": "gguf_dequant_whole_model",
+  "model": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+  "py_seconds": 2.8945820999797434,
+  "py_library": "gguf 0.18.0",
+  "py_output_dtype": "float32",
+  "note": "gguf-py dequantises to float32; anamnesis dequantises to BF16 (half the output bytes). Single-threaded on both sides of this number - compare against anamnesis at --threads 1.",
+  "input_bytes": 105454432,
+  "output_bytes": 538060032,
+  "tensors": 272,
+  "dequantized": 211,
+  "iterations": 5
+}

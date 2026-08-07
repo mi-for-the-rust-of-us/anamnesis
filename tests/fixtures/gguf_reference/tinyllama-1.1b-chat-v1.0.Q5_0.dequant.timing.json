@@ -1,0 +1,13 @@
+{
+  "path_label": "gguf_dequant_whole_model",
+  "model": "tinyllama-1.1b-chat-v1.0.Q5_0.gguf",
+  "py_seconds": 12.03140059998259,
+  "py_library": "gguf 0.18.0",
+  "py_output_dtype": "float32",
+  "note": "gguf-py dequantises to float32; anamnesis dequantises to BF16 (half the output bytes). Single-threaded on both sides of this number - compare against anamnesis at --threads 1.",
+  "input_bytes": 767001984,
+  "output_bytes": 4400193536,
+  "tensors": 201,
+  "dequantized": 156,
+  "iterations": 5
+}
