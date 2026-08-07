@@ -148,7 +148,21 @@ jobs:
       # in the graph is instrumented, so there is no ABI mixing to allow.
       - name: Parallel dispatch under ThreadSanitizer (instrumented std)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
+          # BLANKET RUSTFLAGS, not the target-scoped form. Attempt 7 proved that
+          # CARGO_TARGET_<TRIPLE>_RUSTFLAGS does NOT reach -Zbuild-std's own
+          # units: rustc reported `compiler_builtins` as uninstrumented while
+          # our crate was instrumented. Only the blanket variable instruments
+          # the rebuilt std graph.
+          #
+          # This is safe here precisely because it is a --bin: `cargo run`
+          # builds no dev-dependencies, so the crate graph that made blanket
+          # flags unusable under `cargo test` is absent.
+          #
+          # -Cunsafe-allow-abi-mismatch is still needed for `compiler_builtins`,
+          # which is not instrumentable. It is pure memcpy/memset intrinsics
+          # with no synchronisation of its own, so mixing it in is inert for a
+          # race detector.
+          RUSTFLAGS: "-Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer"
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: |
           cargo +nightly run --release             -Zbuild-std             --target x86_64-unknown-linux-gnu             --bin tsan-harness
