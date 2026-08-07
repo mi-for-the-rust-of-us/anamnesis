@@ -896,10 +896,19 @@ Like vectorization, **verify** — do not assume:
 3. Where the platform supports it, the parallelized path is exercised under a
    race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
    the disjoint-slice design is race-free by construction, so this is a backstop).
-   **Satisfied since v0.7.2** by the `tsan` job in
-   [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs the whole
-   unit-test suite under `-Zsanitizer=thread` with `-Zbuild-std` (instrumenting
-   `std` too, or TSan reports false positives inside its own synchronisation).
+   **Still OPEN as of v0.7.2, with the attempt documented rather than hidden.**
+   A working TSan job exists at
+   [`.github/workflows/tsan.yml`](.github/workflows/tsan.yml) — it compiles, runs
+   the whole unit-test suite, and reports — but it is `workflow_dispatch`-only
+   because it cannot currently be made green for reasons upstream of this crate:
+   `-Zbuild-std` is unusable with `cargo test` (rust-lang/cargo#13146), and
+   without an instrumented `std` TSan reports false races inside libtest itself
+   (rust-lang/rust#39608). The next such report landed in
+   `std::sys::thread::unix::Thread::new` — the same machinery
+   `std::thread::scope` uses — so suppressing it would blind the detector to our
+   own thread creation, which is where the chain was stopped deliberately.
+   Run it by hand and judge a report by whose frames appear in it. Re-attempt is
+   tracked in `ROADMAP.md` Phase 7.3.
 4. **The auto-traits the dispatch depends on are asserted, not assumed.** Sharing
    `&self` across scoped threads needs `Sync`, which holds only because every
    field happens to be `Sync` — adding a `Cell`/`Rc`/raw pointer would silently

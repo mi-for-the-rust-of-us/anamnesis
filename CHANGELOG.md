@@ -79,10 +79,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that silently serialises collapses it while leaving every absolute time
   plausible.
 
-- **A ThreadSanitizer CI job** (`.github/workflows/ci.yml`).
-  `CONVENTIONS.md` has asked for a race-detector run since v0.7.0 and Windows/MSVC
-  has no TSan, so the rule could only ever be satisfied in CI. Now it is, for both
-  the safetensors and the `GGUF` path.
+- **A ThreadSanitizer job — manual-only, and honest about why**
+  (`.github/workflows/tsan.yml`). `CONVENTIONS.md` has asked for a race-detector
+  run since v0.7.0, and Windows/MSVC has no TSan, so CI is the only place the
+  rule could be satisfied. The job builds, runs the whole unit-test suite, and
+  reports — but it is `workflow_dispatch`-only rather than gating, because it
+  cannot currently be made green for upstream reasons: `-Zbuild-std` is unusable
+  with `cargo test` ([cargo#13146](https://github.com/rust-lang/cargo/issues/13146),
+  "duplicate lang item in crate `core`"), and without an instrumented `std`,
+  libtest itself reports false races
+  ([rust#39608](https://github.com/rust-lang/rust/issues/39608)). The libtest
+  result channel was suppressible; the next report landed in
+  `std::sys::thread::unix::Thread::new` — the same machinery
+  `std::thread::scope` uses — where a suppression would have blinded the
+  detector to our own thread creation, so the chain was stopped there rather
+  than papered over. The **`CONVENTIONS.md` rule therefore stays open**, and
+  re-attempting it is carried into Phase 7.3. What the job still verifies when
+  run by hand is documented in the workflow itself.
 
 - **A `gguf-py` performance baseline**
   (`tests/fixtures/gguf_reference/generate_gguf_dequant_timings.py`, committed
