@@ -1,7 +1,7 @@
 # Issue replies archive
 
 This folder archives comments drafted or posted on upstream issues where
-anamnesis's own work surfaced or diagnosed a problem — currently
+anamnesis's own work surfaced or diagnosed a problem. Currently
 [rust-lang/cargo](https://github.com/rust-lang/cargo/issues) and
 [rust-lang/rust](https://github.com/rust-lang/rust/issues); previously
 [huggingface/candle](https://github.com/huggingface/candle/issues), whose thread
@@ -28,9 +28,9 @@ rather than duplicate.
 <upstream-repo>-<issue-number>-p<N>.md
 ```
 
-- `<upstream-repo>` — short identifier (`cargo`, `rust`, `candle`, …)
-- `<issue-number>` — the upstream issue/PR number (no `#`)
-- `p<N>` — post/reply index within that thread (`p1` = our first comment)
+- `<upstream-repo>`: short identifier (`cargo`, `rust`, `candle`, …)
+- `<issue-number>`: the upstream issue/PR number (no `#`)
+- `p<N>`: post/reply index within that thread (`p1` = our first comment)
 
 **Not-yet-filed issues** have no number. Use `<repo>-new-<slug>-p1.md` and
 **rename the file once it is filed**, updating the `Target issue:` line and this
@@ -41,7 +41,7 @@ README's table. Example: `cargo-new-rustflags-build-std-p1.md`.
 A lightweight metadata header, then the reply body verbatim:
 
 ```markdown
-# <upstream-repo> #<issue-number> — reply <N> (<status>)
+# <upstream-repo> #<issue-number>, reply <N> (<status>)
 
 - **Target issue:** <URL>
 - **Status:** <Posted | Draft | Superseded>  (plus date or superseding file)
@@ -63,7 +63,7 @@ The `---` marks the boundary, so the body is pastable into GitHub as-is.
 |--------|---------|
 | **Posted** | Sent upstream; matches what is live there verbatim |
 | **Draft** | Written but not yet posted (pending review, verification, release timing) |
-| **Superseded** | Was posted, but later investigation gave a better diagnosis. Link the superseding file. **Do not delete** — superseded files document the learning curve and stop the same mistake being made twice |
+| **Superseded** | Was posted, but later investigation gave a better diagnosis. Link the superseding file. **Do not delete**, because superseded files document the learning curve and stop the same mistake being made twice |
 
 ## Flagging practice
 
@@ -74,8 +74,8 @@ of the convention that does the most work, and the part most easily skipped:
   (upstream source, a doc page, live tool output), name the reference. If it was
   a reasoned inference, say so in those words.
 - **Confounded evidence.** If two variables changed between the failing and
-  working configurations, the conclusion does not follow from the comparison —
-  say so, and either isolate it or mark the claim conditional. An upstream bug
+  working configurations, the conclusion does not follow from the comparison.
+  Say so, and either isolate it or mark the claim conditional. An upstream bug
   report resting on a confounded comparison wastes a maintainer's time and is
   worse than not filing.
 - **Posted content later found inaccurate.** Note it in the metadata, link the
@@ -100,9 +100,9 @@ of the convention that does the most work, and the part most easily skipped:
 
 | File | Target | Status |
 |------|--------|--------|
-| [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146 — `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Draft |
+| [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146: `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Draft |
 
-A second issue — `target.<triple>.rustflags` not reaching `-Zbuild-std` units —
+A second issue, `target.<triple>.rustflags` not reaching `-Zbuild-std` units,
 was drafted and **abandoned before filing**. The evidence was confounded (two
 variables changed between the failing and working runs), and a single-variable
 rerun disproved it: both flag sources work. It is recorded here rather than in a
