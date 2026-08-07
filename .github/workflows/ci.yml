@@ -134,7 +134,7 @@ jobs:
             -Cunsafe-allow-abi-mismatch=sanitizer
           # `halt_on_error` makes the first detected race fail loudly instead of
           # being buried in later output.
-          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt"
           RUST_TEST_THREADS: "1"
         run: |
           cargo +nightly test --release --all-features \
@@ -146,7 +146,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
             -Zsanitizer=thread
             -Cunsafe-allow-abi-mismatch=sanitizer
-          TSAN_OPTIONS: "halt_on_error=1"
+          TSAN_OPTIONS: "halt_on_error=1 suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt"
           RUST_TEST_THREADS: "1"
         run: |
           cargo +nightly test --release --all-features \

@@ -1,0 +1,40 @@
+# ThreadSanitizer suppressions for the `tsan` CI job (.github/workflows/ci.yml).
+#
+# WHY THIS FILE EXISTS
+#
+# The job cannot instrument the standard library: `-Zbuild-std` combined with
+# `cargo test` is a documented, unresolved Cargo limitation
+# (rust-lang/cargo#13146 — it fails to link with "duplicate lang item in crate
+# `core`"). So the sanitizer sees our code but not std's internals.
+#
+# The consequence is specific and predictable: TSan cannot observe the
+# happens-before edges inside std's pure-Rust atomic channels, so it reports
+# false races there. libtest's own result channel trips this on essentially
+# every run — rust-lang/rust#39608, "ThreadSanitizer detects a data race in the
+# test runner". Our code appears nowhere in those stacks.
+#
+# What TSan *can* still see, and why the job remains worth running: it
+# intercepts pthread_create / pthread_join at the libc level regardless of
+# instrumentation, so the joins that `std::thread::scope` performs — the
+# happens-before edges the parallel dispatch actually relies on — are visible.
+# The dispatch synchronises with a plain `AtomicUsize::fetch_add` plus those
+# joins, and both are in scope for the detector.
+#
+# RULES FOR EDITING
+#
+# 1. Only ever suppress *std-internal* machinery whose synchronisation TSan is
+#    structurally unable to see. Never add a pattern that could match
+#    `anamnesis::` — a race in our own code is the entire point of this job, and
+#    suppressing one would make the job worse than not having it.
+# 2. Every entry names the upstream issue justifying it.
+# 3. If `-Zbuild-std` ever becomes usable with `cargo test`, delete this file
+#    outright rather than pruning it: with an instrumented std none of these
+#    suppressions should be necessary.
+
+# libtest's result channel (std::sync::mpmc). The harness sends CompletedTest
+# events from each test thread to the main thread; with std uninstrumented the
+# channel's internal synchronisation is invisible to TSan, so the send/recv pair
+# looks like a plain data race on the queue's heap block.
+# rust-lang/rust#39608
+race:*std::sync::mpmc*
+race:*test::event*
