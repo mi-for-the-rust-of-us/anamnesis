@@ -118,9 +118,17 @@ pub struct ConvertOptions {
     /// Per-tensor dequantisation thread budget, with the same semantics as
     /// [`RememberOptions::threads`](crate::RememberOptions): `None` (the default)
     /// resolves to `min(available_parallelism, 4)`, `Some(n)` pins it to
-    /// `n.max(1)`, and it is always 1 when the `parallel` feature is off. Applies
-    /// only to the safetensors input path (which reuses the model dequant); other
-    /// readers are single-threaded.
+    /// `n.max(1)`, and it is always 1 when the `parallel` feature is off.
+    ///
+    /// Applies to the **safetensors** input path (which reuses the model
+    /// dequant) and, since v0.7.2, to the **`GGUF`** input path. The `NPZ` and
+    /// `.pth` readers stay sequential by nature rather than by omission: neither
+    /// format is block-quantised, so there is no dequantisation to spread — the
+    /// `NPZ` reader drains an owned map without copying a byte, and the `.pth`
+    /// reader's only per-tensor cost is a single `into_owned()`.
+    ///
+    /// The budget governs how the work is *scheduled*, never what is produced:
+    /// output is byte-identical at any thread count.
     pub threads: Option<usize>,
     /// Caller-supplied `GGUF` key/value metadata, written verbatim and merged
     /// **over** any KV carried from a `GGUF` source (the caller wins on a key
@@ -493,7 +501,7 @@ fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
         #[cfg(feature = "npz")]
         Format::Npz => read_npz(input, &options.limits),
         #[cfg(feature = "gguf")]
-        Format::Gguf => read_gguf(input, &options.limits),
+        Format::Gguf => read_gguf(input, &options.limits, threads),
     }
 }
 
@@ -614,46 +622,77 @@ fn read_pth(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
 /// Reads a `GGUF` file into the hub, dequantising block-quantised tensors to
 /// `BF16` and passing scalar tensors through. `GGUF` shapes are
 /// most-significant-first, so they are reversed into the hub's row-major order.
+///
+/// `threads` is the resolved worker budget: the per-tensor work is dispatched
+/// through `parallel::map_indexed`, which returns the hub tensors in `GGUF` file
+/// order for **any** thread count, so the written output is byte-identical
+/// whatever the budget. Both branches parallelise usefully — the quantised
+/// branch because dequantisation is the compute, the scalar branch because the
+/// `into_owned()` copy is bandwidth-bound — so an all-`F32` `GGUF` gains too.
 #[cfg(feature = "gguf")]
-fn read_gguf(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
+fn read_gguf(path: &Path, limits: &ParseLimits, threads: usize) -> crate::Result<Hub> {
     let parsed = crate::parse_gguf_with_limits(path, limits)?;
 
-    let mut tensors = Vec::new();
-    let mut dequantized = 0usize;
-    for tensor in parsed.tensors() {
-        let mut shape: Vec<usize> = tensor.shape.to_vec();
-        shape.reverse();
+    // Materialise the tensor views up front so the dispatch has an indexable
+    // slice. The views borrow the mapped bytes (name, shape and data are all
+    // references), so this costs one small struct per tensor and copies no
+    // tensor data. Tensors whose dtype has no tabulated byte size are absent
+    // here — `ParsedGguf::tensors` filters them — which preserves the skip this
+    // reader has always had.
+    let views: Vec<crate::GgufTensor<'_>> = parsed.tensors().collect();
+    let work_bytes: u64 = views.iter().fold(0u64, |acc, view| {
+        acc.saturating_add(u64::try_from(view.data.len()).unwrap_or(u64::MAX))
+    });
 
-        if tensor.dtype.is_quantized() {
-            let n_elements = tensor
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!(
-                        "GGUF tensor `{}` shape {:?} element count overflows usize",
-                        tensor.name, tensor.shape
-                    ),
-                })?;
-            let bf16 = crate::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
-            tensors.push(HubTensor {
-                name: tensor.name.to_owned(),
-                shape,
-                dtype: Dtype::BF16,
-                data: bf16,
-            });
-            dequantized = dequantized.saturating_add(1);
-        } else {
-            tensors.push(HubTensor {
-                name: tensor.name.to_owned(),
-                shape,
-                dtype: gguf_type_to_hub(tensor.dtype)?,
-                // BORROW: `into_owned()` copies the mmap-borrowed slice so the
-                // hub outlives the `ParsedGguf`.
-                data: tensor.data.into_owned(),
-            });
-        }
-    }
+    // `ParsedGguf` is `Sync` (asserted in `tests/parallel_contract.rs`), and the
+    // closure below reads only the shared-immutable view it is handed, writing
+    // solely into the `HubTensor` it returns.
+    let tensors: Vec<HubTensor> = crate::parallel::map_indexed(
+        &views,
+        threads,
+        work_bytes,
+        |_, tensor| {
+            let mut shape: Vec<usize> = tensor.shape.to_vec();
+            shape.reverse();
+
+            if tensor.dtype.is_quantized() {
+                let n_elements = tensor
+                    .shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!(
+                            "GGUF tensor `{}` shape {:?} element count overflows usize",
+                            tensor.name, tensor.shape
+                        ),
+                    })?;
+                let bf16 = crate::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
+                Ok(HubTensor {
+                    name: tensor.name.to_owned(),
+                    shape,
+                    dtype: Dtype::BF16,
+                    data: bf16,
+                })
+            } else {
+                Ok(HubTensor {
+                    name: tensor.name.to_owned(),
+                    shape,
+                    dtype: gguf_type_to_hub(tensor.dtype)?,
+                    // BORROW: `to_vec()` copies the mmap-borrowed slice so the
+                    // hub outlives the `ParsedGguf`.
+                    data: tensor.data.to_vec(),
+                })
+            }
+        },
+        |_| {},
+    )?;
+
+    // Counted from the inputs rather than incremented during the dispatch, so no
+    // counter is shared across workers. Derived from the source dtype, not the
+    // hub dtype: a `GGUF` may carry a *scalar* `BF16` tensor, which passes
+    // through untouched and must not be reported as dequantised.
+    let dequantized = views.iter().filter(|v| v.dtype.is_quantized()).count();
+
     Ok(Hub {
         tensors,
         st_metadata: None,
@@ -1503,5 +1542,593 @@ mod stats_tests {
             stats.tensors,
             "dequantised + passthrough must equal the tensors written: {stats:?}"
         );
+    }
+}
+
+/// Correctness and determinism coverage for the **quantised** `GGUF` input path.
+///
+/// Before Phase 7.2 this path had **no test at all**: every `GGUF`-input convert
+/// test in `tests/` builds its fixture with `write_gguf`, which rejects
+/// `is_quantized()` dtypes (quantised emit is Phase 8.5), so the
+/// `dequantize_gguf_to_bf16` branch of [`read_gguf`] was exercised only against
+/// the gitignored multi-`GiB` local models — never in CI. These tests close that
+/// gap with a hand-rolled `GGUF` writer that *can* emit quantised blocks.
+///
+/// They live in-crate rather than in `tests/` for one specific reason: the
+/// fixture is sized off [`crate::parallel::MIN_PARALLEL_BYTES`], which is
+/// `pub(crate)`. Sizing against the constant instead of a hard-coded literal
+/// means the tests keep exercising the **parallel** dispatch if the threshold is
+/// ever retuned — a hard-coded 5 `MiB` fixture would silently fall back to the
+/// sequential path the day the threshold moved to 8 `MiB`, and the determinism
+/// suite would go green while testing nothing.
+#[cfg(all(test, feature = "gguf"))]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    // EXHAUSTIVE: `GgufType` is `#[non_exhaustive]`, so the fixture builder's
+    // dtype matches need a wildcard. It models only the three dtypes the
+    // fixture uses and panics on anything else — a test-authoring error, never
+    // reachable from input. Hoisted here because an arm-level `#[allow]` does
+    // not suppress `wildcard_enum_match_arm`.
+    clippy::wildcard_enum_match_arm
+)]
+mod quantized_gguf_tests {
+    use super::{convert, ConvertOptions, ConvertTarget};
+    use crate::parallel::MIN_PARALLEL_BYTES;
+    use crate::GgufType;
+    use std::path::PathBuf;
+
+    /// `GGUF` default tensor-data alignment.
+    const ALIGNMENT: usize = 32;
+
+    /// One tensor in the synthetic fixture: `(name, dtype, `GGUF`-order shape)`.
+    struct Spec {
+        name: &'static str,
+        dtype: GgufType,
+        /// Most-significant-first, as `GGUF` stores it.
+        shape: Vec<usize>,
+    }
+
+    impl Spec {
+        fn new(name: &'static str, dtype: GgufType, shape: &[usize]) -> Self {
+            Self {
+                name,
+                dtype,
+                shape: shape.to_vec(),
+            }
+        }
+
+        fn n_elements(&self) -> usize {
+            self.shape.iter().product()
+        }
+
+        /// On-disk byte length, from the dtype's block geometry.
+        fn byte_len(&self) -> usize {
+            let n = self.n_elements();
+            match self.dtype {
+                GgufType::F32 => n * 4,
+                // 32-element blocks: 2-byte f16 scale + 32 int8.
+                GgufType::Q8_0 => (n / 32) * 34,
+                // 256-element super-blocks, 144 bytes each.
+                GgufType::Q4_K => (n / 256) * 144,
+                // EXHAUSTIVE: `GgufType` is `#[non_exhaustive]` and this test
+                // builder deliberately models only the three dtypes the fixture
+                // uses; anything else is a test-authoring error, not input.
+                other => panic!("fixture builder does not model {other:?}"),
+            }
+        }
+
+        /// The `GgufType` discriminant as written in the tensor-info table.
+        fn discriminant(&self) -> u32 {
+            match self.dtype {
+                GgufType::F32 => 0,
+                GgufType::Q8_0 => 8,
+                GgufType::Q4_K => 12,
+                // EXHAUSTIVE: see `byte_len` — only the three modelled dtypes.
+                other => panic!("fixture builder does not model {other:?}"),
+            }
+        }
+
+        /// Deterministic block bytes. Quantised blocks get a **sane** f16 scale
+        /// (`0x3C00` = 1.0) rather than random bits: a random scale is often
+        /// `NaN`/`Inf`, which would make every tensor dequantise to the same
+        /// degenerate payload and let an ordering or slicing bug pass unnoticed.
+        fn data(&self) -> Vec<u8> {
+            let len = self.byte_len();
+            let mut buf: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(2_654_435_761) & 0xFF) as u8)
+                .collect();
+            match self.dtype {
+                GgufType::Q8_0 => {
+                    for block in buf.chunks_exact_mut(34) {
+                        block[0] = 0x00;
+                        block[1] = 0x3C; // f16 1.0, little-endian
+                    }
+                }
+                GgufType::Q4_K => {
+                    for block in buf.chunks_exact_mut(144) {
+                        block[0] = 0x00;
+                        block[1] = 0x3C; // d    = f16 1.0
+                        block[2] = 0x00;
+                        block[3] = 0x38; // dmin = f16 0.5
+                    }
+                }
+                GgufType::F32 => {}
+                // EXHAUSTIVE: see `byte_len` — only the three modelled dtypes.
+                other => panic!("fixture builder does not model {other:?}"),
+            }
+            buf
+        }
+    }
+
+    /// The fixture layout: a **prime** tensor count (17) with deliberately
+    /// skewed sizes, so the atomic-cursor partition genuinely differs between
+    /// thread budgets — an equal-count split of 17 items across 2, 4, 8 and 16
+    /// workers lands differently every time, and one oversized `Q8_0` tensor
+    /// forces the pool to rebalance rather than divide evenly.
+    ///
+    /// Mostly `F32` by *byte* count (cheap to produce, and it is what pushes the
+    /// fixture past `MIN_PARALLEL_BYTES`), but the quantised tensors carry the
+    /// interesting work.
+    fn fixture_specs() -> Vec<Spec> {
+        let mut specs = Vec::new();
+        // 8 F32 padding tensors — also exercise the passthrough branch, and one
+        // is 2-D so the shape reversal is covered.
+        for i in 0..8 {
+            let shape: Vec<usize> = if i == 0 {
+                vec![350, 400] // 2-D: GGUF order, reversed to [400, 350] in the hub
+            } else {
+                vec![140_000]
+            };
+            specs.push(Spec::new(
+                match i {
+                    0 => "blk.0.attn_norm.weight",
+                    1 => "blk.1.attn_norm.weight",
+                    2 => "blk.2.attn_norm.weight",
+                    3 => "blk.3.attn_norm.weight",
+                    4 => "blk.4.attn_norm.weight",
+                    5 => "blk.5.attn_norm.weight",
+                    6 => "blk.6.attn_norm.weight",
+                    _ => "output_norm.weight",
+                },
+                GgufType::F32,
+                &shape,
+            ));
+        }
+        // 5 Q8_0 tensors, deliberately lopsided (the first is ~64x the last).
+        specs.push(Spec::new("token_embd.weight", GgufType::Q8_0, &[512, 512]));
+        specs.push(Spec::new("blk.0.attn_q.weight", GgufType::Q8_0, &[32_768]));
+        specs.push(Spec::new("blk.1.attn_q.weight", GgufType::Q8_0, &[16_384]));
+        specs.push(Spec::new("blk.2.attn_q.weight", GgufType::Q8_0, &[8_192]));
+        specs.push(Spec::new("blk.3.attn_q.weight", GgufType::Q8_0, &[4_096]));
+        // 4 Q4_K tensors — a second kernel family through the same dispatch.
+        specs.push(Spec::new(
+            "blk.0.ffn_down.weight",
+            GgufType::Q4_K,
+            &[65_536],
+        ));
+        specs.push(Spec::new(
+            "blk.1.ffn_down.weight",
+            GgufType::Q4_K,
+            &[32_768],
+        ));
+        specs.push(Spec::new(
+            "blk.2.ffn_down.weight",
+            GgufType::Q4_K,
+            &[16_384],
+        ));
+        specs.push(Spec::new("blk.3.ffn_down.weight", GgufType::Q4_K, &[8_192]));
+        specs
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw GGUF writer (quantised-capable)
+    // -----------------------------------------------------------------------
+
+    fn push_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_string(buf: &mut Vec<u8>, s: &str) {
+        push_u64(buf, s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn pad_to_alignment(buf: &mut Vec<u8>) {
+        while !buf.len().is_multiple_of(ALIGNMENT) {
+            buf.push(0);
+        }
+    }
+
+    /// Serialises `specs` into a `GGUF` v3 byte image. Deliberately hand-rolled:
+    /// the crate's own `write_gguf` refuses quantised dtypes, which is exactly
+    /// the case under test.
+    fn build_quantized_gguf(specs: &[Spec]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        push_u32(&mut buf, 3); // version
+        push_u64(&mut buf, specs.len() as u64);
+        push_u64(&mut buf, 2); // kv_count
+
+        // general.architecture (STRING = 8)
+        push_string(&mut buf, "general.architecture");
+        push_u32(&mut buf, 8);
+        push_string(&mut buf, "llama");
+        // general.alignment (UINT32 = 4)
+        push_string(&mut buf, "general.alignment");
+        push_u32(&mut buf, 4);
+        push_u32(&mut buf, ALIGNMENT as u32);
+
+        // Tensor-info table. Relative offsets are each padded to the alignment,
+        // matching how a real GGUF lays its data section out.
+        let mut relative = 0usize;
+        let mut offsets = Vec::with_capacity(specs.len());
+        for spec in specs {
+            offsets.push(relative);
+            relative += spec.byte_len();
+            while !relative.is_multiple_of(ALIGNMENT) {
+                relative += 1;
+            }
+        }
+        for (spec, &offset) in specs.iter().zip(offsets.iter()) {
+            push_string(&mut buf, spec.name);
+            push_u32(&mut buf, spec.shape.len() as u32);
+            for &d in &spec.shape {
+                push_u64(&mut buf, d as u64);
+            }
+            push_u32(&mut buf, spec.discriminant());
+            push_u64(&mut buf, offset as u64);
+        }
+
+        // Data section, aligned, in the same order the info table declares.
+        pad_to_alignment(&mut buf);
+        let data_start = buf.len();
+        for (spec, &offset) in specs.iter().zip(offsets.iter()) {
+            debug_assert_eq!(buf.len() - data_start, offset, "offset table drift");
+            buf.extend_from_slice(&spec.data());
+            pad_to_alignment(&mut buf);
+        }
+        buf
+    }
+
+    /// Byte-equality with a **bounded** failure message.
+    ///
+    /// A plain `assert_eq!` on two multi-`MiB` `Vec<u8>`s renders both in full —
+    /// a determinism regression here produced a 46 `MB` test log, which is
+    /// unreadable and slow enough to look like a hang. Report the length and the
+    /// first divergence instead; that is the whole diagnostic anyone needs.
+    fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: length differs ({} vs {} bytes)",
+            actual.len(),
+            expected.len()
+        );
+        if let Some((offset, (a, e))) = actual
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .find(|(_, (a, e))| a != e)
+            .map(|(i, (a, e))| (i, (*a, *e)))
+        {
+            panic!(
+                "{context}: first difference at byte {offset} of {} (got {a:#04x}, expected {e:#04x})",
+                actual.len()
+            );
+        }
+    }
+
+    /// Writes the fixture into a `TempDir` and returns both so the directory
+    /// outlives the path.
+    fn write_fixture() -> (tempfile::TempDir, PathBuf, Vec<Spec>) {
+        let specs = fixture_specs();
+        let bytes = build_quantized_gguf(&specs);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("quantized.gguf");
+        std::fs::write(&path, &bytes).expect("write fixture");
+        (dir, path, specs)
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    /// The fixture must clear [`MIN_PARALLEL_BYTES`], or every determinism test
+    /// below would silently run on the sequential path and prove nothing about
+    /// the parallel dispatch.
+    #[test]
+    fn fixture_crosses_the_parallel_threshold() {
+        let specs = fixture_specs();
+        let total: u64 = specs.iter().map(|s| s.byte_len() as u64).sum();
+        assert!(
+            total > MIN_PARALLEL_BYTES,
+            "fixture is {total} B but MIN_PARALLEL_BYTES is {MIN_PARALLEL_BYTES} B — \
+             the determinism tests would not exercise the parallel path"
+        );
+        assert_eq!(specs.len(), 17, "a prime tensor count is deliberate");
+    }
+
+    /// The hand-rolled fixture must actually parse, and the quantised tensors
+    /// must dequantise to exactly what the kernel produces when called directly
+    /// on the same block bytes. This is the first test in the repo to convert a
+    /// quantised `GGUF` at all.
+    #[test]
+    fn quantized_gguf_converts_to_expected_bf16() {
+        let (_dir, path, specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let out = dir_out.path().join("out.safetensors");
+
+        let stats = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &out,
+            &ConvertOptions::new().with_threads(4),
+        )
+        .expect("convert quantised gguf -> safetensors");
+
+        assert_eq!(stats.tensors, 17);
+        assert_eq!(stats.dequantized, 9, "5 Q8_0 + 4 Q4_K are dequantised");
+        assert_eq!(stats.passthrough, 8, "the 8 F32 tensors pass through");
+
+        // Re-read the output and check every tensor against the kernel oracle.
+        let written = std::fs::read(&out).expect("read output");
+        let tensors = safetensors::SafeTensors::deserialize(&written).expect("parse output");
+
+        for spec in &specs {
+            let view = tensors.tensor(spec.name).expect("tensor present in output");
+            // GGUF shapes are most-significant-first; the hub reverses them.
+            let expected_shape: Vec<usize> = spec.shape.iter().copied().rev().collect();
+            assert_eq!(view.shape(), expected_shape.as_slice(), "{}", spec.name);
+
+            match spec.dtype {
+                GgufType::F32 => {
+                    assert_eq!(view.dtype(), safetensors::Dtype::F32, "{}", spec.name);
+                    assert_bytes_eq(view.data(), &spec.data(), spec.name);
+                }
+                dtype => {
+                    assert_eq!(view.dtype(), safetensors::Dtype::BF16, "{}", spec.name);
+                    let expected =
+                        crate::dequantize_gguf_to_bf16(&spec.data(), dtype, spec.n_elements())
+                            .expect("oracle dequant");
+                    assert_bytes_eq(
+                        view.data(),
+                        &expected,
+                        &format!("{} vs the kernel called directly", spec.name),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Thread count is a performance knob, never a correctness variable: the
+    /// written bytes must be identical for every budget, including the
+    /// environment-resolved default.
+    #[test]
+    fn gguf_to_safetensors_deterministic_across_thread_counts() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+
+        let baseline_path = dir_out.path().join("baseline.safetensors");
+        convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &baseline_path,
+            &ConvertOptions::new().with_threads(1),
+        )
+        .expect("baseline convert");
+        let baseline = std::fs::read(&baseline_path).expect("read baseline");
+
+        for n in [1usize, 2, 4, 8, 16] {
+            let out = dir_out.path().join(format!("t{n}.safetensors"));
+            convert(
+                &path,
+                ConvertTarget::Safetensors,
+                &out,
+                &ConvertOptions::new().with_threads(n),
+            )
+            .expect("threaded convert");
+            assert_bytes_eq(
+                &std::fs::read(&out).expect("read output"),
+                &baseline,
+                &format!("safetensors output at {n} threads"),
+            );
+        }
+
+        // The default (hardware-resolved) budget must agree too.
+        let default_out = dir_out.path().join("default.safetensors");
+        convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &default_out,
+            &ConvertOptions::new(),
+        )
+        .expect("default convert");
+        assert_bytes_eq(
+            &std::fs::read(&default_out).expect("read output"),
+            &baseline,
+            "the default thread budget vs the sequential baseline",
+        );
+    }
+
+    /// The determinism contract holds for the other two targets reachable from a
+    /// `GGUF` source, not just safetensors: the `GGUF` writer (dequantise in
+    /// place, inheriting the source KV) and the `BnB`-NF4 encoder.
+    #[test]
+    fn gguf_to_other_targets_deterministic_across_thread_counts() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+
+        let targets: &[(ConvertTarget, &str)] = &[
+            (ConvertTarget::Gguf, "gguf"),
+            #[cfg(feature = "bnb")]
+            (ConvertTarget::BnbNf4, "safetensors"),
+        ];
+
+        for &(target, ext) in targets {
+            let baseline_path = dir_out.path().join(format!("baseline-{ext}.{ext}"));
+            convert(
+                &path,
+                target,
+                &baseline_path,
+                &ConvertOptions::new().with_threads(1),
+            )
+            .expect("baseline convert");
+            let baseline = std::fs::read(&baseline_path).expect("read baseline");
+
+            for n in [2usize, 4, 8] {
+                let out = dir_out.path().join(format!("t{n}-{ext}.{ext}"));
+                convert(&path, target, &out, &ConvertOptions::new().with_threads(n))
+                    .expect("threaded convert");
+                assert_bytes_eq(
+                    &std::fs::read(&out).expect("read output"),
+                    &baseline,
+                    &format!("{target:?} output at {n} threads"),
+                );
+            }
+        }
+    }
+}
+
+/// Ad-hoc, `#[ignore]`d stage-isolated scaling measurement for the Phase 7.2
+/// `GGUF`-reader parallelisation.
+///
+/// Lives here rather than in `tests/bench_gguf_convert_adhoc.rs` because the
+/// quantity of interest is [`read_hub`] **alone**. An end-to-end `convert()`
+/// also serialises the whole `BF16` hub to disk — for a 1.1 B-parameter model
+/// that is a 2.2 `GiB` write, which dominates the wall clock and masks whatever
+/// the reader does. `read_hub` is private, so only an in-crate test can time it.
+///
+/// Run with (`--test-threads=1` so the budgets do not contend):
+///
+/// ```text
+/// $env:RUSTFLAGS = "-C target-cpu=native"
+/// cargo test --release --features gguf --lib hub_scaling -- --ignored --nocapture --test-threads=1
+/// $env:RUSTFLAGS = $null
+/// ```
+#[cfg(all(test, feature = "gguf"))]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing
+)]
+mod hub_scaling_bench {
+    use super::{read_hub, ConvertOptions};
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    /// Best-of-5, matching the `CLAUDE.md` perf gate.
+    const SAMPLES: usize = 5;
+
+    fn model_path(file_name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("gguf_reference")
+            .join("models")
+            .join(file_name)
+    }
+
+    /// Reads the committed `gguf-py` timing sidecar for `model`, if present.
+    ///
+    /// Returns `(median seconds, library version, note)`. Sidecars are produced
+    /// by `tests/fixtures/gguf_reference/generate_gguf_dequant_timings.py` and
+    /// **are** checked in (unlike the models themselves), so this comparison
+    /// prints even on a machine with no Python environment.
+    fn python_baseline(model: &str) -> Option<(f64, String, String)> {
+        let stem = model.strip_suffix(".gguf").unwrap_or(model);
+        let sidecar = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("gguf_reference")
+            .join(format!("{stem}.dequant.timing.json"));
+        let raw = std::fs::read_to_string(sidecar).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let seconds = value.get("py_seconds")?.as_f64()?;
+        let library = value.get("py_library")?.as_str()?.to_owned();
+        let note = value
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        Some((seconds, library, note))
+    }
+
+    /// Times `read_hub` at each thread budget, reporting the median and the
+    /// speedup over the 1-thread (v0.7.1-equivalent) baseline.
+    fn hub_scaling_for(model: &str) {
+        let input = model_path(model);
+        if !input.exists() {
+            eprintln!("SKIP {model}: fixture absent (gitignored)");
+            return;
+        }
+        let input_mib = std::fs::metadata(&input).expect("stat").len() as f64 / (1024.0 * 1024.0);
+        eprintln!("\n=== read_hub({model}) — {input_mib:.1} MiB input ===");
+
+        let python = python_baseline(model);
+        let mut baseline = 0.0_f64;
+        for threads in [1usize, 2, 4, 8, 16] {
+            let options = ConvertOptions::new().with_threads(threads);
+            // Warm-up: also pages the mmap in, so the timed samples measure
+            // dequant rather than first-touch page faults.
+            drop(read_hub(&input, &options).expect("warm-up read_hub"));
+
+            let mut samples: Vec<f64> = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = Instant::now();
+                let hub = read_hub(&input, &options).expect("read_hub");
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                drop(hub);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = samples[SAMPLES / 2];
+            if threads == 1 {
+                baseline = median;
+            }
+            let vs_python = python.as_ref().map_or_else(String::new, |&(py, _, _)| {
+                format!("  |  {:.1}x vs gguf-py", (py * 1000.0) / median)
+            });
+            eprintln!(
+                "{threads:>2} threads: median {median:>8.2} ms (min {:.2}, max {:.2}) -> {:.2}x{vs_python}",
+                samples[0],
+                samples[SAMPLES - 1],
+                baseline / median
+            );
+        }
+
+        match python {
+            Some((py, library, note)) => {
+                eprintln!("\npython baseline: {:.1} ms ({library})", py * 1000.0);
+                if !note.is_empty() {
+                    eprintln!("  caveat: {note}");
+                }
+            }
+            None => {
+                eprintln!("\npython baseline: no sidecar (run generate_gguf_dequant_timings.py)");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "ad-hoc measurement; run explicitly with --ignored"]
+    fn hub_scaling_smollm2_q4_k_m() {
+        hub_scaling_for("SmolLM2-135M-Instruct-Q4_K_M.gguf");
+    }
+
+    #[test]
+    #[ignore = "ad-hoc measurement; run explicitly with --ignored"]
+    fn hub_scaling_tinyllama_q5_0() {
+        hub_scaling_for("tinyllama-1.1b-chat-v1.0.Q5_0.gguf");
     }
 }
