@@ -87,6 +87,17 @@ jobs:
   #     out of the instrumented graph.
   #   * CARGO_TARGET_<TRIPLE>_RUSTFLAGS, *not* a blanket RUSTFLAGS, for the same
   #     reason -- a blanket RUSTFLAGS also reaches host artefacts.
+  #   * -Cunsafe-allow-abi-mismatch=sanitizer. Current rustc refuses to link
+  #     instrumented and uninstrumented crates at all ("mixing `-Zsanitizer`
+  #     will cause an ABI mismatch in crate `cfg_if` ... incompatible with
+  #     `-Zsanitizer` being unset in dependency `core`"), and suggests this flag
+  #     itself as the opt-out. Together with the build-std limitation above it
+  #     is a pincer: with build-std the build cannot link, without it the ABI
+  #     check refuses -- so instrumenting our code only requires saying so
+  #     explicitly. That is exactly the long-standing "sanitize your crate, not
+  #     std" mode (see japaric/rust-san), and the `unsafe` in the flag name is
+  #     about ABI mixing in general, not about anything specific to this crate.
+  #     The residual risk is the false-positive exposure described above.
   #   * RUST_TEST_THREADS=1: libtest's own harness races under TSan
   #     (rust-lang/rust#39608). Running tests sequentially is the documented
   #     workaround and costs nothing here -- the code under test spawns its own
@@ -118,7 +129,9 @@ jobs:
       # enough that the ~10-20x instrumentation slowdown is affordable.
       - name: Test under ThreadSanitizer
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
+            -Zsanitizer=thread
+            -Cunsafe-allow-abi-mismatch=sanitizer
           # `halt_on_error` makes the first detected race fail loudly instead of
           # being buried in later output.
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
@@ -130,7 +143,9 @@ jobs:
 
       - name: Test the parallel auto-trait contract under ThreadSanitizer
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
+            -Zsanitizer=thread
+            -Cunsafe-allow-abi-mismatch=sanitizer
           TSAN_OPTIONS: "halt_on_error=1"
           RUST_TEST_THREADS: "1"
         run: |
