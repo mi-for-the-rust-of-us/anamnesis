@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **ThreadSanitizer is now gating, with an instrumented `std`**
+  (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
+  with the `CONVENTIONS.md` race-detector rule still open — the job existed but
+  could not be made green, and its CHANGELOG entry says so. It can now: the
+  parallel dispatch reports **zero races** across `{1, 2, 4, 8}` threads plus
+  the hardware-resolved default, and every budget is byte-identical.
+
+  Getting there needed three constraints to hold at once, each learned from a
+  red build and each individually insufficient:
+
+  1. **A `--bin` target rather than `cargo test`.** `-Zbuild-std` is unusable
+     with `cargo test`
+     ([cargo#13146](https://github.com/rust-lang/cargo/issues/13146), open since
+     2023) because `cargo test` also builds dev-dependencies, several of which
+     are crates `std` itself depends on. `cargo run --bin` builds none.
+  2. **Blanket `RUSTFLAGS`, not `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`.** The
+     target-scoped form silently does not reach `-Zbuild-std`'s units, leaving
+     the rebuilt `std` graph uninstrumented — undocumented, and undiagnosed by
+     Cargo. (An earlier revision of the workflow claimed the target-scoped form
+     was needed to keep build scripts clean; that is wrong — `--target` alone
+     does that, per the Cargo book.)
+  3. **`panic_abort` in the build-std set**, because `[profile.release]` sets
+     `panic = "abort"`; without it rustc falls back to the sysroot and drags its
+     `core` in ([cargo#15347](https://github.com/rust-lang/cargo/issues/15347)).
+
+  This matters beyond tidiness: an instrumented `std` is a **precondition**, not
+  a refinement. Without one, `std::thread::scope`'s own `Arc` teardown
+  false-positives ([rust#101206](https://github.com/rust-lang/rust/issues/101206))
+  — and scoped threads are the mechanism under test, so the detector fires on
+  exactly what it is meant to check.
+
+  `.github/tsan-suppressions.txt` is retained, wired to nothing, as the record
+  of the abandoned uninstrumented-`std` approach.
+
 ## [0.7.2] - 2026-08-07
 
 ### Added

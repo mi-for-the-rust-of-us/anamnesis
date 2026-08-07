@@ -1,6 +1,18 @@
-# ThreadSanitizer suppressions for the `tsan` CI job (.github/workflows/ci.yml).
+# ThreadSanitizer suppressions — RETAINED AS A RECORD, NOT IN USE.
 #
-# WHY THIS FILE EXISTS
+# ┌───────────────────────────────────────────────────────────────────────────┐
+# │ NOT REFERENCED BY ANY WORKFLOW. `.github/workflows/tsan.yml` now builds    │
+# │ with an INSTRUMENTED std (`-Zbuild-std`), under which none of the          │
+# │ suppressions below are needed — the false positives they cover exist only  │
+# │ when std is uninstrumented. Do not wire this file back in without reading  │
+# │ that workflow's header first: reintroducing it would silently narrow what  │
+# │ the detector can see.                                                      │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# It is kept because it documents a dead end precisely, and the reasoning below
+# is what ruled that approach out.
+#
+# WHY THIS FILE EXISTED
 #
 # The job cannot instrument the standard library: `-Zbuild-std` combined with
 # `cargo test` is a documented, unresolved Cargo limitation

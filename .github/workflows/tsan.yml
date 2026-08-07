@@ -1,124 +1,107 @@
-name: ThreadSanitizer (manual)
+name: ThreadSanitizer
 
-# NOT part of gating CI, and deliberately so as of v0.7.2.
+# Race detection over the parallel dequant dispatch, with an INSTRUMENTED
+# standard library.
 #
-# This job runs the parallel dequant paths under ThreadSanitizer. It works --
-# it compiles, runs the full unit-test suite, and reports -- but it cannot
-# currently be made GREEN, for reasons that are upstream rather than ours. It is
-# therefore workflow_dispatch-only: run it on demand, read the report with the
-# caveats below, and do not treat a red result as proof of a race without first
-# checking whose stack frames appear in it.
+# This satisfies CONVENTIONS.md "When Parallelizing Work" -> "Verify
+# parallelism" item 3, which asks for a race-detector run "where the platform
+# supports it". The maintainer's platform is Windows/MSVC, which has no TSan, so
+# CI is the only place the rule can be satisfied at all.
 #
-# ---------------------------------------------------------------------------
-# WHY IT IS NOT GATING
-# ---------------------------------------------------------------------------
-#
-# The ideal setup instruments the standard library so TSan can see std's own
-# synchronisation. That is blocked: `-Zbuild-std` combined with `cargo test` is
-# a documented, unresolved Cargo limitation (rust-lang/cargo#13146), failing to
-# link with "duplicate lang item in crate `core`". The upstream workarounds are
-# to split the crate into subcrates or drive the build from a Makefile.
-#
-# Without an instrumented std, two things follow:
-#
-#   1. rustc refuses to link instrumented against uninstrumented crates at all,
-#      so -Cunsafe-allow-abi-mismatch=sanitizer is required just to build.
-#   2. TSan cannot see the happens-before edges inside std's pure-Rust atomic
-#      machinery, so libtest itself reports false races -- rust-lang/rust#39608.
-#
-# Point 2 is what keeps this red. The libtest result channel was suppressible
-# (see .github/tsan-suppressions.txt), but the next report was in
-# `test::run_test` / `std::sys::thread::unix::Thread::new`, and that is the SAME
-# machinery `std::thread::scope` uses. Suppressing it would blind the detector
-# to our own thread creation -- which would make this job actively worse than
-# not having it. So the chain stops there, honestly, rather than being papered
-# over to get a green tick.
+# The disjoint-output design is race-free by construction — each worker writes
+# only the buffer it returns, and the sole shared mutable datum is the
+# scheduling AtomicUsize — so this job is a backstop against a future edit
+# breaking that invariant, not a suspicion about the current code.
 #
 # ---------------------------------------------------------------------------
-# WHAT IT STILL VERIFIES WHEN RUN MANUALLY
+# THE RECIPE, AND WHY EVERY PART OF IT IS LOAD-BEARING
 # ---------------------------------------------------------------------------
 #
-# TSan intercepts pthread_create / pthread_join at the libc level regardless of
-# instrumentation, so the joins std::thread::scope performs -- the happens-before
-# edges the dispatch actually relies on -- remain visible. The AtomicUsize cursor
-# is in our own instrumented code. Reports naming `anamnesis::` frames are
-# therefore worth taking seriously; reports naming only `test::` / `std::sys::`
-# frames are the known false positives above.
+# Three constraints must hold *simultaneously*. Each one alone still fails, and
+# each was learned from a distinct red build. If you change any of them, expect
+# the job to break in a way whose error message points somewhere else entirely.
 #
-# CONVENTIONS.md "Verify parallelism" item 3 stays OPEN until this is gating.
-# Picking it up again is tracked as part of ROADMAP Phase 7.3.
+# 1. A `--bin` TARGET, NOT `cargo test`.
+#    `-Zbuild-std` is unusable with `cargo test` (rust-lang/cargo#13146, open
+#    since 2023): `cargo test` also compiles dev-dependencies, and several of
+#    those are crates `std` itself depends on — `cfg-if` reaches us through the
+#    unconditional `flate2` dev-dep — which collide as
+#    `error[E0152]: duplicate lang item in crate `core``.
+#    `cargo run --bin` builds NO dev-dependencies, so that collision surface
+#    simply is not there. This is why the harness is a binary
+#    (`src/bin/tsan_harness.rs`) rather than a test.
+#
+# 2. BLANKET `RUSTFLAGS`, NOT `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`.
+#    The target-scoped form does NOT reach `-Zbuild-std`'s own units. The
+#    symptom is rustc reporting `compiler_builtins` (or `core`) as
+#    uninstrumented while our crate is instrumented — i.e. the rebuilt std graph
+#    silently gets no sanitizer at all. Only the blanket variable instruments
+#    it. This is undocumented: the Cargo book describes the precedence order of
+#    the four flag sources but says nothing about build-std units.
+#
+#    NOTE, because an earlier revision of this file claimed the opposite: the
+#    target-scoped form is NOT needed to keep build scripts and proc macros
+#    uninstrumented. Passing `--target` already does that, and the Cargo book is
+#    explicit — "If the --target flag is used, then the flags will only be
+#    passed to the compiler for the target. Things being built for the host,
+#    such as build scripts or proc macros, will not receive the args."
+#
+# 3. `panic_abort` IN THE BUILD-STD SET.
+#    Cargo.toml sets `panic = "abort"` for [profile.release] and this job builds
+#    --release. A build-std set without `panic_abort` leaves rustc unable to
+#    find one in the self-built sysroot, so it falls back to the REAL sysroot's
+#    `panic_abort` — which drags that sysroot's `core` in behind it, producing
+#    E0152 again, this time with one core in target/ and one in ~/.rustup.
+#    See rust-lang/cargo#15347 and rust-lang/rust#115963.
+#
+# `-Cunsafe-allow-abi-mismatch=sanitizer` covers `compiler_builtins`, which is
+# not instrumentable. It is memcpy/memset intrinsics with no synchronisation of
+# its own, so mixing it in is inert as far as a race detector is concerned.
+#
+# ---------------------------------------------------------------------------
+# WHY AN INSTRUMENTED std IS NOT OPTIONAL HERE
+# ---------------------------------------------------------------------------
+#
+# The Rust Unstable Book is explicit that ThreadSanitizer "require[s] all code
+# to be instrumented since otherwise [it] generate[s] false positives". For this
+# crate that is not a quality-of-results matter but a correctness-of-the-tool
+# one: with an uninstrumented std, `std::thread::scope`'s own Arc teardown
+# false-positives (rust-lang/rust#101206, `free` racing `atomic_sub`) — and
+# scoped threads ARE the mechanism under test. The detector would fire on
+# precisely the thing it exists to check.
+#
+# A no-build-std configuration was tried and abandoned for exactly this reason.
+# It also required suppressing libtest's own result channel
+# (rust-lang/rust#39608); the next report after that landed in
+# `std::sys::thread::unix::Thread::new`, which `thread::scope` also uses, so
+# suppressing further would have blinded the job to our own thread creation.
+# `.github/tsan-suppressions.txt` is retained only as the record of that dead
+# end — it is NOT referenced by this workflow and should not be reintroduced
+# without re-reading its header.
+#
+# ---------------------------------------------------------------------------
+# REMAINING CHOICES
+# ---------------------------------------------------------------------------
+#
+#   * nightly + rust-src: -Zsanitizer and -Zbuild-std are both unstable, and
+#     build-std needs the standard library source.
+#   * --release: an instrumented debug build of the dequant kernels is slow
+#     enough to risk the job timeout.
+#   * continue-on-error is NOT set — a detected race must fail CI.
+#
+# The harness itself (what is exercised, and why the fixture is sized the way it
+# is) is documented in src/bin/tsan_harness.rs.
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ThreadSanitizer over the parallelised dequant paths.
-  #
-  # CONVENTIONS.md "When Parallelizing Work" -> "Verify parallelism" item 3 asks
-  # for a race-detector run "where the platform supports it". The maintainer's
-  # platform is Windows/MSVC, which has no TSan, so this is the only place the
-  # rule can actually be satisfied — Phase 7 (v0.7.0) shipped the first threaded
-  # code without it, and Phase 7.2 closes that gap for both the safetensors and
-  # the GGUF path at once.
-  #
-  # The disjoint-output design is race-free by construction (each worker writes
-  # only the buffer it returns; the sole shared mutable datum is the scheduling
-  # AtomicUsize), so this is a backstop against a future edit breaking that — not
-  # a suspicion about the current code.
-  #
-  # NO -Zbuild-std, deliberately. The ideal setup instruments the standard
-  # library too, so TSan can see std's own synchronisation. That is not
-  # achievable here: `-Zbuild-std` combined with `cargo test` is a documented,
-  # unresolved Cargo limitation (rust-lang/cargo#13146), which reports exactly
-  # our failure -- `cargo test --target x86_64-unknown-linux-gnu` producing
-  # "duplicate lang item in crate `core`" -- and states the conflict is general
-  # to build-std, not specific to no_main. The workarounds offered there are to
-  # split the crate into subcrates or drive the build from a Makefile; neither
-  # is worth it for a backstop job.
-  #
-  # Four configurations were tried before reading that issue (blanket RUSTFLAGS,
-  # target-scoped RUSTFLAGS, -Ztarget-applies-to-host, and both panic runtimes
-  # in the build-std set). All four failed identically, with byte-identical
-  # `core` fingerprints every time -- the tell that no command-line flag was
-  # touching the real cause. Do not retry those; read the issue first.
-  #
-  # What we lose: TSan cannot see synchronisation performed inside uninstrumented
-  # std, so it may in principle report a false positive. In practice the risk is
-  # low for this crate -- the dispatch synchronises with a plain
-  # AtomicUsize::fetch_add and thread::scope's join, and TSan intercepts the
-  # pthread primitives underneath join regardless of instrumentation. The
-  # documented false-positive sources (std::sync::atomic::fence, inline asm) are
-  # not used anywhere in the parallel path.
-  #
-  # Requirements and quirks, all load-bearing:
-  #   * nightly, because -Zsanitizer is unstable. rust-src is no longer needed
-  #     without build-std, but is harmless and kept for a future retry.
-  #   * an explicit --target is still REQUIRED even without build-std: it is what
-  #     keeps build scripts and proc macros (clap_derive, serde_derive, codspeed)
-  #     out of the instrumented graph.
-  #   * CARGO_TARGET_<TRIPLE>_RUSTFLAGS, *not* a blanket RUSTFLAGS, for the same
-  #     reason -- a blanket RUSTFLAGS also reaches host artefacts.
-  #   * -Cunsafe-allow-abi-mismatch=sanitizer. Current rustc refuses to link
-  #     instrumented and uninstrumented crates at all ("mixing `-Zsanitizer`
-  #     will cause an ABI mismatch in crate `cfg_if` ... incompatible with
-  #     `-Zsanitizer` being unset in dependency `core`"), and suggests this flag
-  #     itself as the opt-out. Together with the build-std limitation above it
-  #     is a pincer: with build-std the build cannot link, without it the ABI
-  #     check refuses -- so instrumenting our code only requires saying so
-  #     explicitly. That is exactly the long-standing "sanitize your crate, not
-  #     std" mode (see japaric/rust-san), and the `unsafe` in the flag name is
-  #     about ABI mixing in general, not about anything specific to this crate.
-  #     The residual risk is the false-positive exposure described above.
-  #   * RUST_TEST_THREADS=1: libtest's own harness races under TSan
-  #     (rust-lang/rust#39608). Running tests sequentially is the documented
-  #     workaround and costs nothing here -- the code under test spawns its own
-  #     threads regardless, which is the whole point.
-  #   * --release: an instrumented debug build of the dequant kernels is slow
-  #     enough to hit the job timeout.
-  #   * continue-on-error is NOT set — a detected race must fail CI.
   tsan:
     name: ThreadSanitizer (parallel paths)
     runs-on: ubuntu-latest
@@ -134,35 +117,12 @@ jobs:
         with:
           key: tsan
 
-      # THE BINARY ROUTE (attempt 7). `cargo run --bin` builds no
-      # dev-dependencies, which is where the std-shared crates that broke
-      # `-Zbuild-std` came from (`cfg-if` via the unconditional `flate2`
-      # dev-dep). That lets us build the way the Unstable Book's own sanitizer
-      # example does -- with an INSTRUMENTED std -- which is the only
-      # configuration in which this crate can be checked at all: without it,
-      # `std::thread::scope`'s own Arc teardown false-positives
-      # (rust-lang/rust#101206), and scoped threads are the mechanism under
-      # test.
-      #
-      # No -Cunsafe-allow-abi-mismatch here: with build-std working, everything
-      # in the graph is instrumented, so there is no ABI mixing to allow.
       - name: Parallel dispatch under ThreadSanitizer (instrumented std)
         env:
-          # BLANKET RUSTFLAGS, not the target-scoped form. Attempt 7 proved that
-          # CARGO_TARGET_<TRIPLE>_RUSTFLAGS does NOT reach -Zbuild-std's own
-          # units: rustc reported `compiler_builtins` as uninstrumented while
-          # our crate was instrumented. Only the blanket variable instruments
-          # the rebuilt std graph.
-          #
-          # This is safe here precisely because it is a --bin: `cargo run`
-          # builds no dev-dependencies, so the crate graph that made blanket
-          # flags unusable under `cargo test` is absent.
-          #
-          # -Cunsafe-allow-abi-mismatch is still needed for `compiler_builtins`,
-          # which is not instrumentable. It is pure memcpy/memset intrinsics
-          # with no synchronisation of its own, so mixing it in is inert for a
-          # race detector.
+          # Blanket, not target-scoped: see constraint 2 in the header.
           RUSTFLAGS: "-Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer"
+          # `halt_on_error` makes the first detected race fail loudly rather
+          # than being buried in later output.
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: |
           cargo +nightly run --release \

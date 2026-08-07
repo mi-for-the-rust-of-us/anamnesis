@@ -896,19 +896,21 @@ Like vectorization, **verify** — do not assume:
 3. Where the platform supports it, the parallelized path is exercised under a
    race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
    the disjoint-slice design is race-free by construction, so this is a backstop).
-   **Still OPEN as of v0.7.2, with the attempt documented rather than hidden.**
-   A working TSan job exists at
-   [`.github/workflows/tsan.yml`](.github/workflows/tsan.yml) — it compiles, runs
-   the whole unit-test suite, and reports — but it is `workflow_dispatch`-only
-   because it cannot currently be made green for reasons upstream of this crate:
-   `-Zbuild-std` is unusable with `cargo test` (rust-lang/cargo#13146), and
-   without an instrumented `std` TSan reports false races inside libtest itself
-   (rust-lang/rust#39608). The next such report landed in
-   `std::sys::thread::unix::Thread::new` — the same machinery
-   `std::thread::scope` uses — so suppressing it would blind the detector to our
-   own thread creation, which is where the chain was stopped deliberately.
-   Run it by hand and judge a report by whose frames appear in it. Re-attempt is
-   tracked in `ROADMAP.md` Phase 7.3.
+   **Satisfied** by the gating `tsan` job in
+   [`.github/workflows/tsan.yml`](.github/workflows/tsan.yml), which runs the
+   parallel dispatch under `-Zsanitizer=thread` with an **instrumented `std`**
+   (`-Zbuild-std`) and reports zero races across `{1, 2, 4, 8}` threads plus the
+   resolved default. *(Landed just after the v0.7.2 tag; that release shipped
+   with this item still open, which its CHANGELOG entry records honestly.)*
+
+   An instrumented `std` is not a refinement here but a precondition: without
+   it, `std::thread::scope`'s own `Arc` teardown false-positives
+   (rust-lang/rust#101206) and scoped threads *are* the mechanism under test.
+   Getting there needs three things to hold at once — a `--bin` target rather
+   than `cargo test`, blanket `RUSTFLAGS` rather than the target-scoped form,
+   and `panic_abort` in the build-std set. Each is load-bearing and each was
+   learned from a red build; the workflow header explains all three. If you are
+   adding a race-detector run to another project, read it before improvising.
 4. **The auto-traits the dispatch depends on are asserted, not assumed.** Sharing
    `&self` across scoped threads needs `Sync`, which holds only because every
    field happens to be `Sync` — adding a `Cell`/`Rc`/raw pointer would silently
