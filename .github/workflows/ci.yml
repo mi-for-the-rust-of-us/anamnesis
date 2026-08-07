@@ -40,3 +40,69 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features
+
+  # ThreadSanitizer over the parallelised dequant paths.
+  #
+  # CONVENTIONS.md "When Parallelizing Work" -> "Verify parallelism" item 3 asks
+  # for a race-detector run "where the platform supports it". The maintainer's
+  # platform is Windows/MSVC, which has no TSan, so this is the only place the
+  # rule can actually be satisfied — Phase 7 (v0.7.0) shipped the first threaded
+  # code without it, and Phase 7.2 closes that gap for both the safetensors and
+  # the GGUF path at once.
+  #
+  # The disjoint-output design is race-free by construction (each worker writes
+  # only the buffer it returns; the sole shared mutable datum is the scheduling
+  # AtomicUsize), so this is a backstop against a future edit breaking that — not
+  # a suspicion about the current code.
+  #
+  # Requirements and quirks, all load-bearing:
+  #   * nightly + rust-src, because -Zsanitizer and -Zbuild-std are unstable.
+  #   * -Zbuild-std: the sanitizer must instrument the standard library too,
+  #     otherwise TSan reports false positives inside std's own synchronisation.
+  #   * an explicit --target: -Zbuild-std does nothing for a host-only build.
+  #   * --release: an instrumented debug build of the dequant kernels is slow
+  #     enough to hit the job timeout.
+  #   * continue-on-error is NOT set — a detected race must fail CI.
+  tsan:
+    name: ThreadSanitizer (parallel paths)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+
+      # The whole unit-test suite rather than a name filter. Every thread the
+      # crate spawns is spawned from `src/`, so `--lib` covers the entire
+      # concurrent surface (the dispatch helper's own tests, the GGUF reader
+      # determinism sweep across budgets, and the safetensors remember sweep) —
+      # and running it unfiltered means a future parallelised path is covered the
+      # day it lands, with no filter to remember to update. The suite is fast
+      # enough that the ~10-20x instrumentation slowdown is affordable.
+      - name: Test under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          # `halt_on_error` makes the first detected race fail loudly instead of
+          # being buried in later output.
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+        run: |
+          cargo +nightly test --release --all-features \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            --lib
+
+      - name: Test the parallel auto-trait contract under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1"
+        run: |
+          cargo +nightly test --release --all-features \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            --test parallel_contract
