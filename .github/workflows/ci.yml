@@ -71,6 +71,15 @@ jobs:
   #     and rustc rejects it with E0152 "duplicate lang item in crate core:
   #     sized". Scoping the flag to the target keeps host units on the stock
   #     sysroot.
+  #   * -Ztarget-applies-to-host with target-applies-to-host=false. Scoping the
+  #     flags above was necessary but NOT sufficient: the runner triple and
+  #     --target are both x86_64-unknown-linux-gnu, and when target == host
+  #     Cargo shares units between the host and target dependency graphs. That
+  #     lets the core rebuilt by -Zbuild-std and the stock sysroot core both
+  #     reach a crate std also depends on -- cfg-if, memchr, hashbrown, adler2
+  #     and miniz_oxide are all reachable here through the unconditional flate2
+  #     dev-dependency -- which is what actually produces the E0152 above.
+  #     Turning the flag off separates the two graphs.
   tsan:
     name: ThreadSanitizer (parallel paths)
     runs-on: ubuntu-latest
@@ -101,6 +110,8 @@ jobs:
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: |
           cargo +nightly test --release --all-features \
+            -Ztarget-applies-to-host \
+            --config target-applies-to-host=false \
             -Zbuild-std=std,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --lib
@@ -111,6 +122,8 @@ jobs:
           TSAN_OPTIONS: "halt_on_error=1"
         run: |
           cargo +nightly test --release --all-features \
+            -Ztarget-applies-to-host \
+            --config target-applies-to-host=false \
             -Zbuild-std=std,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --test parallel_contract
