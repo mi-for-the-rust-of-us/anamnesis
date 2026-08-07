@@ -55,35 +55,45 @@ jobs:
   # AtomicUsize), so this is a backstop against a future edit breaking that — not
   # a suspicion about the current code.
   #
+  # NO -Zbuild-std, deliberately. The ideal setup instruments the standard
+  # library too, so TSan can see std's own synchronisation. That is not
+  # achievable here: `-Zbuild-std` combined with `cargo test` is a documented,
+  # unresolved Cargo limitation (rust-lang/cargo#13146), which reports exactly
+  # our failure -- `cargo test --target x86_64-unknown-linux-gnu` producing
+  # "duplicate lang item in crate `core`" -- and states the conflict is general
+  # to build-std, not specific to no_main. The workarounds offered there are to
+  # split the crate into subcrates or drive the build from a Makefile; neither
+  # is worth it for a backstop job.
+  #
+  # Four configurations were tried before reading that issue (blanket RUSTFLAGS,
+  # target-scoped RUSTFLAGS, -Ztarget-applies-to-host, and both panic runtimes
+  # in the build-std set). All four failed identically, with byte-identical
+  # `core` fingerprints every time -- the tell that no command-line flag was
+  # touching the real cause. Do not retry those; read the issue first.
+  #
+  # What we lose: TSan cannot see synchronisation performed inside uninstrumented
+  # std, so it may in principle report a false positive. In practice the risk is
+  # low for this crate -- the dispatch synchronises with a plain
+  # AtomicUsize::fetch_add and thread::scope's join, and TSan intercepts the
+  # pthread primitives underneath join regardless of instrumentation. The
+  # documented false-positive sources (std::sync::atomic::fence, inline asm) are
+  # not used anywhere in the parallel path.
+  #
   # Requirements and quirks, all load-bearing:
-  #   * nightly + rust-src, because -Zsanitizer and -Zbuild-std are unstable.
-  #   * -Zbuild-std: the sanitizer must instrument the standard library too,
-  #     otherwise TSan reports false positives inside std's own synchronisation.
-  #   * an explicit --target: -Zbuild-std does nothing for a host-only build.
+  #   * nightly, because -Zsanitizer is unstable. rust-src is no longer needed
+  #     without build-std, but is harmless and kept for a future retry.
+  #   * an explicit --target is still REQUIRED even without build-std: it is what
+  #     keeps build scripts and proc macros (clap_derive, serde_derive, codspeed)
+  #     out of the instrumented graph.
+  #   * CARGO_TARGET_<TRIPLE>_RUSTFLAGS, *not* a blanket RUSTFLAGS, for the same
+  #     reason -- a blanket RUSTFLAGS also reaches host artefacts.
+  #   * RUST_TEST_THREADS=1: libtest's own harness races under TSan
+  #     (rust-lang/rust#39608). Running tests sequentially is the documented
+  #     workaround and costs nothing here -- the code under test spawns its own
+  #     threads regardless, which is the whole point.
   #   * --release: an instrumented debug build of the dequant kernels is slow
   #     enough to hit the job timeout.
   #   * continue-on-error is NOT set — a detected race must fail CI.
-  #   * CARGO_TARGET_<TRIPLE>_RUSTFLAGS, *not* a blanket RUSTFLAGS. Load-bearing,
-  #     and it cost one red build to learn: a blanket RUSTFLAGS also reaches HOST
-  #     artefacts — build scripts and proc macros (clap_derive, serde_derive,
-  #     codspeed) — which compile against the PREBUILT sysroot, while
-  #     -Zbuild-std rebuilds core for the target. Both cores then reach one link
-  #     and rustc rejects it with E0152 "duplicate lang item in crate core:
-  #     sized". Scoping the flag to the target keeps host units on the stock
-  #     sysroot.
-  #   * BOTH panic runtimes in the -Zbuild-std set. This is what actually fixed
-  #     the E0152, and the cause was self-inflicted: [profile.release] in
-  #     Cargo.toml sets panic = "abort", and this job runs --release. Build std
-  #     without panic_abort and rustc cannot find one in the self-built
-  #     sysroot, so it falls back to the REAL sysroot's panic_abort -- which
-  #     drags the rest of that sysroot in with it, including a second core.
-  #     Hence two cores at one link. See rust-lang/cargo#15347 and
-  #     rust-lang/rust#115963.
-  #
-  #     The tell was that both core fingerprints stayed byte-identical across
-  #     three different flag configurations: the real cause was never being
-  #     touched. If this job ever regresses to E0152, check the panic strategy
-  #     before touching anything else.
   tsan:
     name: ThreadSanitizer (parallel paths)
     runs-on: ubuntu-latest
@@ -112,9 +122,9 @@ jobs:
           # `halt_on_error` makes the first detected race fail loudly instead of
           # being buried in later output.
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+          RUST_TEST_THREADS: "1"
         run: |
           cargo +nightly test --release --all-features \
-            -Zbuild-std=std,panic_abort,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --lib
 
@@ -122,8 +132,8 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=1"
+          RUST_TEST_THREADS: "1"
         run: |
           cargo +nightly test --release --all-features \
-            -Zbuild-std=std,panic_abort,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --test parallel_contract
