@@ -63,6 +63,14 @@ jobs:
   #   * --release: an instrumented debug build of the dequant kernels is slow
   #     enough to hit the job timeout.
   #   * continue-on-error is NOT set — a detected race must fail CI.
+  #   * CARGO_TARGET_<TRIPLE>_RUSTFLAGS, *not* a blanket RUSTFLAGS. Load-bearing,
+  #     and it cost one red build to learn: a blanket RUSTFLAGS also reaches HOST
+  #     artefacts — build scripts and proc macros (clap_derive, serde_derive,
+  #     codspeed) — which compile against the PREBUILT sysroot, while
+  #     -Zbuild-std rebuilds core for the target. Both cores then reach one link
+  #     and rustc rejects it with E0152 "duplicate lang item in crate core:
+  #     sized". Scoping the flag to the target keeps host units on the stock
+  #     sysroot.
   tsan:
     name: ThreadSanitizer (parallel paths)
     runs-on: ubuntu-latest
@@ -87,22 +95,22 @@ jobs:
       # enough that the ~10-20x instrumentation slowdown is affordable.
       - name: Test under ThreadSanitizer
         env:
-          RUSTFLAGS: "-Zsanitizer=thread"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
           # `halt_on_error` makes the first detected race fail loudly instead of
           # being buried in later output.
           TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: |
           cargo +nightly test --release --all-features \
-            -Zbuild-std \
+            -Zbuild-std=std,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --lib
 
       - name: Test the parallel auto-trait contract under ThreadSanitizer
         env:
-          RUSTFLAGS: "-Zsanitizer=thread"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=1"
         run: |
           cargo +nightly test --release --all-features \
-            -Zbuild-std \
+            -Zbuild-std=std,panic_unwind \
             --target x86_64-unknown-linux-gnu \
             --test parallel_contract
