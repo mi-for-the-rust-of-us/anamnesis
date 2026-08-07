@@ -31,20 +31,31 @@ name: ThreadSanitizer
 #    simply is not there. This is why the harness is a binary
 #    (`src/bin/tsan_harness.rs`) rather than a test.
 #
-# 2. BLANKET `RUSTFLAGS`, NOT `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`.
-#    The target-scoped form does NOT reach `-Zbuild-std`'s own units. The
-#    symptom is rustc reporting `compiler_builtins` (or `core`) as
-#    uninstrumented while our crate is instrumented — i.e. the rebuilt std graph
-#    silently gets no sanitizer at all. Only the blanket variable instruments
-#    it. This is undocumented: the Cargo book describes the precedence order of
-#    the four flag sources but says nothing about build-std units.
+# 2. `-Cunsafe-allow-abi-mismatch=sanitizer`.
+#    `compiler_builtins` is not instrumentable, so rustc refuses the link with
+#    "mixing `-Zsanitizer` will cause an ABI mismatch ... incompatible with
+#    `-Zsanitizer` being unset in dependency `compiler_builtins`". The flag is
+#    rustc's own suggested opt-out. `compiler_builtins` is memcpy/memset
+#    intrinsics with no synchronisation of its own, so mixing it in is inert as
+#    far as a race detector is concerned.
 #
-#    NOTE, because an earlier revision of this file claimed the opposite: the
-#    target-scoped form is NOT needed to keep build scripts and proc macros
-#    uninstrumented. Passing `--target` already does that, and the Cargo book is
-#    explicit — "If the --target flag is used, then the flags will only be
-#    passed to the compiler for the target. Things being built for the host,
-#    such as build scripts or proc macros, will not receive the args."
+#    NOT a constraint, despite two earlier revisions of this file saying so:
+#    the CHOICE OF FLAG SOURCE does not matter. Blanket `RUSTFLAGS` and
+#    `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` were both verified green with identical
+#    flag content, in a single-variable test against this configuration. An
+#    earlier draft claimed the target-scoped form "does not reach -Zbuild-std
+#    units" and was heading for an upstream bug report; that conclusion came
+#    from a comparison in which two variables changed at once (the source AND
+#    the newly added ABI opt-out), and it did not survive isolating them. The
+#    `core` fingerprint change that looked like evidence was the ABI flag
+#    altering the fingerprint. Either form works; blanket is used below only
+#    because it is what the first green run happened to use.
+#
+#    Passing `--target` is what keeps build scripts and proc macros
+#    uninstrumented, per the Cargo book: "If the --target flag is used, then the
+#    flags will only be passed to the compiler for the target. Things being
+#    built for the host, such as build scripts or proc macros, will not receive
+#    the args."
 #
 # 3. `panic_abort` IN THE BUILD-STD SET.
 #    Cargo.toml sets `panic = "abort"` for [profile.release] and this job builds
@@ -54,10 +65,7 @@ name: ThreadSanitizer
 #    E0152 again, this time with one core in target/ and one in ~/.rustup.
 #    See rust-lang/cargo#15347 and rust-lang/rust#115963.
 #
-# `-Cunsafe-allow-abi-mismatch=sanitizer` covers `compiler_builtins`, which is
-# not instrumentable. It is memcpy/memset intrinsics with no synchronisation of
-# its own, so mixing it in is inert as far as a race detector is concerned.
-#
+
 # ---------------------------------------------------------------------------
 # WHY AN INSTRUMENTED std IS NOT OPTIONAL HERE
 # ---------------------------------------------------------------------------
@@ -119,7 +127,7 @@ jobs:
 
       - name: Parallel dispatch under ThreadSanitizer (instrumented std)
         env:
-          # Blanket, not target-scoped: see constraint 2 in the header.
+          # Either flag source works (verified); see constraint 2 in the header.
           RUSTFLAGS: "-Zsanitizer=thread -Cunsafe-allow-abi-mismatch=sanitizer"
           # `halt_on_error` makes the first detected race fail loudly rather
           # than being buried in later output.

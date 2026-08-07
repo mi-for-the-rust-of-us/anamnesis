@@ -24,12 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      ([cargo#13146](https://github.com/rust-lang/cargo/issues/13146), open since
      2023) because `cargo test` also builds dev-dependencies, several of which
      are crates `std` itself depends on. `cargo run --bin` builds none.
-  2. **Blanket `RUSTFLAGS`, not `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`.** The
-     target-scoped form silently does not reach `-Zbuild-std`'s units, leaving
-     the rebuilt `std` graph uninstrumented — undocumented, and undiagnosed by
-     Cargo. (An earlier revision of the workflow claimed the target-scoped form
-     was needed to keep build scripts clean; that is wrong — `--target` alone
-     does that, per the Cargo book.)
+  2. **`-Cunsafe-allow-abi-mismatch=sanitizer`**, because `compiler_builtins`
+     is not instrumentable and rustc otherwise refuses the link. It is
+     memcpy/memset intrinsics with no synchronisation, so mixing it in is inert
+     for a race detector.
   3. **`panic_abort` in the build-std set**, because `[profile.release]` sets
      `panic = "abort"`; without it rustc falls back to the sysroot and drags its
      `core` in ([cargo#15347](https://github.com/rust-lang/cargo/issues/15347)).
@@ -42,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `.github/tsan-suppressions.txt` is retained, wired to nothing, as the record
   of the abandoned uninstrumented-`std` approach.
+
+  **A claim that did not survive checking**, recorded because it nearly went
+  upstream: an intermediate diagnosis held that `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`
+  silently fails to reach `-Zbuild-std` units, and it was on its way to a Cargo
+  bug report. It came from a comparison in which two variables changed at once —
+  the flag source *and* a newly added `-Cunsafe-allow-abi-mismatch`. Isolating
+  them in a single-variable run against the green configuration showed **both
+  flag sources work**; the `core` fingerprint change that looked like proof was
+  just the ABI flag altering the fingerprint. There is no Cargo bug here.
 
 ## [0.7.2] - 2026-08-07
 
