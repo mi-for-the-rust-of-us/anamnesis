@@ -163,6 +163,17 @@ name = "parsing"
 harness = false
 required-features = ["npz", "pth", "gguf"]
 
+# Phase 7.2: whole-model throughput for the *threaded* paths, each measured at
+# 1 and 4 threads. `dequant` covers single kernels and `parsing` covers headers;
+# neither exercises the thread pool, so before this target the ~3-4x from Phase 7
+# and the ~1.9x GGUF-reader win from Phase 7.2 had no continuous regression
+# guard. The 1-vs-4 pair is the signal: a dispatch that silently serialises shows
+# up as threads_4 converging on threads_1.
+[[bench]]
+name = "convert"
+harness = false
+required-features = ["gguf"]
+
 [lints.rust]
 # `deny` (not `forbid`) so feature-gated modules (e.g., pth with memmap2)
 # can opt in to unsafe with a local #[allow(unsafe_code)] + // SAFETY: comment.

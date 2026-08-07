@@ -25,6 +25,40 @@ checked into `tests/fixtures/`.
 |---|---|---|
 | `dequant.rs` | Dequantisation kernels (decode side) — `FP8` per-tensor / fine-grained, `GPTQ` `INT4`, `AWQ` `INT4`, `BnB` `NF4`, `BnB` `INT8`, `GGUF` `Q4_K`, plus the real-world `GGUF` `Q8_0` slice from the `Ollama`-distributed `llama3.2:1b` fixture | `cargo bench --features gptq,awq,bnb,gguf --bench dequant` |
 | `parsing.rs` | Header / metadata-only parses for the four supported tensor formats vs an `fs::read` baseline at the same fixture | `cargo bench --features npz,pth,gguf --bench parsing` |
+| `convert.rs` | **Whole-model, multi-threaded** paths — quantised `GGUF` → safetensors `convert()`, and `FP8` safetensors → `BF16` `remember_to_bytes` — each measured at **1 and 4 threads** | `cargo bench --features gguf --bench convert` |
+
+### Why `convert.rs` benchmarks each path twice
+
+`dequant.rs` times one kernel on one tensor and `parsing.rs` times a
+header parse; neither spawns a thread. So until Phase 7.2 the ~3–4×
+that Phase 7 shipped had **no continuous regression guard** — it was
+only ever verified by hand.
+
+The `threads_1` / `threads_4` pair is the point. A change that
+silently serialises the dispatch keeps every absolute time plausible
+but collapses the ratio, which a single-budget benchmark would report
+as a uniform slowdown indistinguishable from a slower kernel.
+
+Two caveats worth knowing before reading the numbers:
+
+- **`convert_gguf_to_safetensors` includes the output file write.**
+  `convert()` is the only public entry to the `GGUF` reader, and it
+  writes a file. That write is a large constant both budgets pay, so
+  the visible ratio (~1.25×) understates the dequant stage's own
+  ~1.9×. The stage-isolated figure comes from the `#[ignore]`d
+  `src/convert.rs::hub_scaling_bench`, which can reach the private
+  `read_hub` — a bench target cannot. See
+  [`docs/perf-experiments.md`](../docs/perf-experiments.md)
+  Experiment 12.
+- **`remember_bf16_whole_model` touches no filesystem** (it returns a
+  `Vec<u8>`), so it is the cleaner of the two and the one that tracks
+  Phase 7's headline number.
+
+> **If you retune `parallel::MIN_PARALLEL_BYTES`, re-check the fixture
+> sizes in `convert.rs`.** The dispatch runs sequentially below that
+> threshold, so an undersized fixture makes *both* budgets take the
+> sequential path — the benchmark then looks healthy while measuring
+> nothing. An early draft of the file did exactly that.
 
 **Phase 7.5 forecast** — when the encode-side kernels land (`FP8`,
 `GGUF` legacy / K-quants / IQ / TQ / MXFP4), a new `encode.rs` will
