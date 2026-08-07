@@ -95,6 +95,7 @@ passing scalar tensors through).
 |---|---|---|
 | `--to <value>` | `bf16` | Target. Only `bf16` / `safetensors` are accepted for `.pth` / `.gguf` inputs (they always produce safetensors). |
 | `--output`, `-o <path>` | *(derived)* | Output path; derived from the input if omitted (see [Output paths](#output-path-derivation)). |
+| `--threads <N>` | `min(cores, 4)` | Dequantisation worker threads (see [Threads](#threads)). |
 
 ```
 $ amn remember model.pth
@@ -120,6 +121,7 @@ target. Quantised inputs **auto-chain** through `BF16` (no hand-staged temp file
 | `--output`, `-o <path>` | Output path; derived from the input if omitted. |
 | `--gguf-metadata <FILE>` | JSON `GGUF` key/values to stamp on a `gguf` target (see [GGUF metadata](#gguf-metadata-flags)). |
 | `--gguf-kv <KEY=VALUE>` | Repeatable one-off `GGUF` metadata (string-valued). |
+| `--threads <N>` | Dequantisation worker threads; defaults to `min(cores, 4)` (see [Threads](#threads)). |
 
 ### Conversion matrix (v0.6.9)
 
@@ -197,6 +199,34 @@ The flags need the `gguf` feature; on a build without it, supplying either is a
 clear `Unsupported` error rather than a silent no-op.
 
 ---
+
+## Threads
+
+`--threads N` sets how many worker threads dequantise tensors, on both
+`amn remember` and `amn convert` (added in v0.7.2 — before that the budget was a
+library-only knob).
+
+| Value | Effect |
+|---|---|
+| *(omitted)* | `min(cpu cores, 4)` — the measured scaling knee, leaving the rest of the machine free. |
+| `1` | Fully sequential. |
+| `N > 1` | Up to `N` workers. Useful on a many-channel-memory host, where the default is conservative. |
+| `0` | Clamped to `1`. |
+
+Three things worth knowing:
+
+- **The output is byte-identical whatever you pass.** Thread count is a
+  performance knob, never a correctness variable — this is asserted across
+  `{1, 2, 4, 8, 16}` and the resolved default in the test suite.
+- **The default is deliberately modest.** Dequantisation is memory-bandwidth
+  bound, so throughput plateaus at roughly 3–4× by about four threads; grabbing
+  every core buys little and harms whatever else the machine is doing. Raise it
+  if you have the memory bandwidth to feed it.
+- **Small models ignore it.** Below an internal 4 `MiB` floor the sequential path
+  runs regardless, because spawning a pool costs more than the work saves.
+
+The flag has no effect in a build made with `--no-default-features` (the
+`parallel` Cargo feature off), which is always sequential.
 
 ## Output path derivation
 

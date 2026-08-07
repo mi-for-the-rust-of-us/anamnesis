@@ -51,6 +51,12 @@ enum Commands {
         /// Output file path (derived from input if omitted).
         #[arg(long, short)]
         output: Option<PathBuf>,
+        /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
+        /// measured scaling knee — so the rest of the machine stays free.
+        /// Values below 1 are clamped to 1 (fully sequential). Output is
+        /// byte-identical whatever you pass.
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
     },
     /// Convert a model file to a different format.
     ///
@@ -85,6 +91,12 @@ enum Commands {
         /// a string — use `--gguf-metadata` for typed or array values.
         #[arg(long, value_name = "KEY=VALUE")]
         gguf_kv: Vec<String>,
+        /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
+        /// measured scaling knee — so the rest of the machine stays free.
+        /// Values below 1 are clamped to 1 (fully sequential). Output is
+        /// byte-identical whatever you pass.
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
     },
 }
 
@@ -115,9 +127,14 @@ pub fn run() -> crate::Result<()> {
             let resolved = resolve_input_path(path)?;
             run_inspect(&resolved)
         }
-        Commands::Remember { path, to, output } => {
+        Commands::Remember {
+            path,
+            to,
+            output,
+            threads,
+        } => {
             let resolved = resolve_input_path(path)?;
-            run_remember(&resolved, &to, output.as_deref())
+            run_remember(&resolved, &to, output.as_deref(), threads)
         }
         Commands::Convert {
             path,
@@ -125,6 +142,7 @@ pub fn run() -> crate::Result<()> {
             output,
             gguf_metadata,
             gguf_kv,
+            threads,
         } => {
             let resolved = resolve_input_path(path)?;
             run_convert(
@@ -133,6 +151,7 @@ pub fn run() -> crate::Result<()> {
                 output.as_deref(),
                 gguf_metadata.as_deref(),
                 &gguf_kv,
+                threads,
             )
         }
     }
@@ -359,13 +378,19 @@ fn run_inspect(path: &std::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// `threads` is the caller's `--threads` request, passed straight through to
+/// [`RememberOptions`](crate::RememberOptions) (`None` = the built-in
+/// `min(cores, 4)` default). Only the safetensors arm has dequantisation work to
+/// spread; the `.pth` and `GGUF` arms below are whole-file conversions that go
+/// through their own writers.
 fn run_remember(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
+    threads: Option<usize>,
 ) -> crate::Result<()> {
     match detect_format(path)? {
-        Format::Safetensors => run_remember_safetensors(path, to, output),
+        Format::Safetensors => run_remember_safetensors(path, to, output, threads),
         #[cfg(feature = "pth")]
         Format::Pth => {
             let to_lower = to.to_ascii_lowercase();
@@ -409,6 +434,7 @@ fn run_remember_safetensors(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
+    threads: Option<usize>,
 ) -> crate::Result<()> {
     let target: TargetDtype = to.parse()?;
 
@@ -424,6 +450,13 @@ fn run_remember_safetensors(
         None => derive_output_path(path, target),
     };
 
+    // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
+    // caller's `--threads`, clamped to at least 1 by the builder.
+    let opts = match threads {
+        Some(n) => crate::RememberOptions::new().with_threads(n),
+        None => crate::RememberOptions::new(),
+    };
+
     #[cfg(feature = "indicatif")]
     {
         use indicatif::{ProgressBar, ProgressStyle};
@@ -435,7 +468,7 @@ fn run_remember_safetensors(
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=> ");
         pb.set_style(style);
-        model.remember_with_progress(&output_path, target, || pb.inc(1))?;
+        model.remember_with_progress_and_options(&output_path, target, opts, || pb.inc(1))?;
         pb.finish();
         println!();
     }
@@ -443,7 +476,7 @@ fn run_remember_safetensors(
     #[cfg(not(feature = "indicatif"))]
     {
         println!("Recalling... {quantized} tensors");
-        model.remember(&output_path, target)?;
+        model.remember_with_options(&output_path, target, opts)?;
     }
 
     println!(
@@ -720,9 +753,16 @@ fn run_convert(
     output: Option<&std::path::Path>,
     gguf_metadata: Option<&std::path::Path>,
     gguf_kv: &[String],
+    threads: Option<usize>,
 ) -> crate::Result<()> {
     let target = ConvertTarget::parse(to)?;
     let options = build_convert_options(gguf_metadata, gguf_kv)?;
+    // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
+    // caller's `--threads`, clamped to at least 1 by the builder.
+    let options = match threads {
+        Some(n) => options.with_threads(n),
+        None => options,
+    };
     let output_path = output.map_or_else(
         || crate::convert::derive_output_path(path, target),
         Path::to_owned,
