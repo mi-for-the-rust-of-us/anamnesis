@@ -39,6 +39,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 9 | `convert` copy-elimination pass (avoid hub-sized copies + one `O(P·N)` scan) | **Confirmed: peak −39 % (bnb), −25 % (gguf KV), −49.6 % (npz)** — each drop equals exactly the one eliminated copy | Shipped (v0.6.9, Phase 6.14) |
 | 10 | Phase 7 SIMD exhaustion — is explicit AVX2 worth it anywhere in the dequant kernels? | **No. Bit-exact hand-written AVX2 `f32x8_to_bf16x8` gains 1.02×/1.04× (null) — writer is bandwidth-bound. FP8 already auto-AVX2 yet compute-bound; GPTQ/AWQ arithmetic already vectorizes; slowest kernels (IQ2/IQ3) are gather-bound (AVX2 gather slow on Zen 3). Compiler already captures the SIMD; limits are memory bandwidth + codebook gathers. Real headroom = multi-threading (single-threaded on 16 cores)** | SIMD exhausted with evidence, no product `unsafe` shipped (branch `phase-7-cpu-simd`); bench harness kept as proof; next = multi-threaded dequant |
 | 11 | Phase 7 multi-threaded dequant — prototype scaling (`std::thread::scope`) | **Real but bounded, ~3–4× (not core-count-linear): FP8 (memory-heavy) 2.9×, IQ3_S (compute/gather-heavy) 4.0× at 16 threads — both plateau (bandwidth + all-core-clock ceilings). Per-thread `Vec` alloc caps FP8 at 2.2×; the disjoint `split_at_mut` output pattern (no alloc, no zero-fill) recovers it to 2.9×** | Prototype (branch `phase-7-cpu-simd`) — confirms multi-threading is the real lever and that the disjoint-output-slice pattern matters; corrects an earlier "4–16×" over-estimate |
+| 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36×: the output write is ~60 % of the wall clock (Amdahl). Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 
 ---
 
@@ -1013,3 +1014,149 @@ thread-count-invariant determinism test.
 
 **Re-attempting this requires:** N/A — this is the gating prototype. The product
 implementation's per-kernel scaling lands here as measured, against the sequential baseline.
+
+---
+
+## Experiment 12 — Phase 7.2 GGUF-reader parallelisation (product), threshold calibration, and the `gguf-py` baseline
+
+**Questions.** Three, answered in order:
+
+1. Does bringing `convert::read_gguf` under the shared thread pool actually pay, and how much?
+2. What should `parallel::MIN_PARALLEL_BYTES` — the named size threshold `CONVENTIONS.md`
+   rule 3 requires — be set to, measured rather than guessed?
+3. Since Phase 8 puts this path in front of a Python audience, how does it compare to the
+   Python stack a user would otherwise reach for?
+
+**Method.** 5950X (16 cores), Windows 11, `-C target-cpu=native`, release, best-of-5 median
+per `CLAUDE.md` § Performance Changes. Two harnesses, because the interesting quantity is not
+the one the public API exposes:
+
+- [`src/convert.rs::hub_scaling_bench`](../src/convert.rs) — times **`read_hub` alone**. It is
+  an in-crate `#[ignore]`d test because `read_hub` is private; an integration test cannot reach it.
+- [`tests/bench_gguf_convert_adhoc.rs`](../tests/bench_gguf_convert_adhoc.rs) — times the public
+  end-to-end `convert()`, and separately measures scoped-pool spawn/join cost.
+
+Real fixtures (gitignored, see `tests/fixtures/gguf_reference/generate_gguf.py`):
+`SmolLM2-135M-Instruct-Q4_K_M.gguf` (100.6 MiB) and `tinyllama-1.1b-chat-v1.0.Q5_0.gguf`
+(731.5 MiB). **Determinism is asserted before any timing** — the 1-thread and 8-thread outputs
+must be byte-identical (269 MB and 2.2 GB respectively) or the test fails instead of reporting
+numbers. `threads = 1` *is* the honest "before": the reader was unconditionally sequential
+through v0.7.1.
+
+### Result 1 — stage-isolated `read_hub` scaling
+
+| threads | SmolLM2 Q4_K_M | speedup | TinyLlama Q5_0 | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 103.88 ms | 1.00× | 694.57 ms | 1.00× |
+| 2 | 72.28 ms | 1.44× | 502.40 ms | 1.38× |
+| 4 | 54.70 ms | **1.90×** | 355.76 ms | **1.95×** |
+| 8 | 72.24 ms | 1.44× | 331.58 ms | 2.09× |
+| 16 | 59.45 ms | 1.75× | 319.71 ms | 2.17× |
+
+(The SmolLM2 8-thread row is background-load noise on an interactive machine — its *min* was
+62.3 ms, in line with the 4- and 16-thread rows. The medians either side bracket it.)
+
+### Result 2 — end-to-end `convert()` is much flatter, and that is not a bug
+
+| threads | SmolLM2 → safetensors | TinyLlama → safetensors |
+|---:|---:|---:|
+| 1 | 219.99 ms (1.00×) | 1886.38 ms (1.00×) |
+| 4 | 184.55 ms (1.19×) | 1482.59 ms (1.27×) |
+| 16 | 180.01 ms (1.22×) | 1391.54 ms (1.36×) |
+
+**Amdahl, measured.** `convert()` = read + dequantise (parallelised) + **write the whole hub to
+disk** (not parallelised, and not parallelisable — it is one sequential file). For TinyLlama the
+output is 2.2 GB; at 1 thread the dequant stage is 695 ms of the 1886 ms total, so ~63 % of the
+wall clock is the write. Parallelising the remaining 37 % perfectly would cap the end-to-end gain
+at ~1.6×; the measured 1.36× is that ceiling minus allocator and page-fault cost.
+
+**This is the number to quote for `convert()`, and the 1.9× is the number to quote for the
+reader.** Conflating them would overstate what a user sees.
+
+### Result 3 — why ~2× and not Experiment 11's ~3–4×
+
+Experiment 11 measured two allocation strategies and found `Vec`-per-thread capped FP8 at
+**2.23×** while pre-allocated disjoint `split_at_mut` slices reached **2.92×**. The `GGUF` hub
+is a `Vec<u8>` **per tensor** by construction — `HubTensor` owns its bytes — so this path is
+structurally the `Vec`-per-task case, and it lands exactly where Experiment 11 predicted that
+case would: ~2×, not ~3×.
+
+Reaching the disjoint-slice number would mean pre-allocating one contiguous buffer for the whole
+model and handing out sub-slices — i.e. redesigning `Hub` away from per-tensor ownership. That is
+a real option, but it is a **memory-layout change with an API blast radius**, not a threading
+tweak, and it trades against the Phase 6.14 copy-elimination work. Not attempted here; recorded
+as the known ceiling.
+
+### Result 4 — `MIN_PARALLEL_BYTES` calibration
+
+Scoped-pool spawn **and** join, empty workers, 200 cycles per sample:
+
+| workers | cost / pool cycle |
+|---:|---:|
+| 2 | 118.6 µs |
+| 4 | **236.0 µs** |
+| 8 | 329.2 µs |
+| 16 | 655.3 µs |
+
+Windows thread creation is expensive — roughly 2× what a Linux figure would suggest. With the
+1-thread `read_hub` rate of ~1.05 GB/s and a 1.9× parallel speedup, the break-even is
+`work × (1 − 1/1.9) > 236 µs` → **~0.5 MiB** of input.
+
+**Set to 4 MiB** — break-even with an ~8× margin. At exactly the threshold the pool still nets
+~1.7× and costs under ~6 % overhead, while a mis-set value can only ever waste a few hundred
+microseconds. v0.7.0's dispatch had no byte threshold at all (only `count > 1`), so an
+eight-tensor toy model paid four thread spawns to dequantise a few KiB.
+
+> **Consequence for tests.** The dispatch runs sequentially below the threshold, so any test or
+> benchmark meant to exercise the *parallel* path must use a fixture above it. `benches/convert.rs`
+> was initially written with a 2.64 MiB GGUF fixture and reported **identical** times at 1 and 4
+> threads — a healthy-looking benchmark measuring nothing. The in-crate determinism tests size
+> their fixture off the constant itself (`fixture_crosses_the_parallel_threshold` asserts it) so
+> they cannot silently decay this way.
+
+### Result 5 — versus the Python baseline
+
+Baseline: **`gguf-py` 0.18.0** (`gguf` on PyPI, maintained in the llama.cpp tree). It is the
+right comparison because it is the only general-purpose GGUF dequantiser on PyPI, its kernels
+are NumPy-vectorised rather than naive Python loops (so this is the *strong* baseline), and the
+two libraries provably agree on the numbers.
+
+**What "agree" means, precisely — this is not a like-for-like output.** `gguf-py`'s `dequantize()`
+returns `float32`; anamnesis returns `BF16` (`TargetDtype` has exactly one variant). The
+cross-validation therefore takes gguf-py's `float32`, rounds it to `BF16` round-to-nearest-even
+(`f32_array_to_bf16_bytes` in the fixture generators), and asserts anamnesis matches at
+**`max_ulp = 0` across all 22 kernels** (`tests/cross_validation_gguf.rs`,
+`tests/cross_validation_ollama.rs`). So anamnesis is bit-identical to *gguf-py correctly rounded
+to `BF16`* — same values, narrower delivered type. Both sides do their block arithmetic in `f32`
+internally, so the difference is the **output width**, not the kernel's precision. Script:
+[`tests/fixtures/gguf_reference/generate_gguf_dequant_timings.py`](../tests/fixtures/gguf_reference/generate_gguf_dequant_timings.py);
+the sidecar JSONs are committed, so the Rust harness prints the comparison without a Python
+environment.
+
+| Model | `gguf-py` | anamnesis 1 thread | anamnesis 4 threads |
+|---|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | 2894.6 ms | 103.9 ms — **27.9×** | 54.7 ms — **52.9×** |
+| TinyLlama-1.1B Q5_0 | 12031.4 ms | 694.6 ms — **17.3×** | 355.8 ms — **33.8×** |
+
+**Caveats, both to be stated wherever these numbers are quoted:**
+
+1. **Output width.** gguf-py writes **2× the output bytes** (`float32` vs `BF16`) — a real handicap
+   on a bandwidth-bound workload that is *not* attributable to Python. Halving gguf-py's time as a
+   deliberately generous width correction still leaves **~8.7–14× single-threaded** and
+   **~17–26× at the default budget**.
+2. **Threading.** gguf-py is single-threaded, so the like-for-like row is the 1-thread column.
+
+And one **functional** difference that is not a caveat on the measurement but matters for Phase 8:
+a caller who needs `float32` cannot get it from anamnesis today — `BF16` is the only target dtype.
+They would upcast on the Python side (cheap, but their cost, and it gives back part of the 2×
+byte advantage). `docs/python-interop.md` already frozen the `ml_dtypes.bfloat16` return contract
+this implies.
+
+**Disposition:** shipped. The stage gain (~1.9× at the default budget) is a measured win in the
+expected direction on real fixtures, byte-identical across `{1, 2, 4, 8, 16}` threads and the
+hardware-resolved default, with the end-to-end figure reported separately rather than folded in.
+
+**Re-attempting this requires:** a `Hub` redesign toward one contiguous model-wide buffer with
+per-tensor sub-slices (the Experiment 11 disjoint-output pattern) — the only identified route
+past the ~2× `Vec`-per-tensor ceiling. Measure against the 4-thread medians above, and weigh the
+result against the Phase 6.14 copy-elimination gains it would disturb.

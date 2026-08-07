@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-07-22, anamnesis v0.6.9 -->
+<!-- Last updated: 2026-08-07, anamnesis v0.7.2 -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ — keep growth consistent.
@@ -52,6 +52,8 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I dequantize a quantized model to BF16?](#how-do-i-dequantize-a-quantized-model-to-bf16)
   - [What does "Lethe took ~N B of precision" mean?](#what-does-lethe-took-n-b-of-precision-mean)
   - [How do I convert between formats?](#how-do-i-convert-between-formats)
+  - [Can I control how many threads anamnesis uses?](#can-i-control-how-many-threads-anamnesis-uses)
+  - [Why is the output `BF16` and not `float32`?](#why-is-the-output-bf16-and-not-float32)
 - [Parsing untrusted input](#parsing-untrusted-input)
   - [Is it safe to parse a model file from a stranger?](#is-it-safe-to-parse-a-model-file-from-a-stranger)
   - [How do I bound memory when parsing untrusted files?](#how-do-i-bound-memory-when-parsing-untrusted-files)
@@ -79,7 +81,7 @@ They are the project's names for the two directions of precision change. **Remem
 
 ### Is it stable? What does a `0.7.x` version mean?
 
-`0.7.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The preceding `0.6.x` line centered on a security-hardening pass for untrusted input, capped by the convert-matrix completion in `0.6.9`. The `0.7.x` line is about throughput and API polish ahead of the Python bindings: `0.7.0` made whole-model dequantisation **multi-threaded** (~3–4×, byte-identical at any thread count), and `0.7.1` added reader-generic full `GGUF` front matter. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
+`0.7.x` is pre-`1.0`: the format coverage and dequantization correctness are production-grade (bit-exact against each canonical library), but the public API may still evolve before `1.0`. The preceding `0.6.x` line centered on a security-hardening pass for untrusted input, capped by the convert-matrix completion in `0.6.9`. The `0.7.x` line is about throughput and API polish ahead of the Python bindings: `0.7.0` made whole-model dequantisation **multi-threaded** (~3–4×, byte-identical at any thread count), `0.7.1` added reader-generic full `GGUF` front matter, and `0.7.2` brought the `GGUF` conversion path under that same thread pool (~1.9× on the reader stage) and exposed the budget as `--threads`. Pin a version in `Cargo.toml` and read `CHANGELOG.md` before upgrading.
 
 Note that `0.7.0` was originally planned as a CPU **SIMD** pass. It shipped as multi-threading instead: explicit SIMD was prototyped, measured, and *rejected* — a bit-exact hand-written AVX2 `f32x8_to_bf16x8` scored 1.02×, because the shared `f32 → BF16` writer is memory-bandwidth-bound rather than compute-bound. The measurements are in [`perf-experiments.md`](perf-experiments.md) (Experiments 10–11).
 
@@ -153,6 +155,18 @@ amn convert model.gguf --to bnb-nf4     # dequantize + re-encode, one command
 
 Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full walkthrough with real output is in [Convert a model between formats](tutorials/convert-between-formats.md); the full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
 
+### Can I control how many threads anamnesis uses?
+
+Yes — pass `--threads N` to `amn remember` or `amn convert`, or use `RememberOptions::new().with_threads(n)` / `ConvertOptions::new().with_threads(n)` from the library. The default is `min(cpu cores, 4)`: dequantization is memory-bandwidth bound and plateaus at roughly 3–4× by about four threads, so a bigger number mostly just takes cores away from whatever else you are running. Output is **byte-identical whatever you pass** — the thread count is a performance knob, never a correctness variable — and below a 4 MiB input floor the sequential path runs regardless, because spawning a pool costs more than the work saves.
+
+```
+amn convert model-Q4_K_M.gguf --to safetensors --threads 8
+```
+
+### Why is the output `BF16` and not `float32`?
+
+`BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8 — measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value — for which you need `float32`. Making the output dtype a caller-chosen parameter is [Phase 7.3](../ROADMAP.md#phase-73-caller-chosen-output-dtype) on the roadmap.
+
 ## Parsing untrusted input
 
 ### Is it safe to parse a model file from a stranger?
@@ -171,4 +185,4 @@ No. No public parse/inspect entry point panics or aborts on any input — a malf
 
 ### Is there a `pip install anamnesis`?
 
-Not yet — Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after the throughput work in the `0.7.x` line so the published wheels actually deliver the advertised speed. That ordering is why `0.7.0` ships **multi-threading** rather than the SIMD pass originally planned: threads work regardless of the wheel's `target-cpu`, whereas compile-time SIMD would have been left on the table by any generic wheel a user `pip install`s. When the bindings land, this FAQ gains a Python section (installation, the exception hierarchy, and how to get a `bf16` NumPy array). Until then, use the CLI or the Rust library.
+Not yet — Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after the throughput work in the `0.7.x` line so the published wheels actually deliver the advertised speed. That ordering is why `0.7.0` ships **multi-threading** rather than the SIMD pass originally planned: threads work regardless of the wheel's `target-cpu`, whereas compile-time SIMD would have been left on the table by any generic wheel a user `pip install`s. When the bindings land, this FAQ gains a Python section (installation, the exception hierarchy, and how the returned arrays map onto `NumPy` dtypes — which output dtypes are offered is itself still open, see [Phase 7.3](../ROADMAP.md#phase-73-caller-chosen-output-dtype)). Until then, use the CLI or the Rust library.

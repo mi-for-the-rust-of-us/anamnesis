@@ -794,6 +794,17 @@ as the SIMD rules were.
    reads only shared-**immutable** input. No shared mutable state, no lock in the
    hot path, no cross-task reduction. Dequant qualifies: output element `i`
    depends only on input block `⌊i / block_size⌋` and its scale.
+   - **One sanctioned exception: a scheduling cursor.** A shared `AtomicUsize`
+     that hands each idle worker the next *work item* is permitted, because it
+     carries no output data and is touched **once per item, never inside a
+     kernel loop**. It exists to fix a real problem a static split cannot:
+     tensor sizes are wildly skewed (one `token_embd.weight` can outweigh two
+     hundred norm tensors), so an equal-count partition leaves one worker
+     holding most of the bytes while the pool idles. The independence rule is
+     unchanged for everything the cursor schedules — each task still writes only
+     its own output. This is the only shared mutable state permitted; anything
+     that accumulates a *result* across tasks is still a reduction and still
+     banned. See `src/parallel.rs`.
 2. **A measured win.** A release-mode best-of-N median on a real fixture shows a
    scaling win past the thread spawn/join overhead — the same
    "no measured win → no commit" gate every perf claim obeys
@@ -811,6 +822,15 @@ must **never** change an output byte:
 - **Partition by disjoint output region** (row/tensor ranges via `split_at_mut` /
   `chunks_mut`); each task writes only its own slice. Output bytes are then
   independent of how the work was split.
+- **If tasks are claimed dynamically, tag results with their input index and
+  sort before returning.** With a scheduling cursor the *completion* order is
+  nondeterministic by design; the *returned* order must not be. Restoring input
+  order is what keeps output bytes independent of steal order as well as of
+  thread count.
+- **Error selection must be deterministic too.** A sequential loop reports the
+  **lowest-indexed** failure; a parallel dispatch must report the same one, not
+  whichever worker happened to fail first — otherwise a malformed input yields a
+  different error message run to run and tests become flaky.
 - **Never parallelize a floating-point reduction.** `f32`/`f64` addition is
   non-associative, so a parallel sum reorders rounding and changes the result.
   Dequant has no reductions — keep it that way; if one is ever needed, it runs
@@ -876,3 +896,18 @@ Like vectorization, **verify** — do not assume:
 3. Where the platform supports it, the parallelized path is exercised under a
    race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
    the disjoint-slice design is race-free by construction, so this is a backstop).
+   **Satisfied since v0.7.2** by the `tsan` job in
+   [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which runs the whole
+   unit-test suite under `-Zsanitizer=thread` with `-Zbuild-std` (instrumenting
+   `std` too, or TSan reports false positives inside its own synchronisation).
+4. **The auto-traits the dispatch depends on are asserted, not assumed.** Sharing
+   `&self` across scoped threads needs `Sync`, which holds only because every
+   field happens to be `Sync` — adding a `Cell`/`Rc`/raw pointer would silently
+   break it, and the error would surface as an inscrutable closure bound far from
+   the offending field. Assert it (`tests/parallel_contract.rs`) so the failure
+   names the type.
+5. **Any test or benchmark meant to prove the parallel path must clear the
+   `*_MIN_PARALLEL_*` threshold.** Below it the dispatch is sequential, so an
+   undersized fixture produces a green determinism suite and a flat benchmark
+   that both measure nothing. Size fixtures off the constant itself where the
+   visibility allows, and assert the fixture clears it where it does not.

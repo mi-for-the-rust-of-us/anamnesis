@@ -210,7 +210,8 @@ Representative measured results (release build, `target-cpu=native`, best-of-5):
 - **Dequantization:** 2.7–54× faster than the reference Python/PyTorch path, bit-exact (0 ULP) across FP8 / GPTQ / AWQ / BnB / 22 GGUF block types.
 - **PyTorch `.pth` parsing:** **11–31× faster** than `torch.load()` on torchvision models; **NPZ** at **3.6 GB/s** (17.7× the `npyz` crate).
 - **Conversion:** `npz → safetensors` 6.75×, `pth → safetensors` 5.18×, `safetensors → BnB-NF4` 2.67× vs the Python ecosystem default.
-- **Multi-threaded dequant:** whole-model `remember` / `convert` run **~3–4× faster** across CPU cores via the default-on `parallel` feature (`std::thread::scope`, no new dependency) — byte-identical output at any thread count, with a modest `min(cores, 4)` default (opt out with `default-features = false`).
+- **Multi-threaded dequant:** whole-model `remember` / `convert` run **~3–4× faster** across CPU cores via the default-on `parallel` feature (`std::thread::scope`, no new dependency) — byte-identical output at any thread count, with a modest `min(cores, 4)` default (opt out with `default-features = false`, or tune with `--threads`). Since v0.7.2 the `GGUF`-input path is parallelised too, at **~1.9×** on the reader stage — lower than the safetensors path because the conversion hub owns one buffer per tensor, [measured and explained here](docs/perf-experiments.md).
+- **vs the Python `GGUF` stack:** whole-model `GGUF` dequantisation is **17–28×** faster than [`gguf-py`](https://pypi.org/project/gguf/) single-threaded and **34–53×** at the default thread budget. **Not a like-for-like output:** `gguf-py` returns `float32`, anamnesis returns `BF16` — half the bytes, and the narrower type. What is verified is that anamnesis's `BF16` is **bit-identical to `gguf-py`'s `float32` correctly rounded to `BF16`** (0 ULP, all 22 kernels), so the two agree on the numbers and differ only in the delivered width. Since that width difference is itself worth ~2× of memory traffic on a bandwidth-bound workload, halving `gguf-py`'s time as a generous correction still leaves ~9–14× and ~17–26×.
 
 These are guarded against regression by [CodSpeed](https://codspeed.io/) continuous
 benchmarking in CI, plus dev-only tracks — [Criterion runtime
@@ -236,7 +237,7 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
 ## What's next
 
-- **Phase 7.2 — GGUF-reader parallelisation + fine-tuning (v0.7.2):** bring the `convert` GGUF-*input* path under the same per-tensor thread pool the safetensors path already uses, plus a stabilisation pass on `RememberOptions` / `ConvertOptions` so the bindings freeze a settled API.
+- **Phase 7.3 — caller-chosen output dtype (v0.7.3):** the dequantisation output type becomes a parameter (`BF16` / `F32` / `F16`), monomorphised like a C++ template argument, with a runtime dispatch at the API edge. `F32` recovers the **exact** dequantised value — today's `BF16` rounds 80–97 % of them — and lands before the bindings freeze a dtype contract.
 - **Phase 8 — Python bindings (v0.8.0):** `pip install anamnesis` — typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).

@@ -5,6 +5,136 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GGUF`-input conversions are now multi-threaded** (`src/convert.rs`,
+  `src/parallel.rs`). `convert()`'s `GGUF` reader dequantised every tensor on a
+  single thread — it was the one input path Phase 7 (v0.7.0) left behind, and it
+  did not even receive the caller's thread budget. It now runs through the same
+  per-tensor dispatch the safetensors path uses, honouring
+  `ConvertOptions::with_threads` and preserving the determinism contract:
+  **output is byte-identical at any thread count**, verified across
+  `{1, 2, 4, 8, 16}` and the hardware-resolved default for the `safetensors`,
+  `gguf` and `bnb-nf4` targets. Both branches of the reader benefit — the
+  quantised branch because dequantisation is the compute, the scalar branch
+  because its `into_owned()` copy is bandwidth-bound — so all-`F32` `GGUF`
+  inputs gain too. The ROADMAP had recorded `ParsedGguf: Sync` as the blocker
+  for this work; it turned out to be already satisfied, so no `unsafe` and no
+  marker impl were needed (and `tests/parallel_contract.rs` now asserts it stays
+  that way).
+
+  **Measured** (5950X, `target-cpu=native`, best-of-5, real models;
+  `docs/perf-experiments.md` Experiment 12): the reader stage itself is
+  **1.90×** faster at the default 4-thread budget on `SmolLM2-135M-Q4_K_M` and
+  **1.95×** on `TinyLlama-1.1B-Q5_0`, plateauing ~2.1× at 16 threads.
+  End-to-end `convert()` gains **1.19–1.36×**, and the gap is Amdahl, not a
+  defect: writing the multi-`GiB` output file is ~60 % of the wall clock and is
+  inherently sequential. Both figures are reported because they answer different
+  questions — do not quote the reader number for `convert()`.
+
+- **A shared parallel dispatch, `src/parallel.rs`.** v0.7.0's inline
+  `thread::scope` block split tensors into contiguous **equal-count** chunks,
+  which does not survive contact with `GGUF`: tensor sizes there are heavily
+  skewed, so an equal-count split leaves one worker holding most of the bytes.
+  The new `map_indexed` helper claims work through an atomic cursor instead, so
+  the pool self-balances, and both the safetensors and `GGUF` paths now go
+  through one code path with one `// PARALLEL:` annotation. Results are
+  index-tagged and sorted, so ordering is independent of steal order as well as
+  of thread count; **error selection is deterministic too** — the lowest-indexed
+  failure is reported at any budget, matching the sequential loop exactly.
+
+- **`MIN_PARALLEL_BYTES`, a measured size threshold** (4 `MiB` of input).
+  `CONVENTIONS.md` requires a named floor below which the sequential path runs;
+  v0.7.0 only checked the tensor *count*, so an eight-tensor toy model paid four
+  thread spawns to dequantise a few `KiB`. Calibrated, not guessed: a 4-worker
+  scoped pool costs **236 µs** to spawn and join on Windows, and the reader
+  sustains ~1.05 `GB/s` on one thread, putting break-even at ~0.5 `MiB`; 4 `MiB`
+  takes that with an ~8× margin.
+
+- **`--threads N` on `amn remember` and `amn convert`** (`src/cli.rs`). The
+  thread budget has been a library knob since v0.7.0 but was unreachable from the
+  CLI, which was pinned to the `min(cores, 4)` default with no way to opt out or
+  scale up. Output is byte-identical whatever is passed.
+
+- **`ParsedModel::remember_with_progress_and_options`** (`src/model.rs`) — the
+  two-knob form of `remember_with_progress`. Callers previously had to choose
+  between a progress bar and a thread budget, because the progress variant pinned
+  the budget to its default. `on_tensor` still fires only on the calling thread.
+
+- **First test coverage for quantised-`GGUF` conversion** (`src/convert.rs`).
+  Every existing `GGUF`-input convert test builds its fixture with `write_gguf`,
+  which rejects quantised dtypes (quantised emit is Phase 8.5) — so the
+  `dequantize_gguf_to_bf16` branch of the reader was exercised only against
+  gitignored multi-`GiB` local models and **never in CI**. A hand-rolled
+  quantised-`GGUF` writer closes that gap: a 17-tensor fixture (`Q8_0`, `Q4_K`,
+  `F32`, deliberately skewed sizes) whose every tensor is checked against the
+  dequant kernel called directly.
+
+- **`benches/convert.rs`, a CodSpeed target for the threaded paths.** `dequant.rs`
+  times one kernel and `parsing.rs` times a header parse; neither spawns a thread,
+  so Phase 7's headline speedup had no continuous regression guard. Each group is
+  measured at **1 and 4 threads**, because the ratio is the signal — a dispatch
+  that silently serialises collapses it while leaving every absolute time
+  plausible.
+
+- **A ThreadSanitizer CI job** (`.github/workflows/ci.yml`).
+  `CONVENTIONS.md` has asked for a race-detector run since v0.7.0 and Windows/MSVC
+  has no TSan, so the rule could only ever be satisfied in CI. Now it is, for both
+  the safetensors and the `GGUF` path.
+
+- **A `gguf-py` performance baseline**
+  (`tests/fixtures/gguf_reference/generate_gguf_dequant_timings.py`, committed
+  sidecar JSONs). Ahead of the Phase 8 Python bindings, whole-model `GGUF`
+  dequantisation is now measured against `gguf` 0.18.0 — the only
+  general-purpose `GGUF` dequantiser on PyPI, `NumPy`-vectorised, and the same
+  library the two are cross-validated against each other on.
+  **17.3–27.9× single-threaded, 33.8–52.9× at the default 4-thread budget.**
+
+  **Not a like-for-like output, and the numbers should not be quoted without
+  this:** `gguf-py` returns `float32`, anamnesis returns `BF16` — half the bytes
+  and the narrower type. What is verified is that anamnesis's `BF16` is
+  bit-identical to `gguf-py`'s `float32` **correctly rounded to `BF16`** (0 ULP,
+  all 22 kernels), so the two agree on the values and differ only in delivered
+  width; both do their block arithmetic in `f32` internally. Since that width
+  difference is itself worth ~2× of memory traffic on a bandwidth-bound
+  workload, halving `gguf-py`'s time as a generous correction still leaves
+  ~8.7–14× and ~17–26× respectively.
+
+### Changed
+
+- **BREAKING — `RememberOptions::with_threads` is now a builder method**
+  (`src/model.rs`). It was an associated *constructor* while the equivalent
+  `ConvertOptions::with_threads` was a `self`-taking *builder*: two spellings of
+  one concept, about to be frozen into the Python bindings at v0.8.0. Migration
+  is one line:
+
+  ```rust
+  // before
+  RememberOptions::with_threads(4)
+  // after
+  RememberOptions::new().with_threads(4)
+  ```
+
+  `RememberOptions::new()` is new (a `const fn`); `RememberOptions::default()`
+  is unchanged and equivalent.
+
+### Fixed
+
+- **`ConvertOptions::threads` documented the wrong scope** (`src/convert.rs`).
+  It claimed the budget "applies only to the safetensors input path" and that
+  "other readers are single-threaded" — true when written, false as of this
+  release. It now names both applicable paths and explains why the `NPZ` and
+  `.pth` readers stay sequential by nature rather than by omission: neither
+  format is block-quantised, so there is no dequantisation to spread.
+
+- **Determinism assertions no longer dump megabytes on failure**
+  (`src/convert.rs`). A plain `assert_eq!` on two multi-`MiB` byte vectors
+  renders both in full; a deliberately-injected determinism regression produced a
+  46 `MB` test log. The comparisons now report the length and the first differing
+  byte offset.
+
 ## [0.7.1] - 2026-08-05
 
 ### Added
