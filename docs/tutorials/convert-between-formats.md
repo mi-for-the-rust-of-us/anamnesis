@@ -57,7 +57,7 @@ The first command previews the file header-only; the second writes the converted
 
 ## Step 1 — Get a model
 
-This walkthrough uses `RedHatAI/Llama-3.2-1B-Instruct-FP8` — a per-tensor FP8 checkpoint, small enough to follow along quickly. Fetch it with the sibling tool [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model) (`hf-fm`):
+This walkthrough uses `RedHatAI/Llama-3.2-1B-Instruct-FP8` — a per-tensor FP8 checkpoint, small enough to follow along quickly. Fetch it with the sibling tool [hf-fetch-model](https://github.com/mi-for-the-rust-of-us/hf-fetch-model) (`hf-fm`):
 
 ```
 hf-fm RedHatAI/Llama-3.2-1B-Instruct-FP8 --preset safetensors

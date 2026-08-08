@@ -54,7 +54,7 @@ The first command summarizes the file; the second writes a `BF16` safetensors yo
 
 ## Step 1 — Get a GGUF file
 
-This walkthrough uses `SmolLM2-135M-Instruct-Q4_K_M.gguf` from the `bartowski/SmolLM2-135M-Instruct-GGUF` repository — small enough to follow along quickly. The easiest way to fetch a single file from HuggingFace is the sibling tool [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model):
+This walkthrough uses `SmolLM2-135M-Instruct-Q4_K_M.gguf` from the `bartowski/SmolLM2-135M-Instruct-GGUF` repository — small enough to follow along quickly. The easiest way to fetch a single file from HuggingFace is the sibling tool [hf-fetch-model](https://github.com/mi-for-the-rust-of-us/hf-fetch-model):
 
 ```
 hf-fm download-file bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q4_K_M.gguf

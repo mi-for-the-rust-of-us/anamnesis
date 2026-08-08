@@ -31,7 +31,7 @@ STYLE CONVENTIONS for editing this FAQ. Keep growth consistent.
    an entry grows past ~6 sentences, promote it to docs/tutorials/.
 -->
 
-A living list of the questions we and our early users have actually run into. If your question is not here, please open an issue on [GitHub](https://github.com/PCfVW/anamnesis/issues); we add entries as real questions arrive.
+A living list of the questions we and our early users have actually run into. If your question is not here, please open an issue on [GitHub](https://github.com/mi-for-the-rust-of-us/anamnesis/issues); we add entries as real questions arrive.
 
 ## Contents
 

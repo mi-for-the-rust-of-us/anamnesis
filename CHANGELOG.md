@@ -50,6 +50,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag sources work**; the `core` fingerprint change that looked like proof was
   just the ABI flag altering the fingerprint. There is no Cargo bug here.
 
+### Changed
+
+- **Repository metadata now points at the `mi-for-the-rust-of-us` organization**
+  (`Cargo.toml`, `README.md`, `docs/FAQ.md`, `docs/tutorials/`, `ROADMAP.md`).
+  The repo transferred from `PCfVW/anamnesis` to the org alongside `candle-mi`,
+  `hf-fetch-model` and `hypomnesis`, but anamnesis was the one crate whose
+  `repository` / `homepage` keys were never updated — so **every published
+  version through `0.7.2` links crates.io and docs.rs back to the old personal
+  namespace**. GitHub redirects, so nothing was broken, but the eco-system's
+  four crates did not agree on where they live. Corrected here alongside the CI
+  badge, the `Used by` links, the FAQ issue link, and the two tutorials'
+  sibling-tool links. Historical `CHANGELOG` and per-release roadmap entries are
+  deliberately left untouched: they record what was true when written.
+
+  **This fix only reaches crates.io on the next release** — registry metadata is
+  frozen per published version and cannot be amended in place.
+
 ## [0.7.2] - 2026-08-07
 
 ### Added

@@ -1,6 +1,6 @@
 # anamnesis
 
-[![CI](https://github.com/PCfVW/anamnesis/actions/workflows/ci.yml/badge.svg)](https://github.com/PCfVW/anamnesis/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/anamnesis.svg)](https://crates.io/crates/anamnesis) [![docs.rs](https://docs.rs/anamnesis/badge.svg)](https://docs.rs/anamnesis) [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org) [![license](https://img.shields.io/crates/l/anamnesis.svg)](https://github.com/PCfVW/anamnesis#license) [![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(mmap_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
+[![CI](https://github.com/mi-for-the-rust-of-us/anamnesis/actions/workflows/ci.yml/badge.svg)](https://github.com/mi-for-the-rust-of-us/anamnesis/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/anamnesis.svg)](https://crates.io/crates/anamnesis) [![docs.rs](https://docs.rs/anamnesis/badge.svg)](https://docs.rs/anamnesis) [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org) [![license](https://img.shields.io/crates/l/anamnesis.svg)](https://github.com/mi-for-the-rust-of-us/anamnesis#license) [![unsafe: deny](https://img.shields.io/badge/unsafe-deny_(mmap_only)-blue.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 **ἀνάμνησις**: *Parse any format, recover any precision.*
 
@@ -244,8 +244,8 @@ Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).
 
 ## Used by
 
-- [candle-mi](https://github.com/PCfVW/candle-mi): Mechanistic interpretability toolkit for language models
-- [hf-fetch-model](https://github.com/PCfVW/hf-fetch-model): Download, inspect, and compare HuggingFace models from Rust; uses anamnesis to parse cached tensor-file metadata (`.safetensors` / GGUF / NPZ / PyTorch `.pth`) for `hf-fm inspect --cached`
+- [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi): Mechanistic interpretability toolkit for language models
+- [hf-fetch-model](https://github.com/mi-for-the-rust-of-us/hf-fetch-model): Download, inspect, and compare HuggingFace models from Rust; uses anamnesis to parse cached tensor-file metadata (`.safetensors` / GGUF / NPZ / PyTorch `.pth`) for `hf-fm inspect --cached`
 
 ## License
 
