@@ -67,10 +67,13 @@ use crate::ParseLimits;
 ///
 /// This enum has carried exactly one variant since the commit that introduced
 /// `remember`; the `#[non_exhaustive]` marker has been there just as long,
-/// because more variants were always intended. `ROADMAP.md` Phase 7.3 turns the
-/// output type into a caller-chosen parameter (`BF16` / `F32` / `F16`), which is
-/// cheap because every kernel already computes its values in `f32` and narrows
-/// only at the shared pass-2 writer.
+/// because more variants were always intended. `ROADMAP.md` Phase 7.4 turns the
+/// output type into a caller-chosen parameter (`BF16` / `F32` / `F16`) on this
+/// enum's own path. Every kernel already computes its values in `f32`, so the
+/// idea is only ever "stop narrowing". Note, though, that the schemes
+/// `remember` dispatches over (`FP8`, `GPTQ`, `AWQ`, `BnB`) each narrow
+/// *inside* their hot loop, unlike the `GGUF` kernels, which share one pass-2
+/// writer and are therefore generalised a tag earlier, in Phase 7.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TargetDtype {

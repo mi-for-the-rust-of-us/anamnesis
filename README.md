@@ -237,7 +237,8 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
 ## What's next
 
-- **Phase 7.3, caller-chosen output dtype (v0.7.3):** the dequantisation output type becomes a parameter (`BF16` / `F32` / `F16`), monomorphised like a C++ template argument, with a runtime dispatch at the API edge. `F32` recovers the **exact** dequantised value (today's `BF16` rounds 80–97 % of them), and lands before the bindings freeze a dtype contract.
+- **Phase 7.3, caller-chosen output dtype for `convert` (v0.7.3):** the dequantisation output type becomes a parameter (`BF16` / `F32` / `F16`), monomorphised like a C++ template argument, with a runtime dispatch at the API edge. `F32` drops the narrowing step entirely, so the output is the reference `f32` itself (today's `BF16` rounds 80–97 % of values), cross-validated against `gguf-py` with no rounding in between for the first time.
+- **Phase 7.4, the same for `remember` (v0.7.4):** `TargetDtype` gains `F32` and `F16`, and the FP8 / GPTQ / AWQ / BnB kernels become generic over the output type. Lands before the bindings freeze a dtype contract, so a Python caller can ask for a plain `np.float32` array without an optional dependency.
 - **Phase 8, Python bindings (v0.8.0):** `pip install anamnesis`, with typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).
