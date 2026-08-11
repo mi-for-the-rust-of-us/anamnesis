@@ -4,8 +4,8 @@
 //!
 //! **Why this is a binary and not a test.** The race detector needs an
 //! *instrumented standard library* — the Rust Unstable Book is explicit that
-//! ThreadSanitizer "require[s] all code to be instrumented since otherwise
-//! [it] generate[s] false positives". Instrumenting `std` means `-Zbuild-std`,
+//! ThreadSanitizer "require\[s\] all code to be instrumented since otherwise
+//! \[it\] generate\[s\] false positives". Instrumenting `std` means `-Zbuild-std`,
 //! and `-Zbuild-std` is unusable with `cargo test`
 //! (<https://github.com/rust-lang/cargo/issues/13146>, still open): the build
 //! fails to link with `error[E0152]: duplicate lang item in crate `core``,
