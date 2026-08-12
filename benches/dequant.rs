@@ -48,9 +48,9 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{
-    Dtype, GgufType, dequantize_awq_to_bf16, dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16,
-    dequantize_fp8_to_bf16, dequantize_gguf_to_bf16, dequantize_gptq_to_bf16,
-    dequantize_per_tensor_fp8_to_bf16,
+    Dtype, F32Out, GgufType, dequantize_awq_to_bf16, dequantize_bnb_int8_to_bf16,
+    dequantize_bnb4_to_bf16, dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16,
+    dequantize_gptq_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
 
 // ---------------------------------------------------------------------------
@@ -334,6 +334,22 @@ fn bench_gguf_q4_k(c: &mut Criterion) {
         b.iter(|| {
             let out = dequantize_gguf_to_bf16(black_box(&raw), GgufType::Q4_K, n_elements)
                 .expect("gguf q4_k dequant");
+            black_box(out);
+        });
+    });
+    // Phase 7.3: the cost curve for the new `F32` option, on the kernel that
+    // drives `run_super_kernel`. This arm RECORDS rather than gates: `F32`
+    // doubles the output bytes on a bandwidth-bound path, so it is *expected*
+    // to be slower, and the phase claims exactness rather than speed. The
+    // `BF16` id above is the regression guard, and it is unchanged.
+    //
+    // No `F16` arm: same width as `BF16`, so there is no bandwidth story to
+    // tell, and its interesting properties (accuracy, exponent range) are
+    // tests rather than benchmarks.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::Q4_K, n_elements)
+                .expect("gguf q4_k dequant f32");
             black_box(out);
         });
     });
