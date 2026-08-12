@@ -53,16 +53,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Repository metadata now points at the `mi-for-the-rust-of-us` organization**
-  (`Cargo.toml`, `README.md`, `docs/FAQ.md`, `docs/tutorials/`, `ROADMAP.md`).
+  (`Cargo.toml`, `README.md`, `docs/FAQ.md`, `docs/tutorials/`, `ROADMAP.md`,
+  `docs/issues/README.md`).
   The repo transferred from `PCfVW/anamnesis` to the org alongside `candle-mi`,
   `hf-fetch-model` and `hypomnesis`, but anamnesis was the one crate whose
   `repository` / `homepage` keys were never updated — so **every published
   version through `0.7.2` links crates.io and docs.rs back to the old personal
   namespace**. GitHub redirects, so nothing was broken, but the eco-system's
   four crates did not agree on where they live. Corrected here alongside the CI
-  badge, the `Used by` links, the FAQ issue link, and the two tutorials'
-  sibling-tool links. Historical `CHANGELOG` and per-release roadmap entries are
-  deliberately left untouched: they record what was true when written.
+  badge, the `Used by` links, the FAQ issue link, the two tutorials'
+  sibling-tool links, and the issues archive's pointer at its `hf-fetch-model`
+  original. That last one is corrected because it is a *live* pointer rather
+  than a record: the surrounding text instructs the reader to open that file and
+  to prefer it over this copy, so it has to resolve to where the file lives now.
+
+  The remaining `PCfVW` references are all correct and are deliberately left
+  alone, so that a future `grep` does not read them as a missed spot. Historical
+  `CHANGELOG` and per-release roadmap entries, and the archived reply drafts
+  under `docs/issues/`, record what was true when written. `CONVENTIONS.md`
+  links to `PCfVW/Amphigraphic-Strict`, which is a genuinely personal repository
+  and did not transfer. The `LICENSE-*` files name the copyright holder, not a
+  repository.
 
   **This fix only reaches crates.io on the next release** — registry metadata is
   frozen per published version and cannot be amended in place.

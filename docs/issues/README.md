@@ -8,7 +8,7 @@ anamnesis's own work surfaced or diagnosed a problem. Currently
 is archived in the sibling project (see below).
 
 It follows the conventions established by
-[`hf-fetch-model/docs/issues/README.md`](https://github.com/PCfVW/hf-fetch-model),
+[`hf-fetch-model/docs/issues/README.md`](https://github.com/mi-for-the-rust-of-us/hf-fetch-model),
 deliberately, so the two archives read alike and a reply can move between them
 without reformatting. **That file is the origin of the convention; this one is a
 copy adapted to anamnesis.** If the two ever disagree, prefer the hf-fetch-model
