@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `GGUF` dequantisation output type is now caller-chosen**
+  (`src/remember/output.rs`, `src/remember/gguf.rs`). A new sealed
+  `OutputElement` trait with three implementations, `Bf16Out` (the unchanged
+  default), `F32Out` and `F16Out`, replaces the hard-coded `BF16` narrowing that
+  every kernel has performed since the crate's first commit. Two new entry
+  points, `dequantize_gguf::<E>` and `dequantize_gguf_blocks::<E>`;
+  `dequantize_gguf_to_bf16` and `dequantize_gguf_blocks_to_bf16` remain as
+  `#[inline]` `Bf16Out` wrappers, so **no existing caller changes**.
+
+  **Why it matters.** `BF16` keeps 8 significand bits, but a `Q8_0` value is an
+  `f16` scale times an `int8` and needs about 18; `Q6_K` needs 24. Measured on
+  `SmolLM2-135M-Q4_K_M`, only **3 to 20 %** of dequantised values are exactly
+  `BF16`-representable. The usual defence, that quantisation error dwarfs the
+  rounding, fails precisely where it matters most: `Q8_0`'s own quantisation
+  step is the *same order* as `BF16`'s half-`ULP`, so the crate was adding
+  rounding comparable to the error the format exists to avoid. `F32Out` adds no
+  narrowing step of its own, so its output **is** the reference's `f32`.
+
+  **All 24 kernel bodies are untouched.** Only their signatures thread the type
+  parameter through; the bit manipulation, the formulas and every annotation are
+  byte-identical, which the 22 existing cross-validation fixtures confirm by
+  still passing unchanged. That economy is specific to `GGUF`, where all 24
+  kernels funnel through one pass-2 writer, and is why the `remember` path's
+  four families are a separate phase.
+
+  **The streaming sink's block length is now dtype-dependent**: `QK × E::BYTES`,
+  so 64 B / 512 B at `BF16` and `F16` but 128 B / 1024 B at `F32`. A sink that
+  hard-codes `chunks_exact(2)` is correct only for the 2-byte types. The public
+  docs carry the table and a test asserts the observed length per output type,
+  so the assumption fails loudly rather than silently misreading `F32` output as
+  twice as many `BF16` values.
+
+  `F16` follows **plain IEEE semantics** via `half::f16::from_f32`: overflow to
+  infinity, flush to zero below roughly `2⁻²⁴`, round-to-nearest-even between.
+  Deliberately not saturating, which would fabricate a value no reference
+  produces and put `F16` cross-validation permanently at odds with `NumPy` and
+  `PyTorch`. This range is reachable in real data: `MXFP4`'s `E8M0` scale spans
+  `2⁻¹²⁸` to `2¹²⁷`. Note that `F16` is **not** uniformly the better 2-byte
+  choice, since it buys 3 significand bits and pays a far narrower exponent
+  range.
+
+  The trait is **sealed**. Its contract is a byte-level invariant the
+  cross-validation depends on, and an outside implementation could break it
+  while every test stayed green. Sealing is also the reversible direction:
+  un-sealing later is not a breaking change, sealing later would be.
+
 - **ThreadSanitizer is now gating, with an instrumented `std`**
   (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
   with the `CONVENTIONS.md` race-detector rule still open — the job existed but

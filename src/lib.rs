@@ -465,13 +465,17 @@ pub use parse::{
 pub use remember::dequantize_awq_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
+pub use remember::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(feature = "bnb")]
 pub use remember::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
 pub use remember::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };
 #[cfg(feature = "gguf")]
-pub use remember::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
+pub use remember::{
+    dequantize_gguf, dequantize_gguf_blocks, dequantize_gguf_blocks_to_bf16,
+    dequantize_gguf_to_bf16,
+};
 #[cfg(feature = "npz")]
 pub use remember::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]
