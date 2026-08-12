@@ -45,6 +45,15 @@ Before tagging a release (`v*`), complete these steps in order:
    cargo publish --dry-run --allow-dirty
    ```
    `--allow-dirty` is required because step 4 runs **before** the bump commit (steps 1–3 leave `Cargo.toml`/`Cargo.lock`/`CHANGELOG.md` uncommitted by design). The real publish workflow runs against a tagged commit and never sees a dirty tree. If `cargo publish --dry-run` flags issues, fix them in-place before creating the bump commit.
+
+   **Also run the gauntlet on the MSRV toolchain, not just stable.** The gauntlet above uses whatever `cargo` is on `PATH`, but CI has a separate MSRV job, and the two toolchains do not lint identically:
+   ```powershell
+   rustup run 1.88 cargo clippy --all-targets -- -D warnings;
+   rustup run 1.88 cargo clippy --all-targets --all-features -- -D warnings;
+   rustup run 1.88 cargo clippy --all-targets --no-default-features -- -D warnings;
+   rustup run 1.88 cargo test --all-features
+   ```
+   This is not hypothetical: v0.7.3 pushed a green-on-stable `main` that failed CI on MSRV, because rustc 1.88's dead-code analysis does not count a reference from a `const _: () = { assert!(…) }` block as a use, while current stable does. Note the **`--no-default-features` and default-features runs specifically** — a `pub(crate)` item consumed only from a feature-gated module is live under `--all-features` and dead without it, so an all-features-only sweep cannot see it.
 5. Commit as `bump version to vX.Y.Z, update changelog date`
 6. Push the commit, wait for CI to go GREEN
 7. `git tag vX.Y.Z && git push origin vX.Y.Z`

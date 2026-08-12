@@ -61,11 +61,24 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 /// The `const` block below proves this bound holds for all three types, so the
 /// sub-slice can never be short. [`OutputElement`] being sealed is what makes
 /// those three the complete set.
+///
+/// Feature-gated with its consumer. Those two runners are the only code that
+/// needs it today, so without `gguf` it is genuinely dead — and on the MSRV
+/// toolchain, provably so: rustc 1.88's dead-code analysis does **not** count
+/// the reference from the `const` assertion block below as a use, while current
+/// stable does. Gating it here rather than reaching for `#[allow(dead_code)]`
+/// keeps the lint meaningful. Phase 7.4 widens the gate when the `FP8` / `GPTQ`
+/// / `AWQ` / `BnB` families start sizing buffers from it too.
+#[cfg(feature = "gguf")]
 pub(crate) const MAX_OUTPUT_BYTES: usize = 4;
 
 /// Compile-time proof that [`MAX_OUTPUT_BYTES`] really does bound every
 /// implementation. Adding a wider output type without raising the constant
 /// fails the build here rather than silently truncating tensor data.
+///
+/// Gated alongside the constant: the bound only guards buffers that exist in a
+/// `gguf` build.
+#[cfg(feature = "gguf")]
 const _: () = {
     assert!(Bf16Out::BYTES <= MAX_OUTPUT_BYTES);
     assert!(F32Out::BYTES <= MAX_OUTPUT_BYTES);
