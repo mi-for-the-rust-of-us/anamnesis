@@ -78,6 +78,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **This fix only reaches crates.io on the next release** — registry metadata is
   frozen per published version and cannot be amended in place.
 
+- **Dependencies refreshed** (`Cargo.lock`). 52 packages moved to their latest
+  semver-compatible versions. Every change is transitive: no direct dependency
+  altered its requirement string, so this is a lockfile refresh rather than an
+  API-surface change.
+
+  Two versions are pinned on purpose and were verified to have stayed put.
+  `criterion` (aliased to `codspeed-criterion-compat`) must remain **major 5** to
+  match the `cargo-codspeed` binary the CI installs, because the *walltime*
+  instrument fails to collect results across a major-version mismatch. And `zip`
+  stays at **v2** with v8 available: it is the differential oracle the vendored
+  `src/parse/zip.rs` reader is checked against, so moving it across six majors
+  means porting the `ZipWriter` fixtures, the `differential_*` tests and the
+  `fuzz_zip` harness, with a real risk of quietly weakening the cross-check it
+  exists to provide. It is dev-only, so the pin ships to nobody. Both rationales
+  now sit in `Cargo.toml` beside the pins, since `cargo update` will keep
+  reporting `zip` v8 as available and the next reader deserves to know that is
+  expected rather than an oversight.
+
 ## [0.7.2] - 2026-08-07
 
 ### Added

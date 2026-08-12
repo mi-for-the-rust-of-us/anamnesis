@@ -158,6 +158,15 @@ tempfile = "3"
 # `ZipWriter` test fixtures and as the differential oracle the vendored reader
 # is checked against (`fuzz_zip` + the in-crate `differential_*` tests). Same
 # inflate-only feature set the runtime dep carried (no `zopfli` compressor).
+#
+# HELD AT v2 DELIBERATELY. `cargo update` reports v8 available and will keep
+# reporting it; this is not an oversight. Rebasing the oracle across six majors
+# means porting the `ZipWriter` fixtures, the `differential_*` tests and the
+# `fuzz_zip` harness, which is its own piece of work with its own risk of
+# silently weakening the very cross-check it exists to provide. It is also
+# dev-only, so the version here ships to nobody: no downstream user resolves it
+# and no published artefact contains it. Bump it as a dedicated change with the
+# differential suite re-run, never as part of a routine refresh.
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 # The runtime `flate2` dependency above is `optional` (off unless `npz`/`pth`)
 # and pins `default-features = false`, which suppresses flate2's backend. When a
