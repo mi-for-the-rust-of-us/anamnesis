@@ -55,6 +55,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while every test stayed green. Sealing is also the reversible direction:
   un-sealing later is not a breaking change, sealing later would be.
 
+- **`convert` and the CLI can now choose that output dtype**
+  (`src/convert.rs`, `src/cli.rs`, `docs/FAQ.md`).
+  `ConvertOptions::output_dtype` with a `with_output_dtype` builder matching
+  `with_threads`, and `amn convert --out-dtype bf16|f32|f16`. The flag is named
+  `--out-dtype` rather than reusing `--to` because on `convert` `--to` already
+  selects the output *format*; on `remember`, `--to` already selects a dtype, so
+  that subcommand needs no new flag when Phase 7.4 lands.
+
+  The option takes a `Dtype` rather than introducing a narrower enum, because
+  that is already the type a hub tensor carries, so no third dtype vocabulary
+  enters the crate. Values outside `{BF16, F32, F16}` are rejected at the
+  boundary with a message listing what is accepted.
+
+  **Passthrough policy, now stated rather than assumed.** `remember` and
+  `convert` have always emitted mixed-dtype files, with dequantised tensors at
+  `BF16` and passthrough tensors keeping their source dtype. `--out-dtype`
+  widens **dequantised tensors only**: an `F16` norm stays an `F16` norm and an
+  `F32` tensor stays byte-identical. Widening a passthrough tensor would invent
+  precision that was never in the file while doubling its size, and a caller who
+  wants a uniform-dtype file wants a cast pass, which is a different operation.
+  Asserted per tensor in `convert_honours_every_output_dtype_end_to_end`, not
+  merely documented.
+
+  **Scope, made explicit in the error rather than silently.** Only the `GGUF`
+  reader honours a non-`BF16` request in v0.7.3. A quantised safetensors input
+  returns `Unsupported` naming v0.7.4 and the reason (those four families narrow
+  inside their hot loops), so the caller never gets a file whose dtype differs
+  from the request. `NPZ` and `.pth` dequantise nothing, so the option is
+  vacuous there and is accepted rather than refused, since erroring on
+  `--out-dtype f32` for an already-`F32` `NPZ` would be hostile.
+
+  Determinism is re-established **per dtype**: output is byte-identical across
+  `{1, 2, 4, 8}` threads at each of the three widths, rather than assumed to
+  carry over from the `BF16` suite.
+
 - **ThreadSanitizer is now gating, with an instrumented `std`**
   (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
   with the `CONVENTIONS.md` race-detector rule still open — the job existed but

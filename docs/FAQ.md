@@ -54,6 +54,7 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I convert between formats?](#how-do-i-convert-between-formats)
   - [Can I control how many threads anamnesis uses?](#can-i-control-how-many-threads-anamnesis-uses)
   - [Why is the output `BF16` and not `float32`?](#why-is-the-output-bf16-and-not-float32)
+  - [Does `--out-dtype f32` rewrite every tensor as `float32`?](#does---out-dtype-f32-rewrite-every-tensor-as-float32)
 - [Parsing untrusted input](#parsing-untrusted-input)
   - [Is it safe to parse a model file from a stranger?](#is-it-safe-to-parse-a-model-file-from-a-stranger)
   - [How do I bound memory when parsing untrusted files?](#how-do-i-bound-memory-when-parsing-untrusted-files)
@@ -165,7 +166,23 @@ amn convert model-Q4_K_M.gguf --to safetensors --threads 8
 
 ### Why is the output `BF16` and not `float32`?
 
-`BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8. Measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value, for which you need `float32`. Making the output dtype a caller-chosen parameter is [Phase 7.3](../ROADMAP.md#phase-73-caller-chosen-output-dtype-gguf--convert-path) (the `convert` path) and [Phase 7.4](../ROADMAP.md#phase-74-caller-chosen-output-dtype-remember-path) (the `remember` path) on the roadmap.
+Since v0.7.3 on the `convert` path, it does not have to be. `amn convert model.gguf --to safetensors --out-dtype f32` emits `float32`, and `--out-dtype f16` emits IEEE half. `bf16` remains the default, so nothing changes unless you ask.
+
+`BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8. Measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value, for which you need `float32`.
+
+`--out-dtype f32` is the option that removes anamnesis's own narrowing step entirely, so the value you get is the `f32` that `gguf-py` itself produces. Expect it to be *slower* than `bf16`, not faster: it doubles the output bytes on a path that is bandwidth-bound, which is the honest cost of the precision rather than a defect.
+
+`f16` is not simply "the better 2-byte option". It buys 3 significand bits over `bf16` (11 versus 8) and pays a far narrower exponent range: `bf16` shares `f32`'s range, while `f16` overflows to infinity above 65504 and flushes to zero below about `2⁻²⁴`. anamnesis follows plain IEEE semantics there rather than saturating, so its output matches what NumPy and PyTorch produce for the same conversion.
+
+The `remember` path (`amn remember --to ...`) is still `bf16`-only; its four kernel families fuse the narrowing into their inner loops and are generalized in [Phase 7.4](../ROADMAP.md#phase-74-caller-chosen-output-dtype-remember-path). Asking `convert` for `f32` with a *quantized safetensors* input therefore reports a clear error rather than silently giving you `bf16`.
+
+### Does `--out-dtype f32` rewrite every tensor as `float32`?
+
+No. It governs the tensors anamnesis **dequantizes**, and nothing else.
+
+Both `remember` and `convert` have always produced mixed-dtype files: dequantized tensors came out `BF16`, while passthrough tensors (norms, biases, embeddings, anything not block-quantized) kept whatever dtype the source held. `--out-dtype` changes the first group only. An `F16` norm in the source is still an `F16` norm in the output, and an `F32` tensor stays byte-identical.
+
+That is deliberate. A passthrough tensor is copied, never decoded, so widening it would invent precision that was never in the file while doubling its size. If you want a single-dtype file, what you want is a cast pass, which is a different operation from dequantization.
 
 ## Parsing untrusted input
 

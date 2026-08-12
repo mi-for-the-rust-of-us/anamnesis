@@ -140,6 +140,41 @@ pub struct ConvertOptions {
     /// is a packaging concern for a downstream crate.
     #[cfg(feature = "gguf")]
     pub gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
+    /// Element type written for tensors this conversion **dequantises**.
+    /// `None` (the default) means [`Dtype::BF16`], which is what every release
+    /// before v0.7.3 emitted unconditionally.
+    ///
+    /// Accepts [`Dtype::BF16`], [`Dtype::F32`] and [`Dtype::F16`]; any other
+    /// variant is rejected by [`convert`] with
+    /// [`AnamnesisError::Unsupported`]. It is a `Dtype` rather than a narrower
+    /// enum because that is already the type a hub tensor carries, so no third
+    /// dtype vocabulary enters the crate.
+    ///
+    /// # This governs dequantised tensors only
+    ///
+    /// Both `remember` and `convert` already emit **mixed-dtype** files, where
+    /// dequantised tensors are `BF16` and passthrough tensors (norms, biases,
+    /// embeddings, anything not block-quantised) keep whatever dtype the source
+    /// held. Setting this to `F32` widens the **dequantised** tensors only and
+    /// leaves passthrough tensors exactly as they were. It is emphatically not
+    /// "rewrite every tensor as `F32`": an `F16` norm in the source stays an
+    /// `F16` norm in the output.
+    ///
+    /// The reason is that a passthrough tensor is copied, never decoded, so
+    /// widening it would invent precision that was never in the file while
+    /// doubling its bytes. Callers who want a uniform-dtype file want a cast
+    /// pass, which is a different operation from dequantisation.
+    ///
+    /// # v0.7.3 scope: `GGUF` input only
+    ///
+    /// Only the `GGUF` reader can honour a non-`BF16` request today. The
+    /// safetensors reader dequantises through the `FP8` / `GPTQ` / `AWQ` /
+    /// `BnB` kernels, which fuse the narrowing into their hot loops and are
+    /// generalised in v0.7.4; asking for `F32` with a quantised safetensors
+    /// input is therefore a clean `Unsupported` error rather than a silent
+    /// `BF16` fallback. `NPZ` and `.pth` inputs dequantise nothing at all, so
+    /// the option is vacuous there and is accepted rather than rejected.
+    pub output_dtype: Option<Dtype>,
 }
 
 impl ConvertOptions {
@@ -166,6 +201,19 @@ impl ConvertOptions {
     #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = Some(n.max(1));
+        self
+    }
+
+    /// Sets the element type written for tensors this conversion dequantises.
+    ///
+    /// Accepts [`Dtype::BF16`], [`Dtype::F32`] and [`Dtype::F16`]; anything else
+    /// is rejected by [`convert`], not here, so that the builder stays
+    /// infallible like its siblings. See
+    /// [`output_dtype`](ConvertOptions::output_dtype) for the passthrough
+    /// policy and the v0.7.3 `GGUF`-only scope.
+    #[must_use]
+    pub fn with_output_dtype(mut self, dtype: Dtype) -> Self {
+        self.output_dtype = Some(dtype);
         self
     }
 
@@ -491,17 +539,57 @@ pub fn convert(
     write_hub(&hub, target, output, options)
 }
 
+/// The output element type a conversion writes for the tensors it dequantises.
+///
+/// Resolves [`ConvertOptions::output_dtype`]'s `None` to the `BF16` default and
+/// rejects any dtype that is not a supported output width. This is the single
+/// runtime boundary the design calls for: past this point the width is a static
+/// type parameter and no per-element branch exists.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if `output_dtype` is set to anything
+/// other than [`Dtype::BF16`], [`Dtype::F32`] or [`Dtype::F16`].
+fn resolve_output_dtype(options: &ConvertOptions) -> crate::Result<Dtype> {
+    let requested = options.output_dtype.unwrap_or(Dtype::BF16);
+    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]` and names 15 element types, of
+    // which exactly three are dequantisation output widths. The wildcard is the
+    // rejection path, not a fallthrough.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match requested {
+        Dtype::BF16 | Dtype::F32 | Dtype::F16 => Ok(requested),
+        other => Err(AnamnesisError::Unsupported {
+            format: "convert".into(),
+            detail: format!(
+                "output dtype {other} is not a dequantisation output width \
+                 (supported: bf16, f32, f16)"
+            ),
+        }),
+    }
+}
+
 /// Parses `input` into the hub, dispatching on the detected format.
+///
+/// `out_dtype` reaches only the readers that actually dequantise. A reader that
+/// cannot honour a non-`BF16` request rejects it here rather than silently
+/// emitting `BF16`, so the caller never receives a file whose dtype differs
+/// from what they asked for.
 fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
     let threads = crate::model::resolve_thread_budget(options.threads);
+    let out_dtype = resolve_output_dtype(options)?;
     match detect_format(input)? {
-        Format::Safetensors => read_safetensors(input, &options.limits, threads),
+        Format::Safetensors => read_safetensors(input, &options.limits, threads, out_dtype),
+        // NPZ and `.pth` dequantise nothing: every tensor is already full
+        // precision and is passed through in its source dtype. A non-`BF16`
+        // `output_dtype` is therefore vacuous rather than wrong, and is
+        // accepted. Rejecting it would mean erroring on `--out-dtype f32` for
+        // an NPZ that is already `F32`, which would be hostile.
         #[cfg(feature = "pth")]
         Format::Pth => read_pth(input, &options.limits),
         #[cfg(feature = "npz")]
         Format::Npz => read_npz(input, &options.limits),
         #[cfg(feature = "gguf")]
-        Format::Gguf => read_gguf(input, &options.limits, threads),
+        Format::Gguf => read_gguf(input, &options.limits, threads, out_dtype),
     }
 }
 
@@ -548,8 +636,37 @@ fn write_hub(
 /// Reads a safetensors file into the hub, dequantising quantised tensors to
 /// `BF16` and passing scalar tensors through in their original dtype. Carries
 /// the source `__metadata__`.
-fn read_safetensors(path: &Path, limits: &ParseLimits, threads: usize) -> crate::Result<Hub> {
+///
+/// `out_dtype` must be [`Dtype::BF16`] whenever this file actually contains
+/// something to dequantise. The four kernel families this path dispatches over
+/// (`FP8`, `GPTQ`, `AWQ`, `BnB`) fuse the narrowing into their hot loops rather
+/// than sharing a writer the way the 24 `GGUF` kernels do, so they are
+/// generalised in v0.7.4 rather than v0.7.3.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if `out_dtype` is not
+/// [`Dtype::BF16`] **and** the input carries quantised tensors. An unquantised
+/// safetensors file dequantises nothing, so the request is vacuous and is
+/// allowed through rather than refused on a technicality.
+fn read_safetensors(
+    path: &Path,
+    limits: &ParseLimits,
+    threads: usize,
+    out_dtype: Dtype,
+) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
+    if out_dtype != Dtype::BF16 && model.header.quantized_count() > 0 {
+        return Err(AnamnesisError::Unsupported {
+            format: "safetensors".into(),
+            detail: format!(
+                "{out_dtype} output is not yet available for quantised safetensors input: \
+                 the FP8/GPTQ/AWQ/BnB kernels narrow inside their hot loops and are \
+                 generalised in v0.7.4 (ROADMAP Phase 7.4). v0.7.3 covers the GGUF input \
+                 path; re-run without --out-dtype to emit BF16"
+            ),
+        });
+    }
     let (tensors, dequantized) = model.hub_tensors(threads)?;
     Ok(Hub {
         tensors,
@@ -629,8 +746,51 @@ fn read_pth(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
 /// whatever the budget. Both branches parallelise usefully — the quantised
 /// branch because dequantisation is the compute, the scalar branch because the
 /// `into_owned()` copy is bandwidth-bound — so an all-`F32` `GGUF` gains too.
+///
+/// `out_dtype` selects the element type the **dequantised** tensors are written
+/// in ([`Dtype::BF16`], [`Dtype::F32`] or [`Dtype::F16`]). Passthrough tensors
+/// are copied in their source dtype regardless, per the policy on
+/// [`ConvertOptions::output_dtype`]. The dtype is resolved to a static type
+/// parameter once, outside the per-tensor dispatch, so the choice costs no
+/// per-tensor branch and no per-element branch at all.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if `out_dtype` is not one of the
+/// three supported output widths, and propagates any parse or dequantisation
+/// error from the tensors themselves.
 #[cfg(feature = "gguf")]
-fn read_gguf(path: &Path, limits: &ParseLimits, threads: usize) -> crate::Result<Hub> {
+fn read_gguf(
+    path: &Path,
+    limits: &ParseLimits,
+    threads: usize,
+    out_dtype: Dtype,
+) -> crate::Result<Hub> {
+    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
+    // already rejected everything outside these three, so the wildcard is
+    // defence in depth rather than a reachable path.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match out_dtype {
+        Dtype::BF16 => read_gguf_as::<crate::Bf16Out>(path, limits, threads),
+        Dtype::F32 => read_gguf_as::<crate::F32Out>(path, limits, threads),
+        Dtype::F16 => read_gguf_as::<crate::F16Out>(path, limits, threads),
+        other => Err(AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!(
+                "output dtype {other} is not a dequantisation output width \
+                 (supported: bf16, f32, f16)"
+            ),
+        }),
+    }
+}
+
+/// The monomorphised body of [`read_gguf`], with the output element type fixed.
+#[cfg(feature = "gguf")]
+fn read_gguf_as<E: crate::OutputElement>(
+    path: &Path,
+    limits: &ParseLimits,
+    threads: usize,
+) -> crate::Result<Hub> {
     let parsed = crate::parse_gguf_with_limits(path, limits)?;
 
     // Materialise the tensor views up front so the dispatch has an indexable
@@ -666,12 +826,15 @@ fn read_gguf(path: &Path, limits: &ParseLimits, threads: usize) -> crate::Result
                             tensor.name, tensor.shape
                         ),
                     })?;
-                let bf16 = crate::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
+                let data = crate::dequantize_gguf::<E>(&tensor.data, tensor.dtype, n_elements)?;
                 Ok(HubTensor {
                     name: tensor.name.to_owned(),
                     shape,
-                    dtype: Dtype::BF16,
-                    data: bf16,
+                    // The tensor describes itself with the same dtype the
+                    // writer just used, taken from the trait rather than
+                    // restated here, so the two cannot drift.
+                    dtype: E::DTYPE,
+                    data,
                 })
             } else {
                 Ok(HubTensor {
@@ -1995,6 +2158,196 @@ mod quantized_gguf_tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Caller-chosen output dtype (Phase 7.3)
+    // -----------------------------------------------------------------------
+
+    /// Every supported output dtype round-trips through `convert`, and each
+    /// dequantised tensor matches the kernel called directly at that same width.
+    ///
+    /// This is the end-to-end counterpart of the unit tests on `OutputElement`:
+    /// it proves the dtype survives `ConvertOptions` -> `read_hub` ->
+    /// `read_gguf` -> the safetensors writer, and that the header records the
+    /// width actually written.
+    #[test]
+    fn convert_honours_every_output_dtype_end_to_end() {
+        for (requested, expected_st) in [
+            (crate::Dtype::BF16, safetensors::Dtype::BF16),
+            (crate::Dtype::F32, safetensors::Dtype::F32),
+            (crate::Dtype::F16, safetensors::Dtype::F16),
+        ] {
+            let (_dir, path, specs) = write_fixture();
+            let dir_out = tempfile::tempdir().expect("tempdir");
+            let out = dir_out.path().join("out.safetensors");
+
+            let stats = convert(
+                &path,
+                ConvertTarget::Safetensors,
+                &out,
+                &ConvertOptions::new()
+                    .with_threads(4)
+                    .with_output_dtype(requested),
+            )
+            .unwrap_or_else(|e| panic!("convert at {requested}: {e}"));
+            assert_eq!(stats.dequantized, 9, "{requested}");
+
+            let written = std::fs::read(&out).expect("read output");
+            let tensors = safetensors::SafeTensors::deserialize(&written).expect("parse output");
+
+            for spec in &specs {
+                let view = tensors.tensor(spec.name).expect("tensor present");
+                match spec.dtype {
+                    // PASSTHROUGH POLICY, asserted rather than described: an F32
+                    // source tensor stays F32 and keeps its exact bytes even when
+                    // the caller asks for BF16 or F16 output. `--out-dtype`
+                    // governs dequantised tensors only.
+                    GgufType::F32 => {
+                        assert_eq!(
+                            view.dtype(),
+                            safetensors::Dtype::F32,
+                            "{} passthrough must ignore --out-dtype {requested}",
+                            spec.name
+                        );
+                        assert_bytes_eq(view.data(), &spec.data(), spec.name);
+                    }
+                    dtype => {
+                        assert_eq!(view.dtype(), expected_st, "{}", spec.name);
+                        let expected = match requested {
+                            crate::Dtype::BF16 => crate::dequantize_gguf::<crate::Bf16Out>(
+                                &spec.data(),
+                                dtype,
+                                spec.n_elements(),
+                            ),
+                            crate::Dtype::F32 => crate::dequantize_gguf::<crate::F32Out>(
+                                &spec.data(),
+                                dtype,
+                                spec.n_elements(),
+                            ),
+                            _ => crate::dequantize_gguf::<crate::F16Out>(
+                                &spec.data(),
+                                dtype,
+                                spec.n_elements(),
+                            ),
+                        }
+                        .expect("oracle dequant");
+                        assert_bytes_eq(
+                            view.data(),
+                            &expected,
+                            &format!("{} at {requested}", spec.name),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `F32` output really is twice the payload, and `F16` really is the same
+    /// width as `BF16`.
+    ///
+    /// A structural check that catches a whole class of plumbing mistake: if
+    /// the dtype were dropped anywhere between the option and the writer, all
+    /// three payloads would collapse to one size.
+    ///
+    /// It sums the **dequantised tensors' payload bytes** rather than comparing
+    /// file sizes, because the two are not the same thing. The safetensors JSON
+    /// header spells each tensor's dtype out, so `"BF16"` and `"F16"` differ by
+    /// a byte per tensor; the first draft of this test compared
+    /// `fs::metadata().len()` and failed by 8 bytes on a 5.4 `MB` file for
+    /// exactly that reason. Payload is the quantity the claim is about.
+    #[test]
+    fn output_dtype_changes_the_dequantised_payload_width() {
+        let mut payloads = Vec::new();
+        for requested in [crate::Dtype::BF16, crate::Dtype::F16, crate::Dtype::F32] {
+            let (_dir, path, specs) = write_fixture();
+            let dir_out = tempfile::tempdir().expect("tempdir");
+            let out = dir_out.path().join("out.safetensors");
+            convert(
+                &path,
+                ConvertTarget::Safetensors,
+                &out,
+                &ConvertOptions::new().with_output_dtype(requested),
+            )
+            .expect("convert");
+
+            let written = std::fs::read(&out).expect("read output");
+            let tensors = safetensors::SafeTensors::deserialize(&written).expect("parse output");
+            let dequantised: usize = specs
+                .iter()
+                .filter(|s| s.dtype != GgufType::F32)
+                .map(|s| tensors.tensor(s.name).expect("tensor present").data().len())
+                .sum();
+            payloads.push(dequantised);
+        }
+        assert_eq!(
+            payloads[0], payloads[1],
+            "BF16 and F16 are both 2 bytes per element"
+        );
+        assert_eq!(
+            payloads[2],
+            payloads[0] * 2,
+            "F32 is exactly twice BF16: {payloads:?}"
+        );
+    }
+
+    /// Determinism is preserved at **every** output dtype, not just the default.
+    ///
+    /// `CONVENTIONS.md` requires byte-identical output across thread counts for
+    /// every parallelised path. Phase 7.3 adds a second axis to that path, so
+    /// the guarantee is re-established per dtype rather than assumed to carry
+    /// over from the `BF16` suite.
+    #[test]
+    fn output_dtype_is_deterministic_across_thread_counts() {
+        for requested in [crate::Dtype::BF16, crate::Dtype::F32, crate::Dtype::F16] {
+            let (_dir, path, _specs) = write_fixture();
+            let dir_out = tempfile::tempdir().expect("tempdir");
+
+            let mut baseline: Option<Vec<u8>> = None;
+            for threads in [1usize, 2, 4, 8] {
+                let out = dir_out.path().join(format!("out-{requested}-{threads}.st"));
+                convert(
+                    &path,
+                    ConvertTarget::Safetensors,
+                    &out,
+                    &ConvertOptions::new()
+                        .with_threads(threads)
+                        .with_output_dtype(requested),
+                )
+                .expect("convert");
+                let bytes = std::fs::read(&out).expect("read output");
+                match &baseline {
+                    None => baseline = Some(bytes),
+                    Some(expected) => assert_bytes_eq(
+                        &bytes,
+                        expected,
+                        &format!("{requested} at {threads} threads vs 1 thread"),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A dtype that is not a dequantisation output width is refused at the
+    /// boundary, with a message that lists what is accepted.
+    #[test]
+    fn unsupported_output_dtype_is_rejected() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let out = dir_out.path().join("out.safetensors");
+
+        let err = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &out,
+            &ConvertOptions::new().with_output_dtype(crate::Dtype::I64),
+        )
+        .expect_err("I64 is not an output width");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bf16, f32, f16"),
+            "error should list the supported widths, got: {msg}"
+        );
     }
 }
 
