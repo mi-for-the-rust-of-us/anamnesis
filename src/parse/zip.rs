@@ -43,9 +43,9 @@
 use std::borrow::Cow;
 use std::io::{Read, Seek};
 
+use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::parse::utils::PREALLOC_SOFT_CAP;
-use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
 // Signatures and fixed record sizes (APPNOTE.TXT 6.3.x)

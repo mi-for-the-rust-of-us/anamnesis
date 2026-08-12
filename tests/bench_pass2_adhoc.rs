@@ -66,7 +66,7 @@ use std::time::Instant;
 
 use anamnesis::dequantize_per_tensor_fp8_to_bf16;
 #[cfg(feature = "gguf")]
-use anamnesis::{dequantize_gguf_to_bf16, GgufType};
+use anamnesis::{GgufType, dequantize_gguf_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Timing helpers (mirrors tests/bench_dequant_adhoc.rs)
@@ -153,9 +153,9 @@ fn scalar_write_bf16(scratch: &[f32], out: &mut [u8]) {
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_write_bf16(scratch: &[f32], out: &mut [u8]) {
     use std::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128, _mm256_loadu_si256,
-        _mm256_packus_epi32, _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_srli_epi32,
-        _mm_storeu_si128,
+        __m256i, _mm_storeu_si128, _mm256_add_epi32, _mm256_and_si256, _mm256_castsi256_si128,
+        _mm256_loadu_si256, _mm256_packus_epi32, _mm256_permute4x64_epi64, _mm256_set1_epi32,
+        _mm256_srli_epi32,
     };
     // SAFETY: caller guarantees AVX2 is available (checked via
     // is_x86_feature_detected! before dispatch). That is the function-wide

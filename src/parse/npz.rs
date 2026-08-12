@@ -26,10 +26,10 @@ use std::fmt;
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
-use crate::ParseLimits;
+use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
 
 // ---------------------------------------------------------------------------
 // NPY magic
@@ -1406,11 +1406,13 @@ mod tests {
             matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected array single-alloc limit error, got: {err}"
         );
-        assert!(parse_npz_with_limits(
-            tmp.path(),
-            &ParseLimits::default().with_max_single_alloc(4000)
-        )
-        .is_ok());
+        assert!(
+            parse_npz_with_limits(
+                tmp.path(),
+                &ParseLimits::default().with_max_single_alloc(4000)
+            )
+            .is_ok()
+        );
 
         // Container single-allocation ceiling: since Phase 6.12 the
         // central-directory read on the streaming (reader) path is charged to
@@ -1478,11 +1480,13 @@ mod tests {
         );
 
         // A generous aggregate budget parses, and the default is unchanged.
-        assert!(parse_npz_with_limits(
-            tmp.path(),
-            &ParseLimits::default().with_max_total_bytes(1 << 20)
-        )
-        .is_ok());
+        assert!(
+            parse_npz_with_limits(
+                tmp.path(),
+                &ParseLimits::default().with_max_total_bytes(1 << 20)
+            )
+            .is_ok()
+        );
         assert!(parse_npz_with_limits(tmp.path(), &ParseLimits::default()).is_ok());
     }
 
@@ -1522,11 +1526,13 @@ mod tests {
         );
 
         // A generous cap and the unbounded default both parse it.
-        assert!(parse_npz_with_limits(
-            tmp.path(),
-            &ParseLimits::default().with_max_decompression_ratio(100_000)
-        )
-        .is_ok());
+        assert!(
+            parse_npz_with_limits(
+                tmp.path(),
+                &ParseLimits::default().with_max_decompression_ratio(100_000)
+            )
+            .is_ok()
+        );
         assert!(parse_npz_with_limits(tmp.path(), &ParseLimits::default()).is_ok());
 
         // A STORED entry (ratio 1) is never falsely rejected, even at ratio 1.
@@ -1544,11 +1550,13 @@ mod tests {
             zip.write_all(&npy).unwrap();
             zip.finish().unwrap();
         }
-        assert!(parse_npz_with_limits(
-            stored.path(),
-            &ParseLimits::default().with_max_decompression_ratio(1)
-        )
-        .is_ok());
+        assert!(
+            parse_npz_with_limits(
+                stored.path(),
+                &ParseLimits::default().with_max_decompression_ratio(1)
+            )
+            .is_ok()
+        );
     }
 
     /// Phase 6.12: a `DEFLATE` `.npy` entry inflates correctly through the
@@ -1657,18 +1665,22 @@ mod tests {
         // lower bound: a budget at/below it always rejects.
         let policy_budget = info.total_bytes - 1;
         assert!(info.total_bytes > policy_budget); // the host's cheap pre-check fires
-        assert!(parse_npz_with_limits(
-            tmp.path(),
-            &ParseLimits::default().with_max_total_bytes(policy_budget)
-        )
-        .is_err());
+        assert!(
+            parse_npz_with_limits(
+                tmp.path(),
+                &ParseLimits::default().with_max_total_bytes(policy_budget)
+            )
+            .is_err()
+        );
 
         // Step 3: a generous budget (> inspected total + header overhead) parses.
-        assert!(parse_npz_with_limits(
-            tmp.path(),
-            &ParseLimits::default().with_max_total_bytes(info.total_bytes * 2)
-        )
-        .is_ok());
+        assert!(
+            parse_npz_with_limits(
+                tmp.path(),
+                &ParseLimits::default().with_max_total_bytes(info.total_bytes * 2)
+            )
+            .is_ok()
+        );
     }
 
     // G36: inspect_npz overflow — large shape values saturate gracefully

@@ -53,9 +53,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anamnesis::remember::bnb::{
-    dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16,
+    dequantize_bnb_int8_to_bf16, dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16,
 };
-use anamnesis::{encode_bnb4, encode_bnb4_double_quant, encode_bnb_int8};
+use anamnesis::{encode_bnb_int8, encode_bnb4, encode_bnb4_double_quant};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing (mirrors tests/cross_validation_bnb.rs)

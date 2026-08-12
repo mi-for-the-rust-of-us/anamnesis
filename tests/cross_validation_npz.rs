@@ -21,7 +21,7 @@
 
 use std::time::Instant;
 
-use anamnesis::{inspect_npz, inspect_npz_from_reader, parse_npz, NpzDtype};
+use anamnesis::{NpzDtype, inspect_npz, inspect_npz_from_reader, parse_npz};
 
 // ---------------------------------------------------------------------------
 // Reference fixture parsing

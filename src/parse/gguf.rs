@@ -44,11 +44,11 @@ use std::fmt;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::ParseLimits;
 use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::utils::PREALLOC_SOFT_CAP;
-use crate::ParseLimits;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2756,11 +2756,13 @@ mod tests {
 
         // A generous aggregate budget parses (proving 50 rejected on the total,
         // not any single item).
-        assert!(parse_gguf_with_limits(
-            f.path(),
-            &ParseLimits::default().with_max_total_bytes(1 << 20)
-        )
-        .is_ok());
+        assert!(
+            parse_gguf_with_limits(
+                f.path(),
+                &ParseLimits::default().with_max_total_bytes(1 << 20)
+            )
+            .is_ok()
+        );
     }
 
     /// A metadata string that declares a length **under** `MAX_STRING_LEN` (so
@@ -2776,7 +2778,7 @@ mod tests {
         b.push_u32(3); // version
         b.push_u64(0); // tensor_count
         b.push_u64(1); // kv_count
-                       // One KV: key "k", value type 8 (string), declared length 1 MiB, no body.
+        // One KV: key "k", value type 8 (string), declared length 1 MiB, no body.
         b.push_u64(1);
         b.push_bytes(b"k");
         b.push_u32(8); // GGUF string value type

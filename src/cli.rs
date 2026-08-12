@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use crate::convert::{detect_format, ConvertOptions, ConvertTarget, Format};
-use crate::{format_bytes, parse, InspectInfo, TargetDtype};
+use crate::convert::{ConvertOptions, ConvertTarget, Format, detect_format};
+use crate::{InspectInfo, TargetDtype, format_bytes, parse};
 
 /// Parse any format, recover any precision.
 #[derive(Parser)]

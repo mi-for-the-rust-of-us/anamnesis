@@ -30,7 +30,7 @@ const ST_FP8: &str = "tests/fixtures/safetensors_reference/fp8.safetensors";
 
 #[test]
 fn safetensors_owned_paths_match_mmap() {
-    use anamnesis::{parse, parse_bytes, parse_from_reader, TargetDtype};
+    use anamnesis::{TargetDtype, parse, parse_bytes, parse_from_reader};
 
     let bytes = fs::read(ST_FP8).expect("read fp8 fixture");
 
@@ -97,8 +97,8 @@ fn safetensors_reader_respects_max_single_alloc() {
 
 #[cfg(feature = "pth")]
 mod pth {
-    use super::{fs, ParseLimits};
-    use anamnesis::{parse_pth, parse_pth_bytes, parse_pth_from_reader, ParsedPth};
+    use super::{ParseLimits, fs};
+    use anamnesis::{ParsedPth, parse_pth, parse_pth_bytes, parse_pth_from_reader};
 
     const PTH: &str = "tests/fixtures/pth_reference/algzoo_rnn_small.pth";
 
@@ -180,8 +180,8 @@ mod gguf {
     use std::io::Cursor;
 
     use anamnesis::{
-        parse_gguf, parse_gguf_bytes, parse_gguf_from_reader, write_gguf_to_writer, GgufType,
-        GgufWriteTensor, ParsedGguf,
+        GgufType, GgufWriteTensor, ParsedGguf, parse_gguf, parse_gguf_bytes,
+        parse_gguf_from_reader, write_gguf_to_writer,
     };
 
     /// `(name, data)` for every tensor, sorted — the parity fingerprint.

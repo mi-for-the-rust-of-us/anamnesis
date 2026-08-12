@@ -2886,7 +2886,7 @@ mod tests {
         let mut block = vec![0u8; 56];
         block[48] = 0x38; // sc[0] low byte: bits [5:0] = 0b111000
         block[49] = 0x00; // sc[0] high byte
-                          // sc[2], sc[3] for f16 = 1.0:
+        // sc[2], sc[3] for f16 = 1.0:
         block[48 + 4] = 0x00;
         block[48 + 5] = 0xC0;
         block[48 + 6] = 0x00;

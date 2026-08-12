@@ -75,9 +75,9 @@
 
 use std::path::PathBuf;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use anamnesis::{convert, ConvertOptions, ConvertTarget, RememberOptions, TargetDtype};
+use anamnesis::{ConvertOptions, ConvertTarget, RememberOptions, TargetDtype, convert};
 
 /// The two budgets every group is measured at: the sequential baseline and the
 /// library's default `min(cores, 4)`.

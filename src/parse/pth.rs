@@ -38,11 +38,11 @@ use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
-use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
+use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
 // `ZipSource` is in scope for the reader-path `total_len` / `read_at` calls on
 // the vendored `ReaderSource`; the trait methods are otherwise unreachable.
-use crate::parse::zip::ZipSource;
 use crate::ParseLimits;
+use crate::parse::zip::ZipSource;
 
 /// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
 /// parsers will materialise or interpret.

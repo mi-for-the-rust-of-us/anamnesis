@@ -749,7 +749,7 @@ fn write_gguf_target(
     output: &Path,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
-    use crate::{write_gguf, GgufWriteTensor};
+    use crate::{GgufWriteTensor, write_gguf};
 
     let mut owned: Vec<(String, crate::GgufType, Vec<usize>, &[u8])> =
         Vec::with_capacity(hub.tensors.len());
@@ -804,7 +804,7 @@ fn write_gguf_target(
 /// are encoded to NF4 and everything else passes through as `BF16`.
 #[cfg(feature = "bnb")]
 fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
-    use crate::{classify_inputs, write_bnb_nf4_safetensors, BnbWriteInput};
+    use crate::{BnbWriteInput, classify_inputs, write_bnb_nf4_safetensors};
 
     let mut owned: Vec<(String, Vec<usize>, Cow<'_, [u8]>)> = Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {
@@ -1037,7 +1037,7 @@ fn scalar_of_type(
                     "--gguf-metadata `{key}`: unknown type `{other}` \
                      (expected u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool/string/array)"
                 ),
-            })
+            });
         }
     })
 }
@@ -1099,7 +1099,7 @@ fn array_of_type(
                     "--gguf-metadata `{key}`: unknown array item type `{other}` \
                      (expected u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool/string)"
                 ),
-            })
+            });
         }
     })
 }
@@ -1510,7 +1510,7 @@ mod gguf_metadata_tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod stats_tests {
-    use super::{convert, ConvertOptions, ConvertTarget};
+    use super::{ConvertOptions, ConvertTarget, convert};
     use std::path::Path;
 
     /// `ConvertStats` must **partition** the written tensors: a tensor is either
@@ -1577,9 +1577,9 @@ mod stats_tests {
     clippy::wildcard_enum_match_arm
 )]
 mod quantized_gguf_tests {
-    use super::{convert, ConvertOptions, ConvertTarget};
-    use crate::parallel::MIN_PARALLEL_BYTES;
+    use super::{ConvertOptions, ConvertTarget, convert};
     use crate::GgufType;
+    use crate::parallel::MIN_PARALLEL_BYTES;
     use std::path::PathBuf;
 
     /// `GGUF` default tensor-data alignment.
@@ -2024,7 +2024,7 @@ mod quantized_gguf_tests {
     clippy::indexing_slicing
 )]
 mod hub_scaling_bench {
-    use super::{read_hub, ConvertOptions};
+    use super::{ConvertOptions, read_hub};
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 

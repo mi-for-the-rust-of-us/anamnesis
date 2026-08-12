@@ -456,9 +456,11 @@ mod tests {
         assert!(huge.check_decompression_ratio(10, 4, "ctx").is_ok());
 
         // Unbounded (default) never fires.
-        assert!(ParseLimits::default()
-            .check_decompression_ratio(u64::MAX, 1, "ctx")
-            .is_ok());
+        assert!(
+            ParseLimits::default()
+                .check_decompression_ratio(u64::MAX, 1, "ctx")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -498,8 +500,8 @@ mod tests {
         let mut budget = Budget::new(&limits);
         assert!(budget.charge_alloc(100, "a").is_ok()); // total 100
         assert!(budget.charge_alloc(100, "b").is_ok()); // total 200
-                                                        // Third charge would reach 300 > 250 — rejected by the aggregate even
-                                                        // though 100 passes the per-item cap.
+        // Third charge would reach 300 > 250 — rejected by the aggregate even
+        // though 100 passes the per-item cap.
         let err = budget.charge_alloc(100, "c").unwrap_err();
         assert!(
             matches!(err, crate::AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
@@ -548,8 +550,10 @@ mod tests {
         let limits = ParseLimits::default().with_max_item_count(4);
         assert!(limits.check_item_count(4, "ctx").is_ok());
         assert!(limits.check_item_count(5, "ctx").is_err());
-        assert!(ParseLimits::default()
-            .check_item_count(u64::MAX, "ctx")
-            .is_ok());
+        assert!(
+            ParseLimits::default()
+                .check_item_count(u64::MAX, "ctx")
+                .is_ok()
+        );
     }
 }

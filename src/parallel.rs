@@ -271,7 +271,7 @@ where
     clippy::indexing_slicing
 )]
 mod tests {
-    use super::{map_indexed, MIN_PARALLEL_BYTES};
+    use super::{MIN_PARALLEL_BYTES, map_indexed};
     use crate::AnamnesisError;
 
     /// A work-byte figure comfortably above [`MIN_PARALLEL_BYTES`], so the

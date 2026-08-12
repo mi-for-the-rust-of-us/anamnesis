@@ -1051,9 +1051,9 @@ pub fn encode_bnb_int8_compute_scb(
 mod tests {
     use super::*;
     use crate::lethe::round_trip::{
-        assert_bnb4_decode_encode_round_trip, assert_bnb_int8_decode_encode_round_trip,
+        assert_bnb_int8_decode_encode_round_trip, assert_bnb4_decode_encode_round_trip,
     };
-    use crate::remember::bnb::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
+    use crate::remember::bnb::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
 
     fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -1322,74 +1322,84 @@ mod tests {
         let absmax = vec![0u8];
 
         // block_size = 0
-        assert!(encode_bnb4_double_quant(
-            &[0; 4],
-            &absmax,
-            &codebook_bytes,
-            &nested_absmax_bytes,
-            &nested_cb_bytes,
-            0.0,
-            2,
-            0,
-            256,
-        )
-        .is_err());
+        assert!(
+            encode_bnb4_double_quant(
+                &[0; 4],
+                &absmax,
+                &codebook_bytes,
+                &nested_absmax_bytes,
+                &nested_cb_bytes,
+                0.0,
+                2,
+                0,
+                256,
+            )
+            .is_err()
+        );
 
         // total_elements odd
-        assert!(encode_bnb4_double_quant(
-            &[0; 6],
-            &absmax,
-            &codebook_bytes,
-            &nested_absmax_bytes,
-            &nested_cb_bytes,
-            0.0,
-            3,
-            3,
-            256,
-        )
-        .is_err());
+        assert!(
+            encode_bnb4_double_quant(
+                &[0; 6],
+                &absmax,
+                &codebook_bytes,
+                &nested_absmax_bytes,
+                &nested_cb_bytes,
+                0.0,
+                3,
+                3,
+                256,
+            )
+            .is_err()
+        );
 
         // wrong nested_quant_map size
-        assert!(encode_bnb4_double_quant(
-            &[0; 4],
-            &absmax,
-            &codebook_bytes,
-            &nested_absmax_bytes,
-            &[0; 512],
-            0.0,
-            2,
-            2,
-            256,
-        )
-        .is_err());
+        assert!(
+            encode_bnb4_double_quant(
+                &[0; 4],
+                &absmax,
+                &codebook_bytes,
+                &nested_absmax_bytes,
+                &[0; 512],
+                0.0,
+                2,
+                2,
+                256,
+            )
+            .is_err()
+        );
 
         // absmax byte count mismatch (1 block expected, 2 given)
-        assert!(encode_bnb4_double_quant(
-            &[0; 4],
-            &[0u8, 0u8],
-            &codebook_bytes,
-            &nested_absmax_bytes,
-            &nested_cb_bytes,
-            0.0,
-            2,
-            2,
-            256,
-        )
-        .is_err());
+        assert!(
+            encode_bnb4_double_quant(
+                &[0; 4],
+                &[0u8, 0u8],
+                &codebook_bytes,
+                &nested_absmax_bytes,
+                &nested_cb_bytes,
+                0.0,
+                2,
+                2,
+                256,
+            )
+            .is_err()
+        );
 
         // nested_block_size = 0
-        assert!(encode_bnb4_double_quant(
-            &[0; 4],
-            &absmax,
-            &codebook_bytes,
-            &nested_absmax_bytes,
-            &nested_cb_bytes,
-            0.0,
-            2,
-            2,
-            0,
-        )
-        .is_err());
+        assert!(
+            encode_bnb4_double_quant(
+                &[0; 4],
+                &absmax,
+                &codebook_bytes,
+                &nested_absmax_bytes,
+                &nested_cb_bytes,
+                0.0,
+                2,
+                2,
+                0,
+            )
+            .is_err()
+        );
     }
 
     #[test]

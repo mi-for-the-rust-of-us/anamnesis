@@ -418,55 +418,55 @@ mod parallel;
 pub mod parse;
 pub mod remember;
 
-pub use convert::{convert, ConvertOptions, ConvertStats, ConvertTarget};
+pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
 pub use error::{AnamnesisError, Result};
-pub use inspect::{format_bytes, InspectInfo};
+pub use inspect::{InspectInfo, format_bytes};
 #[cfg(feature = "bnb")]
 pub use lethe::{
-    classify_inputs, encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant,
-    encode_bnb_int8, encode_bnb_int8_compute_scb, is_eligible_for_nf4, write_bnb_nf4_safetensors,
-    write_bnb_nf4_safetensors_bytes, BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE,
-    NF4_CODEBOOK,
+    BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE, NF4_CODEBOOK, classify_inputs,
+    encode_bnb_int8, encode_bnb_int8_compute_scb, encode_bnb4, encode_bnb4_compute_absmax,
+    encode_bnb4_double_quant, is_eligible_for_nf4, write_bnb_nf4_safetensors,
+    write_bnb_nf4_safetensors_bytes,
 };
 pub use limits::ParseLimits;
 pub use model::{
-    parse, parse_bytes, parse_bytes_with_limits, parse_from_reader, parse_from_reader_with_limits,
-    parse_with_limits, ParsedModel, RememberOptions, TargetDtype,
+    ParsedModel, RememberOptions, TargetDtype, parse, parse_bytes, parse_bytes_with_limits,
+    parse_from_reader, parse_from_reader_with_limits, parse_with_limits,
 };
 #[cfg(feature = "ollama")]
 pub use parse::resolve_ollama_model;
+pub use parse::{
+    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
+    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole, parse_safetensors_header,
+    parse_safetensors_header_from_reader, parse_safetensors_header_from_reader_with_limits,
+    parse_safetensors_header_with_limits,
+};
 #[cfg(feature = "gguf")]
 pub use parse::{
-    inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes, parse_gguf_bytes_with_limits,
-    parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
-    parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
-    parse_gguf_with_limits, write_gguf, write_gguf_to_writer, GgufFrontMatter, GgufInspectInfo,
-    GgufMetadataArray, GgufMetadataValue, GgufTensor, GgufTensorInfo, GgufType, GgufWriteTensor,
-    ParsedGguf,
+    GgufFrontMatter, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
+    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf, inspect_gguf_from_reader, parse_gguf,
+    parse_gguf_bytes, parse_gguf_bytes_with_limits, parse_gguf_from_reader,
+    parse_gguf_from_reader_with_limits, parse_gguf_front_matter_from_reader,
+    parse_gguf_front_matter_from_reader_with_limits, parse_gguf_with_limits, write_gguf,
+    write_gguf_to_writer,
 };
 #[cfg(feature = "npz")]
 pub use parse::{
-    inspect_npz, inspect_npz_from_reader, parse_npz, parse_npz_with_limits, NpzDtype,
-    NpzInspectInfo, NpzTensor, NpzTensorInfo,
+    NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo, inspect_npz, inspect_npz_from_reader,
+    parse_npz, parse_npz_with_limits,
 };
 #[cfg(feature = "pth")]
 pub use parse::{
-    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
-    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_with_limits, ParsedPth,
-    PthDtype, PthInspectInfo, PthTensor, PthTensorInfo,
-};
-pub use parse::{
-    parse_safetensors_header, parse_safetensors_header_from_reader,
-    parse_safetensors_header_from_reader_with_limits, parse_safetensors_header_with_limits,
-    AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,
-    QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
+    ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo, inspect_pth_from_reader,
+    parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits, parse_pth_from_reader,
+    parse_pth_from_reader_with_limits, parse_pth_with_limits,
 };
 #[cfg(feature = "awq")]
 pub use remember::dequantize_awq_to_bf16;
 #[cfg(feature = "gptq")]
 pub use remember::dequantize_gptq_to_bf16;
 #[cfg(feature = "bnb")]
-pub use remember::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
+pub use remember::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
 pub use remember::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };

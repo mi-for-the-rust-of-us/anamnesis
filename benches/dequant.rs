@@ -45,12 +45,12 @@
     clippy::cast_precision_loss
 )]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{
-    dequantize_awq_to_bf16, dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16,
+    Dtype, GgufType, dequantize_awq_to_bf16, dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16,
     dequantize_fp8_to_bf16, dequantize_gguf_to_bf16, dequantize_gptq_to_bf16,
-    dequantize_per_tensor_fp8_to_bf16, Dtype, GgufType,
+    dequantize_per_tensor_fp8_to_bf16,
 };
 
 // ---------------------------------------------------------------------------

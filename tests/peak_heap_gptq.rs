@@ -55,7 +55,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use anamnesis::{dequantize_gptq_to_bf16, Dtype};
+use anamnesis::{Dtype, dequantize_gptq_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Synthesis (deterministic, by index)

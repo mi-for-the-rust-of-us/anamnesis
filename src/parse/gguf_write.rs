@@ -31,7 +31,7 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
-use crate::parse::gguf::{align_up, GgufMetadataArray, GgufMetadataValue, GgufType};
+use crate::parse::gguf::{GgufMetadataArray, GgufMetadataValue, GgufType, align_up};
 
 /// `GGUF` magic bytes — spells `"GGUF"` in `ASCII`.
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";

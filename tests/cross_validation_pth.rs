@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use anamnesis::{inspect_pth_from_reader, parse_pth, PthInspectInfo};
+use anamnesis::{PthInspectInfo, inspect_pth_from_reader, parse_pth};
 
 /// Minimal JSON reference structure (deserialized with serde).
 #[derive(serde::Deserialize)]

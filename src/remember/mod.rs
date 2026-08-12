@@ -25,7 +25,7 @@ pub(crate) mod quant_utils;
 #[cfg(feature = "awq")]
 pub use awq::dequantize_awq_to_bf16;
 #[cfg(feature = "bnb")]
-pub use bnb::{dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16};
+pub use bnb::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
 pub use fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
 };

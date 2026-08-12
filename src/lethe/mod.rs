@@ -21,11 +21,11 @@ pub mod round_trip;
 
 #[cfg(feature = "bnb")]
 pub use bnb::{
-    encode_bnb4, encode_bnb4_compute_absmax, encode_bnb4_double_quant, encode_bnb_int8,
-    encode_bnb_int8_compute_scb, FP4_CODEBOOK, NF4_CODEBOOK,
+    FP4_CODEBOOK, NF4_CODEBOOK, encode_bnb_int8, encode_bnb_int8_compute_scb, encode_bnb4,
+    encode_bnb4_compute_absmax, encode_bnb4_double_quant,
 };
 #[cfg(feature = "bnb")]
 pub use bnb_writer::{
-    classify_inputs, is_eligible_for_nf4, write_bnb_nf4_safetensors,
-    write_bnb_nf4_safetensors_bytes, BnbNf4WriteStats, BnbWriteInput, NF4_BLOCK_SIZE,
+    BnbNf4WriteStats, BnbWriteInput, NF4_BLOCK_SIZE, classify_inputs, is_eligible_for_nf4,
+    write_bnb_nf4_safetensors, write_bnb_nf4_safetensors_bytes,
 };
