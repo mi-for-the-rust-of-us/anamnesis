@@ -14,8 +14,10 @@
 //! The hub is a `BF16` *pivot*, not a `BF16` *floor*:
 //!
 //! - **Quantised** tensors (`FP8` / `GPTQ` / `AWQ` / `BnB` safetensors, quantised
-//!   `GGUF` blocks) are dequantised to `BF16` — the only lossless-in-intent
-//!   representation the crate produces.
+//!   `GGUF` blocks) are dequantised to [`ConvertOptions::output_dtype`], which
+//!   defaults to `BF16`. Since v0.7.3 a `GGUF` input can be asked for `F32`
+//!   instead, which is the only width that adds no narrowing step of the
+//!   crate's own, or `F16`.
 //! - **Scalar** tensors keep their **original dtype** (`F64` / `F32` / `F16` /
 //!   `BF16` / `I8`–`I64` / `U8` / `Bool`), so `.pth` → safetensors and
 //!   `NPZ`-`F32` → `GGUF` stay bit-for-bit lossless.
@@ -56,8 +58,9 @@ use crate::{AnamnesisError, Dtype, ParseLimits};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertTarget {
-    /// `safetensors` (alias `bf16`) — dequantise any quantised input to `BF16`,
-    /// passing scalar tensors through in their original dtype.
+    /// `safetensors` (alias `bf16`) — dequantise any quantised input to
+    /// [`ConvertOptions::output_dtype`] (`BF16` by default), passing scalar
+    /// tensors through in their original dtype.
     Safetensors,
     /// `gguf` — an unquantised (scalar) `GGUF` file. Quantised `GGUF` emit
     /// (`gguf-q4km`, …) needs the Phase 8.5 encode kernels.
@@ -236,7 +239,8 @@ impl ConvertOptions {
 pub struct ConvertStats {
     /// Total tensors written.
     pub tensors: usize,
-    /// Input tensors that were dequantised to `BF16` on the way in.
+    /// Input tensors that were dequantised on the way in, into
+    /// [`ConvertOptions::output_dtype`] (`BF16` by default).
     pub dequantized: usize,
     /// Tensors the target *quantised* on the way out (the `BnB-NF4` encoder).
     pub quantized: usize,
@@ -486,14 +490,49 @@ pub(crate) fn strip_quant_suffix(stem: &str) -> &str {
 /// `weights.npz` + `Gguf` → `weights-gguf.gguf`.
 #[must_use]
 pub fn derive_output_path(input: &Path, target: ConvertTarget) -> PathBuf {
+    derive_output_path_for_dtype(input, target, Dtype::BF16)
+}
+
+/// Derives an output path, naming the file after the dtype it will actually
+/// contain.
+///
+/// [`ConvertTarget::suffix`] answers "what did this conversion produce", and
+/// for the safetensors target that used to be `bf16` unconditionally because
+/// `BF16` was the only possible answer. Since v0.7.3 it is not:
+/// `--out-dtype f32` would otherwise write `F32` tensors into a file named
+/// `model-bf16.safetensors`, which is worse than an unhelpful name because it
+/// is an actively wrong one.
+///
+/// The dtype replaces the suffix only where the suffix *was* a dtype. A `gguf`
+/// or `bnb-nf4` target keeps its own suffix, because there the suffix names a
+/// container or an encoding rather than the element type, and the dequantised
+/// tensors are not what distinguishes the file.
+#[must_use]
+pub fn derive_output_path_for_dtype(
+    input: &Path,
+    target: ConvertTarget,
+    dequant_dtype: Dtype,
+) -> PathBuf {
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
+    // EXHAUSTIVE: internal dispatch over the crate's own `ConvertTarget`.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let suffix = match target {
+        // The safetensors target's suffix *is* the output dtype, so it has to
+        // track the caller's choice.
+        ConvertTarget::Safetensors => match dequant_dtype {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+            _ => "bf16",
+        },
+        other => other.suffix(),
+    };
     let new_name = format!(
         "{}-{}.{}",
         strip_quant_suffix(stem),
-        target.suffix(),
+        suffix,
         target.extension()
     );
     input
@@ -1740,7 +1779,9 @@ mod stats_tests {
     clippy::wildcard_enum_match_arm
 )]
 mod quantized_gguf_tests {
-    use super::{ConvertOptions, ConvertTarget, convert};
+    use super::{
+        ConvertOptions, ConvertTarget, convert, derive_output_path, derive_output_path_for_dtype,
+    };
     use crate::GgufType;
     use crate::parallel::MIN_PARALLEL_BYTES;
     use std::path::PathBuf;
@@ -2325,6 +2366,55 @@ mod quantized_gguf_tests {
                     ),
                 }
             }
+        }
+    }
+
+    /// A derived output filename names the dtype the file actually holds.
+    ///
+    /// Regression guard for a real defect this phase introduced and then fixed:
+    /// `ConvertTarget::suffix()` returns `"bf16"` for the safetensors target,
+    /// which was correct while `BF16` was the only possible answer. Adding
+    /// `--out-dtype` without touching the derivation made
+    /// `--out-dtype f32` write `F32` tensors into `model-bf16.safetensors`,
+    /// which is worse than an unhelpful name because it is an actively wrong
+    /// one.
+    ///
+    /// The `gguf` and `bnb-nf4` targets keep their own suffix, because there it
+    /// names a container or an encoding rather than an element type.
+    #[test]
+    fn derived_output_path_names_the_dtype_it_holds() {
+        let input = std::path::Path::new("/models/smollm2.gguf");
+
+        for (dtype, expected) in [
+            (crate::Dtype::BF16, "smollm2-bf16.safetensors"),
+            (crate::Dtype::F32, "smollm2-f32.safetensors"),
+            (crate::Dtype::F16, "smollm2-f16.safetensors"),
+        ] {
+            let path = derive_output_path_for_dtype(input, ConvertTarget::Safetensors, dtype);
+            assert_eq!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some(expected),
+                "safetensors target at {dtype}"
+            );
+        }
+
+        // The no-dtype entry point keeps its historical behaviour exactly.
+        assert_eq!(
+            derive_output_path(input, ConvertTarget::Safetensors)
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("smollm2-bf16.safetensors"),
+        );
+
+        // Non-safetensors targets are unaffected by the output dtype.
+        for dtype in [crate::Dtype::BF16, crate::Dtype::F32] {
+            assert_eq!(
+                derive_output_path_for_dtype(input, ConvertTarget::Gguf, dtype)
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some("smollm2-gguf.gguf"),
+                "gguf target must ignore the dequant dtype"
+            );
         }
     }
 

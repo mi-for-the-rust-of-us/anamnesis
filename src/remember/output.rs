@@ -91,10 +91,14 @@ mod sealed {
 /// The kernels never name this trait. They fill an `[f32; QK]` scratch buffer
 /// and hand it to [`write_scratch`](Self::write_scratch), so all 24 `GGUF`
 /// kernel functions are untouched by the choice of output type.
-// The `sealed::Sealed` supertrait is deliberately private: that privacy *is*
-// the seal. `#[doc(hidden)] pub mod sealed` would satisfy the lint but let an
-// outside crate implement the trait, which is the thing being prevented.
-#[allow(private_bounds)]
+// The `sealed::Sealed` supertrait lives in a private module: that privacy *is*
+// the seal. A `#[doc(hidden)] pub mod sealed` would still let an outside crate
+// name and implement `Sealed`, which is the thing being prevented.
+//
+// No `#[allow(private_bounds)]` here: the lint does not fire on this shape, and
+// carrying an allow for a lint that never triggers would tell the next reader
+// there is a suppression to preserve when there is not. Verified by removing it
+// and rebuilding clean.
 pub trait OutputElement: sealed::Sealed + Copy + Send + Sync + 'static {
     /// Bytes written per input value.
     const BYTES: usize;

@@ -813,7 +813,9 @@ fn run_convert(
         None => options,
     };
     let output_path = output.map_or_else(
-        || crate::convert::derive_output_path(path, target),
+        // Name the file after the dtype it will actually hold: `--out-dtype
+        // f32` must not derive `model-bf16.safetensors`.
+        || crate::convert::derive_output_path_for_dtype(path, target, dequant_dtype),
         Path::to_owned,
     );
 

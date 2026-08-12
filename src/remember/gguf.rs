@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `GGUF` K-quant dequantization — scalar reference kernels producing `BF16`.
+//! `GGUF` K-quant dequantization — scalar reference kernels, with a
+//! caller-chosen output element type.
 //!
 //! This module consumes raw block-encoded tensor bytes (as produced by
 //! [`parse_gguf`](crate::parse::gguf::parse_gguf)) and decodes them into
-//! `BF16` output bytes, matching the output format of the `FP8`, `GPTQ`,
-//! `AWQ`, and `BitsAndBytes` dequantisers.
+//! output bytes of the caller's chosen width: `BF16` (the default, matching
+//! the `FP8`, `GPTQ`, `AWQ` and `BitsAndBytes` dequantisers), `F32`, or `F16`.
+//! The choice is a type parameter, so it costs no branch at run time; see
+//! [`OutputElement`].
 //!
 //! # Supported types
 //!
@@ -20,20 +23,25 @@
 //! remaining `Unsupported` path is for scalar (non-block-quant) types
 //! that are reinterpret-only and never reach the dequantisation layer.
 //!
-//! # Two public entry points
+//! # Two public entry points, each in a generic and a `BF16` form
 //!
-//! - [`dequantize_gguf_to_bf16`] materialises the whole tensor into an
-//!   owned `Vec<u8>`. Convenient for small-to-medium tensors (anything
-//!   that comfortably fits in RAM alongside its `BF16` expansion).
-//! - [`dequantize_gguf_blocks_to_bf16`] is the **streaming** variant: the
-//!   caller supplies a sink closure that receives one block's worth of
-//!   `BF16` bytes at a time (64 B for legacy, 512 B for K-quants), so
-//!   peak heap is O(one scratch buffer) regardless of tensor size. Use
-//!   this for dequantising 70 B-parameter models on modest RAM.
+//! - [`dequantize_gguf`] materialises the whole tensor into an owned
+//!   `Vec<u8>`. Convenient for small-to-medium tensors (anything that
+//!   comfortably fits in RAM alongside its expansion).
+//! - [`dequantize_gguf_blocks`] is the **streaming** variant: the caller
+//!   supplies a sink closure that receives one block's worth of output at
+//!   a time, so peak heap is O(one scratch buffer) regardless of tensor
+//!   size. Use this for dequantising 70 B-parameter models on modest RAM.
+//!   **The block length depends on the output type** (`QK × E::BYTES`);
+//!   see that function's docs for the table.
 //!
-//! Both entry points share the same validation logic and the same scalar
-//! kernels; the `Vec`-returning variant is a thin wrapper that pushes
-//! into a pre-sized `Vec::with_capacity` sink.
+//! [`dequantize_gguf_to_bf16`] and [`dequantize_gguf_blocks_to_bf16`] are
+//! `#[inline]` wrappers pinning `E = Bf16Out`, kept as the names every
+//! caller before v0.7.3 used.
+//!
+//! All four share the same validation logic and the same scalar kernels;
+//! the `Vec`-returning variants are thin wrappers that push into a
+//! pre-sized `Vec::with_capacity` sink.
 //!
 //! # Algorithm
 //!
@@ -42,11 +50,17 @@
 //!
 //! 1. **Pass 1** unpacks the packed-bit storage into a stack-resident
 //!    `[f32; QK]` scratch buffer (one block at a time, L1-resident).
-//! 2. **Pass 2** walks the scratch buffer paired with a per-block
-//!    `[u8; QK × 2]` output buffer and emits `BF16` bytes via the shared
-//!    [`f32_bits_to_bf16_bits`](crate::remember::fp8) helper. The inner
-//!    loop is branch-free and `chunks_exact_mut(2)`-based, giving the
-//!    compiler a clean vectorisation target.
+//! 2. **Pass 2** walks the scratch buffer paired with a per-block output
+//!    buffer and emits the caller's element type via
+//!    [`OutputElement::write_scratch`].
+//!    The inner loop is branch-free and `chunks_exact_mut(E::BYTES)`-based,
+//!    giving the compiler a clean vectorisation target; all three
+//!    implementations are confirmed packed-SIMD.
+//!
+//! **Pass 2 is the *only* place the output width appears.** That is why
+//! all 24 kernel bodies below are byte-identical to their pre-v0.7.3 form:
+//! they fill an `[f32; QK]` scratch and never name an output type. Only
+//! their signatures thread `E` through to the shared runner.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
 //! `dequantize_row_*` reference implementations. Bit-for-bit
@@ -54,9 +68,12 @@
 //!
 //! # Output format
 //!
-//! All kernels emit `BF16` bytes in little-endian order, length
-//! `n_elements × 2`. Round-to-nearest-even is performed inside
-//! `f32_bits_to_bf16_bits`.
+//! Little-endian, `n_elements × E::BYTES` bytes. `BF16` and `F16` round to
+//! nearest even; `F32` performs no conversion at all, so its output is the
+//! `f32` the kernel computed and therefore the reference's own value.
+//! `tests/cross_validation_gguf.rs` checks all 22 production kernels
+//! against `gguf-py` at both widths, the `F32` comparison being bit-exact
+//! with no tolerance.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;

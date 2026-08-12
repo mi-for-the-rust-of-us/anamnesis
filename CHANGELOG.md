@@ -90,6 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{1, 2, 4, 8}` threads at each of the three widths, rather than assumed to
   carry over from the `BF16` suite.
 
+  **A derived output filename now names the dtype it actually holds**
+  (`derive_output_path_for_dtype`, new; `derive_output_path` kept unchanged as
+  the `BF16` spelling, so no caller breaks). `ConvertTarget::suffix()` returns
+  `bf16` for the safetensors target, which was correct while `BF16` was the only
+  possible answer; without this, `amn convert --out-dtype f32` would have
+  written `F32` tensors into `model-bf16.safetensors`. That is worse than an
+  unhelpful name because it is an actively wrong one. The `gguf` and `bnb-nf4`
+  targets keep their own suffix, since there it names a container or an encoding
+  rather than an element type.
+
 - **All 22 `GGUF` kernels are now cross-validated at `F32`, bit-exactly**
   (`tests/cross_validation_gguf.rs`,
   `tests/fixtures/gguf_reference/generate_gguf.py`). Every cross-validation
