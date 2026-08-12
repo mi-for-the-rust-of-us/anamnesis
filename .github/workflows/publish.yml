@@ -13,6 +13,15 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    # `contents: write` is required by the "Create the GitHub Release" step
+    # below. Without it the workflow token is read-only and `gh release create`
+    # fails with `HTTP 403: Resource not accessible by integration` — which is
+    # exactly what happened on the v0.7.3 tag, *after* `cargo publish` had
+    # already succeeded. Declared explicitly rather than relying on the
+    # repository's default token permissions, which are read-only here and are
+    # an org-level setting this file cannot see.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 

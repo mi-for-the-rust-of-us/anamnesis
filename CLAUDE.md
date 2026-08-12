@@ -63,6 +63,16 @@ Before tagging a release (`v*`), complete these steps in order:
    `tests/` out of the published crate (0.60 MiB instead of 4.8 MiB), and
    GitHub's per-tag source tarball ships it verbatim.
 9. Check the Release actually appeared and its notes are the right section.
+   If the job failed *after* `cargo publish` succeeded, **do not re-run the
+   workflow** — the publish step would fail on the already-taken version and
+   mask the real error. Fix the workflow for next time, then create the missing
+   Release by hand from a clean checkout at the tag:
+   ```powershell
+   $v = "0.7.3"
+   awk -v hdr="## [$v]" 'index($0,hdr)==1{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md > release-body.md
+   # append the "Verifying the correctness claims" footer, then:
+   gh release create "v$v" --title "v$v" --notes-file release-body.md --verify-tag
+   ```
    The workflow slices them out of `CHANGELOG.md` by matching
    `## [X.Y.Z]`, and **fails the job** if no section matches — which is the
    intended alarm for "step 3 was skipped and `## [Unreleased]` was never
