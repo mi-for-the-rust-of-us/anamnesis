@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- Last updated: 2026-07-22, anamnesis v0.6.9 -->
+<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
 
 Every subcommand, flag, and output shape for the `anamnesis` / `amn` CLI. The
 [README](../README.md) has the quick tour; this is the complete reference.
@@ -110,10 +110,13 @@ Converting model.pth → model.safetensors
 ## `amn convert <file> --to <target>`
 
 Convert any supported input to a different format through a single dispatch.
-Every `(input × target)` pair routes through an in-memory **`BF16` hub** (Phase
-6.14, v0.6.9): the input is normalised to the hub — quantised tensors dequantised
-to `BF16`, scalar tensors kept in their original dtype — then written to the
-target. Quantised inputs **auto-chain** through `BF16` (no hand-staged temp file).
+Every `(input × target)` pair routes through an in-memory hub (Phase 6.14,
+v0.6.9): the input is normalised to the hub — quantised tensors dequantised,
+scalar tensors kept in their original dtype — then written to the target.
+Quantised inputs **auto-chain** (no hand-staged temp file).
+
+The hub's dequantised width was `BF16` unconditionally until v0.7.3; it is now
+whatever [`--out-dtype`](#output-dtype) selects, defaulting to `BF16`.
 
 | Flag | Description |
 |---|---|
@@ -121,7 +124,42 @@ target. Quantised inputs **auto-chain** through `BF16` (no hand-staged temp file
 | `--output`, `-o <path>` | Output path; derived from the input if omitted. |
 | `--gguf-metadata <FILE>` | JSON `GGUF` key/values to stamp on a `gguf` target (see [GGUF metadata](#gguf-metadata-flags)). |
 | `--gguf-kv <KEY=VALUE>` | Repeatable one-off `GGUF` metadata (string-valued). |
+| `--out-dtype <DTYPE>` | Element type for **dequantised** tensors: `bf16` (default), `f32`, `f16`. `GGUF` input only in v0.7.3 (see [Output dtype](#output-dtype)). |
 | `--threads <N>` | Dequantisation worker threads; defaults to `min(cores, 4)` (see [Threads](#threads)). |
+
+### Output dtype
+
+Added in **v0.7.3**. Named `--out-dtype` rather than reusing `--to`, because on
+`convert` the `--to` flag already selects the output *format*.
+
+```console
+$ amn convert model.gguf --to safetensors --out-dtype f32
+Converting model.gguf -> model-f32.safetensors
+  201 dequantized to F32
+```
+
+- **`f32`** removes anamnesis's own narrowing step, so the values you get are the
+  `f32` that `gguf-py` itself produces. Expect it to be **slower**, not faster: it
+  doubles the output bytes on a bandwidth-bound path (measured 1.54–1.61×
+  end to end). That is the honest cost of the precision.
+- **`f16`** buys 3 significand bits over `bf16` and pays a far narrower exponent
+  range: it overflows to infinity above 65504 and flushes to zero below about
+  `2⁻²⁴`, where `bf16` shares `f32`'s range. anamnesis follows plain IEEE
+  semantics rather than saturating, so its output matches NumPy and PyTorch.
+- The derived output filename tracks the dtype (`model-f32.safetensors`), so a
+  file never claims a width it does not hold.
+
+**It governs dequantised tensors only.** Passthrough tensors (norms, biases,
+anything not block-quantised) keep their source dtype, so `--out-dtype f32` is
+not "rewrite every tensor as f32". Widening a tensor that was merely copied
+would invent precision that was never in the file.
+
+**`GGUF` input only, for now.** A quantised *safetensors* input reports a clear
+`Unsupported` error rather than silently emitting `bf16`: its `FP8` / `GPTQ` /
+`AWQ` / `BnB` kernels fuse the narrowing into their hot loops and are generalised
+in v0.7.4. `NPZ` and `.pth` dequantise nothing, so the flag is accepted and
+inert there. `amn remember --to` stays `bf16`-only until v0.7.4 for the same
+reason.
 
 ### Conversion matrix (v0.6.9)
 
@@ -130,7 +168,7 @@ target. Quantised inputs **auto-chain** through `BF16` (no hand-staged temp file
 | **safetensors** | ✅ dequant or lossless passthrough | ✅¹ | ✅² |
 | **`.pth`** | ✅ | ✅¹ | ✅² |
 | **`.npz`** | ✅ | ✅¹ | ✅² |
-| **`.gguf`** | ✅ dequant to BF16 | ✅ dequant-in-place³ | ✅² |
+| **`.gguf`** | ✅ dequant to `bf16` / `f32` / `f16`⁴ | ✅ dequant-in-place³ | ✅² |
 
 Every current-target cell is wired. ¹ `gguf` target requires the `gguf` feature;
 writes an **unquantised** (scalar) GGUF — quantised GGUF emit (`gguf-q4km`, …)
@@ -142,6 +180,8 @@ multiple of 64) are encoded to NF4, everything else passes through as `BF16`.
 ³ `gguf → gguf` recovers precision and re-emits a scalar GGUF, **preserving the
 source's metadata KV** (architecture, tokenizer) so the result stays loadable;
 `--gguf-metadata` / `--gguf-kv` merge over it.
+⁴ `--out-dtype` (v0.7.3) selects the dequantised element type; see [Output
+dtype](#output-dtype). Every other input is `bf16`-only until v0.7.4.
 
 Still out of scope until Phase 8.5: **quantised GGUF target columns**
 (`gguf-q4km`, FP8, IQ, TQ, MXFP4). A combination whose Cargo feature is disabled
@@ -235,7 +275,11 @@ a known quantization suffix is stripped from the stem, then `-{target}.{ext}` is
 appended.
 
 - `remember`: → `<stem>-bf16.safetensors`
-- `convert`: → `<stem>-{bf16|gguf|bnb-nf4}.{safetensors|gguf}`
+- `convert`: → `<stem>-{bf16|f32|f16|gguf|bnb-nf4}.{safetensors|gguf}`. For a
+  `safetensors` target the suffix **follows `--out-dtype`**, so the filename
+  never claims a width the file does not hold. The `gguf` and `bnb-nf4` suffixes
+  name a container or an encoding rather than an element type, so they are
+  unaffected by it.
 
 Stripped suffixes (case-sensitive, longest-first) include `-fp8`, `-GPTQ-Int4`,
 `-gptq`, `-AWQ`, `-awq`, `-bnb-4bit`, `-bnb-int8`, `-4bit`, `-int8`, … — e.g.

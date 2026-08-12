@@ -29,7 +29,7 @@ use std::fs;
 
 #[test]
 fn safetensors_owned_dequant_outlives_model() {
-    use anamnesis::{parse_bytes, TargetDtype};
+    use anamnesis::{TargetDtype, parse_bytes};
 
     const ST_FP8: &str = "tests/fixtures/safetensors_reference/fp8.safetensors";
 
@@ -55,7 +55,7 @@ fn safetensors_owned_dequant_outlives_model() {
 #[cfg(feature = "gguf")]
 #[test]
 fn gguf_owned_tensors_outlive_parsed() {
-    use anamnesis::{parse_gguf_bytes, write_gguf_to_writer, GgufType, GgufWriteTensor};
+    use anamnesis::{GgufType, GgufWriteTensor, parse_gguf_bytes, write_gguf_to_writer};
     use std::collections::HashMap;
     use std::io::Cursor;
 

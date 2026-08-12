@@ -25,19 +25,20 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::ParseLimits;
 use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::inspect::InspectInfo;
 use crate::parse::safetensors::{
-    parse_safetensors_header_with_limits, Dtype, QuantScheme, SafetensorsHeader, TensorEntry,
-    TensorRole,
+    Dtype, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
+    parse_safetensors_header_with_limits,
 };
 use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
 use crate::remember::awq::dequantize_awq_to_bf16;
 #[cfg(feature = "bnb")]
 use crate::remember::bnb::{
-    dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16, dequantize_bnb_int8_to_bf16,
+    dequantize_bnb_int8_to_bf16, dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16,
 };
 use crate::remember::fp8::{
     dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
@@ -46,7 +47,6 @@ use crate::remember::fp8::{
 use crate::remember::gptq::dequantize_gptq_to_bf16;
 #[cfg(any(feature = "gptq", feature = "awq"))]
 use crate::remember::quant_utils::transpose_bf16;
-use crate::ParseLimits;
 
 /// Target dtype for dequantization output.
 ///
@@ -1163,7 +1163,7 @@ impl ParsedModel {
                                                  for `{}` (required for nested_offset)",
                                     entry.name
                                 ),
-                            })
+                            });
                         }
                     };
 

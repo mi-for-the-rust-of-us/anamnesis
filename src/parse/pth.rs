@@ -38,11 +38,11 @@ use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
-use crate::parse::utils::{byteswap_inplace, PREALLOC_SOFT_CAP};
+use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
 // `ZipSource` is in scope for the reader-path `total_len` / `read_at` calls on
 // the vendored `ReaderSource`; the trait methods are otherwise unreachable.
-use crate::parse::zip::ZipSource;
 use crate::ParseLimits;
+use crate::parse::zip::ZipSource;
 
 /// Maximum declared size for a `.pth` archive's `data.pkl` entry that the
 /// parsers will materialise or interpret.
@@ -696,12 +696,12 @@ fn is_allowed_global(module: &str, name: &str) -> bool {
 /// Returns `true` if this is a `REDUCE(OrderedDict, ())` call that should
 /// produce an empty `Dict` instead of a `Reduced` node.
 fn is_ordered_dict_constructor(callable: &PickleValue, args: &PickleValue) -> bool {
-    if let PickleValue::Global { module, name } = callable {
-        if module == "collections" && name == "OrderedDict" {
-            if let PickleValue::Tuple(items) = args {
-                return items.is_empty();
-            }
-        }
+    if let PickleValue::Global { module, name } = callable
+        && module == "collections"
+        && name == "OrderedDict"
+        && let PickleValue::Tuple(items) = args
+    {
+        return items.is_empty();
     }
     false
 }
@@ -1095,7 +1095,7 @@ impl<'a> PickleVm<'a> {
             None => {
                 return Err(AnamnesisError::Parse {
                     reason: format!("{opcode}: empty stack"),
-                })
+                });
             }
         };
         self.charge(bytes, "PTH pickle memo clone")?;
@@ -1137,7 +1137,7 @@ impl<'a> PickleVm<'a> {
             None => {
                 return Err(AnamnesisError::Parse {
                     reason: format!("{opcode}: memo key {key} not found"),
-                })
+                });
             }
         };
         self.charge(children, "PTH pickle memo replay")?;
@@ -1146,7 +1146,7 @@ impl<'a> PickleVm<'a> {
             None => {
                 return Err(AnamnesisError::Parse {
                     reason: format!("{opcode}: memo key {key} not found"),
-                })
+                });
             }
         };
         Ok((val, depth))
@@ -1436,7 +1436,7 @@ impl<'a> PickleVm<'a> {
                         _ => {
                             return Err(AnamnesisError::Parse {
                                 reason: "STACK_GLOBAL: module/name are not strings".into(),
-                            })
+                            });
                         }
                     };
                     if !is_allowed_global(module, name) {
@@ -1697,13 +1697,13 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
                     reason: format!(
                         "tensor `{name}`: PersistentId payload is not a tuple: {other:?}"
                     ),
-                })
+                });
             }
         },
         other => {
             return Err(AnamnesisError::Parse {
                 reason: format!("tensor `{name}`: expected PersistentId, got {other:?}"),
-            })
+            });
         }
     };
 
@@ -1725,7 +1725,7 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
         other => {
             return Err(AnamnesisError::Parse {
                 reason: format!("tensor `{name}`: expected storage Global, got {other:?}"),
-            })
+            });
         }
     };
     let st2 = storage_tuple.get(2).ok_or_else(|| AnamnesisError::Parse {
@@ -1812,12 +1812,10 @@ fn unwrap_to_rebuild(val: &PickleValue, depth: u32) -> Option<(&PickleValue, &Pi
                 // REDUCE(_rebuild_parameter, TUPLE(REDUCE(_rebuild_tensor_v2, ...), ...))
                 if module == "torch._utils"
                     && (name == "_rebuild_parameter" || name == "_rebuild_parameter_with_state")
+                    && let PickleValue::Tuple(items) = args.as_ref()
+                    && let Some(first) = items.first()
                 {
-                    if let PickleValue::Tuple(items) = args.as_ref() {
-                        if let Some(first) = items.first() {
-                            return unwrap_to_rebuild(first, depth + 1);
-                        }
-                    }
+                    return unwrap_to_rebuild(first, depth + 1);
                 }
             }
             None
@@ -1856,14 +1854,15 @@ fn extract_dict_pairs(
             // {OrderedDict} reaches here, it indicates a bug in the VM
             // or an unrecognized opcode sequence. Returning Ok(&[]) would
             // silently lose all tensors — always error instead.
-            if let PickleValue::Global { module, name } = callable.as_ref() {
-                if module == "collections" && name == "OrderedDict" {
-                    return Err(AnamnesisError::Parse {
-                        reason: "OrderedDict arrived as Reduced (expected Dict \
-                                 after REDUCE rewrite); possible pickle VM bug"
-                            .into(),
-                    });
-                }
+            if let PickleValue::Global { module, name } = callable.as_ref()
+                && module == "collections"
+                && name == "OrderedDict"
+            {
+                return Err(AnamnesisError::Parse {
+                    reason: "OrderedDict arrived as Reduced (expected Dict \
+                             after REDUCE rewrite); possible pickle VM bug"
+                        .into(),
+                });
             }
             Err(AnamnesisError::Parse {
                 reason: format!("top-level pickle value is not a dict: {root:?}"),
@@ -1890,14 +1889,14 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     // previously computed stride[i+1]; an iterator chain cannot express this.
     for i in (0..ndim.saturating_sub(1)).rev() {
         // .get() returns Some because i < ndim-1 ⇒ i+1 < ndim
-        if let (Some(&prev), Some(&dim)) = (strides.get(i + 1), shape.get(i + 1)) {
-            if let Some(s) = strides.get_mut(i) {
-                // saturating_mul: overflow on astronomic shapes produces
-                // usize::MAX, causing is_contiguous() to return false
-                // and copy_to_contiguous() to fail with a checked error
-                // — safe but intentional degradation.
-                *s = prev.saturating_mul(dim);
-            }
+        if let (Some(&prev), Some(&dim)) = (strides.get(i + 1), shape.get(i + 1))
+            && let Some(s) = strides.get_mut(i)
+        {
+            // saturating_mul: overflow on astronomic shapes produces
+            // usize::MAX, causing is_contiguous() to return false
+            // and copy_to_contiguous() to fail with a checked error
+            // — safe but intentional degradation.
+            *s = prev.saturating_mul(dim);
         }
     }
     strides
@@ -2209,7 +2208,7 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
                         reason: format!(
                             "unknown byte order `{other}` (expected `little` or `big`)"
                         ),
-                    })
+                    });
                 }
             }
         }

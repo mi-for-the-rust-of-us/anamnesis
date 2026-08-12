@@ -48,7 +48,7 @@
 
 use std::time::Instant;
 
-use anamnesis::{dequantize_gguf_to_bf16, GgufType};
+use anamnesis::{GgufType, dequantize_gguf_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing

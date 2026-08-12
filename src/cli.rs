@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use crate::convert::{detect_format, ConvertOptions, ConvertTarget, Format};
-use crate::{format_bytes, parse, InspectInfo, TargetDtype};
+use crate::convert::{ConvertOptions, ConvertTarget, Format, detect_format};
+use crate::{InspectInfo, TargetDtype, format_bytes, parse};
 
 /// Parse any format, recover any precision.
 #[derive(Parser)]
@@ -91,6 +91,27 @@ enum Commands {
         /// a string — use `--gguf-metadata` for typed or array values.
         #[arg(long, value_name = "KEY=VALUE")]
         gguf_kv: Vec<String>,
+        /// Element type for tensors this conversion dequantises:
+        /// `bf16` (default), `f32`, or `f16`.
+        ///
+        /// Named `--out-dtype` rather than reusing `--to`, because on `convert`
+        /// `--to` already selects the output *format*. (On `remember`, `--to`
+        /// selects a dtype, so that subcommand needs no new flag.)
+        ///
+        /// `f32` emits the reference implementation's own `f32` with no
+        /// narrowing step of anamnesis's, at double the output bytes. `f16`
+        /// buys 3 significand bits over `bf16` and pays a far narrower exponent
+        /// range, saturating to infinity above 65504.
+        ///
+        /// Applies to **dequantised tensors only**. Passthrough tensors (norms,
+        /// biases, anything not block-quantised) keep their source dtype, so
+        /// this is not "rewrite every tensor as f32".
+        ///
+        /// v0.7.3 honours non-`bf16` values for `GGUF` input only; a quantised
+        /// safetensors input reports a clear error rather than silently
+        /// emitting `bf16`.
+        #[arg(long, value_name = "DTYPE", default_value = "bf16")]
+        out_dtype: String,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
         /// measured scaling knee — so the rest of the machine stays free.
         /// Values below 1 are clamped to 1 (fully sequential). Output is
@@ -142,6 +163,7 @@ pub fn run() -> crate::Result<()> {
             output,
             gguf_metadata,
             gguf_kv,
+            out_dtype,
             threads,
         } => {
             let resolved = resolve_input_path(path)?;
@@ -151,6 +173,7 @@ pub fn run() -> crate::Result<()> {
                 output.as_deref(),
                 gguf_metadata.as_deref(),
                 &gguf_kv,
+                &out_dtype,
                 threads,
             )
         }
@@ -747,16 +770,42 @@ fn build_convert_options(
 /// Runs the `convert` subcommand: parses the `--to` target, derives an output
 /// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
 /// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
+/// Parses `--out-dtype` into the element type the dequantised tensors get.
+///
+/// Accepts exactly the three dequantisation output widths, case-insensitively.
+/// Deliberately **not** an `impl FromStr for Dtype`: `Dtype` names 15 element
+/// types, and a `FromStr` on it would advertise that `--out-dtype i64` is a
+/// meaningful request. The error string lists what is actually accepted, in the
+/// same wording `TargetDtype`'s parser uses on the `remember` side.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32` or
+/// `f16`.
+fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
+    match s.to_ascii_lowercase().as_str() {
+        "bf16" => Ok(crate::Dtype::BF16),
+        "f32" => Ok(crate::Dtype::F32),
+        "f16" => Ok(crate::Dtype::F16),
+        other => Err(crate::AnamnesisError::Unsupported {
+            format: other.to_owned(),
+            detail: "supported output dtypes: bf16, f32, f16".to_owned(),
+        }),
+    }
+}
+
 fn run_convert(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
     gguf_metadata: Option<&std::path::Path>,
     gguf_kv: &[String],
+    out_dtype: &str,
     threads: Option<usize>,
 ) -> crate::Result<()> {
     let target = ConvertTarget::parse(to)?;
-    let options = build_convert_options(gguf_metadata, gguf_kv)?;
+    let dequant_dtype = parse_out_dtype(out_dtype)?;
+    let options = build_convert_options(gguf_metadata, gguf_kv)?.with_output_dtype(dequant_dtype);
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
     // caller's `--threads`, clamped to at least 1 by the builder.
     let options = match threads {
@@ -764,7 +813,9 @@ fn run_convert(
         None => options,
     };
     let output_path = output.map_or_else(
-        || crate::convert::derive_output_path(path, target),
+        // Name the file after the dtype it will actually hold: `--out-dtype
+        // f32` must not derive `model-bf16.safetensors`.
+        || crate::convert::derive_output_path_for_dtype(path, target, dequant_dtype),
         Path::to_owned,
     );
 
@@ -782,7 +833,10 @@ fn run_convert(
     let stats = crate::convert::convert(path, target, &output_path, &options)?;
 
     if stats.dequantized > 0 {
-        println!("  {} dequantized to BF16", stats.dequantized);
+        // Report the dtype actually written, not a hard-coded "BF16": since
+        // v0.7.3 that is a caller choice, and a line claiming BF16 while the
+        // file holds F32 would be worse than no line at all.
+        println!("  {} dequantized to {dequant_dtype}", stats.dequantized);
     }
     if stats.quantized > 0 {
         println!(

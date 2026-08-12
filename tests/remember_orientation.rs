@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 
-use anamnesis::{parse, TargetDtype};
+use anamnesis::{TargetDtype, parse};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -198,8 +198,8 @@ fn awq_remember_emits_out_in_orientation() {
     let in_features = 8usize;
     let out_features = 16usize;
     let pack_factor = 8usize; // 4-bit
-                              // AWQ_REVERSE_ORDER from awq/utils/packing_utils.py: logical column
-                              // offset jo is stored at bit position 4 × REV[jo].
+    // AWQ_REVERSE_ORDER from awq/utils/packing_utils.py: logical column
+    // offset jo is stored at bit position 4 × REV[jo].
     let rev = [0usize, 4, 1, 5, 2, 6, 3, 7];
 
     // qweight [in, out/pf] = [8, 2] I32, AutoAWQ interleave.
@@ -284,7 +284,7 @@ fn awq_remember_emits_out_in_orientation() {
 #[cfg(feature = "bnb")]
 #[test]
 fn bnb4_remember_preserves_out_in_shape() {
-    use anamnesis::{write_bnb_nf4_safetensors_bytes, BnbWriteInput};
+    use anamnesis::{BnbWriteInput, write_bnb_nf4_safetensors_bytes};
 
     // Non-square [6, 64] BF16 source (384 elements, multiple of 64).
     let rows = 6usize;

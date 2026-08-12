@@ -48,7 +48,26 @@ Before tagging a release (`v*`), complete these steps in order:
 5. Commit as `bump version to vX.Y.Z, update changelog date`
 6. Push the commit, wait for CI to go GREEN
 7. `git tag vX.Y.Z && git push origin vX.Y.Z`
-8. Wait for the publish workflow to go GREEN
+8. Wait for the publish workflow to go GREEN. Since v0.7.3 it does **two**
+   things: `cargo publish`, then `gh release create` for the tag. The Release
+   is what carries the test corpus, because `Cargo.toml`'s `exclude` keeps
+   `tests/` out of the published crate (0.60 MiB instead of 4.8 MiB), and
+   GitHub's per-tag source tarball ships it verbatim.
+9. Check the Release actually appeared and its notes are the right section.
+   The workflow slices them out of `CHANGELOG.md` by matching
+   `## [X.Y.Z]`, and **fails the job** if no section matches — which is the
+   intended alarm for "step 3 was skipped and `## [Unreleased]` was never
+   renamed". Release creation runs *after* `cargo publish` on purpose, so a
+   Release can never advertise a version whose publish failed.
+
+**Two checks specific to the packaging split**, worth running before the tag:
+
+- `cargo package --list | grep '^tests/'` must print **nothing**. If it does,
+  the `exclude` regressed and the crate is about to grow ~8×.
+- `scripts/verify-claims.sh` (or `.ps1`) should pass from a clean checkout.
+  That is the path the README points a consumer at for verifying the
+  correctness claims, so it needs to work at the tag, not just on your
+  machine.
 
 **Never tag before bumping `Cargo.toml`** — `cargo publish` will reject the crate if the version in the registry already exists.
 

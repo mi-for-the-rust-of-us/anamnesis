@@ -26,11 +26,7 @@ const GEMMA_SCOPE_RELATIVE: &str = ".cache/huggingface/hub/\
 fn gemma_scope_path() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let path = PathBuf::from(home).join(GEMMA_SCOPE_RELATIVE);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 #[test]

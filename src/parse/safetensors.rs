@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 
+use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::ParseLimits;
 
 /// Sanity cap on the safetensors header length declared by the 8-byte
 /// little-endian prefix.
@@ -819,28 +819,29 @@ fn infer_awq_config(entries: &[TensorEntry]) -> Option<AwqConfig> {
     {
         let base = entry.name.strip_suffix(".qweight")?;
         let scales_name = format!("{base}.scales");
-        if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
-            if entry.shape.len() >= 2 && scales.shape.len() >= 2 {
-                let in_features = entry.shape.first().copied()?;
-                let qw_cols = entry.shape.last().copied()?;
-                let num_groups = scales.shape.first().copied()?;
-                let out_features = scales.shape.last().copied()?;
+        if let Some(scales) = entries.iter().find(|e| e.name == scales_name)
+            && entry.shape.len() >= 2
+            && scales.shape.len() >= 2
+        {
+            let in_features = entry.shape.first().copied()?;
+            let qw_cols = entry.shape.last().copied()?;
+            let num_groups = scales.shape.first().copied()?;
+            let out_features = scales.shape.last().copied()?;
 
-                if qw_cols == 0 || out_features == 0 || num_groups == 0 || in_features == 0 {
-                    return None;
-                }
+            if qw_cols == 0 || out_features == 0 || num_groups == 0 || in_features == 0 {
+                return None;
+            }
 
-                // AWQ: out_features = qw_cols * pack_factor → pack_factor = out_features / qw_cols
-                if out_features.is_multiple_of(qw_cols) {
-                    let pack_factor = out_features / qw_cols;
-                    for bits in [4u8, 8] {
-                        // CAST: u8 → usize, bits is 4 or 8
-                        #[allow(clippy::as_conversions)]
-                        let expected_pf = 32 / bits as usize;
-                        if pack_factor == expected_pf && in_features.is_multiple_of(num_groups) {
-                            let group_size = in_features / num_groups;
-                            return Some(AwqConfig { bits, group_size });
-                        }
+            // AWQ: out_features = qw_cols * pack_factor → pack_factor = out_features / qw_cols
+            if out_features.is_multiple_of(qw_cols) {
+                let pack_factor = out_features / qw_cols;
+                for bits in [4u8, 8] {
+                    // CAST: u8 → usize, bits is 4 or 8
+                    #[allow(clippy::as_conversions)]
+                    let expected_pf = 32 / bits as usize;
+                    if pack_factor == expected_pf && in_features.is_multiple_of(num_groups) {
+                        let group_size = in_features / num_groups;
+                        return Some(AwqConfig { bits, group_size });
                     }
                 }
             }
@@ -1572,7 +1573,7 @@ mod tests {
     /// unbounded default accepts, on both the slice and reader entry points.
     #[test]
     fn safetensors_header_respects_parse_limits() {
-        use safetensors::tensor::{serialize, TensorView};
+        use safetensors::tensor::{TensorView, serialize};
 
         let data: Vec<u8> = vec![0; 4];
         let tensors = vec![(
@@ -1584,11 +1585,13 @@ mod tests {
 
         // Default (unbounded) parses on both the slice and reader paths.
         assert!(parse_safetensors_header_with_limits(&buffer, &ParseLimits::default()).is_ok());
-        assert!(parse_safetensors_header_from_reader_with_limits(
-            std::io::Cursor::new(&buffer),
-            &ParseLimits::default()
-        )
-        .is_ok());
+        assert!(
+            parse_safetensors_header_from_reader_with_limits(
+                std::io::Cursor::new(&buffer),
+                &ParseLimits::default()
+            )
+            .is_ok()
+        );
 
         // A 1-byte single-allocation ceiling rejects the dozens-of-bytes header.
         let tight = ParseLimits::default().with_max_single_alloc(1);
@@ -1687,7 +1690,7 @@ mod tests {
     /// adapter) cannot change the metadata.
     #[test]
     fn parse_from_reader_matches_slice_minimal() {
-        use safetensors::tensor::{serialize, TensorView};
+        use safetensors::tensor::{TensorView, serialize};
 
         // One BF16 tensor: 2 elements × 2 bytes = 4 bytes of data.
         let data: Vec<u8> = vec![0; 4];
@@ -1726,7 +1729,7 @@ mod tests {
     /// per-tensor metadata.
     #[test]
     fn parse_from_reader_matches_slice_fp8_with_scale() {
-        use safetensors::tensor::{serialize, TensorView};
+        use safetensors::tensor::{TensorView, serialize};
 
         let weight_data: Vec<u8> = vec![0; 4];
         let scale_data: Vec<u8> = vec![0; 8];

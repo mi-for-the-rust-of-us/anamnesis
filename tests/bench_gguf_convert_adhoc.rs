@@ -56,7 +56,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anamnesis::{convert, ConvertOptions, ConvertTarget};
+use anamnesis::{ConvertOptions, ConvertTarget, convert};
 
 /// Best-of-N sample count. `CLAUDE.md` mandates best-of-5 for a perf-claim
 /// commit; this harness runs the same 5 so the reported median is the one the

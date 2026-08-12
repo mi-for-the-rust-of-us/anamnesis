@@ -803,7 +803,7 @@ mod tests {
         let nested_quant_map_bytes = f32_to_bytes(&nested_quant_map);
 
         let nested_absmax_bytes = f32_to_bytes(&[4.0]); // nested scale = 4.0
-                                                        // Recovered absmax = nested_quant_map[2] * nested_absmax[0] = 0.5 * 4.0 = 2.0
+        // Recovered absmax = nested_quant_map[2] * nested_absmax[0] = 0.5 * 4.0 = 2.0
 
         let absmax_data = vec![2u8]; // 1 block, absmax byte = 2
         let weight_data = vec![0x10]; // nibbles: high=1, low=0
@@ -883,7 +883,7 @@ mod tests {
         // Row 0: scale = 127.0/127.0 = 1.0
         assert_eq!(read_bf16(&out, 0), 1.0); // 1 * 1.0
         assert_eq!(read_bf16(&out, 1), -1.0); // -1 * 1.0
-                                              // Row 1: scale = 254.0/127.0 = 2.0
+        // Row 1: scale = 254.0/127.0 = 2.0
         assert_eq!(read_bf16(&out, 2), 4.0); // 2 * 2.0
         assert_eq!(read_bf16(&out, 3), -4.0); // -2 * 2.0
     }

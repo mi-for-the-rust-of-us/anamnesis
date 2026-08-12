@@ -39,6 +39,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 9 | `convert` copy-elimination pass (avoid hub-sized copies + one `O(P·N)` scan) | **Confirmed: peak −39 % (bnb), −25 % (gguf KV), −49.6 % (npz)** — each drop equals exactly the one eliminated copy | Shipped (v0.6.9, Phase 6.14) |
 | 10 | Phase 7 SIMD exhaustion — is explicit AVX2 worth it anywhere in the dequant kernels? | **No. Bit-exact hand-written AVX2 `f32x8_to_bf16x8` gains 1.02×/1.04× (null) — writer is bandwidth-bound. FP8 already auto-AVX2 yet compute-bound; GPTQ/AWQ arithmetic already vectorizes; slowest kernels (IQ2/IQ3) are gather-bound (AVX2 gather slow on Zen 3). Compiler already captures the SIMD; limits are memory bandwidth + codebook gathers. Real headroom = multi-threading (single-threaded on 16 cores)** | SIMD exhausted with evidence, no product `unsafe` shipped (branch `phase-7-cpu-simd`); bench harness kept as proof; next = multi-threaded dequant |
 | 11 | Phase 7 multi-threaded dequant — prototype scaling (`std::thread::scope`) | **Real but bounded, ~3–4× (not core-count-linear): FP8 (memory-heavy) 2.9×, IQ3_S (compute/gather-heavy) 4.0× at 16 threads — both plateau (bandwidth + all-core-clock ceilings). Per-thread `Vec` alloc caps FP8 at 2.2×; the disjoint `split_at_mut` output pattern (no alloc, no zero-fill) recovers it to 2.9×** | Prototype (branch `phase-7-cpu-simd`) — confirms multi-threading is the real lever and that the disjoint-output-slice pattern matters; corrects an earlier "4–16×" over-estimate |
+| 13 | Phase 7.3 caller-chosen output dtype — what `F32` and `F16` cost | **A capability, not a perf claim: `F32` is *expected* to be slower and is. Kernel level 1.79× slower than `BF16` against 2.00× of output bytes, so the cost is the doubled write and nothing else. End to end 1.54×/1.61× (1/4 threads), less than the kernel figure because fixed parse cost does not scale. The Phase 7.2 threading ratio shifts 1.19× → 1.14×, as a more bandwidth-bound path should. `BF16` default did not regress (`p = 0.41`, `p = 0.13`). All three writers vectorise: `Bf16Out` 8-wide AVX2, `F32Out` 8-wide stores, `F16Out` 4-wide F16C. Peak heap equals output exactly at every width, streaming peak is 0 B** | Shipped (v0.7.3, Phase 7.3) |
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36×: the output write is ~60 % of the wall clock (Amdahl). Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 
 ---
@@ -1160,3 +1161,111 @@ hardware-resolved default, with the end-to-end figure reported separately rather
 per-tensor sub-slices (the Experiment 11 disjoint-output pattern) — the only identified route
 past the ~2× `Vec`-per-tensor ceiling. Measure against the 4-thread medians above, and weigh the
 result against the Phase 6.14 copy-elimination gains it would disturb.
+
+---
+
+## Experiment 13 — Phase 7.3 caller-chosen output dtype: what `F32` and `F16` cost
+
+**Question.** Phase 7.3 makes the `GGUF` dequantisation output width a caller-chosen parameter.
+`F32` doubles the output bytes on a path Experiment 12 showed is bandwidth-bound, so it is
+*expected* to be slower. How much slower, does the default `BF16` path regress, and does the
+Phase 7.2 threading ratio hold?
+
+**This is a capability, not a perf claim.** `CLAUDE.md`'s "no measured win, no commit" rule
+governs *perf-claim* commits. This phase claims **exactness**: `F32` output removes anamnesis's
+own narrowing step, so the emitted value is the reference's own `f32`. A correct-but-slower
+`F32` path is the point of it. The numbers below are recorded as the honest cost of the new
+option, not as a result to be optimised before shipping.
+
+**Method.** Criterion, release, `RUSTFLAGS="-C target-cpu=native"`, 5950X / Windows 11.
+Kernel level: `cargo bench --features "gptq awq bnb gguf" --bench dequant -- dequant_gguf_q4_k`
+on a synthetic 4096 × 11008 `Q4_K` tensor (45 088 768 elements). End to end:
+`cargo bench --features gguf --bench convert -- convert_gguf_to_safetensors` on the ~10.6 `MiB`
+quantised `GGUF` fixture, which includes the output file write.
+
+### Kernel level (`dequant_gguf_q4_k`)
+
+| Output dtype | median | range | throughput | vs `BF16` |
+|---|---:|---|---:|---:|
+| `BF16` | **20.300 ms** | [19.575, 21.142] | 2.2211 Gelem/s | 1.00× |
+| `F32` | **36.298 ms** | [34.508, 38.283] | 1.2422 Gelem/s | **1.79× slower** |
+
+**1.79× against 2.00× of output bytes.** The cost is very nearly the doubled write and nothing
+else, which is what "the kernels already compute in `f32`, `F32` output simply stops narrowing"
+predicts: pass 1 is unchanged, and pass 2 writes twice as much. The shortfall from 2.00× is the
+shared input read and unpack.
+
+### End to end (`convert_gguf_to_safetensors`, includes the output write)
+
+| Output dtype | 1 thread | 4 threads | threading gain |
+|---|---:|---:|---:|
+| `BF16` | 17.939 ms | 15.134 ms | 1.19× |
+| `F32` | 27.694 ms | 24.376 ms | 1.14× |
+| **`F32` vs `BF16`** | **1.54×** | **1.61×** | |
+
+Two things worth reading off this table. End-to-end `F32` costs **less** than the kernel-level
+1.79×, because the fixed parse and file-open costs do not scale with output width. And the
+**threading ratio shifts down**, 1.19× → 1.14×, exactly as predicted: `F32` moves more bytes per
+unit of compute, so the path is more bandwidth-bound and threading buys slightly less. Phase 7.2's
+ratios remain valid for `BF16`; do not quote them for `F32`.
+
+### The `BF16` default did not regress
+
+The generic refactor makes `Bf16Out::write_scratch` byte-for-byte the loop that shipped as
+`write_scratch_to_bf16`, so the default path's codegen should be unchanged by construction. The
+measurements agree: the two end-to-end `BF16` arms report `p = 0.41` and `p = 0.13` against their
+stored baselines, i.e. **no statistically significant change**. The kernel arm reported a nominal
+−9.8 % (`p = 0.02`); that is recorded rather than claimed as a win, since nothing in the change
+plausibly makes `BF16` faster and run-to-run variation on an interactive machine is the more
+likely explanation.
+
+### Vectorisation, verified per implementation
+
+`RUSTFLAGS="-C target-cpu=native --emit=asm"`, inspecting each `dispatch_streaming::<E, _>`
+monomorphisation. This is why the trait carries a block-level `write_scratch` rather than a
+per-element hook: three independent loops, three independent verdicts.
+
+| Impl | Evidence | Width |
+|---|---|---|
+| `Bf16Out` | `vpaddd`, `vpsrld`, `vpand`, `vmovdqu` on `%ymm` | 8-wide AVX2 |
+| `F32Out` | `vmovups` on `%ymm` | 8-wide AVX2 stores |
+| `F16Out` | `vcvtps2ph $0, %xmm, %xmm` (F16C) | 4-wide packed |
+
+All three are packed; none fell back to scalar. `F16Out` is narrower because `vcvtps2ph` takes a
+128-bit source, which is a hardware property rather than a missed vectorisation. Its `$0`
+immediate is round-to-nearest-even, so the documented `F16` rounding is enforced by the
+instruction itself.
+
+### No `F16` throughput arm, deliberately
+
+`F16` is the same width as `BF16`, so there is no bandwidth story to tell, and a benchmark would
+only re-measure `BF16`'s number with a different conversion instruction. `F16`'s interesting
+properties are accuracy (11 significand bits against 8) and exponent range (saturating to infinity
+above 65504, where `BF16` shares `f32`'s range), and both are **tests**, in
+`src/remember/output.rs`, not benchmarks.
+
+### Memory, verified to the byte
+
+`tests/peak_heap_gguf.rs` (`dhat`, release, 45 M-element `Q4_K`):
+
+| Path | `BF16` | `F16` | `F32` |
+|---|---:|---:|---:|
+| owned `Vec` peak | 90 177 536 B | 90 177 536 B | 180 355 072 B |
+| overhead above output | **0 B** | **0 B** | **0 B** |
+| streaming peak | **0 B** | — | **0 B** |
+
+Peak equals output exactly at every width, and `F32` is exactly twice `BF16`. The streaming entry
+point allocates nothing at all on the heap for a 45 M-element tensor, which is its `# Memory`
+claim confirmed literally rather than argued.
+
+### Monomorphisation cost
+
+Three output types across the two block runners duplicate two small writer loops, not the 24
+kernel functions, because every kernel funnels through one shared pass-2 writer. Release
+`libanamnesis` binary size is unchanged at the resolution `ls` reports; the `.crate` stayed at
+0.60 MiB. This economy is specific to `GGUF` and is precisely why Phase 7.4 (the `remember`
+path's four fused-narrowing families) is a separate tag.
+
+**Verdict:** shipped (v0.7.3, Phase 7.3). `F32` costs 1.79× at the kernel and 1.54–1.61×
+end to end, for output that is bit-identical to `gguf-py`'s own `f32`. Optimising it is a
+follow-up, not a gate.

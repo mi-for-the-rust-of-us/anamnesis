@@ -75,9 +75,9 @@
 
 use std::path::PathBuf;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use anamnesis::{convert, ConvertOptions, ConvertTarget, RememberOptions, TargetDtype};
+use anamnesis::{ConvertOptions, ConvertTarget, RememberOptions, TargetDtype, convert};
 
 /// The two budgets every group is measured at: the sequential baseline and the
 /// library's default `min(cores, 4)`.
@@ -334,6 +334,33 @@ fn bench_convert_gguf_to_safetensors(c: &mut Criterion) {
                     &ConvertOptions::new().with_threads(threads),
                 )
                 .expect("convert gguf -> safetensors");
+                black_box(stats);
+            });
+        });
+    }
+    // Phase 7.3: end-to-end cost of `F32` output, where the doubled write meets
+    // the output stage that Experiment 12 measured at ~60 % of wall clock. This
+    // is the number that answers "what does --out-dtype f32 cost me", as
+    // distinct from the kernel-level arm in benches/dequant.rs.
+    //
+    // Added as a sibling id rather than a rename: renaming `threads_{n}` would
+    // orphan its CodSpeed history, and that BF16 series is exactly the baseline
+    // this phase must not regress. Records rather than gates.
+    for threads in BUDGETS {
+        let output = out_dir
+            .path()
+            .join(format!("out-f32-t{threads}.safetensors"));
+        group.bench_function(format!("threads_{threads}_f32"), |b| {
+            b.iter(|| {
+                let stats = convert(
+                    black_box(&input),
+                    ConvertTarget::Safetensors,
+                    &output,
+                    &ConvertOptions::new()
+                        .with_threads(threads)
+                        .with_output_dtype(anamnesis::Dtype::F32),
+                )
+                .expect("convert gguf -> safetensors f32");
                 black_box(stats);
             });
         });

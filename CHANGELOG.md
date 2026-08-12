@@ -5,9 +5,154 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.3] - 2026-08-12
 
 ### Added
+
+- **The `GGUF` dequantisation output type is now caller-chosen**
+  (`src/remember/output.rs`, `src/remember/gguf.rs`). A new sealed
+  `OutputElement` trait with three implementations, `Bf16Out` (the unchanged
+  default), `F32Out` and `F16Out`, replaces the hard-coded `BF16` narrowing that
+  every kernel has performed since the crate's first commit. Two new entry
+  points, `dequantize_gguf::<E>` and `dequantize_gguf_blocks::<E>`;
+  `dequantize_gguf_to_bf16` and `dequantize_gguf_blocks_to_bf16` remain as
+  `#[inline]` `Bf16Out` wrappers, so **no existing caller changes**.
+
+  **Why it matters.** `BF16` keeps 8 significand bits, but a `Q8_0` value is an
+  `f16` scale times an `int8` and needs about 18; `Q6_K` needs 24. Measured on
+  `SmolLM2-135M-Q4_K_M`, only **3 to 20 %** of dequantised values are exactly
+  `BF16`-representable. The usual defence, that quantisation error dwarfs the
+  rounding, fails precisely where it matters most: `Q8_0`'s own quantisation
+  step is the *same order* as `BF16`'s half-`ULP`, so the crate was adding
+  rounding comparable to the error the format exists to avoid. `F32Out` adds no
+  narrowing step of its own, so its output **is** the reference's `f32`.
+
+  **All 24 kernel bodies are untouched.** Only their signatures thread the type
+  parameter through; the bit manipulation, the formulas and every annotation are
+  byte-identical, which the 22 existing cross-validation fixtures confirm by
+  still passing unchanged. That economy is specific to `GGUF`, where all 24
+  kernels funnel through one pass-2 writer, and is why the `remember` path's
+  four families are a separate phase.
+
+  **The streaming sink's block length is now dtype-dependent**: `QK × E::BYTES`,
+  so 64 B / 512 B at `BF16` and `F16` but 128 B / 1024 B at `F32`. A sink that
+  hard-codes `chunks_exact(2)` is correct only for the 2-byte types. The public
+  docs carry the table and a test asserts the observed length per output type,
+  so the assumption fails loudly rather than silently misreading `F32` output as
+  twice as many `BF16` values.
+
+  `F16` follows **plain IEEE semantics** via `half::f16::from_f32`: overflow to
+  infinity, flush to zero below roughly `2⁻²⁴`, round-to-nearest-even between.
+  Deliberately not saturating, which would fabricate a value no reference
+  produces and put `F16` cross-validation permanently at odds with `NumPy` and
+  `PyTorch`. This range is reachable in real data: `MXFP4`'s `E8M0` scale spans
+  `2⁻¹²⁸` to `2¹²⁷`. Note that `F16` is **not** uniformly the better 2-byte
+  choice, since it buys 3 significand bits and pays a far narrower exponent
+  range.
+
+  The trait is **sealed**. Its contract is a byte-level invariant the
+  cross-validation depends on, and an outside implementation could break it
+  while every test stayed green. Sealing is also the reversible direction:
+  un-sealing later is not a breaking change, sealing later would be.
+
+- **`ParsedGguf::dequantize_tensor_as::<E>`** (`src/parse/gguf.rs`), the
+  per-tensor counterpart of the whole-file option. `dequantize_tensor` remains
+  as the `BF16` spelling. Without it, a caller wanting `F32` for a single tensor
+  would have had to re-implement the offset, byte-length and element-count
+  validation that method exists to encapsulate, which would have left the
+  per-tensor path worse off than the whole-file one.
+
+- **`convert` and the CLI can now choose that output dtype**
+  (`src/convert.rs`, `src/cli.rs`, `docs/FAQ.md`).
+  `ConvertOptions::output_dtype` with a `with_output_dtype` builder matching
+  `with_threads`, and `amn convert --out-dtype bf16|f32|f16`. The flag is named
+  `--out-dtype` rather than reusing `--to` because on `convert` `--to` already
+  selects the output *format*; on `remember`, `--to` already selects a dtype, so
+  that subcommand needs no new flag when Phase 7.4 lands.
+
+  The option takes a `Dtype` rather than introducing a narrower enum, because
+  that is already the type a hub tensor carries, so no third dtype vocabulary
+  enters the crate. Values outside `{BF16, F32, F16}` are rejected at the
+  boundary with a message listing what is accepted.
+
+  **Passthrough policy, now stated rather than assumed.** `remember` and
+  `convert` have always emitted mixed-dtype files, with dequantised tensors at
+  `BF16` and passthrough tensors keeping their source dtype. `--out-dtype`
+  widens **dequantised tensors only**: an `F16` norm stays an `F16` norm and an
+  `F32` tensor stays byte-identical. Widening a passthrough tensor would invent
+  precision that was never in the file while doubling its size, and a caller who
+  wants a uniform-dtype file wants a cast pass, which is a different operation.
+  Asserted per tensor in `convert_honours_every_output_dtype_end_to_end`, not
+  merely documented.
+
+  **Scope, made explicit in the error rather than silently.** Only the `GGUF`
+  reader honours a non-`BF16` request in v0.7.3. A quantised safetensors input
+  returns `Unsupported` naming v0.7.4 and the reason (those four families narrow
+  inside their hot loops), so the caller never gets a file whose dtype differs
+  from the request. `NPZ` and `.pth` dequantise nothing, so the option is
+  vacuous there and is accepted rather than refused, since erroring on
+  `--out-dtype f32` for an already-`F32` `NPZ` would be hostile.
+
+  Determinism is re-established **per dtype**: output is byte-identical across
+  `{1, 2, 4, 8}` threads at each of the three widths, rather than assumed to
+  carry over from the `BF16` suite.
+
+  **A derived output filename now names the dtype it actually holds**
+  (`derive_output_path_for_dtype`, new; `derive_output_path` kept unchanged as
+  the `BF16` spelling, so no caller breaks). `ConvertTarget::suffix()` returns
+  `bf16` for the safetensors target, which was correct while `BF16` was the only
+  possible answer; without this, `amn convert --out-dtype f32` would have
+  written `F32` tensors into `model-bf16.safetensors`. That is worse than an
+  unhelpful name because it is an actively wrong one. The `gguf` and `bnb-nf4`
+  targets keep their own suffix, since there it names a container or an encoding
+  rather than an element type.
+
+- **All 22 `GGUF` kernels are now cross-validated at `F32`, bit-exactly**
+  (`tests/cross_validation_gguf.rs`,
+  `tests/fixtures/gguf_reference/generate_gguf.py`). Every cross-validation
+  before this rounded the `gguf-py` reference to `BF16` before comparing, which
+  discarded 16 mantissa bits: **no kernel's `f32` had ever been checked at full
+  width.** A kernel could have associated its arithmetic differently from the
+  reference (`(d·sc)·q` against `d·(sc·q)`, or a contraction on a `d·q - dmin·m`
+  line) and every fixture would still have passed.
+
+  **The result: 22 of 22 pass, exactly, with no tolerance.** This was the step
+  the ROADMAP told us to budget for failing, so the null result is worth
+  stating plainly rather than passing over. All 22 production kernels already
+  associate their arithmetic identically to `gguf-py`. Nothing needed fixing;
+  what changed is that it is now *verified* rather than assumed.
+
+  Exact bit equality is the right bar, not an epsilon: anamnesis computes in
+  `f32` and so does `gguf-py`, so identical operations in identical order must
+  produce identical bits, and any difference is a real divergence rather than
+  accumulated noise.
+
+  **The comparison has teeth, and that was demonstrated rather than asserted.**
+  Across the 22 fixtures, **76.5 %** of the 1 441 792 reference values (1 102 549
+  of them) carry mantissa bits `BF16` cannot represent, so the new assertion
+  reads information the old one discarded. Flipping a single mantissa bit in one
+  golden makes exactly one of 65 536 elements fail at 1 `ULP` while the `BF16`
+  comparison stays green, which is the hidden-16-bits problem shown directly.
+
+  Fixtures move to a **versioned container** (magic `AMNG`, version 2) carrying
+  the `BF16` and `F32` goldens side by side; the previous layout had neither
+  magic nor version and so could not be extended unambiguously. The Rust reader
+  rejects any other version by name instead of misreading offsets.
+
+  Both goldens come from `gguf-py`. The `BF16` one is **not** derived by
+  rounding the `F32` one in Rust, which would compare anamnesis's output against
+  a golden produced by anamnesis's own rounding, i.e. the circular-fixture class
+  that shipped three green bugs in v0.6.4.
+
+  `generate_gguf.py --upgrade` rebuilds the fixtures **from their own raw
+  quantised bytes**, so the `F32` goldens are reproducible from a clean checkout
+  with `pip install gguf numpy` and no multi-`GiB` model download. Each upgrade
+  re-derives the `BF16` golden and refuses to proceed unless it reproduces the
+  committed one byte for byte, so a differing `gguf` version fails loudly
+  instead of silently rebasing the reference. All 22 verified unchanged.
+
+  The fixtures grew ~6 MB, which costs the published crate nothing: `tests/` is
+  now excluded, and the `.crate` stayed at **0.60 MiB** across this change.
 
 - **ThreadSanitizer is now gating, with an instrumented `std`**
   (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
@@ -50,6 +195,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag sources work**; the `core` fingerprint change that looked like proof was
   just the ABI flag altering the fingerprint. There is no Cargo bug here.
 
+- **The crate is now on Rust Edition 2024** (`Cargo.toml`, plus twelve
+  hand-written sites). `rust-version = "1.88"` already cleared the edition's
+  1.85 floor, so the MSRV is unchanged and no consumer needs a newer toolchain.
+
+  Only one site changed meaning rather than spelling. In
+  [`src/parallel.rs`](src/parallel.rs), `handle.join()` was a `match` scrutinee
+  whose temporary may carry a custom destructor (the `Err` arm holds a panic
+  payload as a `Box<dyn Any>`), and Edition 2024 drops such a temporary
+  **earlier** than 2021 relative to the iterator in the matched arm
+  (`tail_expr_drop_order`). The join result is now bound to a local first, which
+  pins the drop point identically under both editions. The reordering is inert
+  here in any case, and that was checked rather than assumed: the lint's own
+  caveat is to inspect the `impl Drop`s for side effects like releasing a lock
+  or sending a message, and there are none on either path.
+
+  The rest is spelling. Edition 2024 stabilises let-chains, so eight nested
+  `if let` blocks that previously *could not* be collapsed now can and must
+  (`clippy::collapsible_if`), across `src/parse/{pth, safetensors, ollama}.rs`
+  and `tests/panic_profile.rs`. And `unsafe_op_in_unsafe_fn` is an error rather
+  than a lint, so the AVX2 experiment in `tests/bench_pass2_adhoc.rs` states its
+  bounds argument per operation instead of inheriting it from the `unsafe fn`
+  signature, which is a strict improvement in what the `// SAFETY:` comments
+  actually claim.
+
+  Two knock-on effects worth recording. Cargo's resolver moves to **v3**, which
+  is MSRV-aware: `cargo update` now reports "latest Rust 1.88 compatible
+  versions" and will no longer propose a dependency that would silently raise
+  the floor. It selected nothing new, so the lockfile is byte-identical across
+  the flip. Separately, rustfmt's default `style_edition` follows the language
+  edition; that reformat is deliberately **not** in this change, so the diff
+  here is the migration and nothing else.
+
 ### Changed
 
 - **Repository metadata now points at the `mi-for-the-rust-of-us` organization**
@@ -77,6 +254,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **This fix only reaches crates.io on the next release** — registry metadata is
   frozen per published version and cannot be amended in place.
+
+- **The published crate no longer carries the test corpus, and is 8× smaller**
+  (`Cargo.toml` `exclude`). `tests/` joins `fuzz/` in the exclude list. Measured
+  with `cargo publish --dry-run`: the payload drops to 2.2 MiB of almost
+  entirely text and gzips to **628 687 bytes (0.60 MiB)**, against the
+  **4.8 MiB** crates.io served for `0.7.2`. `tests/fixtures` alone was 6.33 MiB
+  of binary goldens, which is 71 % of everything tracked and reachable from
+  nobody's build.
+
+  Nothing else was dropped: `README.md`, `CHANGELOG.md`, `ROADMAP.md`,
+  `CONVENTIONS.md`, all of `docs/`, and `benches/` still ship. `benches/` stays
+  deliberately, because the `[[bench]]` targets are declared explicitly in
+  `Cargo.toml` and would dangle without their sources.
+
+  **The tests are not gone.** Every tag now gets a GitHub Release, and GitHub's
+  per-tag source tarball carries `tests/` verbatim;
+  `scripts/verify-claims.ps1` / `.sh` run the cross-validation suites from
+  there. See *Verifying the correctness claims* in the `README`.
+
+  Beyond the download, this removes a constraint that had started pointing the
+  wrong way. The 10 MiB registry cap was beginning to bound how wide the
+  cross-validation goldens could be, and a test corpus should be sized by the
+  correctness claim it has to support, not by a packaging limit. The release
+  gate is unaffected: `cargo package`'s verification build never compiled test
+  code, and `publish.yml` runs `cargo test --all-features` before `cargo
+  publish`.
 
 - **Dependencies refreshed** (`Cargo.lock`). 52 packages moved to their latest
   semver-compatible versions. Every change is transitive: no direct dependency

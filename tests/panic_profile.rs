@@ -39,10 +39,10 @@ fn profile_value<'a>(toml: &'a str, header: &str, key: &str) -> Option<&'a str> 
         if trimmed.starts_with('#') {
             continue; // comment, e.g. prose quoting `panic = "abort"`
         }
-        if let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim() == key {
-                return Some(v.trim().trim_matches('"'));
-            }
+        if let Some((k, v)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            return Some(v.trim().trim_matches('"'));
         }
     }
     None

@@ -141,6 +141,19 @@ machine-specific and should not be compared across machines.
 | `dequant_bnb_nf4` (b64) | 37.6 ms | 1.20 Gelem/s |
 | `dequant_bnb_int8` | 25.6 ms | 1.76 Gelem/s |
 | `dequant_gguf_q4_k` | 22.5 ms | 2.01 Gelem/s |
+| `dequant_gguf_q4_k` `_f32` (v0.7.3) | 36.3 ms | 1.24 Gelem/s |
+
+The `_f32` arm **records, it does not gate.** `F32` output doubles the
+bytes written on a bandwidth-bound path, so it is *expected* to be
+slower: 1.79× against 2.00× of output, meaning the cost is the doubled
+write and essentially nothing else. `convert_gguf_to_safetensors` gains
+`threads_{1,4}_f32` on the same footing (1.54–1.61× end to end). Both
+were added as **sibling ids rather than renames**, because renaming the
+`BF16` ids would orphan their CodSpeed history, and that series is
+exactly the baseline the output-dtype work must not regress. There is
+no `F16` arm: same width as `BF16`, so no bandwidth story to tell, and
+its interesting properties are tests rather than benchmarks. Full
+numbers and method: `docs/perf-experiments.md` Experiment 13.
 
 These are `--quick` numbers (`criterion --quick`, ~10 samples each).
 The full statistical run produces tighter confidence intervals but

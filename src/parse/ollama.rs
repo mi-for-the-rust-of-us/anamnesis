@@ -161,10 +161,10 @@ pub fn resolve_ollama_model(spec: &str) -> crate::Result<PathBuf> {
 /// `std::env::home_dir` was un-deprecated in Rust 1.85 and is available
 /// on the crate's MSRV (1.88).
 fn ollama_models_root() -> PathBuf {
-    if let Ok(explicit) = std::env::var("OLLAMA_MODELS") {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
-        }
+    if let Ok(explicit) = std::env::var("OLLAMA_MODELS")
+        && !explicit.is_empty()
+    {
+        return PathBuf::from(explicit);
     }
     if let Some(home) = std::env::home_dir() {
         return home.join(".ollama").join("models");

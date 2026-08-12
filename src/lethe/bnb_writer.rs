@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::error::AnamnesisError;
-use crate::lethe::bnb::{encode_bnb4_compute_absmax, NF4_CODEBOOK};
+use crate::lethe::bnb::{NF4_CODEBOOK, encode_bnb4_compute_absmax};
 use crate::parse::utils::checked_num_elements;
 
 /// `bitsandbytes`-default block size for `NF4` encoding.
@@ -318,7 +318,7 @@ pub fn classify_inputs(inputs: &[BnbWriteInput<'_>]) -> BnbNf4WriteStats {
 )]
 mod tests {
     use super::*;
-    use crate::parse::safetensors::{parse_safetensors_header, QuantScheme};
+    use crate::parse::safetensors::{QuantScheme, parse_safetensors_header};
     use crate::remember::bnb::dequantize_bnb4_to_bf16;
 
     fn synth_bf16(rows: usize, cols: usize) -> Vec<u8> {

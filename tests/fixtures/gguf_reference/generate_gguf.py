@@ -45,11 +45,43 @@ Usage:
 """
 
 import struct
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from gguf import GGUFReader, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
+
+# ---------------------------------------------------------------------------
+# Fixture container format
+# ---------------------------------------------------------------------------
+#
+# v2 (Phase 7.3) adds an F32 golden alongside the BF16 one, so the kernels can
+# be cross-validated at full width for the first time. Every earlier fixture
+# rounded the reference to BF16 before comparing, discarding 16 mantissa bits of
+# any disagreement.
+#
+# v1 had no magic and no version field, so it could not be extended without
+# ambiguity. v2 leads with both:
+#
+#   magic     "AMNG"          4 B
+#   version   2               u32
+#   type      ggml_type disc  u32
+#   n_elems                   u32
+#   raw_len                   u32
+#   bf16_len                  u32
+#   f32_len                   u32
+#   raw quantised block bytes
+#   BF16 golden
+#   F32 golden
+#
+# The Rust reader rejects any other version with a clear message rather than
+# misreading the offsets.
+FIXTURE_MAGIC = b"AMNG"
+FIXTURE_VERSION = 2
+
+# v1 layout, needed only by the in-place upgrade path below.
+V1_HEADER_LEN = 16
 
 # Number of elements to extract per fixture.  65 536 = 256 × 256, same
 # slice size the FP8/GPTQ/AWQ/BnB fixtures use.  For legacy quants
@@ -135,6 +167,92 @@ def f32_array_to_bf16_bytes(f32_arr: np.ndarray) -> bytes:
     return bf16_bits.tobytes()
 
 
+def write_fixture_v2(
+    output_path: Path,
+    disc: int,
+    n_elements: int,
+    raw_bytes: bytes,
+    f32: np.ndarray,
+) -> None:
+    """Write one fixture in the v2 container (BF16 *and* F32 goldens).
+
+    ``f32`` must be the ``gguf`` reference's own output, unmodified. Both
+    goldens are derived from it here, on the Python side: the BF16 one is never
+    computed by rounding in Rust, because comparing anamnesis's output against a
+    golden produced by anamnesis's own rounding would be circular. That is the
+    v0.6.4 lesson (three bugs shipped green behind circular fixtures).
+    """
+    assert f32.dtype == np.float32, f"reference must be f32, got {f32.dtype}"
+    assert f32.shape == (n_elements,), f"expected {n_elements}, got {f32.shape}"
+
+    bf16_bytes = f32_array_to_bf16_bytes(f32)
+    f32_bytes = f32.tobytes()
+    assert len(bf16_bytes) == n_elements * 2
+    assert len(f32_bytes) == n_elements * 4
+
+    with open(output_path, "wb") as out:
+        out.write(FIXTURE_MAGIC)
+        out.write(struct.pack("<I", FIXTURE_VERSION))
+        out.write(struct.pack("<I", disc))
+        out.write(struct.pack("<I", n_elements))
+        out.write(struct.pack("<I", len(raw_bytes)))
+        out.write(struct.pack("<I", len(bf16_bytes)))
+        out.write(struct.pack("<I", len(f32_bytes)))
+        out.write(raw_bytes)
+        out.write(bf16_bytes)
+        out.write(f32_bytes)
+
+
+def upgrade_existing_fixtures() -> int:
+    """Rewrite every v1 fixture in place as v2, **without any model file**.
+
+    The v1 fixtures already carry the raw quantised block bytes, which is all
+    the reference needs. That matters because ``models/`` is gitignored and
+    holds multi-GB downloads: this path lets the F32 goldens be produced from a
+    clean checkout with nothing but ``pip install gguf numpy``.
+
+    Every upgrade re-derives the BF16 golden and **asserts it reproduces the
+    stored one byte for byte**. If the installed ``gguf`` version dequantised
+    any differently from the one that produced the committed fixtures, this
+    fails loudly instead of silently rebasing the goldens onto a new reference.
+    """
+    fixture_dir = Path(__file__).parent
+    upgraded = 0
+    for path in sorted(fixture_dir.glob("*.bin")):
+        blob = path.read_bytes()
+        if blob[:4] == FIXTURE_MAGIC:
+            version = struct.unpack_from("<I", blob, 4)[0]
+            print(f"  SKIP {path.name}: already v{version}")
+            continue
+
+        disc, n_elements, raw_len, bf16_len = struct.unpack_from("<IIII", blob, 0)
+        raw_bytes = blob[V1_HEADER_LEN : V1_HEADER_LEN + raw_len]
+        stored_bf16 = blob[V1_HEADER_LEN + raw_len : V1_HEADER_LEN + raw_len + bf16_len]
+        assert len(raw_bytes) == raw_len, f"{path.name}: truncated raw section"
+        assert len(stored_bf16) == bf16_len, f"{path.name}: truncated golden"
+
+        target_type = GGMLQuantizationType(disc)
+        f32 = dequantize(np.frombuffer(raw_bytes, dtype=np.uint8), target_type)
+        assert f32.dtype == np.float32
+
+        rederived_bf16 = f32_array_to_bf16_bytes(f32)
+        if rederived_bf16 != stored_bf16:
+            raise SystemExit(
+                f"{path.name}: re-derived BF16 golden does not match the committed one.\n"
+                f"  The installed `gguf` package dequantises {target_type.name} differently\n"
+                f"  from the version that produced the fixtures. Refusing to rebase the\n"
+                f"  goldens silently: investigate before regenerating."
+            )
+
+        write_fixture_v2(path, disc, n_elements, raw_bytes, f32)
+        upgraded += 1
+        print(
+            f"  {path.name}: {target_type.name} upgraded to v2 "
+            f"(+{n_elements * 4} B of F32 golden, BF16 verified unchanged)"
+        )
+    return upgraded
+
+
 def generate_fixture(name: str, gguf_path: Path, target_type: GGMLQuantizationType) -> None:
     """Extract one tensor slice and write the binary fixture."""
     reader = GGUFReader(str(gguf_path))
@@ -170,26 +288,16 @@ def generate_fixture(name: str, gguf_path: Path, target_type: GGMLQuantizationTy
     assert f32.shape == (SLICE_ELEMENTS,), f"expected {SLICE_ELEMENTS}, got {f32.shape}"
     assert f32.dtype == np.float32
 
-    # Convert f32 → BF16 using round-to-nearest-even.
-    golden_bytes = f32_array_to_bf16_bytes(f32)
-    golden_len = SLICE_ELEMENTS * 2
-    assert len(golden_bytes) == golden_len
-
-    # Write fixture.
+    # Write fixture (v2: BF16 and F32 goldens, both derived from `f32` here).
     output_path = Path(__file__).parent / f"{name}.bin"
     disc = target_type.value
-    with open(output_path, "wb") as out:
-        out.write(struct.pack("<I", disc))
-        out.write(struct.pack("<I", SLICE_ELEMENTS))
-        out.write(struct.pack("<I", raw_byte_len))
-        out.write(struct.pack("<I", golden_len))
-        out.write(raw_bytes)
-        out.write(golden_bytes)
+    write_fixture_v2(output_path, disc, SLICE_ELEMENTS, raw_bytes, f32)
+    golden_len = SLICE_ELEMENTS * 2
 
     print(
         f"  {name}: tensor={tensor.name}, {target_type.name} (disc={disc}), "
         f"{SLICE_ELEMENTS} elements, "
-        f"raw={raw_byte_len} B, golden={golden_len} B, "
+        f"raw={raw_byte_len} B, bf16={golden_len} B, f32={SLICE_ELEMENTS * 4} B, "
         f"fixture={output_path.stat().st_size} B, "
         f"gguf dequant={best_us:.1f} µs (best of 5)"
     )
@@ -226,19 +334,10 @@ def generate_synthetic_fixture(name: str, target_type: GGMLQuantizationType) -> 
     assert f32.shape == (SLICE_ELEMENTS,), f"expected {SLICE_ELEMENTS}, got {f32.shape}"
     assert f32.dtype == np.float32
 
-    golden_bytes = f32_array_to_bf16_bytes(f32)
     golden_len = SLICE_ELEMENTS * 2
-    assert len(golden_bytes) == golden_len
-
     output_path = Path(__file__).parent / f"{name}.bin"
     disc = target_type.value
-    with open(output_path, "wb") as out:
-        out.write(struct.pack("<I", disc))
-        out.write(struct.pack("<I", SLICE_ELEMENTS))
-        out.write(struct.pack("<I", raw_byte_len))
-        out.write(struct.pack("<I", golden_len))
-        out.write(raw_bytes)
-        out.write(golden_bytes)
+    write_fixture_v2(output_path, disc, SLICE_ELEMENTS, raw_bytes, f32)
 
     print(
         f"  {name}: synthetic (seed=42), {target_type.name} (disc={disc}), "
@@ -250,6 +349,15 @@ def generate_synthetic_fixture(name: str, target_type: GGMLQuantizationType) -> 
 
 
 if __name__ == "__main__":
+    # `--upgrade` rewrites the committed v1 fixtures as v2 from their own raw
+    # bytes, so the F32 goldens can be produced from a clean checkout with no
+    # multi-GB model download. Full regeneration still needs `models/`.
+    if "--upgrade" in sys.argv:
+        print("Upgrading GGUF fixtures to the v2 container (BF16 + F32 goldens)...")
+        count = upgrade_existing_fixtures()
+        print(f"\nDone: {count} fixture(s) upgraded.")
+        raise SystemExit(0)
+
     print("Generating GGUF cross-validation fixtures...")
     print(f"Models directory: {MODELS_DIR}")
     for name, filename, target_type in FIXTURES:

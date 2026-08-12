@@ -1,6 +1,6 @@
 # Validation & tested models
 
-<!-- Last updated: 2026-06-25, anamnesis v0.6.8 -->
+<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
 
 The evidence behind anamnesis's correctness, performance, and robustness claims —
 the per-scheme cross-validation tables, the conversion / parsing benchmarks, the
@@ -82,6 +82,10 @@ Cross-validated against real `bitsandbytes` (`functional.dequantize_4bit` / `int
 ### GGUF block-quant
 
 Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on **22 block-quant kernels** from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct) plus 3 synthetic fixtures (`TQ1_0` / `TQ2_0` / `MXFP4` — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on HuggingFace, and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload, so a deterministic random tensor is the practical fixture source). Bit-exact output (0 ULP difference). **All 22 of 22 GGUF block types supported** — Phase 4.5 closed in step 6 (MXFP4). Feature-gated behind `gguf`.
+
+**Since v0.7.3 this is verified at full `f32` width, which it never was before.** Every earlier GGUF cross-validation rounded the reference to `BF16` before comparing, discarding 16 mantissa bits: a kernel could have associated its arithmetic differently from `gguf-py` (`(d·sc)·q` against `d·(sc·q)`, or a contraction on a `d·q - dmin·m` line) and every fixture would still have passed. The fixtures now carry an `f32` golden alongside the `BF16` one, and **all 22 kernels match it exactly, with no tolerance** — so the "0 ULP" claim is now against the reference *as the reference computes it*, not merely against the reference rounded to the width anamnesis happened to emit.
+
+The comparison was shown to have teeth rather than assumed to: **76.5 %** of the 1 441 792 reference values (1 102 549 of them) carry mantissa bits `BF16` cannot represent, and flipping a single mantissa bit in one golden fails exactly one element of 65 536 at 1 `ULP` while the `BF16` comparison stays green. Both goldens come from `gguf-py`; the `BF16` one is never derived by rounding the `f32` one in Rust, which would compare anamnesis against its own arithmetic.
 
 | Kernel | Model | vs `gguf` Python (AVX2) |
 |---|---|---|

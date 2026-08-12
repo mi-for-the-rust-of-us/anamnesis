@@ -939,7 +939,7 @@ mod tests {
         let rows = 2;
         let cols = 4;
         let weight_data = vec![0x38u8; rows * cols]; // all 1.0 in E4M3
-                                                     // Row 0: scale=2.0, Row 1: scale=3.0
+        // Row 0: scale=2.0, Row 1: scale=3.0
         let scale_data = make_scale_bytes(&[2.0, 3.0]);
 
         let output =

@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use anamnesis::dequantize_per_tensor_fp8_to_bf16;
 #[cfg(feature = "gguf")]
-use anamnesis::{dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16, GgufType};
+use anamnesis::{GgufType, dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
 
 /// Median + range of an ascending-sorted `&[f64]`, formatted for stderr.
 fn fmt_stats(samples: &[f64]) -> String {

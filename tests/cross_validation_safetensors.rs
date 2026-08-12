@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use anamnesis::{
-    parse_safetensors_header, parse_safetensors_header_from_reader, Dtype, SafetensorsHeader,
+    Dtype, SafetensorsHeader, parse_safetensors_header, parse_safetensors_header_from_reader,
 };
 use serde::Deserialize;
 

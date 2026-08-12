@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use anamnesis::{dequantize_awq_to_bf16, Dtype};
+use anamnesis::{Dtype, dequantize_awq_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing

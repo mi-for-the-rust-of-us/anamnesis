@@ -56,12 +56,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{
-    inspect_gguf_from_reader, inspect_npz_from_reader, inspect_pth_from_reader,
-    parse_gguf_front_matter_from_reader, parse_safetensors_header_from_reader, write_gguf,
-    GgufType, GgufWriteTensor,
+    GgufType, GgufWriteTensor, inspect_gguf_from_reader, inspect_npz_from_reader,
+    inspect_pth_from_reader, parse_gguf_front_matter_from_reader,
+    parse_safetensors_header_from_reader, write_gguf,
 };
 
 // ---------------------------------------------------------------------------

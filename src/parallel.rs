@@ -216,7 +216,22 @@ where
         // once a failure is known: the deterministic-error rule needs the
         // *minimum* failing index, not the first one observed.
         for handle in handles {
-            match handle.join() {
+            // The join result is bound to a local rather than used as the
+            // `match` scrutinee directly. As a scrutinee its temporary lives to
+            // the end of the `match` under Edition 2021 but is dropped earlier
+            // under Edition 2024 (`tail_expr_drop_order`), because it may carry a
+            // custom destructor: the `Err` arm holds a panic payload as a
+            // `Box<dyn Any>`, and the `Ok` arm's `local` has one too. Binding it
+            // pins the drop point identically under both editions.
+            //
+            // The reordering is inert here in any case. The lint's own caveat is
+            // to check the `impl Drop`s for side effects like releasing a lock or
+            // sending a message; there are none on either path. No lock is
+            // released, no channel is written, and the panic payload is dropped
+            // unread whichever edition applies. The scoped-thread `Packet`
+            // destructor belongs to `handles`, which this does not touch.
+            let joined = handle.join();
+            match joined {
                 Ok(Ok(local)) => {
                     for (idx, result) in local {
                         on_result(&result);
@@ -256,7 +271,7 @@ where
     clippy::indexing_slicing
 )]
 mod tests {
-    use super::{map_indexed, MIN_PARALLEL_BYTES};
+    use super::{MIN_PARALLEL_BYTES, map_indexed};
     use crate::AnamnesisError;
 
     /// A work-byte figure comfortably above [`MIN_PARALLEL_BYTES`], so the

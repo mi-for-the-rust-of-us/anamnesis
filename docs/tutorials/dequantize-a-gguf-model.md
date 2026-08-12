@@ -2,9 +2,9 @@
 
 *Take a llama.cpp GGUF quant, recover full `BF16` weights, and load the result in any Rust ML framework — candle, burn, or tch.*
 
-*~950 words · about 4 min read*
+*~1000 words · about 4 min read*
 
-<!-- Last updated: 2026-08-07, anamnesis v0.7.2 -->
+<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -34,6 +34,7 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
 - [Step 1 — Get a GGUF file](#step-1--get-a-gguf-file)
 - [Step 2 — Inspect before you commit](#step-2--inspect-before-you-commit)
 - [Step 3 — Dequantize to BF16](#step-3--dequantize-to-bf16)
+  - [If you want `float32` instead (v0.7.3+)](#if-you-want-float32-instead-v073)
 - [Step 4 — Verify the result](#step-4--verify-the-result)
 - [What you've learned](#what-youve-learned)
 
@@ -92,6 +93,27 @@ Converting SmolLM2-135M-Instruct-Q4_K_M.gguf → smol-bf16.safetensors
 
 The breakdown is the interesting part: of 272 tensors, **211 were quantized and are now recovered to `BF16`**, while **61 passed through** unchanged — those are the `F32` tensors (norms, a few small weights) that GGUF never quantized in the first place, so there was nothing to recover. anamnesis dequantizes each k-quant block bit-exactly against the `gguf` Python reference, then writes a single standard safetensors file.
 
+### If you want `float32` instead (v0.7.3+)
+
+`BF16` keeps 8 significand bits, and a `Q8_0` value is an `f16` scale times an `int8` — up to ~18 bits. On this very model, only **3–20 %** of dequantized values land exactly on a `BF16` grid point; the rest get rounded. For `Q4_K` that rounding is dwarfed by the quantization error, but for the high-precision types (`Q8_0`, `Q6_K`) it is the *same order* as the error the format exists to avoid.
+
+If that matters to you, ask `convert` for `f32`:
+
+```
+$ amn convert SmolLM2-135M-Instruct-Q4_K_M.gguf --to safetensors --out-dtype f32
+Converting SmolLM2-135M-Instruct-Q4_K_M.gguf -> SmolLM2-135M-Instruct-Q4_K_M-f32.safetensors
+  211 dequantized to F32
+  Wrote 272 tensors -> SmolLM2-135M-Instruct-Q4_K_M-f32.safetensors
+```
+
+Note the derived filename ends in `-f32`, not `-bf16`: it tracks the dtype, so a file never claims a width it does not hold.
+
+`f32` output performs **no narrowing at all**, so the values are the `f32` that `gguf-py` itself produces — verified bit-exactly against it across all 22 kernels, with no tolerance. Two things to expect. The file is twice the size (**513 MB against 257 MB** here), and the conversion runs about **1.5–1.6× slower**, because doubling the output bytes costs real bandwidth. That is the price of the precision, not a defect.
+
+There is also `--out-dtype f16`, which buys 3 significand bits over `bf16` at the same 2 bytes — but pays for them with a much narrower exponent range, overflowing to infinity above 65504 where `bf16` matches `f32`'s range. It is not simply the better 2-byte choice.
+
+Note this is `amn convert`, not `amn remember`: the `remember` path stays `BF16`-only until v0.7.4, when its other kernel families get the same treatment.
+
 ## Step 4 — Verify the result
 
 Inspect the file you just wrote:
@@ -120,5 +142,6 @@ let vb = VarBuilder::from_mmaped_safetensors(&["smol-bf16.safetensors"], DType::
 - `amn inspect` is a free, header-only preview — use it to read the dtype mix and size *before* spending disk on a full dequantization.
 - A `Q4_K_M` file is a mix of block types, and the tensors GGUF left in `F32` simply pass through untouched.
 - Dequantization trades size for compatibility (here 99 MB → 257 MB), so check the numbers up front.
+- Since v0.7.3, `amn convert --out-dtype f32` skips the `BF16` narrowing entirely when you need the reference `float32`, at twice the bytes and ~1.5× the time.
 
 For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs. And to change *container* rather than just recover precision — GGUF → `bnb-nf4`, or writing a scalar GGUF with your own metadata — see [Convert a model between formats](convert-between-formats.md).

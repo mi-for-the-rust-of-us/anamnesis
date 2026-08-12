@@ -1,7 +1,7 @@
 [package]
 name = "anamnesis"
-version = "0.7.2"
-edition = "2021"
+version = "0.7.3"
+edition = "2024"
 rust-version = "1.88"
 description = "Parse any tensor format, recover any precision — framework-agnostic FP8/GPTQ/AWQ/BnB dequantization, NPZ parsing, and PyTorch .pth conversion for Rust"
 license = "MIT OR Apache-2.0"
@@ -11,9 +11,35 @@ documentation = "https://docs.rs/anamnesis"
 keywords = ["safetensors", "dequantization", "pytorch", "gptq", "machine-learning"]
 categories = ["science", "parser-implementations"]
 default-run = "anamnesis"
-# The `fuzz/` cargo-fuzz harness is dev-only (nightly + libFuzzer) and must
-# never ship in the published crate or affect the build for ordinary users.
-exclude = ["/fuzz"]
+# Kept out of the published crate. Neither path is reachable from a consumer's
+# build, and together they were 71 % of what the registry served.
+#
+# `/fuzz` is the cargo-fuzz harness: dev-only (nightly + libFuzzer), and it must
+# never affect the build for ordinary users.
+#
+# `/tests` is the cross-validation corpus. `tests/fixtures` alone is 6.33 MiB of
+# binary goldens, which took the published `.crate` to 4.8 MiB gzipped against
+# the registry's 10 MiB cap. Measured with `cargo package`, excluding it leaves
+# a 2.2 MiB payload that is almost entirely text and gzips to **628 687 bytes
+# (0.60 MiB)**, an 8.0x reduction. The cap was also starting to constrain how wide
+# those goldens could be, which is backwards: the test corpus should be sized by
+# the correctness claim it has to support, and the artefact by what consumers
+# actually need.
+#
+# The tests are NOT gone. Every tag gets a GitHub Release, and GitHub's
+# per-tag source tarball carries `tests/` verbatim:
+#
+#   https://github.com/mi-for-the-rust-of-us/anamnesis/archive/refs/tags/vX.Y.Z.tar.gz
+#
+# `scripts/verify-claims.{ps1,sh}` runs the cross-validation suites from there.
+# See the "Verifying the correctness claims" section in README.md.
+#
+# Excluding `/tests` does not weaken the release gate: `cargo package`'s
+# verification build never compiled test code anyway, and
+# `.github/workflows/publish.yml` runs `cargo test --all-features` before it
+# runs `cargo publish`. `/benches` deliberately stays, because the `[[bench]]`
+# targets below are declared explicitly and would dangle without their sources.
+exclude = ["/fuzz", "/tests"]
 
 # `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys
 # (features, targets, all-features, no-default-features). Other Cargo

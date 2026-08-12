@@ -35,24 +35,51 @@
 
 use std::time::Instant;
 
-use anamnesis::{dequantize_gguf_to_bf16, inspect_gguf_from_reader, parse_gguf, GgufType};
+use anamnesis::{
+    F32Out, GgufType, dequantize_gguf, dequantize_gguf_to_bf16, inspect_gguf_from_reader,
+    parse_gguf,
+};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
 // ---------------------------------------------------------------------------
 
-/// Binary fixture layout (all little-endian):
+/// Fixture container magic, introduced with v2.
+const FIXTURE_MAGIC: &[u8; 4] = b"AMNG";
+
+/// Fixture container version this reader understands.
+const FIXTURE_VERSION: u32 = 2;
+
+/// Header length of the v2 container: magic + six `u32` fields.
+const V2_HEADER_LEN: usize = 4 + 6 * 4;
+
+/// Binary fixture layout, v2 (all little-endian):
 ///
+/// - 4 bytes: magic `AMNG`
+/// - 4 bytes: container version (`u32`, currently 2)
 /// - 4 bytes: `ggml_type` discriminant (`u32`)
 /// - 4 bytes: `n_elements` (`u32`)
 /// - 4 bytes: raw data byte count (`u32`)
 /// - 4 bytes: golden `BF16` byte count (`u32`)
+/// - 4 bytes: golden `F32` byte count (`u32`)
 /// - raw quantized block data
 /// - expected `BF16` output
+/// - expected `F32` output
+///
+/// v1 had neither magic nor version and carried only the `BF16` golden, so
+/// every comparison discarded 16 mantissa bits of any disagreement before it
+/// could be seen. The `F32` golden added here is what lets the kernels be
+/// checked at the width the reference actually computes in.
+///
+/// **Both goldens come from `gguf-py`.** The `BF16` one is not derived by
+/// rounding the `F32` one in Rust: that would compare anamnesis's output
+/// against a golden produced by anamnesis's own rounding, which is the
+/// circular-fixture class that shipped three green bugs in v0.6.4.
 struct GgufFixture {
     n_elements: usize,
     raw_data: Vec<u8>,
     expected_bf16: Vec<u8>,
+    expected_f32: Vec<u8>,
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
@@ -96,25 +123,45 @@ fn gguf_type_from_disc(disc: u32) -> GgufType {
 }
 
 fn parse_gguf_fixture(data: &[u8], expected_dtype: GgufType) -> GgufFixture {
-    let disc = read_u32_le(data, 0);
-    let n_elements = read_u32_le(data, 4) as usize;
-    let raw_data_len = read_u32_le(data, 8) as usize;
-    let golden_len = read_u32_le(data, 12) as usize;
+    // Reject a v1 fixture by name rather than misreading its offsets: without
+    // the magic, v1's first field is the type discriminant, which would parse
+    // as a nonsense magic and then silently slice the wrong ranges.
+    assert_eq!(
+        &data[0..4],
+        FIXTURE_MAGIC,
+        "fixture is not in the v2 container (missing AMNG magic). Regenerate with \
+         `python tests/fixtures/gguf_reference/generate_gguf.py --upgrade`"
+    );
+    let version = read_u32_le(data, 4);
+    assert_eq!(
+        version, FIXTURE_VERSION,
+        "unsupported fixture container version {version} (this reader understands \
+         v{FIXTURE_VERSION})"
+    );
+
+    let disc = read_u32_le(data, 8);
+    let n_elements = read_u32_le(data, 12) as usize;
+    let raw_data_len = read_u32_le(data, 16) as usize;
+    let bf16_len = read_u32_le(data, 20) as usize;
+    let f32_len = read_u32_le(data, 24) as usize;
 
     let actual_dtype = gguf_type_from_disc(disc);
     assert_eq!(
         actual_dtype, expected_dtype,
         "fixture dtype mismatch: expected {expected_dtype:?}, got {actual_dtype:?} (disc={disc})"
     );
+    assert_eq!(bf16_len, n_elements * 2, "BF16 golden length");
+    assert_eq!(f32_len, n_elements * 4, "F32 golden length");
 
-    let header_size = 16;
-    let raw_start = header_size;
-    let golden_start = raw_start + raw_data_len;
+    let raw_start = V2_HEADER_LEN;
+    let bf16_start = raw_start + raw_data_len;
+    let f32_start = bf16_start + bf16_len;
 
     GgufFixture {
         n_elements,
         raw_data: data[raw_start..raw_start + raw_data_len].to_vec(),
-        expected_bf16: data[golden_start..golden_start + golden_len].to_vec(),
+        expected_bf16: data[bf16_start..bf16_start + bf16_len].to_vec(),
+        expected_f32: data[f32_start..f32_start + f32_len].to_vec(),
     }
 }
 
@@ -195,6 +242,72 @@ fn run_cross_validation(name: &str, data: &[u8], dtype: GgufType, max_ulp: u16) 
     assert_eq!(
         mismatches, 0,
         "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
+    );
+
+    compare_f32_exact(name, &fixture, dtype);
+}
+
+/// Compares `F32` output against the reference **bit for bit**, with no
+/// tolerance at all.
+///
+/// This is the assertion the `BF16` comparison above could never make. Rounding
+/// to `BF16` first discards 16 mantissa bits, so any disagreement smaller than
+/// half a `BF16` `ULP` was invisible: a kernel could have associated its
+/// arithmetic differently from `gguf-py` (`(d*sc)*q` against `d*(sc*q)`, or a
+/// contraction on a `d*q - dm` line) and every fixture would still have passed.
+///
+/// Exact equality is the right bar here, not an epsilon. anamnesis computes in
+/// `f32` and `gguf-py` computes in `f32`; if both perform the same operations in
+/// the same order on the same inputs, IEEE 754 requires the same bits. A
+/// difference is therefore a real divergence in the arithmetic, not accumulated
+/// noise.
+fn compare_f32_exact(name: &str, fixture: &GgufFixture, dtype: GgufType) {
+    let actual = dequantize_gguf::<F32Out>(&fixture.raw_data, dtype, fixture.n_elements)
+        .expect("F32 dequantization failed");
+    assert_eq!(
+        actual.len(),
+        fixture.expected_f32.len(),
+        "{name}: F32 output length mismatch"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first_reports = 0usize;
+    for (i, (a_word, e_word)) in actual
+        .chunks_exact(4)
+        .zip(fixture.expected_f32.chunks_exact(4))
+        .enumerate()
+    {
+        let a = f32::from_le_bytes([a_word[0], a_word[1], a_word[2], a_word[3]]);
+        let e = f32::from_le_bytes([e_word[0], e_word[1], e_word[2], e_word[3]]);
+
+        // Both NaN is a match; NaN payloads are not part of the contract.
+        if a.is_nan() && e.is_nan() {
+            continue;
+        }
+        if a.to_bits() == e.to_bits() {
+            continue;
+        }
+
+        mismatches += 1;
+        if first_reports < 5 {
+            first_reports += 1;
+            let ulps = (i64::from(a.to_bits()) - i64::from(e.to_bits())).abs();
+            eprintln!(
+                "  F32 element {i}: actual={a:e} (0x{:08X}), expected={e:e} (0x{:08X}), \
+                 {ulps} f32 ULP",
+                a.to_bits(),
+                e.to_bits()
+            );
+        }
+    }
+
+    assert_eq!(
+        mismatches, 0,
+        "{name}: {mismatches}/{} F32 elements differ from the gguf-py reference. \
+         This is an arithmetic-association difference, not a rounding artefact: \
+         both sides compute in f32, so identical operations in identical order \
+         must produce identical bits.",
+        fixture.n_elements
     );
 }
 

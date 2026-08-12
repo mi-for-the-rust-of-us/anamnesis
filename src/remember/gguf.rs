@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `GGUF` K-quant dequantization — scalar reference kernels producing `BF16`.
+//! `GGUF` K-quant dequantization — scalar reference kernels, with a
+//! caller-chosen output element type.
 //!
 //! This module consumes raw block-encoded tensor bytes (as produced by
 //! [`parse_gguf`](crate::parse::gguf::parse_gguf)) and decodes them into
-//! `BF16` output bytes, matching the output format of the `FP8`, `GPTQ`,
-//! `AWQ`, and `BitsAndBytes` dequantisers.
+//! output bytes of the caller's chosen width: `BF16` (the default, matching
+//! the `FP8`, `GPTQ`, `AWQ` and `BitsAndBytes` dequantisers), `F32`, or `F16`.
+//! The choice is a type parameter, so it costs no branch at run time; see
+//! [`OutputElement`].
 //!
 //! # Supported types
 //!
@@ -20,20 +23,25 @@
 //! remaining `Unsupported` path is for scalar (non-block-quant) types
 //! that are reinterpret-only and never reach the dequantisation layer.
 //!
-//! # Two public entry points
+//! # Two public entry points, each in a generic and a `BF16` form
 //!
-//! - [`dequantize_gguf_to_bf16`] materialises the whole tensor into an
-//!   owned `Vec<u8>`. Convenient for small-to-medium tensors (anything
-//!   that comfortably fits in RAM alongside its `BF16` expansion).
-//! - [`dequantize_gguf_blocks_to_bf16`] is the **streaming** variant: the
-//!   caller supplies a sink closure that receives one block's worth of
-//!   `BF16` bytes at a time (64 B for legacy, 512 B for K-quants), so
-//!   peak heap is O(one scratch buffer) regardless of tensor size. Use
-//!   this for dequantising 70 B-parameter models on modest RAM.
+//! - [`dequantize_gguf`] materialises the whole tensor into an owned
+//!   `Vec<u8>`. Convenient for small-to-medium tensors (anything that
+//!   comfortably fits in RAM alongside its expansion).
+//! - [`dequantize_gguf_blocks`] is the **streaming** variant: the caller
+//!   supplies a sink closure that receives one block's worth of output at
+//!   a time, so peak heap is O(one scratch buffer) regardless of tensor
+//!   size. Use this for dequantising 70 B-parameter models on modest RAM.
+//!   **The block length depends on the output type** (`QK × E::BYTES`);
+//!   see that function's docs for the table.
 //!
-//! Both entry points share the same validation logic and the same scalar
-//! kernels; the `Vec`-returning variant is a thin wrapper that pushes
-//! into a pre-sized `Vec::with_capacity` sink.
+//! [`dequantize_gguf_to_bf16`] and [`dequantize_gguf_blocks_to_bf16`] are
+//! `#[inline]` wrappers pinning `E = Bf16Out`, kept as the names every
+//! caller before v0.7.3 used.
+//!
+//! All four share the same validation logic and the same scalar kernels;
+//! the `Vec`-returning variants are thin wrappers that push into a
+//! pre-sized `Vec::with_capacity` sink.
 //!
 //! # Algorithm
 //!
@@ -42,11 +50,17 @@
 //!
 //! 1. **Pass 1** unpacks the packed-bit storage into a stack-resident
 //!    `[f32; QK]` scratch buffer (one block at a time, L1-resident).
-//! 2. **Pass 2** walks the scratch buffer paired with a per-block
-//!    `[u8; QK × 2]` output buffer and emits `BF16` bytes via the shared
-//!    [`f32_bits_to_bf16_bits`](crate::remember::fp8) helper. The inner
-//!    loop is branch-free and `chunks_exact_mut(2)`-based, giving the
-//!    compiler a clean vectorisation target.
+//! 2. **Pass 2** walks the scratch buffer paired with a per-block output
+//!    buffer and emits the caller's element type via
+//!    [`OutputElement::write_scratch`].
+//!    The inner loop is branch-free and `chunks_exact_mut(E::BYTES)`-based,
+//!    giving the compiler a clean vectorisation target; all three
+//!    implementations are confirmed packed-SIMD.
+//!
+//! **Pass 2 is the *only* place the output width appears.** That is why
+//! all 24 kernel bodies below are byte-identical to their pre-v0.7.3 form:
+//! they fill an `[f32; QK]` scratch and never name an output type. Only
+//! their signatures thread `E` through to the shared runner.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
 //! `dequantize_row_*` reference implementations. Bit-for-bit
@@ -54,13 +68,16 @@
 //!
 //! # Output format
 //!
-//! All kernels emit `BF16` bytes in little-endian order, length
-//! `n_elements × 2`. Round-to-nearest-even is performed inside
-//! `f32_bits_to_bf16_bits`.
+//! Little-endian, `n_elements × E::BYTES` bytes. `BF16` and `F16` round to
+//! nearest even; `F32` performs no conversion at all, so its output is the
+//! `f32` the kernel computed and therefore the reference's own value.
+//! `tests/cross_validation_gguf.rs` checks all 22 production kernels
+//! against `gguf-py` at both widths, the `F32` comparison being bit-exact
+//! with no tolerance.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;
-use crate::remember::fp8::f32_bits_to_bf16_bits;
+use crate::remember::output::{Bf16Out, MAX_OUTPUT_BYTES, OutputElement};
 use iq_grids::{
     IQ1S_DELTA, IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
     KSIGNS_IQ2XS,
@@ -203,53 +220,44 @@ fn read_scales12(block: &[u8], offset: usize) -> [u8; 12] {
     ]
 }
 
-/// Converts a block's worth of `f32` scratch values to `BF16` bytes.
-///
-/// This is the hot-path pass 2 for every kernel. Branch-free, contiguous
-/// reads, contiguous writes — exactly the shape the compiler needs to
-/// auto-vectorise the inner `f32 → BF16` conversion. A future commit may
-/// add an AVX2-gated intrinsic variant behind a `simd` feature flag; the
-/// scalar version here is the canonical fallback.
-///
-/// # Preconditions
-///
-/// `out_block.len() == 2 × scratch.len()`. `chunks_exact_mut(2)` silently
-/// truncates any remainder, so a caller that passes the wrong length
-/// produces short output rather than a panic — every kernel sizes both
-/// buffers at compile time so this never happens in practice.
-#[inline]
-fn write_scratch_to_bf16(scratch: &[f32], out_block: &mut [u8]) {
-    // VECTORIZED: pending cargo-show-asm verification on the scalar path.
-    // TODO(phase4-followup): AVX2 `f32x8 → bf16x8` gated behind a `simd`
-    // feature per CONVENTIONS.md's accepted-unsafe table — would give a
-    // ~4-8× speedup on pass 2, which is ~40-60% of total dequant time.
-    for (&val, out_pair) in scratch.iter().zip(out_block.chunks_exact_mut(2)) {
-        let bf16 = f32_bits_to_bf16_bits(val.to_bits());
-        out_pair.copy_from_slice(&bf16.to_le_bytes());
-    }
-}
+// Pass 2, the shared `f32` -> output-element writer, now lives on the
+// `OutputElement` trait in `remember::output`. Each implementation owns a
+// complete monomorphic loop, so the choice of output width costs the kernels
+// nothing: all 24 of them below still fill an `[f32; QK]` scratch buffer and
+// never mention an output type.
 
 // ---------------------------------------------------------------------------
 // Shared validation
 // ---------------------------------------------------------------------------
 
 /// Validates dispatcher inputs and returns the output byte length
-/// (`n_elements × 2`), with an overflow guard that catches 32-bit targets
-/// where the `BF16` output would exceed `usize::MAX`.
+/// (`n_elements × bytes_per_element`), with an overflow guard that catches
+/// 32-bit targets where the output would exceed `usize::MAX`.
+///
+/// `bytes_per_element` is passed as a plain `usize` rather than making this
+/// function generic over `OutputElement`. The validator does no per-element
+/// work, so monomorphising it once per output type would triple its code for
+/// no benefit; the callers supply `E::BYTES` at their own call site.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if
 /// - `n_elements` is not a multiple of `dtype.block_size()`,
-/// - `n_elements × 2` overflows `usize` (32-bit targets with > 2 GiB
-///   output), or
+/// - `n_elements × bytes_per_element` overflows `usize` (32-bit targets;
+///   the threshold halves from > 2 `GiB` of output to > 1 `GiB` when `F32`
+///   doubles the width), or
 /// - `data.len()` does not equal `n_blocks × dtype.type_size()`.
 ///
 /// Returns [`AnamnesisError::Unsupported`] only if a future `GgufType`
 /// variant is added without a `type_size()` arm — every variant
 /// recognised today returns `Some(_)`, so this branch is a forward-
 /// compatibility safety net rather than a current code path.
-fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> crate::Result<usize> {
+fn validate_dequant_input(
+    data: &[u8],
+    dtype: GgufType,
+    n_elements: usize,
+    bytes_per_element: usize,
+) -> crate::Result<usize> {
     let block_size = dtype.block_size();
     if !n_elements.is_multiple_of(block_size) {
         return Err(AnamnesisError::Parse {
@@ -259,14 +267,20 @@ fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> cr
             ),
         });
     }
-    // Output byte length: `n_elements × 2`. Guarded against overflow so a
-    // 32-bit target with > 2 GiB of BF16 output produces a clean `Parse`
-    // error rather than silently truncating the allocation.
-    let out_byte_len = n_elements
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("GGUF dequant: output byte length {n_elements}×2 overflows usize"),
-        })?;
+    // Output byte length. Guarded against overflow so a 32-bit target with more
+    // output than `usize` can address produces a clean `Parse` error rather
+    // than silently truncating the allocation. This guard matters *more* now
+    // that the width is caller-chosen: `F32` reaches the ceiling at half the
+    // element count `BF16` does.
+    let out_byte_len =
+        n_elements
+            .checked_mul(bytes_per_element)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "GGUF dequant: output byte length {n_elements}×{bytes_per_element} \
+                 overflows usize"
+                ),
+            })?;
     let n_blocks = n_elements / block_size;
     let type_size = dtype
         .type_size()
@@ -299,28 +313,39 @@ fn validate_dequant_input(data: &[u8], dtype: GgufType, n_elements: usize) -> cr
 ///
 /// Walks `data` in `type_size` chunks via `chunks_exact`, invokes the
 /// caller-supplied `unpack` closure to fill the stack `[f32; 32]`
-/// scratch, then writes `BF16` bytes into a stack `[u8; 64]` buffer and
-/// forwards it to `sink`.
+/// scratch, then writes `E`-typed bytes into a stack buffer and forwards
+/// exactly `QK_SMALL × E::BYTES` of it to `sink`.
 ///
 /// Generic + `#[inline]` so the per-type kernel's closure body fully
 /// inlines into the outer loop with no indirect-call overhead.
+///
+/// The output buffer is sized at the widest output element rather than at
+/// `QK_SMALL × E::BYTES`, because the latter needs `generic_const_exprs`
+/// (unstable). The sub-slice below is what makes the block the caller sees
+/// exactly as wide as `E`.
 #[inline]
-fn run_legacy_kernel<F, P>(
+fn run_legacy_kernel<E, F, P>(
     data: &[u8],
     type_size: usize,
     mut sink: F,
     mut unpack: P,
 ) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
     P: FnMut(&[u8], &mut [f32; QK_SMALL]),
 {
     let mut scratch = [0.0_f32; QK_SMALL];
-    let mut block_out = [0u8; QK_SMALL * 2];
+    let mut block_buf = [0u8; QK_SMALL * MAX_OUTPUT_BYTES];
+    // INDEX: `E::BYTES <= MAX_OUTPUT_BYTES` is proven at compile time by the
+    // `const` block in `remember::output`, and `OutputElement` is sealed, so
+    // this range can never exceed the buffer.
+    #[allow(clippy::indexing_slicing)]
+    let block_out = &mut block_buf[..QK_SMALL * E::BYTES];
     for in_block in data.chunks_exact(type_size) {
         unpack(in_block, &mut scratch);
-        write_scratch_to_bf16(&scratch, &mut block_out);
-        sink(&block_out)?;
+        E::write_scratch(&scratch, block_out);
+        sink(block_out)?;
     }
     Ok(())
 }
@@ -328,33 +353,39 @@ where
 /// Outer-loop runner for 256-element K-quant super-blocks.
 ///
 /// Structurally identical to [`run_legacy_kernel`] but with a 1 KB
-/// scratch buffer and a 512 B output buffer. Both still fit comfortably
-/// in L1 cache.
+/// scratch buffer and an output buffer eight times larger. Both still fit
+/// comfortably in L1 cache at every supported output width (the buffer is
+/// 1 KB at `MAX_OUTPUT_BYTES`).
 #[inline]
-fn run_super_kernel<F, P>(
+fn run_super_kernel<E, F, P>(
     data: &[u8],
     type_size: usize,
     mut sink: F,
     mut unpack: P,
 ) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
     P: FnMut(&[u8], &mut [f32; QK_K]),
 {
     let mut scratch = [0.0_f32; QK_K];
-    let mut block_out = [0u8; QK_K * 2];
+    let mut block_buf = [0u8; QK_K * MAX_OUTPUT_BYTES];
+    // INDEX: see `run_legacy_kernel` — the bound is a compile-time constant.
+    #[allow(clippy::indexing_slicing)]
+    let block_out = &mut block_buf[..QK_K * E::BYTES];
     for in_block in data.chunks_exact(type_size) {
         unpack(in_block, &mut scratch);
-        write_scratch_to_bf16(&scratch, &mut block_out);
-        sink(&block_out)?;
+        E::write_scratch(&scratch, block_out);
+        sink(block_out)?;
     }
     Ok(())
 }
 
 /// Routes a validated `(data, dtype)` pair to the correct per-type
 /// streaming kernel. Called by both public entry points.
-fn dispatch_streaming<F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result<()>
+fn dispatch_streaming<E, F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
     // EXHAUSTIVE: internal dispatch over GgufType. Scalar (non-block)
@@ -363,30 +394,30 @@ where
     // step 6 every block-quantised variant has a dedicated kernel.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
-        GgufType::Q4_0 => dequant_q4_0(data, sink),
-        GgufType::Q4_1 => dequant_q4_1(data, sink),
-        GgufType::Q5_0 => dequant_q5_0(data, sink),
-        GgufType::Q5_1 => dequant_q5_1(data, sink),
-        GgufType::Q8_0 => dequant_q8_0(data, sink),
-        GgufType::Q8_1 => dequant_q8_1(data, sink),
-        GgufType::Q2_K => dequant_q2_k(data, sink),
-        GgufType::Q3_K => dequant_q3_k(data, sink),
-        GgufType::Q4_K => dequant_q4_k(data, sink),
-        GgufType::Q5_K => dequant_q5_k(data, sink),
-        GgufType::Q6_K => dequant_q6_k(data, sink),
-        GgufType::Q8_K => dequant_q8_k(data, sink),
-        GgufType::IQ4_NL => dequant_iq4_nl(data, sink),
-        GgufType::IQ4_XS => dequant_iq4_xs(data, sink),
-        GgufType::IQ2_XXS => dequant_iq2_xxs(data, sink),
-        GgufType::IQ2_XS => dequant_iq2_xs(data, sink),
-        GgufType::IQ2_S => dequant_iq2_s(data, sink),
-        GgufType::IQ3_XXS => dequant_iq3_xxs(data, sink),
-        GgufType::IQ3_S => dequant_iq3_s(data, sink),
-        GgufType::IQ1_S => dequant_iq1_s(data, sink),
-        GgufType::IQ1_M => dequant_iq1_m(data, sink),
-        GgufType::TQ1_0 => dequant_tq1_0(data, sink),
-        GgufType::TQ2_0 => dequant_tq2_0(data, sink),
-        GgufType::MXFP4 => dequant_mxfp4(data, sink),
+        GgufType::Q4_0 => dequant_q4_0::<E, _>(data, sink),
+        GgufType::Q4_1 => dequant_q4_1::<E, _>(data, sink),
+        GgufType::Q5_0 => dequant_q5_0::<E, _>(data, sink),
+        GgufType::Q5_1 => dequant_q5_1::<E, _>(data, sink),
+        GgufType::Q8_0 => dequant_q8_0::<E, _>(data, sink),
+        GgufType::Q8_1 => dequant_q8_1::<E, _>(data, sink),
+        GgufType::Q2_K => dequant_q2_k::<E, _>(data, sink),
+        GgufType::Q3_K => dequant_q3_k::<E, _>(data, sink),
+        GgufType::Q4_K => dequant_q4_k::<E, _>(data, sink),
+        GgufType::Q5_K => dequant_q5_k::<E, _>(data, sink),
+        GgufType::Q6_K => dequant_q6_k::<E, _>(data, sink),
+        GgufType::Q8_K => dequant_q8_k::<E, _>(data, sink),
+        GgufType::IQ4_NL => dequant_iq4_nl::<E, _>(data, sink),
+        GgufType::IQ4_XS => dequant_iq4_xs::<E, _>(data, sink),
+        GgufType::IQ2_XXS => dequant_iq2_xxs::<E, _>(data, sink),
+        GgufType::IQ2_XS => dequant_iq2_xs::<E, _>(data, sink),
+        GgufType::IQ2_S => dequant_iq2_s::<E, _>(data, sink),
+        GgufType::IQ3_XXS => dequant_iq3_xxs::<E, _>(data, sink),
+        GgufType::IQ3_S => dequant_iq3_s::<E, _>(data, sink),
+        GgufType::IQ1_S => dequant_iq1_s::<E, _>(data, sink),
+        GgufType::IQ1_M => dequant_iq1_m::<E, _>(data, sink),
+        GgufType::TQ1_0 => dequant_tq1_0::<E, _>(data, sink),
+        GgufType::TQ2_0 => dequant_tq2_0::<E, _>(data, sink),
+        GgufType::MXFP4 => dequant_mxfp4::<E, _>(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!("dequantisation not yet supported for {dtype}"),
@@ -399,17 +430,22 @@ where
 // ---------------------------------------------------------------------------
 
 /// Dequantises a `GGUF`-encoded block-quantised tensor into an owned
-/// `Vec<u8>` of `BF16` bytes.
+/// `Vec<u8>`, in the output element type `E`.
 ///
-/// Convenience wrapper around [`dequantize_gguf_blocks_to_bf16`] that
-/// pushes each block's output into a pre-allocated `Vec::with_capacity`.
-/// For very large tensors, prefer the streaming variant — this variant's
-/// peak heap is O(`n_elements × 2`).
+/// `E` is [`Bf16Out`], [`F32Out`](crate::remember::output::F32Out) or [`F16Out`](crate::remember::output::F16Out). Pick [`F32Out`](crate::remember::output::F32Out) when you want
+/// the reference implementation's own `f32` with no narrowing step of
+/// anamnesis's own; see `remember::output` for what that does and does not
+/// guarantee. [`dequantize_gguf_to_bf16`] is the `E = Bf16Out` spelling.
+///
+/// Convenience wrapper around [`dequantize_gguf_blocks`] that pushes each
+/// block's output into a pre-allocated `Vec::with_capacity`. For very large
+/// tensors, prefer the streaming variant — this variant's peak heap is
+/// O(`n_elements × E::BYTES`).
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `n_elements` is not a multiple of
-/// the block size for `dtype`, if `n_elements × 2` overflows `usize`
+/// the block size for `dtype`, if `n_elements × E::BYTES` overflows `usize`
 /// (32-bit targets only), or if `data.len()` does not equal the expected
 /// byte count (`n_blocks × type_size`).
 ///
@@ -420,20 +456,21 @@ where
 ///
 /// # Memory
 ///
-/// Allocates a single `Vec<u8>` of length `n_elements × 2` for the `BF16`
-/// output. Uses `Vec::with_capacity` + `extend_from_slice` to avoid the
-/// `vec![0u8; n]` zero-init memset that would otherwise touch every byte
-/// of the output before the dequant loop overwrites them. Peak heap is
-/// the output buffer itself — O(n) per call.
+/// Allocates a single `Vec<u8>` of length `n_elements × E::BYTES`. Uses
+/// `Vec::with_capacity` + `extend_from_slice` to avoid the `vec![0u8; n]`
+/// zero-init memset that would otherwise touch every byte of the output
+/// before the dequant loop overwrites them. Peak heap is the output buffer
+/// itself — O(n) per call, and **choosing [`F32Out`](crate::remember::output::F32Out) doubles it** against
+/// the `BF16` default.
 ///
 /// Callers that dequantise many tensors should drop each result before
-/// allocating the next, or use [`dequantize_gguf_blocks_to_bf16`] to
-/// stream block bytes directly into a writer. The crate's high-level
-/// orchestrators (`ParsedModel::remember`, the `amn remember model.gguf`
-/// CLI path) currently retain every tensor's `Vec<u8>` in heap memory
-/// until `safetensors::serialize_to_file` returns — see the streaming
-/// output milestone (ROADMAP Phase 10) for the planned fix.
-pub fn dequantize_gguf_to_bf16(
+/// allocating the next, or use [`dequantize_gguf_blocks`] to stream block
+/// bytes directly into a writer. The crate's high-level orchestrators
+/// (`ParsedModel::remember`, the `amn remember model.gguf` CLI path)
+/// currently retain every tensor's `Vec<u8>` in heap memory until
+/// `safetensors::serialize_to_file` returns — see the streaming output
+/// milestone (ROADMAP Phase 10) for the planned fix.
+pub fn dequantize_gguf<E: OutputElement>(
     data: &[u8],
     dtype: GgufType,
     n_elements: usize,
@@ -441,58 +478,125 @@ pub fn dequantize_gguf_to_bf16(
     if n_elements == 0 {
         return Ok(Vec::new());
     }
-    let out_byte_len = validate_dequant_input(data, dtype, n_elements)?;
+    let out_byte_len = validate_dequant_input(data, dtype, n_elements, E::BYTES)?;
     let mut out: Vec<u8> = Vec::with_capacity(out_byte_len);
-    dispatch_streaming(data, dtype, |block_out| {
+    dispatch_streaming::<E, _>(data, dtype, |block_out| {
         out.extend_from_slice(block_out);
         Ok(())
     })?;
     Ok(out)
 }
 
-/// Streaming `GGUF` dequantisation: invokes `sink` once per block with
-/// that block's `BF16` bytes. Peak heap is O(one block) regardless of
-/// tensor size.
+/// Dequantises a `GGUF` tensor into an owned `Vec<u8>` of `BF16` bytes.
 ///
-/// The `sink` closure receives `64` bytes per call for 32-element block
-/// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`, `MXFP4`) and `512` bytes per call
-/// for 256-element super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`,
-/// `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`,
-/// `TQ1_0`, `TQ2_0`). Sink errors abort the stream and are propagated
-/// unchanged as the return value.
-///
-/// This is the canonical form. [`dequantize_gguf_to_bf16`] is a thin
-/// wrapper that sinks into a `Vec::with_capacity`.
+/// The `E = Bf16Out` spelling of [`dequantize_gguf`], kept as the name every
+/// caller before v0.7.3 used. Behaviour is unchanged.
 ///
 /// # Errors
 ///
-/// Returns the same validation errors as [`dequantize_gguf_to_bf16`]
-/// plus any [`AnamnesisError`] that `sink` itself returns.
+/// See [`dequantize_gguf`].
 ///
 /// # Memory
 ///
-/// Stack only: one `[f32; QK]` scratch buffer (128 B for 32-element
-/// block kernels, 1 KB for 256-element super-block kernels) and one
-/// `[u8; QK × 2]` block output buffer (64 B / 512 B). No heap allocation
-/// in this function's frame.
+/// See [`dequantize_gguf`]: one `Vec<u8>` of `n_elements × 2` bytes.
+#[inline]
+pub fn dequantize_gguf_to_bf16(
+    data: &[u8],
+    dtype: GgufType,
+    n_elements: usize,
+) -> crate::Result<Vec<u8>> {
+    dequantize_gguf::<Bf16Out>(data, dtype, n_elements)
+}
+
+/// Streaming `GGUF` dequantisation: invokes `sink` once per block with
+/// that block's bytes in output type `E`. Peak heap is O(one block)
+/// regardless of tensor size.
+///
+/// # The block length depends on `E`
+///
+/// The `sink` closure receives `QK × E::BYTES` bytes per call, where `QK` is
+/// 32 for the legacy block kernels (`Q4_0`–`Q8_1`, `IQ4_NL`, `MXFP4`) and 256
+/// for the K-quant super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
+/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`):
+///
+/// | `E` | legacy block | super-block |
+/// |---|---:|---:|
+/// | [`Bf16Out`] | 64 B | 512 B |
+/// | [`F16Out`](crate::remember::output::F16Out) | 64 B | 512 B |
+/// | [`F32Out`](crate::remember::output::F32Out) | 128 B | 1024 B |
+///
+/// **A sink that hard-codes `chunks_exact(2)` is correct only for the 2-byte
+/// output types.** Derive the stride from `E::BYTES` rather than assuming it,
+/// or the sink will silently misread `F32` output as twice as many `BF16`
+/// values. Sink errors abort the stream and are propagated unchanged.
+///
+/// This is the canonical form. [`dequantize_gguf`] is a thin wrapper that
+/// sinks into a `Vec::with_capacity`.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`dequantize_gguf`] plus any
+/// [`AnamnesisError`] that `sink` itself returns.
+///
+/// # Memory
+///
+/// Stack only: one `[f32; QK]` scratch buffer (128 B for legacy blocks, 1 KB
+/// for super-blocks) and one block output buffer sized at the widest supported
+/// output element (128 B / 1 KB), of which `QK × E::BYTES` is used. No heap
+/// allocation in this function's frame, and no dependence on `E` in the peak.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// # #[cfg(feature = "gguf")]
 /// # fn _doc() -> anamnesis::Result<()> {
-/// use anamnesis::{dequantize_gguf_blocks_to_bf16, GgufType};
+/// use anamnesis::{dequantize_gguf_blocks, F32Out, GgufType, OutputElement};
 ///
 /// let data: &[u8] = &[];
 /// let n_elements = 0;
-/// let mut total_bytes = 0usize;
-/// dequantize_gguf_blocks_to_bf16(data, GgufType::Q4_0, n_elements, |block| {
-///     total_bytes += block.len();
+/// let mut values = 0usize;
+/// dequantize_gguf_blocks::<F32Out, _>(data, GgufType::Q4_0, n_elements, |block| {
+///     // Stride from `E::BYTES`, never from a literal.
+///     values += block.len() / F32Out::BYTES;
 ///     Ok(())
 /// })?;
 /// # Ok(())
 /// # }
 /// ```
+pub fn dequantize_gguf_blocks<E, F>(
+    data: &[u8],
+    dtype: GgufType,
+    n_elements: usize,
+    sink: F,
+) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    if n_elements == 0 {
+        return Ok(());
+    }
+    // Discarding the returned `out_byte_len`: the streaming variant does
+    // not allocate an output buffer, so it only needs the validation side
+    // effects.
+    let _ = validate_dequant_input(data, dtype, n_elements, E::BYTES)?;
+    dispatch_streaming::<E, _>(data, dtype, sink)
+}
+
+/// Streaming `GGUF` dequantisation emitting `BF16` blocks.
+///
+/// The `E = Bf16Out` spelling of [`dequantize_gguf_blocks`], kept as the name
+/// every caller before v0.7.3 used. The sink receives 64 B per legacy block and
+/// 512 B per K-quant super-block, unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_gguf_blocks`].
+///
+/// # Memory
+///
+/// See [`dequantize_gguf_blocks`]: stack only.
+#[inline]
 pub fn dequantize_gguf_blocks_to_bf16<F>(
     data: &[u8],
     dtype: GgufType,
@@ -502,14 +606,7 @@ pub fn dequantize_gguf_blocks_to_bf16<F>(
 where
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    if n_elements == 0 {
-        return Ok(());
-    }
-    // Discarding the returned `out_byte_len`: the streaming variant does
-    // not allocate an output buffer, so it only needs the validation side
-    // effects.
-    let _ = validate_dequant_input(data, dtype, n_elements)?;
-    dispatch_streaming(data, dtype, sink)
+    dequantize_gguf_blocks::<Bf16Out, F>(data, dtype, n_elements, sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -525,11 +622,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q4_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q4_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 18, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 18, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         // BITWISE: split each qs byte into two 4-bit nibbles, bias by -8
         // CAST: i32 → f32, lossless for values in [-8, 7]
@@ -550,11 +648,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q4_1<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q4_1<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 20, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 20, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let m = read_f16_bytes([in_block[2], in_block[3]]);
         // BITWISE: split each qs byte into two unsigned 4-bit nibbles
@@ -578,11 +677,12 @@ where
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
-fn dequant_q5_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q5_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 22, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 22, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let qh = u32::from_le_bytes([in_block[2], in_block[3], in_block[4], in_block[5]]);
         // BITWISE: merge low 4 bits from qs with bit 4 from qh, bias by -16
@@ -610,11 +710,12 @@ where
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
-fn dequant_q5_1<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q5_1<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 24, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 24, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let m = read_f16_bytes([in_block[2], in_block[3]]);
         let qh = u32::from_le_bytes([in_block[4], in_block[5], in_block[6], in_block[7]]);
@@ -641,11 +742,12 @@ where
     clippy::as_conversions,
     clippy::cast_possible_wrap
 )]
-fn dequant_q8_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q8_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 34, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 34, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         // CAST: u8 → i8 intentional signed reinterpret, then i8 → f32 lossless
         for j in 0..QK_SMALL {
@@ -664,11 +766,12 @@ where
     clippy::as_conversions,
     clippy::cast_possible_wrap
 )]
-fn dequant_q8_1<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q8_1<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 36, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 36, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         // in_block[2..4] is `s` (aux, ignored)
         for j in 0..QK_SMALL {
@@ -690,11 +793,12 @@ where
 /// y[j + 16]  = d * K_VALUES_IQ4_NL[qs[j] >> 4]    for j ∈ 0..16
 /// ```
 #[allow(clippy::indexing_slicing)]
-fn dequant_iq4_nl<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq4_nl<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 18, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 18, sink, |in_block, scratch| {
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         // BITWISE: split each qs byte into two 4-bit codebook indices
         // INDEX: nibble masked to 0..16 — K_VALUES_IQ4_NL lookup is in-bounds
@@ -723,11 +827,12 @@ where
 ///
 /// Ported verbatim from `ggml-quants.c::dequantize_row_mxfp4`.
 #[allow(clippy::indexing_slicing)]
-fn dequant_mxfp4<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_mxfp4<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_legacy_kernel(data, 17, sink, |in_block, scratch| {
+    run_legacy_kernel::<E, _, _>(data, 17, sink, |in_block, scratch| {
         let d = e8m0_to_fp32_half(in_block[0]);
         // BITWISE: split each qs byte into two 4-bit codebook indices.
         // INDEX: nibble masked to 0..16 — K_VALUES_MXFP4 lookup is in-bounds.
@@ -753,11 +858,12 @@ where
     clippy::as_conversions,
     clippy::cast_possible_wrap
 )]
-fn dequant_q8_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q8_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 292, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 292, sink, |in_block, scratch| {
         let d = read_f32_bytes([in_block[0], in_block[1], in_block[2], in_block[3]]);
         // CAST: u8 → i8 intentional signed reinterpret, i8 → f32 lossless
         for j in 0..QK_K {
@@ -782,11 +888,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q2_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q2_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 84, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 84, sink, |in_block, scratch| {
         // Field offsets: scales [0..16], qs [16..80], d [80..82], dmin [82..84]
         let scales = &in_block[0..16];
         let qs = &in_block[16..80];
@@ -839,11 +946,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q3_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q3_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 110, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 110, sink, |in_block, scratch| {
         // Field offsets: hmask [0..32], qs [32..96], scales [96..108], d [108..110]
         let hmask = &in_block[0..32];
         let qs = &in_block[32..96];
@@ -896,11 +1004,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q4_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q4_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 144, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 144, sink, |in_block, scratch| {
         // Field offsets: d [0..2], dmin [2..4], scales [4..16], qs [16..144]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let dmin = read_f16_bytes([in_block[2], in_block[3]]);
@@ -943,11 +1052,12 @@ where
     clippy::as_conversions,
     clippy::cast_precision_loss
 )]
-fn dequant_q5_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q5_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 176, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 176, sink, |in_block, scratch| {
         // Field offsets: d [0..2], dmin [2..4], scales [4..16], qh [16..48], ql [48..176]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let dmin = read_f16_bytes([in_block[2], in_block[3]]);
@@ -996,11 +1106,12 @@ where
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
-fn dequant_q6_k<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_q6_k<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 210, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 210, sink, |in_block, scratch| {
         // Field offsets: ql [0..128], qh [128..192], scales [192..208], d [208..210]
         let ql_all = &in_block[0..128];
         let qh_all = &in_block[128..192];
@@ -1070,11 +1181,12 @@ where
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
 )]
-fn dequant_iq4_xs<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq4_xs<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 136, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 136, sink, |in_block, scratch| {
         // Field offsets: d [0..2], scales_h [2..4], scales_l [4..8], qs [8..136]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let scales_h = u16::from_le_bytes([in_block[2], in_block[3]]);
@@ -1208,11 +1320,12 @@ fn decode_pow3_ternary(packed: u8, pow3_n: u8, d: f32) -> f32 {
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
 )]
-fn dequant_iq2_xxs<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq2_xxs<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 66, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 66, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs [2..66]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let qs = &in_block[2..66];
@@ -1258,11 +1371,12 @@ where
     clippy::cast_precision_loss,
     clippy::needless_range_loop
 )]
-fn dequant_iq2_xs<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq2_xs<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 74, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 74, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs [2..66] (u16[32] LE), scales [66..74]
         let d = read_f16_bytes([in_block[0], in_block[1]]);
         let qs = &in_block[2..66];
@@ -1309,11 +1423,12 @@ where
     clippy::cast_possible_truncation,
     clippy::needless_range_loop
 )]
-fn dequant_iq2_s<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq2_s<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 82, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 82, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs_indices [2..34], qs_signs [34..66],
         //                qh [66..74], scales [74..82].
         let d = read_f16_bytes([in_block[0], in_block[1]]);
@@ -1364,11 +1479,12 @@ where
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation
 )]
-fn dequant_iq3_xxs<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq3_xxs<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 98, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 98, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs [2..98].
         // Inside qs: qs[0..64] = grid-index bytes (8 per sub-block),
         //            qs[64..96] = 8 × u32 scales_and_signs words.
@@ -1435,11 +1551,12 @@ where
     clippy::needless_range_loop,
     clippy::similar_names
 )]
-fn dequant_iq3_s<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq3_s<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 110, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 110, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs [2..66], qh [66..74], signs [74..106],
         //                scales [106..110].
         let d = read_f16_bytes([in_block[0], in_block[1]]);
@@ -1527,11 +1644,12 @@ where
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
 )]
-fn dequant_iq1_s<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq1_s<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 50, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 50, sink, |in_block, scratch| {
         // Field offsets: d [0..2], qs [2..34], qh [34..50] (u16[8] LE — one
         // qh word per ib32, totalling 16 bytes).
         let d = read_f16_bytes([in_block[0], in_block[1]]);
@@ -1596,11 +1714,12 @@ where
     clippy::cast_possible_wrap,
     clippy::similar_names
 )]
-fn dequant_iq1_m<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_iq1_m<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 56, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 56, sink, |in_block, scratch| {
         // Field offsets: qs [0..32], qh [32..48], scales [48..56].
         // No top-level `d`: the super-block scale is reconstructed below.
         let qs = &in_block[0..32];
@@ -1704,11 +1823,12 @@ where
 ///
 /// Ported verbatim from `ggml-quants.c::dequantize_row_tq1_0`.
 #[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
-fn dequant_tq1_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_tq1_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 54, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 54, sink, |in_block, scratch| {
         // Field offsets: qs [0..48], qh [48..52], d [52..54].
         let qs = &in_block[0..48];
         let qh = &in_block[48..52];
@@ -1750,11 +1870,12 @@ where
 ///
 /// Ported verbatim from `ggml-quants.c::dequantize_row_tq2_0`.
 #[allow(clippy::indexing_slicing)]
-fn dequant_tq2_0<F>(data: &[u8], sink: F) -> crate::Result<()>
+fn dequant_tq2_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
 where
+    E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    run_super_kernel(data, 66, sink, |in_block, scratch| {
+    run_super_kernel::<E, _, _>(data, 66, sink, |in_block, scratch| {
         // Field offsets: qs [0..64], d [64..66].
         let qs = &in_block[0..64];
         let d = read_f16_bytes([in_block[64], in_block[65]]);
@@ -1860,6 +1981,13 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 )]
 mod tests {
     use super::*;
+    // The BF16 rounding helper is no longer imported by the module itself
+    // (pass 2 moved to `OutputElement`), but the kernel tests still use it to
+    // derive expected values rather than baking in fragile constants.
+    use crate::remember::fp8::f32_bits_to_bf16_bits;
+    // The non-default output types are referenced only from doc links in the
+    // module body, so they are imported here for the Phase 7.3 tests.
+    use crate::remember::output::{F16Out, F32Out};
 
     // -----------------------------------------------------------------
     // Helpers shared by test fixtures
@@ -2886,7 +3014,7 @@ mod tests {
         let mut block = vec![0u8; 56];
         block[48] = 0x38; // sc[0] low byte: bits [5:0] = 0b111000
         block[49] = 0x00; // sc[0] high byte
-                          // sc[2], sc[3] for f16 = 1.0:
+        // sc[2], sc[3] for f16 = 1.0:
         block[48 + 4] = 0x00;
         block[48 + 5] = 0xC0;
         block[48 + 6] = 0x00;
@@ -3073,6 +3201,139 @@ mod tests {
         let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
         assert_eq!(bf16_pair_to_f32(&out[0..2]), -1.0);
         assert_eq!(bf16_pair_to_f32(&out[32..34]), -12.0);
+    }
+
+    // -----------------------------------------------------------------
+    // Caller-chosen output dtype (Phase 7.3)
+    // -----------------------------------------------------------------
+
+    /// The streaming sink's block length is `QK × E::BYTES`, not a constant.
+    ///
+    /// This is the contract a caller's `chunks_exact(2)` would silently break
+    /// under `F32`, so it is asserted per output type rather than documented
+    /// and hoped for. `Q8_0` is a 32-element legacy block (34 B in), `Q4_K` a
+    /// 256-element super-block (144 B in).
+    #[test]
+    fn streaming_block_length_tracks_the_output_type() {
+        fn observed<E: OutputElement>(dtype: GgufType, type_size: usize, n: usize) -> Vec<usize> {
+            let data = vec![0u8; type_size * (n / dtype.block_size())];
+            let mut lengths = Vec::new();
+            dequantize_gguf_blocks::<E, _>(&data, dtype, n, |block| {
+                lengths.push(block.len());
+                Ok(())
+            })
+            .unwrap();
+            lengths
+        }
+
+        // Legacy 32-element blocks: 64 B at 2-byte output, 128 B at F32.
+        assert_eq!(observed::<Bf16Out>(GgufType::Q8_0, 34, 64), vec![64, 64]);
+        assert_eq!(observed::<F16Out>(GgufType::Q8_0, 34, 64), vec![64, 64]);
+        assert_eq!(observed::<F32Out>(GgufType::Q8_0, 34, 64), vec![128, 128]);
+
+        // K-quant 256-element super-blocks: 512 B at 2-byte output, 1 KiB at F32.
+        assert_eq!(
+            observed::<Bf16Out>(GgufType::Q4_K, 144, 512),
+            vec![512, 512]
+        );
+        assert_eq!(observed::<F16Out>(GgufType::Q4_K, 144, 512), vec![512, 512]);
+        assert_eq!(
+            observed::<F32Out>(GgufType::Q4_K, 144, 512),
+            vec![1024, 1024]
+        );
+    }
+
+    /// `F32` output is the `f32` the kernel actually computed, and `BF16` is
+    /// that same value narrowed.
+    ///
+    /// This is what "removes a narrowing step" means operationally: every
+    /// `BF16` byte pair must equal round-to-nearest-even applied to the
+    /// corresponding `F32` word. If the two ever disagreed, one of the two
+    /// paths would be computing something different from the other.
+    #[test]
+    fn f32_output_is_the_unnarrowed_source_of_the_bf16_output() {
+        // A Q8_0 block with a non-trivial scale and a spread of quant values,
+        // so the low mantissa bits BF16 discards are actually populated.
+        let mut block = vec![0u8; 34];
+        // d = 0.0999755859375 (f16 0x2E66), chosen because d × q lands off the
+        // BF16 grid for most q.
+        block[0] = 0x66;
+        block[1] = 0x2E;
+        for (i, byte) in block[2..34].iter_mut().enumerate() {
+            // CAST: usize → u8, i < 32 and the arithmetic stays in i8 range.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            {
+                *byte = (i as u8).wrapping_sub(16);
+            }
+        }
+
+        let as_f32 = dequantize_gguf::<F32Out>(&block, GgufType::Q8_0, 32).unwrap();
+        let as_bf16 = dequantize_gguf::<Bf16Out>(&block, GgufType::Q8_0, 32).unwrap();
+        assert_eq!(as_f32.len(), 128, "F32 output is 4 B per element");
+        assert_eq!(as_bf16.len(), 64, "BF16 output is 2 B per element");
+
+        let mut narrowing_was_observed = false;
+        for i in 0..32 {
+            let word = f32::from_le_bytes([
+                as_f32[i * 4],
+                as_f32[i * 4 + 1],
+                as_f32[i * 4 + 2],
+                as_f32[i * 4 + 3],
+            ]);
+            let narrowed = f32_bits_to_bf16_bits(word.to_bits());
+            let actual = u16::from_le_bytes([as_bf16[i * 2], as_bf16[i * 2 + 1]]);
+            assert_eq!(actual, narrowed, "element {i}: BF16 != round(F32)");
+
+            // Confirm the fixture is doing its job: at least one value must
+            // actually lose bits, or the assertion above proves nothing.
+            if word.to_bits() & 0x0000_FFFF != 0 {
+                narrowing_was_observed = true;
+            }
+        }
+        assert!(
+            narrowing_was_observed,
+            "fixture is degenerate: no value had mantissa bits for BF16 to discard"
+        );
+    }
+
+    /// Zero-element tensors stay zero-length at every output width.
+    #[test]
+    fn empty_tensor_is_empty_for_every_output_type() {
+        assert!(
+            dequantize_gguf::<Bf16Out>(&[], GgufType::Q8_0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dequantize_gguf::<F32Out>(&[], GgufType::Q8_0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            dequantize_gguf::<F16Out>(&[], GgufType::Q8_0, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The `BF16` wrappers are exactly the `Bf16Out` monomorphisation.
+    ///
+    /// Guards the compatibility promise made to every pre-v0.7.3 caller.
+    #[test]
+    fn bf16_wrappers_match_the_generic_form() {
+        let mut block = vec![0u8; 34];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+        for (i, byte) in block[2..34].iter_mut().enumerate() {
+            // CAST: usize → u8, i < 32.
+            #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+            {
+                *byte = i as u8;
+            }
+        }
+        let via_wrapper = dequantize_gguf_to_bf16(&block, GgufType::Q8_0, 32).unwrap();
+        let via_generic = dequantize_gguf::<Bf16Out>(&block, GgufType::Q8_0, 32).unwrap();
+        assert_eq!(via_wrapper, via_generic);
     }
 }
 

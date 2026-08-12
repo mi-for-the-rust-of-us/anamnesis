@@ -61,7 +61,7 @@
     clippy::doc_markdown
 )]
 
-use anamnesis::{parse_bytes, RememberOptions, TargetDtype};
+use anamnesis::{RememberOptions, TargetDtype, parse_bytes};
 
 /// Number of `FP8` weights in the fixture. A prime count so the atomic cursor
 /// distributes work unevenly across every budget tried below, rather than

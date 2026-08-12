@@ -19,8 +19,8 @@
 use std::time::Instant;
 
 use anamnesis::{
-    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
-    Dtype,
+    Dtype, dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16,
+    dequantize_per_tensor_fp8_to_bf16,
 };
 
 // ---------------------------------------------------------------------------
