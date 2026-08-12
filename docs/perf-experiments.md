@@ -1263,7 +1263,7 @@ claim confirmed literally rather than argued.
 Three output types across the two block runners duplicate two small writer loops, not the 24
 kernel functions, because every kernel funnels through one shared pass-2 writer. Release
 `libanamnesis` binary size is unchanged at the resolution `ls` reports; the `.crate` stayed at
-0.19 MiB. This economy is specific to `GGUF` and is precisely why Phase 7.4 (the `remember`
+0.60 MiB. This economy is specific to `GGUF` and is precisely why Phase 7.4 (the `remember`
 path's four fused-narrowing families) is a separate tag.
 
 **Verdict:** shipped (v0.7.3, Phase 7.3). `F32` costs 1.79× at the kernel and 1.54–1.61×

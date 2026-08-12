@@ -20,8 +20,8 @@ default-run = "anamnesis"
 # `/tests` is the cross-validation corpus. `tests/fixtures` alone is 6.33 MiB of
 # binary goldens, which took the published `.crate` to 4.8 MiB gzipped against
 # the registry's 10 MiB cap. Measured with `cargo package`, excluding it leaves
-# a 2.14 MiB payload that is almost entirely text and gzips to **197 121 bytes
-# (0.19 MiB)**, a 25x reduction. The cap was also starting to constrain how wide
+# a 2.2 MiB payload that is almost entirely text and gzips to **628 687 bytes
+# (0.60 MiB)**, an 8.0x reduction. The cap was also starting to constrain how wide
 # those goldens could be, which is backwards: the test corpus should be sized by
 # the correctness claim it has to support, and the artefact by what consumers
 # actually need.

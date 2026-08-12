@@ -19,7 +19,7 @@ if [ ! -d tests/fixtures ]; then
 error: tests/fixtures/ is missing.
 
 You are probably in a crate unpacked from crates.io, which excludes tests/
-to keep the published artefact at 0.19 MiB instead of 4.8 MiB.
+to keep the published artefact at 0.60 MiB instead of 4.8 MiB.
 
 Get the corpus from the matching GitHub Release (the "Source code (tar.gz)"
 asset carries tests/ verbatim), or clone the repository:

@@ -224,7 +224,7 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
 ### Verifying the correctness claims yourself
 
-The crate published to crates.io is 0.19 MiB and **excludes `tests/`**, because
+The crate published to crates.io is 0.60 MiB and **excludes `tests/`**, because
 the cross-validation corpus is 6.3 MiB of binary goldens that no consumer's
 build can reach. The corpus ships with every
 [GitHub Release](https://github.com/mi-for-the-rust-of-us/anamnesis/releases)

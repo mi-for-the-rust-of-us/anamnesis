@@ -51,7 +51,7 @@ Before tagging a release (`v*`), complete these steps in order:
 8. Wait for the publish workflow to go GREEN. Since v0.7.3 it does **two**
    things: `cargo publish`, then `gh release create` for the tag. The Release
    is what carries the test corpus, because `Cargo.toml`'s `exclude` keeps
-   `tests/` out of the published crate (0.19 MiB instead of 4.8 MiB), and
+   `tests/` out of the published crate (0.60 MiB instead of 4.8 MiB), and
    GitHub's per-tag source tarball ships it verbatim.
 9. Check the Release actually appeared and its notes are the right section.
    The workflow slices them out of `CHANGELOG.md` by matching
@@ -63,7 +63,7 @@ Before tagging a release (`v*`), complete these steps in order:
 **Two checks specific to the packaging split**, worth running before the tag:
 
 - `cargo package --list | grep '^tests/'` must print **nothing**. If it does,
-  the `exclude` regressed and the crate is about to grow ~25×.
+  the `exclude` regressed and the crate is about to grow ~8×.
 - `scripts/verify-claims.sh` (or `.ps1`) should pass from a clean checkout.
   That is the path the README points a consumer at for verifying the
   correctness claims, so it needs to work at the tag, not just on your

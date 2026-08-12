@@ -152,7 +152,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of silently rebasing the reference. All 22 verified unchanged.
 
   The fixtures grew ~6 MB, which costs the published crate nothing: `tests/` is
-  now excluded, and the `.crate` stayed at **0.19 MiB** across this change.
+  now excluded, and the `.crate` stayed at **0.60 MiB** across this change.
 
 - **ThreadSanitizer is now gating, with an instrumented `std`**
   (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
@@ -255,12 +255,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **This fix only reaches crates.io on the next release** — registry metadata is
   frozen per published version and cannot be amended in place.
 
-- **The published crate no longer carries the test corpus, and is 25× smaller**
+- **The published crate no longer carries the test corpus, and is 8× smaller**
   (`Cargo.toml` `exclude`). `tests/` joins `fuzz/` in the exclude list. Measured
-  with `cargo package`: the payload drops to 2.14 MiB of almost entirely text
-  and gzips to **197 121 bytes (0.19 MiB)**, against the **4.8 MiB** crates.io
-  served for `0.7.2`. `tests/fixtures` alone was 6.33 MiB of binary goldens,
-  which is 71 % of everything tracked and reachable from nobody's build.
+  with `cargo publish --dry-run`: the payload drops to 2.2 MiB of almost
+  entirely text and gzips to **628 687 bytes (0.60 MiB)**, against the
+  **4.8 MiB** crates.io served for `0.7.2`. `tests/fixtures` alone was 6.33 MiB
+  of binary goldens, which is 71 % of everything tracked and reachable from
+  nobody's build.
 
   Nothing else was dropped: `README.md`, `CHANGELOG.md`, `ROADMAP.md`,
   `CONVENTIONS.md`, all of `docs/`, and `benches/` still ship. `benches/` stays
