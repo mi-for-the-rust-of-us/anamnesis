@@ -90,6 +90,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{1, 2, 4, 8}` threads at each of the three widths, rather than assumed to
   carry over from the `BF16` suite.
 
+- **All 22 `GGUF` kernels are now cross-validated at `F32`, bit-exactly**
+  (`tests/cross_validation_gguf.rs`,
+  `tests/fixtures/gguf_reference/generate_gguf.py`). Every cross-validation
+  before this rounded the `gguf-py` reference to `BF16` before comparing, which
+  discarded 16 mantissa bits: **no kernel's `f32` had ever been checked at full
+  width.** A kernel could have associated its arithmetic differently from the
+  reference (`(d·sc)·q` against `d·(sc·q)`, or a contraction on a `d·q - dmin·m`
+  line) and every fixture would still have passed.
+
+  **The result: 22 of 22 pass, exactly, with no tolerance.** This was the step
+  the ROADMAP told us to budget for failing, so the null result is worth
+  stating plainly rather than passing over. All 22 production kernels already
+  associate their arithmetic identically to `gguf-py`. Nothing needed fixing;
+  what changed is that it is now *verified* rather than assumed.
+
+  Exact bit equality is the right bar, not an epsilon: anamnesis computes in
+  `f32` and so does `gguf-py`, so identical operations in identical order must
+  produce identical bits, and any difference is a real divergence rather than
+  accumulated noise.
+
+  **The comparison has teeth, and that was demonstrated rather than asserted.**
+  Across the 22 fixtures, **76.5 %** of the 1 441 792 reference values (1 102 549
+  of them) carry mantissa bits `BF16` cannot represent, so the new assertion
+  reads information the old one discarded. Flipping a single mantissa bit in one
+  golden makes exactly one of 65 536 elements fail at 1 `ULP` while the `BF16`
+  comparison stays green, which is the hidden-16-bits problem shown directly.
+
+  Fixtures move to a **versioned container** (magic `AMNG`, version 2) carrying
+  the `BF16` and `F32` goldens side by side; the previous layout had neither
+  magic nor version and so could not be extended unambiguously. The Rust reader
+  rejects any other version by name instead of misreading offsets.
+
+  Both goldens come from `gguf-py`. The `BF16` one is **not** derived by
+  rounding the `F32` one in Rust, which would compare anamnesis's output against
+  a golden produced by anamnesis's own rounding, i.e. the circular-fixture class
+  that shipped three green bugs in v0.6.4.
+
+  `generate_gguf.py --upgrade` rebuilds the fixtures **from their own raw
+  quantised bytes**, so the `F32` goldens are reproducible from a clean checkout
+  with `pip install gguf numpy` and no multi-`GiB` model download. Each upgrade
+  re-derives the `BF16` golden and refuses to proceed unless it reproduces the
+  committed one byte for byte, so a differing `gguf` version fails loudly
+  instead of silently rebasing the reference. All 22 verified unchanged.
+
+  The fixtures grew ~6 MB, which costs the published crate nothing: `tests/` is
+  now excluded, and the `.crate` stayed at **0.19 MiB** across this change.
+
 - **ThreadSanitizer is now gating, with an instrumented `std`**
   (`.github/workflows/tsan.yml`, `src/bin/tsan_harness.rs`). v0.7.2 shipped
   with the `CONVENTIONS.md` race-detector rule still open — the job existed but
