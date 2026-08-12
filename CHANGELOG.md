@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while every test stayed green. Sealing is also the reversible direction:
   un-sealing later is not a breaking change, sealing later would be.
 
+- **`ParsedGguf::dequantize_tensor_as::<E>`** (`src/parse/gguf.rs`), the
+  per-tensor counterpart of the whole-file option. `dequantize_tensor` remains
+  as the `BF16` spelling. Without it, a caller wanting `F32` for a single tensor
+  would have had to re-implement the offset, byte-length and element-count
+  validation that method exists to encapsulate, which would have left the
+  per-tensor path worse off than the whole-file one.
+
 - **`convert` and the CLI can now choose that output dtype**
   (`src/convert.rs`, `src/cli.rs`, `docs/FAQ.md`).
   `ConvertOptions::output_dtype` with a `with_output_dtype` builder matching

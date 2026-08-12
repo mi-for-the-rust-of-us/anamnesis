@@ -29,6 +29,22 @@ deterministic synthetic data.
 | `peak_heap_gptq.rs` | `dequantize_gptq_to_bf16` | `peak < output_size + O(out_features)` (NOT `O(num_groups × out_features)`) | `cargo test --release --features gptq --test peak_heap_gptq -- --ignored --nocapture` |
 | `peak_heap_awq.rs` | `dequantize_awq_to_bf16` | same as `GPTQ` (identical scratch shape) | `cargo test --release --features awq --test peak_heap_awq -- --ignored --nocapture` |
 | `peak_heap_bnb_dq.rs` | `dequantize_bnb4_double_quant_to_bf16` | "no intermediate byte-serialisation allocation" | `cargo test --release --features bnb --test peak_heap_bnb_dq -- --ignored --nocapture` |
+| `peak_heap_gguf.rs` | `dequantize_gguf::<E>` / `dequantize_gguf_blocks::<E>` | `peak == output_size` exactly, **per output dtype**; streaming peak `== 0` | `cargo test --release --features gguf --test peak_heap_gguf -- --ignored --nocapture` |
+
+> **`peak_heap_gguf.rs` asserts a stronger claim than its siblings.** `GPTQ` and
+> `AWQ` allow `output_size + O(out_features)` of scratch; `GGUF` allows **no heap
+> scratch at all**, because both kernel runners keep their `[f32; QK]` scratch
+> and their block output buffer on the *stack*. Its ceiling is therefore the
+> output size plus a fixed constant, deliberately not a term that scales with the
+> tensor: if heap scratch that grows with the input ever appears, the assertion
+> must fail rather than absorb it.
+>
+> It is also the only one parameterised over the **output dtype**, because since
+> v0.7.3 the `GGUF` output width is caller-chosen and the `# Memory` claim is
+> stated in terms of `E::BYTES`. Measured on 4096 × 11008 `Q4_K` (45 M elements):
+> peak equals output exactly at `BF16` (90 177 536 B), `F16` (same) and `F32`
+> (180 355 072 B, exactly twice), with **0 B** of overhead in every case, and the
+> streaming entry point peaks at **0 B**.
 
 Each file declares `dhat::Alloc` as `#[global_allocator]` for its
 own test binary (`tests/<file>.rs` becomes one binary per Cargo's

@@ -9,7 +9,7 @@
 | `cross_validation_gptq.rs` | `gptq` | GPTQ dequantization: bit-exact comparison against PyTorch on 4 real models (2 quantizers × 2 bit widths) |
 | `cross_validation_awq.rs` | `awq` | AWQ dequantization: bit-exact comparison against PyTorch on 2 real models (AutoAWQ GEMM, 4-bit) |
 | `cross_validation_bnb.rs` | `bnb` | BitsAndBytes dequantization: bit-exact comparison against PyTorch on 4 real models (NF4, FP4, double-quant NF4, INT8) |
-| `cross_validation_gguf.rs` | `gguf` | GGUF block-quant dequantization: bit-exact comparison against `gguf` Python package (`ggml-org` reference) on 10 kernels from 3 real models (SmolLM2-135M, TinyLlama-1.1B) |
+| `cross_validation_gguf.rs` | `gguf` | GGUF block-quant dequantization: bit-exact comparison against the `gguf` Python package (`ggml-org` reference) on **all 22 kernels** from 4 real models (SmolLM2-135M, TinyLlama-1.1B, Mistral-7B-v0.3, Qwen2.5-0.5B) plus 3 synthetic fixtures. Since v0.7.3 each kernel is checked at **both `BF16` and full `F32` width**, the latter with no tolerance at all |
 | `cross_validation_pth.rs` | `pth` | PyTorch `.pth` parsing: byte-exact comparison against PyTorch on 3 AlgZoo models (RNN + Transformer, both newer and older ZIP prefix formats) |
 
 ## Fixtures
