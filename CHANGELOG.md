@@ -110,6 +110,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **This fix only reaches crates.io on the next release** — registry metadata is
   frozen per published version and cannot be amended in place.
 
+- **The published crate no longer carries the test corpus, and is 25× smaller**
+  (`Cargo.toml` `exclude`). `tests/` joins `fuzz/` in the exclude list. Measured
+  with `cargo package`: the payload drops to 2.14 MiB of almost entirely text
+  and gzips to **197 121 bytes (0.19 MiB)**, against the **4.8 MiB** crates.io
+  served for `0.7.2`. `tests/fixtures` alone was 6.33 MiB of binary goldens,
+  which is 71 % of everything tracked and reachable from nobody's build.
+
+  Nothing else was dropped: `README.md`, `CHANGELOG.md`, `ROADMAP.md`,
+  `CONVENTIONS.md`, all of `docs/`, and `benches/` still ship. `benches/` stays
+  deliberately, because the `[[bench]]` targets are declared explicitly in
+  `Cargo.toml` and would dangle without their sources.
+
+  **The tests are not gone.** Every tag now gets a GitHub Release, and GitHub's
+  per-tag source tarball carries `tests/` verbatim;
+  `scripts/verify-claims.ps1` / `.sh` run the cross-validation suites from
+  there. See *Verifying the correctness claims* in the `README`.
+
+  Beyond the download, this removes a constraint that had started pointing the
+  wrong way. The 10 MiB registry cap was beginning to bound how wide the
+  cross-validation goldens could be, and a test corpus should be sized by the
+  correctness claim it has to support, not by a packaging limit. The release
+  gate is unaffected: `cargo package`'s verification build never compiled test
+  code, and `publish.yml` runs `cargo test --all-features` before `cargo
+  publish`.
+
 - **Dependencies refreshed** (`Cargo.lock`). 52 packages moved to their latest
   semver-compatible versions. Every change is transitive: no direct dependency
   altered its requirement string, so this is a lockfile refresh rather than an
