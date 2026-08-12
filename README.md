@@ -222,6 +222,26 @@ cross-validation, none of which ship in the published crate.
 Numbers, fixtures, and method: [Validation & tested models](docs/validation.md)
 and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
+### Verifying the correctness claims yourself
+
+The crate published to crates.io is 0.19 MiB and **excludes `tests/`**, because
+the cross-validation corpus is 6.3 MiB of binary goldens that no consumer's
+build can reach. The corpus ships with every
+[GitHub Release](https://github.com/mi-for-the-rust-of-us/anamnesis/releases)
+instead: the *Source code (tar.gz)* asset carries `tests/` verbatim.
+
+```bash
+# from a release tarball or a clone
+./scripts/verify-claims.sh        # Windows: .\scripts\verify-claims.ps1
+```
+
+That runs the `cross_validation_*` suites and prints which reference produced
+each family's goldens (`gguf-py`, `bitsandbytes`, `AutoAWQ`, `GPTQModel`,
+PyTorch, NumPy). Be clear on what it establishes: it checks anamnesis against
+goldens **committed to this repository**, and does not re-derive them. The
+script explains how to do that stronger check, which for `GGUF` needs nothing
+but `pip install gguf numpy` and no model download.
+
 ## Documentation
 
 | Doc | |

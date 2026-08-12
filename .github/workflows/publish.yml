@@ -45,3 +45,63 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # Since v0.7.3 the published crate excludes `tests/` (Cargo.toml
+      # `exclude`), which took the .crate from 4.8 MiB to 0.19 MiB. The test
+      # corpus reaches users through the GitHub Release created below: GitHub
+      # serves a source tarball per tag containing `tests/` verbatim, so no
+      # artefact is built or uploaded here that could drift from the tag.
+      #
+      # Runs AFTER `cargo publish` on purpose: a Release must never advertise a
+      # version whose publish failed.
+      - name: Extract this version's CHANGELOG section
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Print the body between this version's heading and the next `## [`.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/       { exit }
+            found                   { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG section found for [$VERSION]. \
+          Rename '## [Unreleased]' to '## [$VERSION] - YYYY-MM-DD' before tagging."
+            exit 1
+          fi
+          echo "Extracted $(wc -l < release-notes.md) lines of notes for $VERSION"
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          {
+            cat release-notes.md
+            cat <<'FOOTER'
+
+          ---
+
+          ### Verifying the correctness claims
+
+          The published crate on crates.io excludes `tests/` (0.19 MiB instead of
+          4.8 MiB). The cross-validation corpus ships here instead: the **Source
+          code (tar.gz)** asset below contains `tests/` verbatim.
+
+          ```bash
+          tar xzf anamnesis-<tag>.tar.gz && cd anamnesis-*
+          ./scripts/verify-claims.sh          # or scripts\verify-claims.ps1
+          ```
+
+          That runs the `cross_validation_*` suites against goldens produced by
+          each format's own canonical library. Note what it does and does not
+          prove: it checks anamnesis against goldens committed to this repo, and
+          does **not** re-derive those goldens from PyTorch / `gguf-py`. See the
+          script output for how to do that stronger check.
+          FOOTER
+          } > release-body.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-body.md \
+            --verify-tag
