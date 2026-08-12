@@ -4,7 +4,7 @@
 
 *~1000 words · about 4 min read*
 
-<!-- Last updated: 2026-08-07, anamnesis v0.7.2 -->
+<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.

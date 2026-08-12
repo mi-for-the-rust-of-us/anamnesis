@@ -287,6 +287,16 @@
 //!   estimates from the parsed header (zero further I/O)
 //! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
 //!   and write a standard `.safetensors` file
+//! - [`OutputElement`] with [`Bf16Out`] / [`F32Out`] / [`F16Out`] — the
+//!   element type a `GGUF` dequant kernel writes, chosen by the caller
+//!   since v0.7.3 and monomorphised so it costs no run-time branch.
+//!   `F32Out` performs **no narrowing at all**, so its output is the
+//!   `f32` the reference implementation itself produces. Reachable
+//!   through `dequantize_gguf` / `dequantize_gguf_blocks` (both requiring
+//!   the `gguf` feature), through
+//!   `ParsedGguf::dequantize_tensor_as` per tensor, and through
+//!   `ConvertOptions::output_dtype` (`amn convert --out-dtype`) for a
+//!   whole file. The `remember` path stays `BF16`-only until v0.7.4.
 //! - [`ParsedModel::remember_to_bytes`] — the same dequant, returning the
 //!   `.safetensors` bytes in memory instead of writing a file (no disk
 //!   round-trip for an embedder)

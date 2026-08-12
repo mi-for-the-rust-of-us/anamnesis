@@ -1124,10 +1124,39 @@ impl ParsedGguf {
     /// Dequantises a single tensor from the memory-mapped file to `BF16`
     /// bytes.
     ///
+    /// The `E = Bf16Out` spelling of
+    /// [`dequantize_tensor_as`](Self::dequantize_tensor_as), kept as the name
+    /// every caller before v0.7.3 used. Behaviour is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// See [`dequantize_tensor_as`](Self::dequantize_tensor_as).
+    ///
+    /// # Memory
+    ///
+    /// Allocates a single `Vec<u8>` of length `n_elements * 2` for the
+    /// `BF16` output. The input data is read directly from the mmap — no
+    /// input copy. Peak heap is the output buffer (O(`n_elements`)).
+    pub fn dequantize_tensor(&self, info: &GgufTensorInfo) -> crate::Result<Vec<u8>> {
+        self.dequantize_tensor_as::<crate::Bf16Out>(info)
+    }
+
+    /// Dequantises a single tensor from the memory-mapped file, in the output
+    /// element type `E`.
+    ///
     /// Convenience method that slices the internal mmap using `info`'s
     /// offset and byte length, infers the element count from `info.shape`,
     /// and delegates to
-    /// [`dequantize_gguf_to_bf16`](crate::remember::gguf::dequantize_gguf_to_bf16).
+    /// [`dequantize_gguf`](crate::remember::gguf::dequantize_gguf).
+    ///
+    /// `E` is `Bf16Out`, `F32Out` or `F16Out`. Choosing `F32Out` gives the
+    /// `f32` the reference implementation itself produces, with no narrowing
+    /// step of anamnesis's own.
+    ///
+    /// This exists so that a per-tensor caller does not have to re-implement
+    /// the offset, byte-length and element-count validation below in order to
+    /// pick a width. It is the per-tensor counterpart of `ConvertOptions`'s
+    /// `output_dtype` on the whole-file path.
     ///
     /// # Errors
     ///
@@ -1142,10 +1171,14 @@ impl ParsedGguf {
     ///
     /// # Memory
     ///
-    /// Allocates a single `Vec<u8>` of length `n_elements * 2` for the
-    /// `BF16` output. The input data is read directly from the mmap — no
-    /// input copy. Peak heap is the output buffer (O(`n_elements`)).
-    pub fn dequantize_tensor(&self, info: &GgufTensorInfo) -> crate::Result<Vec<u8>> {
+    /// Allocates a single `Vec<u8>` of length `n_elements * E::BYTES`. The
+    /// input data is read directly from the mmap — no input copy. Peak heap is
+    /// the output buffer (O(`n_elements`)), so `F32Out` doubles it against the
+    /// `BF16` default.
+    pub fn dequantize_tensor_as<E: crate::OutputElement>(
+        &self,
+        info: &GgufTensorInfo,
+    ) -> crate::Result<Vec<u8>> {
         let byte_len_u64 = info.byte_len.ok_or_else(|| AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!(
@@ -1190,7 +1223,7 @@ impl ParsedGguf {
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("tensor `{}`: element count overflows usize", info.name),
             })?;
-        crate::remember::gguf::dequantize_gguf_to_bf16(data, info.dtype, n_elements)
+        crate::remember::gguf::dequantize_gguf::<E>(data, info.dtype, n_elements)
     }
 }
 
