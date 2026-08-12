@@ -60,10 +60,19 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           # Print the body between this version's heading and the next `## [`.
-          awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { found = 1; next }
-            found && /^## \[/       { exit }
-            found                   { print }
+          #
+          # The version is matched with `index(...) == 1`, a LITERAL
+          # prefix test, not a regex. An earlier draft used a dynamic regex
+          # (`$0 ~ "^## \\[" v "\\]"`) and silently matched nothing: inside the
+          # shell-quoted awk program `\\[` collapses to `\[`, which gawk treats
+          # as a plain `[`, so the pattern became `^## [0.7.3]` where `[0.7.3]`
+          # is a CHARACTER CLASS matching one of `0 . 7 3`. It could never match
+          # a literal bracket. Dots in a version string are regex metacharacters
+          # too, so literal matching is the right tool here regardless.
+          awk -v hdr="## [$VERSION]" '
+            index($0, hdr) == 1 { found = 1; next }
+            found && /^## \[/   { exit }
+            found               { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then
             echo "::error::No CHANGELOG section found for [$VERSION]. \
