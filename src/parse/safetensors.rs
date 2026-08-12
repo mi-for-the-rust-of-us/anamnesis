@@ -819,28 +819,29 @@ fn infer_awq_config(entries: &[TensorEntry]) -> Option<AwqConfig> {
     {
         let base = entry.name.strip_suffix(".qweight")?;
         let scales_name = format!("{base}.scales");
-        if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
-            if entry.shape.len() >= 2 && scales.shape.len() >= 2 {
-                let in_features = entry.shape.first().copied()?;
-                let qw_cols = entry.shape.last().copied()?;
-                let num_groups = scales.shape.first().copied()?;
-                let out_features = scales.shape.last().copied()?;
+        if let Some(scales) = entries.iter().find(|e| e.name == scales_name)
+            && entry.shape.len() >= 2
+            && scales.shape.len() >= 2
+        {
+            let in_features = entry.shape.first().copied()?;
+            let qw_cols = entry.shape.last().copied()?;
+            let num_groups = scales.shape.first().copied()?;
+            let out_features = scales.shape.last().copied()?;
 
-                if qw_cols == 0 || out_features == 0 || num_groups == 0 || in_features == 0 {
-                    return None;
-                }
+            if qw_cols == 0 || out_features == 0 || num_groups == 0 || in_features == 0 {
+                return None;
+            }
 
-                // AWQ: out_features = qw_cols * pack_factor → pack_factor = out_features / qw_cols
-                if out_features.is_multiple_of(qw_cols) {
-                    let pack_factor = out_features / qw_cols;
-                    for bits in [4u8, 8] {
-                        // CAST: u8 → usize, bits is 4 or 8
-                        #[allow(clippy::as_conversions)]
-                        let expected_pf = 32 / bits as usize;
-                        if pack_factor == expected_pf && in_features.is_multiple_of(num_groups) {
-                            let group_size = in_features / num_groups;
-                            return Some(AwqConfig { bits, group_size });
-                        }
+            // AWQ: out_features = qw_cols * pack_factor → pack_factor = out_features / qw_cols
+            if out_features.is_multiple_of(qw_cols) {
+                let pack_factor = out_features / qw_cols;
+                for bits in [4u8, 8] {
+                    // CAST: u8 → usize, bits is 4 or 8
+                    #[allow(clippy::as_conversions)]
+                    let expected_pf = 32 / bits as usize;
+                    if pack_factor == expected_pf && in_features.is_multiple_of(num_groups) {
+                        let group_size = in_features / num_groups;
+                        return Some(AwqConfig { bits, group_size });
                     }
                 }
             }

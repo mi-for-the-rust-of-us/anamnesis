@@ -50,6 +50,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag sources work**; the `core` fingerprint change that looked like proof was
   just the ABI flag altering the fingerprint. There is no Cargo bug here.
 
+- **The crate is now on Rust Edition 2024** (`Cargo.toml`, plus twelve
+  hand-written sites). `rust-version = "1.88"` already cleared the edition's
+  1.85 floor, so the MSRV is unchanged and no consumer needs a newer toolchain.
+
+  Only one site changed meaning rather than spelling. In
+  [`src/parallel.rs`](src/parallel.rs), `handle.join()` was a `match` scrutinee
+  whose temporary may carry a custom destructor (the `Err` arm holds a panic
+  payload as a `Box<dyn Any>`), and Edition 2024 drops such a temporary
+  **earlier** than 2021 relative to the iterator in the matched arm
+  (`tail_expr_drop_order`). The join result is now bound to a local first, which
+  pins the drop point identically under both editions. The reordering is inert
+  here in any case, and that was checked rather than assumed: the lint's own
+  caveat is to inspect the `impl Drop`s for side effects like releasing a lock
+  or sending a message, and there are none on either path.
+
+  The rest is spelling. Edition 2024 stabilises let-chains, so eight nested
+  `if let` blocks that previously *could not* be collapsed now can and must
+  (`clippy::collapsible_if`), across `src/parse/{pth, safetensors, ollama}.rs`
+  and `tests/panic_profile.rs`. And `unsafe_op_in_unsafe_fn` is an error rather
+  than a lint, so the AVX2 experiment in `tests/bench_pass2_adhoc.rs` states its
+  bounds argument per operation instead of inheriting it from the `unsafe fn`
+  signature, which is a strict improvement in what the `// SAFETY:` comments
+  actually claim.
+
+  Two knock-on effects worth recording. Cargo's resolver moves to **v3**, which
+  is MSRV-aware: `cargo update` now reports "latest Rust 1.88 compatible
+  versions" and will no longer propose a dependency that would silently raise
+  the floor. It selected nothing new, so the lockfile is byte-identical across
+  the flip. Separately, rustfmt's default `style_edition` follows the language
+  edition; that reformat is deliberately **not** in this change, so the diff
+  here is the migration and nothing else.
+
 ### Changed
 
 - **Repository metadata now points at the `mi-for-the-rust-of-us` organization**

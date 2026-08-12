@@ -158,16 +158,19 @@ unsafe fn avx2_write_bf16(scratch: &[f32], out: &mut [u8]) {
         _mm_storeu_si128,
     };
     // SAFETY: caller guarantees AVX2 is available (checked via
-    // is_x86_feature_detected! before dispatch). All loads/stores are unaligned
-    // (`loadu`/`storeu`), and every offset stays within `scratch`/`out`: the loop
-    // covers only whole 8-lane chunks (`chunks * 8 <= n`, `chunks * 16 <= 2n`),
-    // and the scalar tail handles the remainder in-bounds.
+    // is_x86_feature_detected! before dispatch). That is the function-wide
+    // precondition; the per-operation bounds arguments sit at each `unsafe`
+    // block below, which Edition 2024 requires to be written out rather than
+    // inherited from the `unsafe fn` signature (`unsafe_op_in_unsafe_fn`).
     let n = scratch.len().min(out.len() / 2);
     let chunks = n / 8;
     let bias_base = _mm256_set1_epi32(0x7FFF);
     let one = _mm256_set1_epi32(1);
     for c in 0..chunks {
-        let v = _mm256_loadu_si256(scratch.as_ptr().add(c * 8).cast::<__m256i>());
+        // SAFETY: `c < chunks` and `chunks * 8 <= n <= scratch.len()`, so the
+        // 8-lane read at element offset `c * 8` lies wholly inside `scratch`.
+        // The load is unaligned (`loadu`), so no alignment precondition applies.
+        let v = unsafe { _mm256_loadu_si256(scratch.as_ptr().add(c * 8).cast::<__m256i>()) };
         let lsb = _mm256_and_si256(_mm256_srli_epi32::<16>(v), one);
         let bias = _mm256_add_epi32(bias_base, lsb);
         let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(v, bias));
@@ -176,10 +179,16 @@ unsafe fn avx2_write_bf16(scratch: &[f32], out: &mut [u8]) {
         // packus is per-128-bit-lane; permute u64 lanes [0,2] into the low 128
         // to make the 8 wanted u16 contiguous.
         let perm = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
-        _mm_storeu_si128(
-            out.as_mut_ptr().add(c * 16).cast(),
-            _mm256_castsi256_si128(perm),
-        );
+        // SAFETY: `n <= out.len() / 2`, so `chunks * 16 <= 2n <= out.len()` and
+        // the 16-byte write at byte offset `c * 16` lies wholly inside `out`.
+        // The store is unaligned (`storeu`). `out` and `scratch` are distinct
+        // slices, so the write cannot alias the load above.
+        unsafe {
+            _mm_storeu_si128(
+                out.as_mut_ptr().add(c * 16).cast(),
+                _mm256_castsi256_si128(perm),
+            );
+        }
     }
     for i in chunks * 8..n {
         let bf16 = f32_bits_to_bf16_bits(scratch[i].to_bits());
