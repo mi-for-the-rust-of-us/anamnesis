@@ -49,6 +49,35 @@
 //! `cargo-show-asm`. A per-element hook would put a slice-length check on every
 //! element and leave one generic loop whose codegen would have to be inspected
 //! three times anyway.
+//!
+//! **v0.7.4 tested that claim rather than inheriting it, and it held.** The
+//! four `remember` families narrow inside their hot loops, so routing them
+//! through `write_scratch` costs an `f32` intermediate the `GGUF` kernels never
+//! pay. A `write_one(value: f32, out: &mut [u8])` hook was implemented in full
+//! and benchmarked against the pre-v0.7.4 baseline binary, interleaved, on an
+//! idle machine:
+//!
+//! | family | `write_one` | with `write_scratch` + register tiles |
+//! |---|---:|---:|
+//! | `AWQ` | 0.98× | 1.04× |
+//! | `BnB` `NF4` | 1.00× | 1.04× |
+//! | `BnB` `INT8` | 1.01× | 1.09× |
+//! | `FP8` fine-grained | **1.46×** | 1.06× |
+//! | `GPTQ` `INT4` | **4.25×** | 1.09× |
+//!
+//! Three kernels reached parity and two collapsed. `--emit=asm` on the
+//! `Bf16Out` monomorphisations shows why: `GPTQ`'s pass 2 emitted scalar
+//! `vsubss` / `vmulss` where it had emitted `vsubps` / `vmulps` on `%ymm`, and
+//! `FP8` likewise fell to scalar `vmulss`. The `copy_from_slice` inside
+//! `write_one` carries a length check that `LLVM` eliminates for some callers
+//! and not others, because the chunk width comes from the generic `E::BYTES`
+//! rather than the literal the pre-v0.7.4 loops used. **Only the implementation
+//! can supply a literal chunk width**, which is exactly the property
+//! `write_scratch` has and a per-element hook cannot.
+//!
+//! So the trade is a uniform, predictable 1.04–1.09× against a bimodal
+//! 0.98×–4.25×, and the design note stands. See `docs/perf-experiments.md` for
+//! the full numbers.
 
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
