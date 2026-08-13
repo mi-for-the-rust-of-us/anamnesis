@@ -148,14 +148,19 @@ fn bench_fp8_per_tensor() {
 fn bench_bf16_all_families() {
     eprintln!("\n=== bench_bf16_all_families (BF16 default path, best-of-5 median) ===");
 
-    // -- FP8 fine-grained: 4096 × 11008, one scale per 128×128 block ---------
-    {
-        const ROWS: usize = 4096;
-        const COLS: usize = 11008;
-        let weight: Vec<u8> = (0..ROWS * COLS)
+    // -- FP8 fine-grained at two shapes, one scale per 128×128 block ---------
+    // Two shapes because the v0.7.4 split proved strongly shape-dependent: the
+    // column count decides how many 128-wide blocks a row holds, and therefore
+    // how often the per-block prologue (`load_scale` + slicing) runs relative
+    // to the element work.
+    for (rows, cols, label) in [
+        (4096_usize, 11008_usize, "fp8_fg_4096x11008"),
+        (4096, 4096, "fp8_fg_4096x4096 "),
+    ] {
+        let weight: Vec<u8> = (0..rows * cols)
             .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
             .collect();
-        let scale_blocks = ROWS.div_ceil(128) * COLS.div_ceil(128);
+        let scale_blocks = rows.div_ceil(128) * cols.div_ceil(128);
         let scales: Vec<u8> = (0..scale_blocks)
             .flat_map(|i| (0.5_f32 + (i % 8) as f32 * 0.01).to_le_bytes())
             .collect();
@@ -163,14 +168,17 @@ fn bench_bf16_all_families() {
             let out = anamnesis::dequantize_fp8_to_bf16(
                 &weight,
                 &scales,
-                ROWS,
-                COLS,
+                rows,
+                cols,
                 anamnesis::Dtype::F32,
             )
             .unwrap();
             out[out.len() - 1]
         });
-        eprintln!("fp8_fine_grained  {}", fmt_stats(&samples));
+        // Normalised per megaelement so the two shapes compare directly
+        // despite differing element counts.
+        let per_melem = samples[2] / ((rows * cols) as f64 / 1.0e6);
+        eprintln!("{label} {}  [{per_melem:.3} ms/Melem]", fmt_stats(&samples));
     }
 
     // -- BnB INT8: 4096 × 11008, one SCB per row -----------------------------
@@ -276,6 +284,103 @@ fn bench_bf16_all_families() {
             out[out.len() - 1]
         });
         eprintln!("awq_int4          {}", fmt_stats(&samples));
+    }
+}
+
+/// Whole-model `remember` at 1 and 4 threads, the number a user actually feels.
+///
+/// `bench_bf16_all_families` isolates one kernel on one thread, which is the
+/// right level to attribute a codegen change but the wrong level to size its
+/// consequences. This bench closes that gap two ways:
+///
+/// - **Per-tensor parallelism is on**, through `parallel::map_indexed`, exactly
+///   as a real `remember` call has it. Threading cannot remove a per-element
+///   cost (it scales both sides equally), but it does change how much of the
+///   wall clock the kernels account for.
+/// - **The serialization and allocation stages are included**, and they dilute
+///   the kernel ratio. Phase 7.3 saw `F32` cost 1.79× at kernel level but only
+///   1.54–1.61× end to end for exactly this reason.
+///
+/// Uses only `remember_to_bytes_with_options` + `RememberOptions`, both present
+/// before v0.7.4, so the identical test runs on the parent commit's binary.
+#[test]
+#[ignore = "ad-hoc benchmark; run with --release --ignored --nocapture"]
+fn bench_remember_whole_model_threaded() {
+    use anamnesis::{RememberOptions, TargetDtype};
+
+    // 4 layers of 4096 × 4096 FP8, each with its own 32 × 32 block-scale grid.
+    //
+    // Two deliberate choices, both learned the hard way:
+    //
+    // - **Fine-grained, not per-tensor.** That is the kernel
+    //   `bench_bf16_all_families` measures in isolation, so the two numbers are
+    //   directly comparable.
+    // - **Realistically sized tensors.** A first draft used 24 × 1024 × 1024,
+    //   whose 2 MB of output per tensor stays cache-resident, and it reported
+    //   the v0.7.4 kernels **1.78× faster** — the exact opposite of the
+    //   isolated bench's 1.17× slower, from the same two binaries. Real
+    //   attention and FFN weights are 4096 × 4096 and larger, i.e. tens of MB
+    //   of output per tensor and firmly DRAM-bound, which is the regime where
+    //   the extra pass actually costs something. Sizing the fixture below that
+    //   knee measures a regime no real model is in.
+    const TENSORS: usize = 4;
+    const ROWS: usize = 4096;
+    const COLS: usize = 4096;
+    const BLOCK: usize = 128;
+
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..TENSORS {
+        let w_off = data.len();
+        data.extend((0..ROWS * COLS).map(|k| ((k as u64 * 0x9E37_79B9) >> 24) as u8));
+        header.insert(
+            format!("layer.{i}.weight"),
+            serde_json::json!({
+                "dtype": "F8_E4M3",
+                "shape": [ROWS, COLS],
+                "data_offsets": [w_off, data.len()],
+            }),
+        );
+        let s_off = data.len();
+        let scale_rows = ROWS.div_ceil(BLOCK);
+        let scale_cols = COLS.div_ceil(BLOCK);
+        for k in 0..scale_rows * scale_cols {
+            data.extend_from_slice(&(0.125_f32 + (k % 8) as f32 * 0.01).to_le_bytes());
+        }
+        header.insert(
+            format!("layer.{i}.weight_scale"),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": [scale_rows, scale_cols],
+                "data_offsets": [s_off, data.len()],
+            }),
+        );
+    }
+    let header_json = serde_json::to_string(&header).unwrap();
+    let mut file_bytes = Vec::new();
+    file_bytes.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+    file_bytes.extend_from_slice(header_json.as_bytes());
+    file_bytes.extend_from_slice(&data);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synth-fp8.safetensors");
+    std::fs::write(&path, &file_bytes).unwrap();
+    let model = anamnesis::parse(&path).unwrap();
+
+    eprintln!(
+        "\n=== bench_remember_whole_model_threaded ({TENSORS} tensors × {ROWS}×{COLS} fine-grained FP8) ==="
+    );
+    for threads in [1usize, 4] {
+        let samples = time_best_of_5(|| {
+            let bytes = model
+                .remember_to_bytes_with_options(
+                    TargetDtype::BF16,
+                    RememberOptions::new().with_threads(threads),
+                )
+                .unwrap();
+            bytes[bytes.len() - 1]
+        });
+        eprintln!("remember_bf16_t{threads:<2}      {}", fmt_stats(&samples));
     }
 }
 
