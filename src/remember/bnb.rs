@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `BitsAndBytes` dequantization (`NF4`/`FP4` 4-bit and `INT8`) to `BF16`.
+//! `BitsAndBytes` dequantization (`NF4`/`FP4` 4-bit and `INT8`).
 //!
 //! `NF4`/`FP4` uses a 16-entry lookup table + per-block absmax scaling.
 //! `INT8` (`LLM.int8()`) uses per-row absmax with linear `I8` quantization.
+//!
+//! # Output width
+//!
+//! Since v0.7.4 [`dequantize_bnb4`], `dequantize_bnb4_double_quant` and
+//! [`dequantize_bnb_int8`] are generic over
+//! [`OutputElement`](crate::OutputElement); the `*_to_bf16` names remain as
+//! `Bf16Out` wrappers. Both kernels end in
+//! [`OutputElement::write_scratch`]: the `NF4`/`FP4` path already had an `f32`
+//! block scratch and simply stopped narrowing inside pass 2, and the `INT8`
+//! path gained a per-row scratch so it has the same shape.
 //!
 //! # References
 //!
@@ -13,7 +23,7 @@
 //!   Language Models", `NeurIPS` 2023 (`arXiv:2305.14314`)
 
 use crate::error::AnamnesisError;
-use crate::remember::fp8::f32_bits_to_bf16_bits;
+use crate::remember::output::{Bf16Out, OutputElement};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,7 +80,7 @@ fn apply_sign_magnitude_zero(entry: f32, nibble: usize) -> f32 {
 /// Shared by both the plain and double-quant public entry points.
 /// Callers are responsible for validation; this function assumes inputs
 /// are dimensionally consistent.
-fn dequantize_bnb4_core(
+fn dequantize_bnb4_core<E: OutputElement>(
     weight_data: &[u8],
     absmax: &[f32],
     quant_map: &[f32; 16],
@@ -78,11 +88,12 @@ fn dequantize_bnb4_core(
     block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Allocate output ---
-    let out_byte_len = total_elements
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 output byte count overflow".into(),
-        })?;
+    let out_byte_len =
+        total_elements
+            .checked_mul(E::BYTES)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "BnB4 output byte count overflow".into(),
+            })?;
     let mut output = vec![0u8; out_byte_len];
 
     // --- Per-block dequantization with loop fission ---
@@ -100,8 +111,8 @@ fn dequantize_bnb4_core(
                 .ok_or_else(|| AnamnesisError::Parse {
                     reason: format!("BnB4 weight block {block_idx} out of bounds"),
                 })?;
-        let o_start = block_idx * block_size * 2;
-        let o_end = o_start + block_size * 2;
+        let o_start = block_idx * block_size * E::BYTES;
+        let o_end = o_start + block_size * E::BYTES;
         let out_block = output
             .get_mut(o_start..o_end)
             .ok_or_else(|| AnamnesisError::Parse {
@@ -148,22 +159,55 @@ fn dequantize_bnb4_core(
             }
         }
 
-        // --- Pass 2 (scale): f32 scratch × absmax → BF16 output ---
-        // Pure float multiply + BF16 integer rounding — vectorizes to AVX2.
-        // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
-        #[allow(clippy::indexing_slicing)]
-        let scratch_view = &scratch[..block_size];
-        for (val, out_pair) in scratch_view.iter().zip(out_block.chunks_exact_mut(2)) {
-            let scaled = val * block_absmax;
-            let bf16 = f32_bits_to_bf16_bits(scaled.to_bits());
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
+        // --- Pass 2 (scale): f32 scratch × absmax, in place ---
+        // Pure float multiply, no narrowing: the output width is applied once
+        // per block by pass 3. Scaling in place rather than into a second
+        // buffer keeps the block's working set at one L1-resident array; the
+        // read and the write are the same element, so there is no aliasing
+        // ambiguity for the vectorizer to give up on.
+        // VECTORIZED: pending cargo-show-asm verification
+        for val in scratch_block.iter_mut() {
+            *val *= block_absmax;
         }
+
+        // --- Pass 3: narrow to the caller's output width ---
+        E::write_scratch(scratch_block, out_block);
     }
 
     Ok(output)
 }
 
 /// Dequantizes `BitsAndBytes` `NF4`/`FP4` quantized weights to `BF16`.
+///
+/// The [`Bf16Out`] special case of [`dequantize_bnb4`], kept so that every
+/// pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_bnb4`].
+///
+/// # Memory
+///
+/// See [`dequantize_bnb4`]; at `BF16` the output buffer is
+/// `total_elements × 2` bytes.
+#[inline]
+pub fn dequantize_bnb4_to_bf16(
+    weight_data: &[u8],
+    absmax_data: &[u8],
+    quant_map_data: &[u8],
+    total_elements: usize,
+    block_size: usize,
+) -> crate::Result<Vec<u8>> {
+    dequantize_bnb4::<Bf16Out>(
+        weight_data,
+        absmax_data,
+        quant_map_data,
+        total_elements,
+        block_size,
+    )
+}
+
+/// Dequantizes `BitsAndBytes` `NF4`/`FP4` quantized weights into `E`.
 ///
 /// Each byte in `weight_data` packs two 4-bit values: high nibble first
 /// (`byte >> 4` → element `2i`), low nibble second (`byte & 0x0F` →
@@ -205,9 +249,9 @@ fn dequantize_bnb4_core(
 ///
 /// # Memory
 ///
-/// Allocates `total_elements × 2` bytes for `BF16` output, plus a scratch
+/// Allocates `total_elements × E::BYTES` bytes of output, plus a scratch
 /// buffer of `block_size × 4` bytes for loop fission (fits in L1 cache).
-pub fn dequantize_bnb4_to_bf16(
+pub fn dequantize_bnb4<E: OutputElement>(
     weight_data: &[u8],
     absmax_data: &[u8],
     quant_map_data: &[u8],
@@ -293,7 +337,7 @@ pub fn dequantize_bnb4_to_bf16(
         })?;
     }
 
-    dequantize_bnb4_core(
+    dequantize_bnb4_core::<E>(
         weight_data,
         &absmax_f32,
         &quant_map,
@@ -303,6 +347,45 @@ pub fn dequantize_bnb4_to_bf16(
 }
 
 /// Dequantizes `BitsAndBytes` `NF4`/`FP4` with double quantization to `BF16`.
+///
+/// The [`Bf16Out`] special case of [`dequantize_bnb4_double_quant`], kept so
+/// that every pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_bnb4_double_quant`].
+///
+/// # Memory
+///
+/// See [`dequantize_bnb4_double_quant`]; at `BF16` the output buffer is
+/// `total_elements × 2` bytes.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn dequantize_bnb4_double_quant_to_bf16(
+    weight_data: &[u8],
+    absmax_data: &[u8],
+    quant_map_data: &[u8],
+    nested_absmax_data: &[u8],
+    nested_quant_map_data: &[u8],
+    nested_offset: f32,
+    total_elements: usize,
+    block_size: usize,
+    nested_block_size: usize,
+) -> crate::Result<Vec<u8>> {
+    dequantize_bnb4_double_quant::<Bf16Out>(
+        weight_data,
+        absmax_data,
+        quant_map_data,
+        nested_absmax_data,
+        nested_quant_map_data,
+        nested_offset,
+        total_elements,
+        block_size,
+        nested_block_size,
+    )
+}
+
+/// Dequantizes `BitsAndBytes` `NF4`/`FP4` with double quantization into `E`.
 ///
 /// First dequantizes the nested absmax values (themselves quantized to `U8`),
 /// then uses the recovered `F32` absmax values for the main `NF4`/`FP4` dequant.
@@ -341,11 +424,11 @@ pub fn dequantize_bnb4_to_bf16(
 ///
 /// # Memory
 ///
-/// Allocates `total_elements × 2` bytes for `BF16` output, plus an `f32`
+/// Allocates `total_elements × E::BYTES` bytes of output, plus an `f32`
 /// absmax array (`num_blocks × 4` bytes) and a scratch buffer
 /// (`block_size × 4` bytes). No intermediate byte serialization.
 #[allow(clippy::too_many_arguments)]
-pub fn dequantize_bnb4_double_quant_to_bf16(
+pub fn dequantize_bnb4_double_quant<E: OutputElement>(
     weight_data: &[u8],
     absmax_data: &[u8],
     quant_map_data: &[u8],
@@ -467,7 +550,7 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
 
     // --- Delegate to core dequant with recovered f32 absmax directly ---
     // No intermediate serialization: dequantized_absmax is passed as &[f32].
-    dequantize_bnb4_core(
+    dequantize_bnb4_core::<E>(
         weight_data,
         &dequantized_absmax,
         &quant_map,
@@ -481,6 +564,29 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
 // ---------------------------------------------------------------------------
 
 /// Dequantizes `BitsAndBytes` `INT8` (`LLM.int8()`) quantized weights to `BF16`.
+///
+/// The [`Bf16Out`] special case of [`dequantize_bnb_int8`], kept so that every
+/// pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_bnb_int8`].
+///
+/// # Memory
+///
+/// See [`dequantize_bnb_int8`]; at `BF16` the output buffer is
+/// `out_features × in_features × 2` bytes.
+#[inline]
+pub fn dequantize_bnb_int8_to_bf16(
+    weight_data: &[u8],
+    scb_data: &[u8],
+    out_features: usize,
+    in_features: usize,
+) -> crate::Result<Vec<u8>> {
+    dequantize_bnb_int8::<Bf16Out>(weight_data, scb_data, out_features, in_features)
+}
+
+/// Dequantizes `BitsAndBytes` `INT8` (`LLM.int8()`) quantized weights into `E`.
 ///
 /// Each `I8` weight value is dequantized via: `value = weight_i8 × (SCB / 127)`,
 /// where `SCB` is the per-row absolute maximum.
@@ -498,8 +604,12 @@ pub fn dequantize_bnb4_double_quant_to_bf16(
 ///
 /// # Memory
 ///
-/// Allocates `out_features × in_features × 2` bytes for `BF16` output.
-pub fn dequantize_bnb_int8_to_bf16(
+/// Allocates `out_features × in_features × E::BYTES` bytes of output, plus one
+/// `in_features × 4`-byte row scratch. The scratch is new in v0.7.4: it is what
+/// lets the narrowing move out of the arithmetic loop and into
+/// [`OutputElement::write_scratch`], and it is L1-resident for any realistic
+/// row width.
+pub fn dequantize_bnb_int8<E: OutputElement>(
     weight_data: &[u8],
     scb_data: &[u8],
     out_features: usize,
@@ -535,18 +645,21 @@ pub fn dequantize_bnb_int8_to_bf16(
     }
 
     // --- Allocate output ---
-    let out_byte_len = total_elements
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB INT8 output byte count overflow".into(),
-        })?;
+    let out_byte_len =
+        total_elements
+            .checked_mul(E::BYTES)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "BnB INT8 output byte count overflow".into(),
+            })?;
     let mut output = vec![0u8; out_byte_len];
 
+    // Row scratch, reused across rows. Before v0.7.4 this kernel was a single
+    // fused pass, which is also why it was `BF16`-only; the split is what lets
+    // `OutputElement::write_scratch` own the narrowing for every width.
+    let mut values_buf = vec![0.0_f32; in_features];
+
     // --- Per-row dequantization ---
-    // Scale is constant per row → hoisted. Inner loop is 1:1 (I8 → BF16),
-    // should vectorize without loop fission (like FP8 per-channel).
-    // VECTORIZED: single-pass i8→f32 multiply + BF16 convert; verified
-    // vcvtdq2ps + vmulps ymm with target-cpu=native.
+    // Scale is constant per row → hoisted.
     for row in 0..out_features {
         let scb_val = read_f32_le(scb_data, row * 4).ok_or_else(|| AnamnesisError::Parse {
             reason: format!("BnB INT8 SCB read out of bounds at row {row}"),
@@ -562,24 +675,32 @@ pub fn dequantize_bnb_int8_to_bf16(
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("BnB INT8 weight row {row} out of bounds"),
             })?;
-        let o_start = row * in_features * 2;
-        let o_end = o_start + in_features * 2;
+        let o_start = row * in_features * E::BYTES;
+        let o_end = o_start + in_features * E::BYTES;
         let out_row = output
             .get_mut(o_start..o_end)
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("BnB INT8 output row {row} out of bounds"),
             })?;
+        // INDEX: values_buf.len() == in_features, allocated before the loop
+        let values_row =
+            values_buf
+                .get_mut(..in_features)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "BnB INT8 dequantised values buffer too short".into(),
+                })?;
 
-        // Hot loop: 1:1 byte → BF16, scale hoisted, contiguous I/O
-        for (&w_byte, out_pair) in row_weights.iter().zip(out_row.chunks_exact_mut(2)) {
+        // Pass 1: 1:1 byte → f32, scale hoisted, contiguous I/O
+        // VECTORIZED: pending cargo-show-asm verification
+        for (&w_byte, value) in row_weights.iter().zip(values_row.iter_mut()) {
             // CAST: u8 (from I8 two's complement) → i8 → f32
             #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
             let w_i8 = w_byte as i8;
-            let w_f32 = f32::from(w_i8);
-            let val = w_f32 * scale;
-            let bf16 = f32_bits_to_bf16_bits(val.to_bits());
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
+            *value = f32::from(w_i8) * scale;
         }
+
+        // Pass 2: narrow to the caller's output width
+        E::write_scratch(values_row, out_row);
     }
 
     Ok(output)

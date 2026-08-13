@@ -63,12 +63,19 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 /// those three the complete set.
 ///
 /// Feature-gated with its consumer. Those two runners are the only code that
-/// needs it today, so without `gguf` it is genuinely dead — and on the MSRV
+/// needs it, so without `gguf` it is genuinely dead — and on the MSRV
 /// toolchain, provably so: rustc 1.88's dead-code analysis does **not** count
 /// the reference from the `const` assertion block below as a use, while current
 /// stable does. Gating it here rather than reaching for `#[allow(dead_code)]`
-/// keeps the lint meaningful. Phase 7.4 widens the gate when the `FP8` / `GPTQ`
-/// / `AWQ` / `BnB` families start sizing buffers from it too.
+/// keeps the lint meaningful.
+///
+/// v0.7.3 expected v0.7.4 to widen this gate once `FP8` / `GPTQ` / `AWQ` /
+/// `BnB` went generic. **It did not, and the gate is correct as it stands.**
+/// Those four families tile through an **`f32` scratch** and hand it to
+/// [`OutputElement::write_scratch`], so their scratch is sized in `f32`s and
+/// never in output bytes; only the `GGUF` runners build a byte tile up front,
+/// because their kernels write into a fixed `[f32; QK]` and the output buffer
+/// has to be materialised beside it. The constant stays a `GGUF` concept.
 #[cfg(feature = "gguf")]
 pub(crate) const MAX_OUTPUT_BYTES: usize = 4;
 

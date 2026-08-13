@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `AWQ` dequantization (activation-aware, INT4 with per-group scales) to `BF16`.
+//! `AWQ` dequantization (activation-aware, INT4 with per-group scales).
 //!
 //! Converts packed integer weights with per-group scale factors and zero-points
-//! into `BF16` output bytes. `AWQ` packs along `out_features` (columns), unlike
-//! `GPTQ` which packs along `in_features` (rows). No `.g_idx` — groups are always
-//! sequential.
+//! into output bytes of a caller-chosen width. `AWQ` packs along `out_features`
+//! (columns), unlike `GPTQ` which packs along `in_features` (rows). No
+//! `.g_idx` — groups are always sequential.
+//!
+//! # Output width
+//!
+//! Since v0.7.4 [`dequantize_awq`] is generic over
+//! [`OutputElement`](crate::OutputElement); `dequantize_awq_to_bf16` remains as
+//! the `Bf16Out` wrapper. The kernel is a three-pass loop fission matching
+//! `GPTQ`'s: unpack the interleaved nibbles into `f32`, apply
+//! `(q - zero) × scale` into a second `f32` scratch, then hand that scratch to
+//! [`OutputElement::write_scratch`].
 //!
 //! # Packing order (the `AutoAWQ` GEMM interleave)
 //!
@@ -29,7 +38,7 @@
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
-use crate::remember::fp8::f32_bits_to_bf16_bits;
+use crate::remember::output::{Bf16Out, OutputElement};
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 /// `AWQ` 4-bit pack factor: 8 nibbles per packed `I32`.
@@ -139,6 +148,43 @@ fn unpack_scales_for_group(
 
 /// Dequantizes an `AWQ`-quantized weight tensor to `BF16`.
 ///
+/// The [`Bf16Out`] special case of [`dequantize_awq`], kept so that every
+/// pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_awq`].
+///
+/// # Memory
+///
+/// See [`dequantize_awq`]; at `BF16` the output buffer is
+/// `in_features × out_features × 2` bytes.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn dequantize_awq_to_bf16(
+    qweight_data: &[u8],
+    scales_data: &[u8],
+    qzeros_data: &[u8],
+    in_features: usize,
+    out_features: usize,
+    group_size: usize,
+    bits: u8,
+    scale_dtype: Dtype,
+) -> crate::Result<Vec<u8>> {
+    dequantize_awq::<Bf16Out>(
+        qweight_data,
+        scales_data,
+        qzeros_data,
+        in_features,
+        out_features,
+        group_size,
+        bits,
+        scale_dtype,
+    )
+}
+
+/// Dequantizes an `AWQ`-quantized weight tensor into `E`.
+///
 /// `AWQ` packs along `out_features` (columns): `qweight` shape is
 /// `[in_features, out_features / pack_factor]`. The dequantization formula is:
 /// `dequant[i, j] = (qweight[i, j] - qzeros[g, j]) × scales[g, j]`
@@ -164,8 +210,8 @@ fn unpack_scales_for_group(
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` of length `in_features × out_features × 2`, containing `BF16`
-/// values in little-endian byte order. Shape: `[in_features, out_features]`
+/// A `Vec<u8>` of length `in_features × out_features × E::BYTES`, in
+/// little-endian byte order. Shape: `[in_features, out_features]`
 /// — the **GEMM-native** orientation the canonical `AutoAWQ` kernel
 /// produces (and the cross-validation fixtures anchor). Note this is the
 /// transpose of a standard `nn.Linear.weight` (`[out, in]`);
@@ -181,12 +227,15 @@ fn unpack_scales_for_group(
 /// # Memory
 ///
 /// Allocates per-group scratch buffers for zero-points and scales
-/// (`out_features × 4` bytes each), an unpacking scratch buffer
-/// (`out_features × 4` bytes), plus the output buffer
-/// (`in_features × out_features × 2` bytes). Group data is computed
-/// lazily — only the current group's row is live at any time.
+/// (`out_features × 4` bytes each), an unpacking scratch buffer and a values
+/// scratch buffer (`out_features × 4` bytes each), plus the output buffer
+/// (`in_features × out_features × E::BYTES` bytes). Group data is computed
+/// lazily — only the current group's row is live at any time. The values
+/// scratch is new in v0.7.4: it is what lets the narrowing move out of the
+/// arithmetic loop and into [`OutputElement::write_scratch`], and at
+/// `out_features × 4` bytes it is L1-resident and independent of model size.
 #[allow(clippy::too_many_arguments)]
-pub fn dequantize_awq_to_bf16(
+pub fn dequantize_awq<E: OutputElement>(
     qweight_data: &[u8],
     scales_data: &[u8],
     qzeros_data: &[u8],
@@ -286,7 +335,7 @@ pub fn dequantize_awq_to_bf16(
     // --- Allocate output + scratch buffers ---
     let out_byte_len = in_features
         .checked_mul(out_features)
-        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_mul(E::BYTES))
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "output size overflow".into(),
         })?;
@@ -296,6 +345,7 @@ pub fn dequantize_awq_to_bf16(
     // Lazy per-group: only `out_features` f32 values are live at a time,
     // instead of the full `num_groups × out_features` grid.
     let mut unpacked_buf = vec![0.0_f32; out_features];
+    let mut values_buf = vec![0.0_f32; out_features];
     let mut zeros_buf = vec![0.0_f32; out_features];
     let mut scales_buf = vec![0.0_f32; out_features];
     let mut cached_group: Option<usize> = None;
@@ -343,12 +393,12 @@ pub fn dequantize_awq_to_bf16(
         // Output row.
         let out_row_start = i
             .checked_mul(out_features)
-            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_mul(E::BYTES))
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {i} offset overflow"),
             })?;
         let out_row_end = out_features
-            .checked_mul(2)
+            .checked_mul(E::BYTES)
             .and_then(|row_bytes| out_row_start.checked_add(row_bytes))
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {i} end overflow"),
@@ -395,20 +445,28 @@ pub fn dequantize_awq_to_bf16(
             }
         }
 
-        // --- Pass 2: pure f32 arithmetic → BF16 output (VECTORIZES to AVX2) ---
-        // Contiguous f32 reads (unpacked, zeros, scales) and contiguous BF16 writes.
-        // No byte manipulation — just sub + mul + bf16 convert.
+        // --- Pass 2: pure f32 arithmetic into an f32 scratch ---
+        // Contiguous f32 reads (unpacked, zeros, scales), contiguous f32
+        // writes, no byte manipulation and no narrowing — just sub + mul.
+        // INDEX: values_buf.len() == out_features, allocated before the outer loop
+        let values_row =
+            values_buf
+                .get_mut(..out_features)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "dequantised values buffer too short".into(),
+                })?;
         // VECTORIZED: pending cargo-show-asm verification
-        for (((out_pair, &qw), &zero), &scale) in out_row
-            .chunks_exact_mut(2)
+        for (((value, &qw), &zero), &scale) in values_row
+            .iter_mut()
             .zip(unpacked_row.iter())
             .zip(zeros_row.iter())
             .zip(scales_row.iter())
         {
-            let val = (qw - zero) * scale;
-            let bf16 = f32_bits_to_bf16_bits(val.to_bits());
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
+            *value = (qw - zero) * scale;
         }
+
+        // --- Pass 3: narrow to the caller's output width ---
+        E::write_scratch(values_row, out_row);
     }
 
     Ok(output)
@@ -429,6 +487,10 @@ pub fn dequantize_awq_to_bf16(
 )]
 mod tests {
     use super::*;
+    // The kernel itself no longer narrows (v0.7.4 moved that to
+    // `OutputElement::write_scratch`), but the `BF16` expectations these tests
+    // assert still have to be built the same way the writer builds them.
+    use crate::remember::fp8::f32_bits_to_bf16_bits;
 
     // -- Small dequantization with known values ------------------------------
 

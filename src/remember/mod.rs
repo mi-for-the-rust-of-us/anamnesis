@@ -24,11 +24,16 @@ pub mod pth;
 pub(crate) mod quant_utils;
 
 #[cfg(feature = "awq")]
-pub use awq::dequantize_awq_to_bf16;
+pub use awq::{dequantize_awq, dequantize_awq_to_bf16};
 #[cfg(feature = "bnb")]
-pub use bnb::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
+pub use bnb::{
+    dequantize_bnb_int8, dequantize_bnb_int8_to_bf16, dequantize_bnb4,
+    dequantize_bnb4_double_quant, dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16,
+};
 pub use fp8::{
-    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
+    dequantize_fp8, dequantize_fp8_to_bf16, dequantize_per_channel_fp8,
+    dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8,
+    dequantize_per_tensor_fp8_to_bf16,
 };
 #[cfg(feature = "gguf")]
 pub use gguf::{
@@ -36,7 +41,7 @@ pub use gguf::{
     dequantize_gguf_to_bf16,
 };
 #[cfg(feature = "gptq")]
-pub use gptq::dequantize_gptq_to_bf16;
+pub use gptq::{dequantize_gptq, dequantize_gptq_to_bf16};
 #[cfg(feature = "npz")]
 pub use npz::{npz_to_safetensors, npz_to_safetensors_bytes};
 pub use output::{Bf16Out, F16Out, F32Out, OutputElement};

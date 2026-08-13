@@ -673,21 +673,24 @@ fn write_hub(
 // ---------------------------------------------------------------------------
 
 /// Reads a safetensors file into the hub, dequantising quantised tensors to
-/// `BF16` and passing scalar tensors through in their original dtype. Carries
-/// the source `__metadata__`.
+/// `out_dtype` and passing scalar tensors through in their original dtype.
+/// Carries the source `__metadata__`.
 ///
-/// `out_dtype` must be [`Dtype::BF16`] whenever this file actually contains
-/// something to dequantise. The four kernel families this path dispatches over
-/// (`FP8`, `GPTQ`, `AWQ`, `BnB`) fuse the narrowing into their hot loops rather
-/// than sharing a writer the way the 24 `GGUF` kernels do, so they are
-/// generalised in v0.7.4 rather than v0.7.3.
+/// `out_dtype` selects the element type the **dequantised** tensors are written
+/// in ([`Dtype::BF16`], [`Dtype::F32`] or [`Dtype::F16`]); passthrough tensors
+/// keep their source dtype regardless. Resolved to a static type parameter once,
+/// here, so the choice costs no per-tensor branch and no per-element branch.
+///
+/// Until v0.7.4 this rejected every non-`BF16` request that met a quantised
+/// input, because the four kernel families it dispatches over (`FP8`, `GPTQ`,
+/// `AWQ`, `BnB`) fused the narrowing into their hot loops. Phase 7.4 made them
+/// generic over `OutputElement`, so the rejection is gone and this path now
+/// behaves exactly like the `GGUF` one.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `out_dtype` is not
-/// [`Dtype::BF16`] **and** the input carries quantised tensors. An unquantised
-/// safetensors file dequantises nothing, so the request is vacuous and is
-/// allowed through rather than refused on a technicality.
+/// Propagates parse and dequantisation errors. `resolve_output_dtype` has
+/// already rejected any dtype that is not an output width.
 fn read_safetensors(
     path: &Path,
     limits: &ParseLimits,
@@ -695,18 +698,21 @@ fn read_safetensors(
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
-    if out_dtype != Dtype::BF16 && model.header.quantized_count() > 0 {
-        return Err(AnamnesisError::Unsupported {
-            format: "safetensors".into(),
-            detail: format!(
-                "{out_dtype} output is not yet available for quantised safetensors input: \
-                 the FP8/GPTQ/AWQ/BnB kernels narrow inside their hot loops and are \
-                 generalised in v0.7.4 (ROADMAP Phase 7.4). v0.7.3 covers the GGUF input \
-                 path; re-run without --out-dtype to emit BF16"
-            ),
-        });
-    }
-    let (tensors, dequantized) = model.hub_tensors(threads)?;
+    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
+    // already rejected everything outside these three, so the wildcard is
+    // defence in depth rather than a reachable path.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let (tensors, dequantized) = match out_dtype {
+        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads)?,
+        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads)?,
+        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads)?,
+        other => {
+            return Err(AnamnesisError::Unsupported {
+                format: "safetensors".into(),
+                detail: format!("{other} is not a dequantisation output width"),
+            });
+        }
+    };
     Ok(Hub {
         tensors,
         st_metadata: model.header.metadata.clone(),

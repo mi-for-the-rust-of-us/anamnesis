@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Fine-grained `FP8` `E4M3` dequantization to `BF16`.
+//! Fine-grained `FP8` `E4M3` dequantization.
 //!
-//! Converts raw `F8_E4M3` bytes with 128×128 block scale factors into
-//! `BF16` output bytes. The conversion pipeline is fully branchless to
-//! enable auto-vectorization.
+//! Converts raw `F8_E4M3` bytes with 128×128 block scale factors into output
+//! bytes of a caller-chosen width. The conversion pipeline is fully branchless
+//! to enable auto-vectorization.
+//!
+//! # Output width
+//!
+//! Since v0.7.4 the three entry points are generic over
+//! [`OutputElement`](crate::OutputElement): `Bf16Out` (the default and the only
+//! width before v0.7.4), `F32Out` (no narrowing step at all, so the emitted
+//! value *is* the one the kernel computed) and `F16Out`. The `*_to_bf16` names
+//! remain as `#[inline]` `Bf16Out` wrappers, so no existing caller changes.
+//!
+//! The narrowing is **not** fused into the arithmetic. Each entry point tiles
+//! its work into `BLOCK_SIZE`-element runs through a stack `f32` scratch
+//! ([`fp8_run_to_output`]) and hands the scratch to
+//! [`OutputElement::write_scratch`], which is where every output width in this
+//! crate is produced. That keeps the kernel arithmetic identical across output
+//! types and gives each width one loop to verify rather than three per family.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
+use crate::remember::output::{Bf16Out, OutputElement};
 
 /// Block size for fine-grained `FP8` quantization (128×128 elements per block).
 const BLOCK_SIZE: usize = 128;
@@ -111,16 +127,65 @@ pub(crate) fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
     bf16
 }
 
-/// Converts a single `E4M3` byte to `BF16` bits, multiplied by `scale`.
+/// Converts a single `E4M3` byte to `f32`, multiplied by `scale`.
 ///
-/// This is the hot-loop kernel. It combines [`e4m3_to_f32_bits`],
-/// `f32` scale multiplication, and [`f32_bits_to_bf16_bits`] into a
-/// single branchless pipeline.
+/// This is the hot-loop kernel: [`e4m3_to_f32_bits`] followed by one `f32`
+/// multiply, branchless throughout. It deliberately stops at `f32` — the
+/// narrowing to the caller's output width happens once per tile in
+/// [`OutputElement::write_scratch`], not once per element here. Before v0.7.4
+/// this function was `e4m3_to_scaled_bf16` and fused the narrowing in, which is
+/// what made the family `BF16`-only.
 #[must_use]
-fn e4m3_to_scaled_bf16(byte: u8, scale: f32) -> u16 {
+fn e4m3_to_scaled_f32(byte: u8, scale: f32) -> f32 {
     let value_bits = e4m3_to_f32_bits(byte);
-    let scaled = f32::from_bits(value_bits) * scale;
-    f32_bits_to_bf16_bits(scaled.to_bits())
+    f32::from_bits(value_bits) * scale
+}
+
+/// Converts a run of `E4M3` bytes at one hoisted `scale` into `out`.
+///
+/// The shared tail of all three `FP8` entry points, and the only place the
+/// family's output width is decided. Work is tiled into [`BLOCK_SIZE`]-element
+/// runs through a stack scratch buffer (512 B, L1-resident, no allocation), so
+/// pass 1 stays pure `E4M3` → `f32` arithmetic and pass 2 is
+/// [`OutputElement::write_scratch`] verbatim.
+///
+/// # Preconditions
+///
+/// `out.len() == bytes.len() × E::BYTES`. The iteration pairs chunks of both
+/// slices, so a short `out` produces short output rather than a panic and a
+/// long one leaves the tail untouched. Every caller sizes both from the same
+/// element count, so neither happens in practice.
+#[inline]
+fn fp8_run_to_output<E: OutputElement>(bytes: &[u8], scale: f32, out: &mut [u8]) {
+    let mut scratch = [0.0_f32; BLOCK_SIZE];
+    let in_tiles = bytes.chunks_exact(BLOCK_SIZE);
+    // Read before the iterator is consumed: `remainder` borrows rather than
+    // advances, so this is the edge run the loop below will not cover.
+    let tail_in = in_tiles.remainder();
+    let mut out_tiles = out.chunks_exact_mut(BLOCK_SIZE * E::BYTES);
+
+    // VECTORIZED: pending cargo-show-asm verification
+    for (in_tile, out_tile) in in_tiles.zip(out_tiles.by_ref()) {
+        for (&byte, dst) in in_tile.iter().zip(scratch.iter_mut()) {
+            *dst = e4m3_to_scaled_f32(byte, scale);
+        }
+        E::write_scratch(&scratch, out_tile);
+    }
+
+    // Edge run (< BLOCK_SIZE elements). `chunks_exact` hands back exactly the
+    // elements that did not fill a tile, and `into_remainder` the bytes that
+    // did not fill an output tile, so the two lengths correspond.
+    let tail_out = out_tiles.into_remainder();
+    // `tail_in.len() < BLOCK_SIZE == scratch.len()`, so this is always `Some`;
+    // `get_mut` is used rather than a slice index so the crate's no-panic floor
+    // is upheld by construction rather than by an argument in a comment.
+    if let Some(tail_scratch) = scratch.get_mut(..tail_in.len()) {
+        // VECTORIZED: pending cargo-show-asm verification
+        for (&byte, dst) in tail_in.iter().zip(tail_scratch.iter_mut()) {
+            *dst = e4m3_to_scaled_f32(byte, scale);
+        }
+        E::write_scratch(tail_scratch, tail_out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +281,35 @@ fn read_scale_bytes(slice: &[u8], dtype: Dtype) -> crate::Result<f32> {
 
 /// Dequantizes a fine-grained `FP8` `E4M3` weight tensor to `BF16`.
 ///
+/// The [`Bf16Out`] special case of [`dequantize_fp8`], kept so that every
+/// pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_fp8`].
+///
+/// # Memory
+///
+/// See [`dequantize_fp8`]; at `BF16` the output buffer is `rows × cols × 2`
+/// bytes.
+#[inline]
+pub fn dequantize_fp8_to_bf16(
+    weight_data: &[u8],
+    scale_data: &[u8],
+    rows: usize,
+    cols: usize,
+    scale_dtype: Dtype,
+) -> crate::Result<Vec<u8>> {
+    dequantize_fp8::<Bf16Out>(weight_data, scale_data, rows, cols, scale_dtype)
+}
+
+/// Dequantizes a fine-grained `FP8` `E4M3` weight tensor into `E`.
+///
 /// Each 128×128 block of the weight tensor shares one `F32` scale factor.
-/// The formula is: `BF16(FP8_to_f32(byte) × scale)`.
+/// The formula is: `E(FP8_to_f32(byte) × scale)`, where the only step that
+/// depends on `E` is the final write. With [`F32Out`](crate::F32Out) there is
+/// no narrowing step at all, so the emitted value is the one the kernel
+/// computed.
 ///
 /// # Arguments
 ///
@@ -230,9 +322,9 @@ fn read_scale_bytes(slice: &[u8], dtype: Dtype) -> crate::Result<f32> {
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` of length `rows × cols × 2`, containing `BF16` values in
-/// little-endian byte order, suitable for writing directly into a
-/// `.safetensors` output file.
+/// A `Vec<u8>` of length `rows × cols × E::BYTES`, in little-endian byte
+/// order, suitable for writing directly into a `.safetensors` output file
+/// whose header declares `E::DTYPE`.
 ///
 /// # Errors
 ///
@@ -242,9 +334,10 @@ fn read_scale_bytes(slice: &[u8], dtype: Dtype) -> crate::Result<f32> {
 ///
 /// # Memory
 ///
-/// Allocates a single output buffer of `rows × cols × 2` bytes. No intermediate
-/// allocations. Peak memory is input + output (~3× the `FP8` weight size).
-pub fn dequantize_fp8_to_bf16(
+/// Allocates a single output buffer of `rows × cols × E::BYTES` bytes, plus a
+/// fixed 512-byte stack tile. No intermediate heap allocations. Peak memory is
+/// input + output (~3× the `FP8` weight size at `BF16`, ~5× at `F32`).
+pub fn dequantize_fp8<E: OutputElement>(
     weight_data: &[u8],
     scale_data: &[u8],
     rows: usize,
@@ -313,11 +406,12 @@ pub fn dequantize_fp8_to_bf16(
     }
 
     // --- Allocate output ---
-    let out_byte_len = expected_weight_len
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "output size overflow".into(),
-        })?;
+    let out_byte_len =
+        expected_weight_len
+            .checked_mul(E::BYTES)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "output size overflow".into(),
+            })?;
     let mut output = vec![0u8; out_byte_len];
 
     // --- Row-by-row, column-block iteration ---
@@ -331,13 +425,14 @@ pub fn dequantize_fp8_to_bf16(
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("weight row {r} out of bounds"),
             })?;
-        let out_row_offset = row_offset
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "output row offset overflow".into(),
-            })?;
+        let out_row_offset =
+            row_offset
+                .checked_mul(E::BYTES)
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: "output row offset overflow".into(),
+                })?;
         let row_o = output
-            .get_mut(out_row_offset..out_row_offset + cols * 2)
+            .get_mut(out_row_offset..out_row_offset + cols * E::BYTES)
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {r} out of bounds"),
             })?;
@@ -346,22 +441,18 @@ pub fn dequantize_fp8_to_bf16(
         let full_blocks = row_w.chunks_exact(BLOCK_SIZE);
         let remainder_w = full_blocks.remainder();
 
-        // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
-        // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3
         for (block_col, w_chunk) in full_blocks.enumerate() {
             let scale = load_scale(scale_data, block_row, block_col, scale_cols, scale_dtype)?;
-            let o_start = block_col * BLOCK_SIZE * 2;
+            let o_start = block_col * BLOCK_SIZE * E::BYTES;
             let o_chunk = row_o
-                .get_mut(o_start..o_start + BLOCK_SIZE * 2)
+                .get_mut(o_start..o_start + BLOCK_SIZE * E::BYTES)
                 .ok_or_else(|| AnamnesisError::Parse {
                     reason: format!("output chunk at row {r}, block_col {block_col} out of bounds"),
                 })?;
 
-            // Hot inner loop: 128 elements with hoisted scale
-            for (&byte, out_pair) in w_chunk.iter().zip(o_chunk.chunks_exact_mut(2)) {
-                let bf16 = e4m3_to_scaled_bf16(byte, scale);
-                out_pair.copy_from_slice(&bf16.to_le_bytes());
-            }
+            // Hot inner run: 128 elements with a hoisted scale. The output
+            // width lives entirely inside `fp8_run_to_output`.
+            fp8_run_to_output::<E>(w_chunk, scale, o_chunk);
         }
 
         // Edge column block (< 128 columns)
@@ -374,17 +465,14 @@ pub fn dequantize_fp8_to_bf16(
                 scale_cols,
                 scale_dtype,
             )?;
-            let o_start = last_block_col * BLOCK_SIZE * 2;
+            let o_start = last_block_col * BLOCK_SIZE * E::BYTES;
             let o_chunk = row_o
-                .get_mut(o_start..o_start + remainder_w.len() * 2)
+                .get_mut(o_start..o_start + remainder_w.len() * E::BYTES)
                 .ok_or_else(|| AnamnesisError::Parse {
                     reason: format!("output remainder at row {r} out of bounds"),
                 })?;
 
-            for (&byte, out_pair) in remainder_w.iter().zip(o_chunk.chunks_exact_mut(2)) {
-                let bf16 = e4m3_to_scaled_bf16(byte, scale);
-                out_pair.copy_from_slice(&bf16.to_le_bytes());
-            }
+            fp8_run_to_output::<E>(remainder_w, scale, o_chunk);
         }
     }
 
@@ -397,9 +485,27 @@ pub fn dequantize_fp8_to_bf16(
 
 /// Dequantizes a per-tensor `FP8` `E4M3` weight tensor to `BF16`.
 ///
+/// The [`Bf16Out`] special case of [`dequantize_per_tensor_fp8`], kept so that
+/// every pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_per_tensor_fp8`].
+///
+/// # Memory
+///
+/// See [`dequantize_per_tensor_fp8`]; at `BF16` the output buffer is
+/// `weight_data.len() × 2` bytes.
+#[inline]
+pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> crate::Result<Vec<u8>> {
+    dequantize_per_tensor_fp8::<Bf16Out>(weight_data, scale)
+}
+
+/// Dequantizes a per-tensor `FP8` `E4M3` weight tensor into `E`.
+///
 /// The entire tensor shares a single `F32` scale factor. This is the simpler
 /// case compared to fine-grained (block-wise) dequantization.
-/// The formula is: `BF16(FP8_to_f32(byte) × scale)`.
+/// The formula is: `E(FP8_to_f32(byte) × scale)`.
 ///
 /// # Arguments
 ///
@@ -408,8 +514,8 @@ pub fn dequantize_fp8_to_bf16(
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` of length `weight_data.len() × 2`, containing `BF16` values
-/// in little-endian byte order.
+/// A `Vec<u8>` of length `weight_data.len() × E::BYTES`, in little-endian byte
+/// order.
 ///
 /// # Errors
 ///
@@ -417,26 +523,26 @@ pub fn dequantize_fp8_to_bf16(
 ///
 /// # Memory
 ///
-/// Allocates a single output buffer of `weight_data.len() × 2` bytes.
-/// Peak memory is input + output (~3× the `FP8` weight size).
-pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> crate::Result<Vec<u8>> {
-    let out_byte_len = weight_data
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "output size overflow".into(),
-        })?;
+/// Allocates a single output buffer of `weight_data.len() × E::BYTES` bytes,
+/// plus a fixed 512-byte stack tile. Peak memory is input + output (~3× the
+/// `FP8` weight size at `BF16`, ~5× at `F32`).
+pub fn dequantize_per_tensor_fp8<E: OutputElement>(
+    weight_data: &[u8],
+    scale: f32,
+) -> crate::Result<Vec<u8>> {
+    let out_byte_len =
+        weight_data
+            .len()
+            .checked_mul(E::BYTES)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "output size overflow".into(),
+            })?;
     let mut output = vec![0u8; out_byte_len];
 
-    // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
-    // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3.
-    // Scale is hoisted (single value for the entire tensor).
-    // Flat iteration over all bytes — the compiler sees a single contiguous
-    // loop with no aliasing between input (&[u8]) and output (&mut [u8]).
-    for (&byte, out_pair) in weight_data.iter().zip(output.chunks_exact_mut(2)) {
-        let bf16 = e4m3_to_scaled_bf16(byte, scale);
-        out_pair.copy_from_slice(&bf16.to_le_bytes());
-    }
+    // One flat run over the whole tensor: the scale is a single value, so
+    // there is nothing to hoist per block and the tiling inside
+    // `fp8_run_to_output` is the only structure the loop needs.
+    fp8_run_to_output::<E>(weight_data, scale, &mut output);
 
     Ok(output)
 }
@@ -447,8 +553,27 @@ pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> crat
 
 /// Dequantizes a per-channel `FP8` `E4M3` weight tensor to `BF16`.
 ///
+/// The [`Bf16Out`] special case of [`dequantize_per_channel_fp8`], kept so that
+/// every pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_per_channel_fp8`].
+#[inline]
+pub fn dequantize_per_channel_fp8_to_bf16(
+    weight_data: &[u8],
+    scale_data: &[u8],
+    rows: usize,
+    cols: usize,
+    scale_dtype: Dtype,
+) -> crate::Result<Vec<u8>> {
+    dequantize_per_channel_fp8::<Bf16Out>(weight_data, scale_data, rows, cols, scale_dtype)
+}
+
+/// Dequantizes a per-channel `FP8` `E4M3` weight tensor into `E`.
+///
 /// Each row of the weight tensor has its own scale factor (shape `[rows, 1]`).
-/// The formula is: `BF16(FP8_to_f32(weight[r, c]) × scale[r])`.
+/// The formula is: `E(FP8_to_f32(weight[r, c]) × scale[r])`.
 ///
 /// # Arguments
 ///
@@ -460,13 +585,18 @@ pub fn dequantize_per_tensor_fp8_to_bf16(weight_data: &[u8], scale: f32) -> crat
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` of length `rows × cols × 2`, containing `BF16` values
-/// in little-endian byte order.
+/// A `Vec<u8>` of length `rows × cols × E::BYTES`, in little-endian byte order.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if dimensions or scale data are inconsistent.
-pub fn dequantize_per_channel_fp8_to_bf16(
+///
+/// # Memory
+///
+/// Allocates a single output buffer of `rows × cols × E::BYTES` bytes, plus a
+/// fixed 512-byte stack tile. Peak memory is input + output (~3× the `FP8`
+/// weight size at `BF16`, ~5× at `F32`).
+pub fn dequantize_per_channel_fp8<E: OutputElement>(
     weight_data: &[u8],
     scale_data: &[u8],
     rows: usize,
@@ -500,16 +630,16 @@ pub fn dequantize_per_channel_fp8_to_bf16(
         });
     }
 
-    let out_byte_len = expected_weight_len
-        .checked_mul(2)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "output size overflow".into(),
-        })?;
+    let out_byte_len =
+        expected_weight_len
+            .checked_mul(E::BYTES)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "output size overflow".into(),
+            })?;
     let mut output = vec![0u8; out_byte_len];
 
-    // VECTORIZED: confirmed SSE2 mulps+packssdw (default), AVX2 vmulps+vpackusdw
-    // (target-cpu=native) in cargo-show-asm, x86-64, opt-level=3.
-    // Per-row iteration: scale is hoisted per row, inner loop over cols.
+    // Per-row iteration: the scale is hoisted per row, and each row is one
+    // run through `fp8_run_to_output`.
     for r in 0..rows {
         let scale_offset = r * bps;
         let scale_slice = scale_data
@@ -525,17 +655,14 @@ pub fn dequantize_per_channel_fp8_to_bf16(
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("weight row {r} out of bounds"),
             })?;
-        let out_row_start = row_start * 2;
+        let out_row_start = row_start * E::BYTES;
         let row_o = output
-            .get_mut(out_row_start..out_row_start + cols * 2)
+            .get_mut(out_row_start..out_row_start + cols * E::BYTES)
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {r} out of bounds"),
             })?;
 
-        for (&byte, out_pair) in row_w.iter().zip(row_o.chunks_exact_mut(2)) {
-            let bf16 = e4m3_to_scaled_bf16(byte, scale);
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
-        }
+        fp8_run_to_output::<E>(row_w, scale, row_o);
     }
 
     Ok(output)
@@ -702,34 +829,77 @@ mod tests {
         assert_eq!(f32_bits_to_bf16_bits(0x3F81_8000), 0x3F82);
     }
 
-    // -- e4m3_to_scaled_bf16 -------------------------------------------------
+    // -- e4m3_to_scaled_f32 --------------------------------------------------
+    //
+    // These assert the *unnarrowed* value, which is the whole point of the
+    // v0.7.4 split: the kernel now stops at `f32` and the output width is
+    // applied once per tile by `OutputElement::write_scratch`. The `BF16`
+    // results the pre-v0.7.4 versions of these tests asserted are still
+    // covered, one layer out, by the `dequantize_*_to_bf16` block tests below.
 
     #[test]
-    fn scaled_bf16_identity() {
+    fn scaled_f32_identity() {
         // scale=1.0: result should match unscaled conversion
         let byte = 0x38; // 1.0 in E4M3
-        let bf16 = e4m3_to_scaled_bf16(byte, 1.0);
-        assert_eq!(bf16, 0x3F80); // 1.0 in BF16
+        assert_eq!(e4m3_to_scaled_f32(byte, 1.0), 1.0);
     }
 
     #[test]
-    fn scaled_bf16_by_two() {
+    fn scaled_f32_by_two() {
         // 1.0 × 2.0 = 2.0
-        let bf16 = e4m3_to_scaled_bf16(0x38, 2.0);
-        assert_eq!(bf16, 0x4000); // 2.0 in BF16
+        assert_eq!(e4m3_to_scaled_f32(0x38, 2.0), 2.0);
     }
 
     #[test]
-    fn scaled_bf16_nan_times_scale() {
-        let bf16 = e4m3_to_scaled_bf16(0x7F, 42.0);
-        let f = f32::from_bits(u32::from(bf16) << 16);
-        assert!(f.is_nan());
+    fn scaled_f32_nan_times_scale() {
+        assert!(e4m3_to_scaled_f32(0x7F, 42.0).is_nan());
     }
 
     #[test]
-    fn scaled_bf16_zero_times_scale() {
-        let bf16 = e4m3_to_scaled_bf16(0x00, 100.0);
-        assert_eq!(bf16, 0x0000);
+    fn scaled_f32_zero_times_scale() {
+        assert_eq!(e4m3_to_scaled_f32(0x00, 100.0), 0.0);
+    }
+
+    #[test]
+    fn scaled_f32_keeps_bits_bf16_would_round() {
+        // The reason the split exists. 0x39 is E4M3 1.125; times 1.0009766
+        // the product needs more significand bits than BF16 holds, so the
+        // f32 the kernel now returns is strictly more informative than the
+        // BF16 the pre-v0.7.4 kernel returned.
+        let scale = 1.0_f32 + 1.0 / 1024.0;
+        let exact = e4m3_to_scaled_f32(0x39, scale);
+        let narrowed = f32::from_bits(u32::from(f32_bits_to_bf16_bits(exact.to_bits())) << 16);
+        assert_ne!(exact.to_bits(), narrowed.to_bits());
+    }
+
+    // -- fp8_run_to_output ---------------------------------------------------
+
+    #[test]
+    fn run_to_output_covers_the_tail_past_a_full_tile() {
+        // BLOCK_SIZE + 3 elements: one full tile plus a 3-element remainder.
+        // The remainder path is the one a `chunks_exact`-only implementation
+        // would silently drop, so it is asserted explicitly at every width.
+        let bytes = vec![0x38u8; BLOCK_SIZE + 3]; // all 1.0 in E4M3
+
+        let mut bf16 = vec![0u8; bytes.len() * 2];
+        fp8_run_to_output::<Bf16Out>(&bytes, 2.0, &mut bf16);
+        for pair in bf16.chunks_exact(2) {
+            assert_eq!(pair, &[0x00, 0x40], "BF16 2.0");
+        }
+
+        let mut f32_out = vec![0u8; bytes.len() * 4];
+        fp8_run_to_output::<crate::F32Out>(&bytes, 2.0, &mut f32_out);
+        for word in f32_out.chunks_exact(4) {
+            let v = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            assert_eq!(v, 2.0, "F32 2.0");
+        }
+
+        let mut f16_out = vec![0u8; bytes.len() * 2];
+        fp8_run_to_output::<crate::F16Out>(&bytes, 2.0, &mut f16_out);
+        for pair in f16_out.chunks_exact(2) {
+            let v = half::f16::from_le_bytes([pair[0], pair[1]]);
+            assert_eq!(f32::from(v), 2.0, "F16 2.0");
+        }
     }
 
     // -- dequantize_fp8_to_bf16: block-level tests ---------------------------

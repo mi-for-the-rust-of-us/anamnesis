@@ -35,26 +35,24 @@ use crate::parse::safetensors::{
 };
 use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
-use crate::remember::awq::dequantize_awq_to_bf16;
+use crate::remember::awq::dequantize_awq;
 #[cfg(feature = "bnb")]
-use crate::remember::bnb::{
-    dequantize_bnb_int8_to_bf16, dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16,
-};
-use crate::remember::fp8::{
-    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
-};
+use crate::remember::bnb::{dequantize_bnb_int8, dequantize_bnb4, dequantize_bnb4_double_quant};
+use crate::remember::fp8::{dequantize_fp8, dequantize_per_channel_fp8, dequantize_per_tensor_fp8};
 #[cfg(feature = "gptq")]
-use crate::remember::gptq::dequantize_gptq_to_bf16;
+use crate::remember::gptq::dequantize_gptq;
+use crate::remember::output::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(any(feature = "gptq", feature = "awq"))]
-use crate::remember::quant_utils::transpose_bf16;
+use crate::remember::quant_utils::transpose_elements;
 
 /// Target dtype for dequantization output.
 ///
-/// # Why only `BF16` today
+/// # Choosing a width
 ///
-/// `BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights
-/// in, and at 2 bytes per element it halves the memory traffic on a path that is
-/// bandwidth-bound end to end.
+/// [`BF16`](Self::BF16) is the dtype the safetensors / Hugging Face ecosystem
+/// serves weights in, and at 2 bytes per element it halves the memory traffic on
+/// a path that is bandwidth-bound end to end. It is the default and, before
+/// v0.7.4, was the only option.
 ///
 /// It is, however, **lossy relative to the exact dequantised value**, and that is
 /// worth stating plainly: a `Q8_0` value is an `f16` scale (11-bit significand)
@@ -62,31 +60,71 @@ use crate::remember::quant_utils::transpose_bf16;
 /// `SmolLM2-135M-Q4_K_M`, only **3–20 %** of dequantised values are exactly
 /// `BF16`-representable; the rest are rounded, at up to half a `BF16` `ULP`
 /// (`2⁻⁸` ≈ 0.39 % relative). The crate's "bit-exact, 0 `ULP`" claim is therefore
-/// scoped to *the reference rounded to `BF16`* — which is how every fixture is
-/// built — not to the true value, which needs `F32`.
+/// scoped to *the reference rounded to `BF16`* — which is how the `BF16`
+/// fixtures are built — not to the true value, which needs
+/// [`F32`](Self::F32).
 ///
-/// This enum has carried exactly one variant since the commit that introduced
-/// `remember`; the `#[non_exhaustive]` marker has been there just as long,
-/// because more variants were always intended. `ROADMAP.md` Phase 7.4 turns the
-/// output type into a caller-chosen parameter (`BF16` / `F32` / `F16`) on this
-/// enum's own path. Every kernel already computes its values in `f32`, so the
-/// idea is only ever "stop narrowing". Note, though, that the schemes
-/// `remember` dispatches over (`FP8`, `GPTQ`, `AWQ`, `BnB`) each narrow
-/// *inside* their hot loop, unlike the `GGUF` kernels, which share one pass-2
-/// writer and are therefore generalised a tag earlier, in Phase 7.3.
+/// Every kernel in the crate computes in `f32` and narrows once at the end, so
+/// [`F32`](Self::F32) is not extra work: it is the *absence* of the narrowing
+/// step, at double the output bytes.
+///
+/// # Passthrough policy
+///
+/// This selects the width for **dequantised** tensors only. Tensors that pass
+/// through untouched (norms, embeddings, anything already unquantised) keep
+/// their source dtype, so a `remember` output is legitimately mixed-dtype.
+/// `TargetDtype::F32` is a request to stop narrowing, not an instruction to
+/// rewrite every tensor as `F32`. `ConvertOptions::output_dtype` documents the
+/// same policy for the `convert` path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TargetDtype {
-    /// `BF16` (bfloat16) — 2 bytes per element. The standard research/training
-    /// dtype, and currently the only output width (see the type-level docs for
-    /// the precision trade-off this implies).
+    /// `BF16` (bfloat16) — 2 bytes per element, round-to-nearest-even. The
+    /// standard research/training dtype and the default (see the type-level
+    /// docs for the precision trade-off this implies).
     BF16,
+    /// `F32` — 4 bytes per element, and **no narrowing step at all**. The
+    /// kernels already compute in `f32`, so this emits the value they computed,
+    /// bit-identical to the reference implementation's own `f32`. Doubles
+    /// output bytes on a bandwidth-bound path; that is the honest cost of the
+    /// precision, not a defect.
+    F32,
+    /// `F16` — 2 bytes per element, IEEE 754 binary16, round-to-nearest-even.
+    ///
+    /// **Not uniformly the better 2-byte choice.** Against `BF16` it buys 3
+    /// significand bits (11 versus 8) and pays a far narrower exponent range:
+    /// `BF16` shares `f32`'s range, while `F16` saturates at 65504 and flushes
+    /// to zero below about `2⁻²⁴`. Out-of-range values follow plain IEEE
+    /// semantics (infinity, flush-to-zero), never saturation — see
+    /// [`F16Out`](crate::F16Out) for why.
+    F16,
+}
+
+impl TargetDtype {
+    /// Bytes each dequantised element occupies in the output.
+    ///
+    /// The runtime mirror of `OutputElement::BYTES`, for the callers that need
+    /// the width as a value rather than as a type parameter (size estimates,
+    /// header sizing, the CLI's reporting).
+    #[must_use]
+    pub const fn byte_size(self) -> usize {
+        match self {
+            Self::BF16 | Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
 }
 
 impl fmt::Display for TargetDtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Wildcard-free on purpose: `src/cli.rs`'s `derive_output_path` builds
+        // the output filename's dtype suffix from this string, so a new variant
+        // that fell through to a catch-all would silently produce a wrongly
+        // named file rather than failing to compile.
         match self {
             Self::BF16 => f.write_str("BF16"),
+            Self::F32 => f.write_str("F32"),
+            Self::F16 => f.write_str("F16"),
         }
     }
 }
@@ -103,9 +141,11 @@ impl FromStr for TargetDtype {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "bf16" => Ok(Self::BF16),
+            "f32" => Ok(Self::F32),
+            "f16" => Ok(Self::F16),
             other => Err(AnamnesisError::Unsupported {
                 format: other.to_owned(),
-                detail: "supported target dtypes: bf16".to_owned(),
+                detail: "supported target dtypes: bf16, f32, f16".to_owned(),
             }),
         }
     }
@@ -649,10 +689,7 @@ impl ParsedModel {
         target: TargetDtype,
         opts: RememberOptions,
     ) -> crate::Result<()> {
-        let threads = opts.resolved_threads();
-        match target {
-            TargetDtype::BF16 => self.remember_bf16(output_path.as_ref(), threads),
-        }
+        self.remember_with_progress_and_options(output_path, target, opts, || {})
     }
 
     /// Dequantizes all quantized tensors with per-tensor progress reporting,
@@ -714,8 +751,14 @@ impl ParsedModel {
         F: FnMut(),
     {
         let threads = opts.resolved_threads();
+        let path = output_path.as_ref();
+        // The single runtime boundary for the file destination: past this
+        // `match` the output width is a static type parameter and there is no
+        // per-tensor branch, let alone a per-element one.
         match target {
-            TargetDtype::BF16 => self.remember_bf16_inner(output_path.as_ref(), threads, on_tensor),
+            TargetDtype::BF16 => self.remember_inner::<Bf16Out, F>(path, threads, on_tensor),
+            TargetDtype::F32 => self.remember_inner::<F32Out, F>(path, threads, on_tensor),
+            TargetDtype::F16 => self.remember_inner::<F16Out, F>(path, threads, on_tensor),
         }
     }
 
@@ -775,17 +818,22 @@ impl ParsedModel {
         opts: RememberOptions,
     ) -> crate::Result<Vec<u8>> {
         let threads = opts.resolved_threads();
+        // The single runtime boundary for the in-memory destination; see
+        // `remember_with_progress_and_options` for the file one.
         match target {
-            TargetDtype::BF16 => self.remember_to_bytes_bf16(threads),
+            TargetDtype::BF16 => self.remember_to_bytes_inner::<Bf16Out>(threads),
+            TargetDtype::F32 => self.remember_to_bytes_inner::<F32Out>(threads),
+            TargetDtype::F16 => self.remember_to_bytes_inner::<F16Out>(threads),
         }
     }
 
     /// Normalises this model into [`crate::convert`]'s hub form: quantised
-    /// entries dequantised to `BF16`, passthrough entries copied in their
+    /// entries dequantised to `E`, passthrough entries copied in their
     /// **original** dtype. Returns the tensors plus how many were dequantised.
     ///
     /// Shares [`Self::dequantize_all`] with the `remember` paths, so the convert
-    /// hub and `remember` cannot drift apart.
+    /// hub and `remember` cannot drift apart — including on the output width,
+    /// which is the same type parameter on both.
     ///
     /// # Errors
     ///
@@ -796,13 +844,15 @@ impl ParsedModel {
     /// # Memory
     ///
     /// Allocates owned copies of **every** tensor — peak heap is one full
-    /// dequantised model (`O(model)`, the hub itself). The end-to-end `convert`
-    /// peak adds only the target writer's buffer; see the `convert` module docs.
-    pub(crate) fn hub_tensors(
+    /// dequantised model (`O(model)`, the hub itself), which is
+    /// `E::BYTES / 2 ×` the pre-v0.7.4 figure for the dequantised share. The
+    /// end-to-end `convert` peak adds only the target writer's buffer; see the
+    /// `convert` module docs.
+    pub(crate) fn hub_tensors<E: OutputElement>(
         &self,
         threads: usize,
     ) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, || {})?;
+        let (dequantized_data, passthrough_refs) = self.dequantize_all::<E, _>(threads, || {})?;
 
         let dequantized = dequantized_data.len();
         let mut tensors = Vec::with_capacity(dequantized.saturating_add(passthrough_refs.len()));
@@ -811,7 +861,7 @@ impl ParsedModel {
             tensors.push(crate::convert::HubTensor {
                 name,
                 shape,
-                dtype: crate::Dtype::BF16,
+                dtype: E::DTYPE,
                 data,
             });
         }
@@ -843,12 +893,7 @@ impl ParsedModel {
         Ok((tensors, dequantized))
     }
 
-    /// Internal: dequantize to `BF16` and write (no progress callback).
-    fn remember_bf16(&self, output_path: &Path, threads: usize) -> crate::Result<()> {
-        self.remember_bf16_inner(output_path, threads, || {})
-    }
-
-    /// Internal: dequantise one `TensorRole::Quantized` entry to owned `BF16`
+    /// Internal: dequantise one `TensorRole::Quantized` entry to owned `E`
     /// output.
     ///
     /// A **pure function** of `&self` + `entry`: it reads only shared-immutable
@@ -865,7 +910,10 @@ impl ParsedModel {
     /// Returns [`AnamnesisError::Parse`] if the entry's data or a required
     /// companion tensor is malformed or missing, and
     /// [`AnamnesisError::Unsupported`] if the scheme's Cargo feature is disabled.
-    fn dequantize_quantized_entry(&self, entry: &TensorEntry) -> crate::Result<TensorDequant> {
+    fn dequantize_quantized_entry<E: OutputElement>(
+        &self,
+        entry: &TensorEntry,
+    ) -> crate::Result<TensorDequant> {
         let weight_data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
 
         let result = match self.header.scheme {
@@ -881,9 +929,9 @@ impl ParsedModel {
                 let scale_data =
                     self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
                 let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
-                let bf16 =
-                    dequantize_fp8_to_bf16(weight_data, scale_data, rows, cols, scale_entry.dtype)?;
-                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+                let out =
+                    dequantize_fp8::<E>(weight_data, scale_data, rows, cols, scale_entry.dtype)?;
+                TensorDequant::Owned(entry.name.clone(), out, entry.shape.clone())
             }
             QuantScheme::PerChannelFp8 => {
                 let scale_entry = self.header.find_scale_for(&entry.name).ok_or_else(|| {
@@ -897,14 +945,14 @@ impl ParsedModel {
                 let scale_data =
                     self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
                 let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
-                let bf16 = dequantize_per_channel_fp8_to_bf16(
+                let out = dequantize_per_channel_fp8::<E>(
                     weight_data,
                     scale_data,
                     rows,
                     cols,
                     scale_entry.dtype,
                 )?;
-                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+                TensorDequant::Owned(entry.name.clone(), out, entry.shape.clone())
             }
             QuantScheme::PerTensorFp8 => {
                 // Look for a companion scale tensor; default to 1.0 if none.
@@ -915,8 +963,8 @@ impl ParsedModel {
                 } else {
                     1.0
                 };
-                let bf16 = dequantize_per_tensor_fp8_to_bf16(weight_data, scale)?;
-                TensorDequant::Owned(entry.name.clone(), bf16, entry.shape.clone())
+                let out = dequantize_per_tensor_fp8::<E>(weight_data, scale)?;
+                TensorDequant::Owned(entry.name.clone(), out, entry.shape.clone())
             }
             #[cfg(feature = "gptq")]
             QuantScheme::Gptq => {
@@ -959,7 +1007,7 @@ impl ParsedModel {
                             reason: "in_features overflow".into(),
                         })?;
 
-                let bf16_native = dequantize_gptq_to_bf16(
+                let native = dequantize_gptq::<E>(
                     weight_data,
                     scales_data,
                     qzeros_data,
@@ -977,7 +1025,7 @@ impl ParsedModel {
                 // nn.Linear safetensors is [out, in] — apply the
                 // same boundary transpose GPTQModel's
                 // dequantize_model applies (`.T`).
-                let bf16_data = transpose_bf16(&bf16_native, in_features, out_features)?;
+                let data = transpose_elements::<E>(&native, in_features, out_features)?;
 
                 // Output tensor: strip ".qweight" suffix, use ".weight".
                 let output_name = entry
@@ -986,7 +1034,7 @@ impl ParsedModel {
                     .map_or_else(|| entry.name.clone(), |base| format!("{base}.weight"));
                 let output_shape = vec![out_features, in_features];
 
-                TensorDequant::Owned(output_name, bf16_data, output_shape)
+                TensorDequant::Owned(output_name, data, output_shape)
             }
             #[cfg(not(feature = "gptq"))]
             QuantScheme::Gptq => {
@@ -1036,7 +1084,7 @@ impl ParsedModel {
                     }
                 })?;
 
-                let bf16_native = dequantize_awq_to_bf16(
+                let native = dequantize_awq::<E>(
                     weight_data,
                     scales_data,
                     qzeros_data,
@@ -1054,7 +1102,7 @@ impl ParsedModel {
                 // at the output-contract boundary, exactly as
                 // GPTQModel's dequantize_model does for its
                 // GEMM-native dequant (`.T`).
-                let bf16_data = transpose_bf16(&bf16_native, in_features, out_features)?;
+                let data = transpose_elements::<E>(&native, in_features, out_features)?;
 
                 // Output tensor: strip ".qweight" suffix, use ".weight".
                 let output_name = entry
@@ -1063,7 +1111,7 @@ impl ParsedModel {
                     .map_or_else(|| entry.name.clone(), |base| format!("{base}.weight"));
                 let output_shape = vec![out_features, in_features];
 
-                TensorDequant::Owned(output_name, bf16_data, output_shape)
+                TensorDequant::Owned(output_name, data, output_shape)
             }
             #[cfg(not(feature = "awq"))]
             QuantScheme::Awq => {
@@ -1115,7 +1163,7 @@ impl ParsedModel {
                     })
                     .transpose()?;
 
-                let bf16_data = if config.double_quant {
+                let data = if config.double_quant {
                     let nested_absmax =
                         companions
                             .nested_absmax
@@ -1167,7 +1215,7 @@ impl ParsedModel {
                         }
                     };
 
-                    dequantize_bnb4_double_quant_to_bf16(
+                    dequantize_bnb4_double_quant::<E>(
                         weight_data,
                         absmax_data,
                         quant_map_data,
@@ -1179,7 +1227,7 @@ impl ParsedModel {
                         nested_block_size,
                     )?
                 } else {
-                    dequantize_bnb4_to_bf16(
+                    dequantize_bnb4::<E>(
                         weight_data,
                         absmax_data,
                         quant_map_data,
@@ -1197,7 +1245,7 @@ impl ParsedModel {
                     vec![total_elements]
                 };
 
-                TensorDequant::Owned(entry.name.clone(), bf16_data, output_shape)
+                TensorDequant::Owned(entry.name.clone(), data, output_shape)
             }
             #[cfg(feature = "bnb")]
             QuantScheme::BnbInt8 => {
@@ -1212,11 +1260,11 @@ impl ParsedModel {
                 // INT8 keeps its 2D shape [out_features, in_features].
                 let (out_features, in_features) = Self::shape_to_rows_cols(&entry.shape)?;
 
-                let bf16_data =
-                    dequantize_bnb_int8_to_bf16(weight_data, scb_data, out_features, in_features)?;
+                let data =
+                    dequantize_bnb_int8::<E>(weight_data, scb_data, out_features, in_features)?;
 
                 // Output tensor: keep name, keep shape.
-                TensorDequant::Owned(entry.name.clone(), bf16_data, entry.shape.clone())
+                TensorDequant::Owned(entry.name.clone(), data, entry.shape.clone())
             }
             #[cfg(not(feature = "bnb"))]
             QuantScheme::Bnb4 | QuantScheme::BnbInt8 => {
@@ -1237,10 +1285,11 @@ impl ParsedModel {
     }
 
     /// Internal: run the per-scheme dequant for every tensor, returning the owned
-    /// `BF16` results plus the passthrough tensors (which borrow `self.buffer`).
-    /// Shared by `remember_bf16_inner` (→ file) and `remember_to_bytes_bf16`
-    /// (→ bytes); `on_tensor` fires on the **main thread** after each quantized
-    /// tensor is dequantised so callers can drive a progress bar.
+    /// `E` results plus the passthrough tensors (which borrow `self.buffer`).
+    /// Shared by `remember_inner` (→ file), `remember_to_bytes_inner`
+    /// (→ bytes) and `hub_tensors` (→ the `convert` hub); `on_tensor` fires on
+    /// the **main thread** after each quantized tensor is dequantised so callers
+    /// can drive a progress bar.
     ///
     /// `threads` is the resolved worker budget (see [`resolve_thread_budget`]);
     /// the quantized entries are handed to `parallel::map_indexed`, which decides
@@ -1254,7 +1303,7 @@ impl ParsedModel {
     /// Propagates [`Self::dequantize_quantized_entry`]'s errors — deterministically,
     /// the lowest-indexed failure, at any thread count — and returns
     /// [`AnamnesisError::Parse`] if a dequant worker thread panics.
-    fn dequantize_all<F>(
+    fn dequantize_all<E: OutputElement, F>(
         &self,
         threads: usize,
         mut on_tensor: F,
@@ -1310,7 +1359,7 @@ impl ParsedModel {
             &quantized,
             threads,
             work_bytes,
-            |_, &(_, entry)| self.dequantize_quantized_entry(entry),
+            |_, &(_, entry)| self.dequantize_quantized_entry::<E>(entry),
             |dq| {
                 if matches!(dq, TensorDequant::Owned(..)) {
                     on_tensor();
@@ -1353,22 +1402,26 @@ impl ParsedModel {
     /// (owned) tensors and the passthrough (borrowed) tensors. Shared by both
     /// `remember` destinations; the views borrow `dequantized_data`, so the
     /// caller must keep it alive until serialization completes.
-    fn build_views<'a>(
+    fn build_views<'a, E: OutputElement>(
         &'a self,
         dequantized_data: &'a [(String, Vec<u8>, Vec<usize>)],
         passthrough_refs: &[(&'a str, &'a [u8], &'a [usize])],
     ) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'a>)>> {
         // Build TensorView list for serialization.
-        // Dequantized tensors use safetensors::Dtype::BF16.
-        // Passthrough tensors keep their original dtype.
+        // Dequantized tensors are declared as `E::DTYPE` — the width the
+        // kernels actually wrote, taken from the same constant that sized their
+        // output buffers, so the header cannot disagree with the payload.
+        // Passthrough tensors keep their original dtype: an `F32` request
+        // widens what was dequantised, never what was already full precision
+        // (see `TargetDtype`'s passthrough policy).
+        let dequantized_dtype = E::DTYPE.to_safetensors_dtype()?;
         let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> = Vec::new();
 
         for (name, data, shape) in dequantized_data {
-            let view =
-                safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, shape.clone(), data)
-                    .map_err(|e| AnamnesisError::Parse {
-                        reason: format!("failed to create TensorView for `{name}`: {e}"),
-                    })?;
+            let view = safetensors::tensor::TensorView::new(dequantized_dtype, shape.clone(), data)
+                .map_err(|e| AnamnesisError::Parse {
+                    reason: format!("failed to create TensorView for `{name}`: {e}"),
+                })?;
             views.push((name.clone(), view));
         }
 
@@ -1393,8 +1446,8 @@ impl ParsedModel {
         Ok(views)
     }
 
-    /// Internal: dequantize to `BF16` and write, with optional progress callback.
-    fn remember_bf16_inner<F>(
+    /// Internal: dequantize to `E` and write, with optional progress callback.
+    fn remember_inner<E: OutputElement, F>(
         &self,
         output_path: &Path,
         threads: usize,
@@ -1403,8 +1456,9 @@ impl ParsedModel {
     where
         F: FnMut(),
     {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, on_tensor)?;
-        let views = self.build_views(&dequantized_data, &passthrough_refs)?;
+        let (dequantized_data, passthrough_refs) =
+            self.dequantize_all::<E, F>(threads, on_tensor)?;
+        let views = self.build_views::<E>(&dequantized_data, &passthrough_refs)?;
 
         // Serialize to file. The safetensors writer streams tensor bodies one at
         // a time, so the file path's peak stays at the dequantised set — unlike
@@ -1425,10 +1479,10 @@ impl ParsedModel {
         Ok(())
     }
 
-    /// Internal: dequantize to `BF16` and return the serialized safetensors bytes.
-    fn remember_to_bytes_bf16(&self, threads: usize) -> crate::Result<Vec<u8>> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all(threads, || {})?;
-        let views = self.build_views(&dequantized_data, &passthrough_refs)?;
+    /// Internal: dequantize to `E` and return the serialized safetensors bytes.
+    fn remember_to_bytes_inner<E: OutputElement>(&self, threads: usize) -> crate::Result<Vec<u8>> {
+        let (dequantized_data, passthrough_refs) = self.dequantize_all::<E, _>(threads, || {})?;
+        let views = self.build_views::<E>(&dequantized_data, &passthrough_refs)?;
 
         let metadata = self.header.metadata.clone();
         safetensors::tensor::serialize(views, metadata).map_err(|e| AnamnesisError::Parse {
