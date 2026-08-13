@@ -23,7 +23,7 @@
 //!   Language Models", `NeurIPS` 2023 (`arXiv:2305.14314`)
 
 use crate::error::AnamnesisError;
-use crate::remember::output::{Bf16Out, OutputElement};
+use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -653,10 +653,14 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
             })?;
     let mut output = vec![0u8; out_byte_len];
 
-    // Row scratch, reused across rows. Before v0.7.4 this kernel was a single
-    // fused pass, which is also why it was `BF16`-only; the split is what lets
-    // `OutputElement::write_scratch` own the narrowing for every width.
-    let mut values_buf = vec![0.0_f32; in_features];
+    // One register-sized tile, reused for every row. Before v0.7.4 this kernel
+    // was a single fused pass, which is also why it was `BF16`-only; the split
+    // is what lets `OutputElement::write_scratch` own the narrowing for every
+    // width. The tile is [`VECTOR_TILE`]-sized rather than row-sized for the
+    // reason that constant documents: a 44 KB row scratch measured 1.115×
+    // against the pre-v0.7.4 fused kernel, because the f32s reached memory
+    // between the two passes.
+    let mut tile = [0.0_f32; VECTOR_TILE];
 
     // --- Per-row dequantization ---
     // Scale is constant per row → hoisted.
@@ -682,25 +686,38 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("BnB INT8 output row {row} out of bounds"),
             })?;
-        // INDEX: values_buf.len() == in_features, allocated before the loop
-        let values_row =
-            values_buf
-                .get_mut(..in_features)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "BnB INT8 dequantised values buffer too short".into(),
-                })?;
+        // Two passes per tile: `I8` → `f32` × scale, then narrow. Tiling at
+        // `VECTOR_TILE` keeps the intermediate `f32`s in registers, so the
+        // split costs no memory traffic over the pre-v0.7.4 fused loop.
+        let w_tiles = row_weights.chunks_exact(VECTOR_TILE);
+        // Read before the iterator is consumed: `remainder` borrows.
+        let tail_w = w_tiles.remainder();
+        let mut o_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
 
-        // Pass 1: 1:1 byte → f32, scale hoisted, contiguous I/O
         // VECTORIZED: pending cargo-show-asm verification
-        for (&w_byte, value) in row_weights.iter().zip(values_row.iter_mut()) {
-            // CAST: u8 (from I8 two's complement) → i8 → f32
-            #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
-            let w_i8 = w_byte as i8;
-            *value = f32::from(w_i8) * scale;
+        for (w_tile, o_tile) in w_tiles.zip(o_tiles.by_ref()) {
+            for (&w_byte, value) in w_tile.iter().zip(tile.iter_mut()) {
+                // CAST: u8 (from I8 two's complement) → i8 → f32
+                #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+                let w_i8 = w_byte as i8;
+                *value = f32::from(w_i8) * scale;
+            }
+            E::write_scratch(&tile, o_tile);
         }
 
-        // Pass 2: narrow to the caller's output width
-        E::write_scratch(values_row, out_row);
+        // Edge tile (< VECTOR_TILE elements). `tail_w.len() < VECTOR_TILE ==
+        // tile.len()`, so the sub-slice is always `Some`; `get_mut` rather than
+        // an index keeps the no-panic floor structural.
+        if let Some(tail_tile) = tile.get_mut(..tail_w.len()) {
+            // VECTORIZED: pending cargo-show-asm verification
+            for (&w_byte, value) in tail_w.iter().zip(tail_tile.iter_mut()) {
+                // CAST: u8 (from I8 two's complement) → i8 → f32
+                #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+                let w_i8 = w_byte as i8;
+                *value = f32::from(w_i8) * scale;
+            }
+            E::write_scratch(tail_tile, o_tiles.into_remainder());
+        }
     }
 
     Ok(output)

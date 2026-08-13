@@ -53,6 +53,30 @@
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
 
+/// Elements a fused-narrowing kernel hands to [`OutputElement::write_scratch`]
+/// per call.
+///
+/// **Calibrated, not guessed, and the reason v0.7.4's split is nearly free.**
+/// The four `remember` families (`FP8`, `GPTQ`, `AWQ`, `BnB`) narrowed inside
+/// their hot loops before v0.7.4. Splitting that into an arithmetic pass plus a
+/// narrowing pass introduces an `f32` intermediate, and where that intermediate
+/// goes decides the whole cost:
+///
+/// - **Row-sized** (the first draft: `out_features × 4` = 44 KB at
+///   `out_features = 11008`) the `f32`s reach memory between the passes.
+///   Measured 1.115× against the pre-v0.7.4 fused kernel on `BnB` `INT8`.
+/// - **Register-sized** (this constant) they stay in `ymm` registers, because
+///   32 `f32`s is four AVX2 vectors and both loops fully unroll. `FP8`
+///   fine-grained went from 1.43× to **1.06×** across this change plus hoisting
+///   its buffer out of the per-block call.
+///
+/// 32 rather than 8 is measured too: an 8-element tile left more loop-setup
+/// overhead per element than the register pressure it saved.
+///
+/// Not feature-gated: the always-on `FP8` family uses it, so it is live in
+/// every build. Contrast [`MAX_OUTPUT_BYTES`], which is a `GGUF`-only concept.
+pub(crate) const VECTOR_TILE: usize = 32;
+
 /// Widest output element in bytes, over every [`OutputElement`] implementation.
 ///
 /// The block runners in `remember::gguf` size their stack output buffers at

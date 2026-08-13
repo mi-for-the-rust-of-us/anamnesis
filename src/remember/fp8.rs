@@ -23,20 +23,10 @@
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
-use crate::remember::output::{Bf16Out, OutputElement};
+use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 
 /// Block size for fine-grained `FP8` quantization (128×128 elements per block).
 const BLOCK_SIZE: usize = 128;
-
-/// Elements handed to [`OutputElement::write_scratch`] per call.
-///
-/// One AVX2 `f32` vector. The point is that the `f32` scratch never reaches
-/// memory: pass 1 fills eight lanes, pass 2 consumes the same eight, and the
-/// compiler keeps them in a `ymm` register instead of round-tripping through a
-/// buffer. That is what makes the v0.7.4 arithmetic/narrowing split cost
-/// nothing on the `BF16` default path rather than the extra pass it would
-/// otherwise be.
-const VECTOR_TILE: usize = 32;
 
 /// `F32` bit patterns for `E4M3` subnormal values (exponent = 0).
 ///
