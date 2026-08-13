@@ -411,7 +411,6 @@ pub fn dequantize_gptq<E: OutputElement>(
     // Lazy per-group: only `out_features` f32 values are live at a time,
     // instead of the full `num_groups × out_features` grid.
     let mut unpacked_buf = vec![0.0_f32; out_features];
-    let mut values_buf = vec![0.0_f32; out_features];
     let mut zeros_buf = vec![0.0_f32; out_features];
     let mut scales_buf = vec![0.0_f32; out_features];
     let mut cached_group: Option<usize> = None;
@@ -510,29 +509,29 @@ pub fn dequantize_gptq<E: OutputElement>(
             unpacked_row[j] = qw;
         }
 
-        // --- Pass 2: pure f32 arithmetic, BRANCH-FREE ---
-        // Contiguous f32 reads (unpacked, zeros, scales) into a contiguous f32
-        // scratch. No byte manipulation and no narrowing — just sub + mul, the
-        // shape CONVENTIONS.md's loop-fission rule asks for.
-        // INDEX: values_buf.len() == out_features, allocated before the outer loop
-        let values_row =
-            values_buf
-                .get_mut(..out_features)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "dequantised values buffer too short".into(),
-                })?;
+        // --- Pass 2: pure f32 arithmetic, BRANCH-FREE, IN PLACE ---
+        // Contiguous f32 reads (unpacked, zeros, scales), no byte manipulation
+        // and no narrowing — just sub + mul, the shape CONVENTIONS.md's
+        // loop-fission rule asks for.
+        //
+        // **In place over `unpacked_row`, not into a second buffer.** The first
+        // v0.7.4 draft wrote into a separate `out_features`-sized scratch, which
+        // doubled the row working set to ~88 KB at `out_features = 11008` and
+        // pushed it out of L1. CONVENTIONS.md's "separate input and output
+        // slices" rule is about aliasing *between distinct slices* defeating the
+        // vectorizer; element `i` here reads and writes only element `i` of the
+        // same slice, which raises no aliasing question at all.
         // VECTORIZED: pending cargo-show-asm verification
-        for (((value, &qw), &zero), &scale) in values_row
+        for ((value, &zero), &scale) in unpacked_row
             .iter_mut()
-            .zip(unpacked_row.iter())
             .zip(zeros_row.iter())
             .zip(scales_row.iter())
         {
-            *value = (qw - zero) * scale;
+            *value = (*value - zero) * scale;
         }
 
         // --- Pass 3: narrow to the caller's output width ---
-        E::write_scratch(values_row, out_row);
+        E::write_scratch(unpacked_row, out_row);
     }
 
     Ok(output)

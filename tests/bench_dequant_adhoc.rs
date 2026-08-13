@@ -119,6 +119,167 @@ fn bench_fp8_per_tensor() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7.4: the BF16 default must not regress when the four families gain
+// their loop-fission split
+// ---------------------------------------------------------------------------
+
+/// Best-of-5 release-mode median for **every `remember` kernel family at
+/// `BF16`**, on one comparable ~45M-element fixture each.
+///
+/// This exists for one job: v0.7.4 splits `FP8` / `GPTQ` / `AWQ` / `BnB` into
+/// an arithmetic pass plus `OutputElement::write_scratch`, which adds a pass
+/// over an L1-resident scratch on the default path. That is a plausible
+/// slowdown, and `CONVENTIONS.md` will not let a `// VECTORIZED: confirmed`
+/// annotation stand on asm evidence alone — it also wants a measurement
+/// showing the kernel is at least as fast as the previous baseline.
+///
+/// **Deliberately written against the `*_to_bf16` names only**, never the new
+/// generic entry points, so the identical test compiles and runs on the parent
+/// commit. That is what makes it a before/after comparison rather than an
+/// absolute number:
+///
+/// ```text
+/// cargo test --release --all-features --test bench_dequant_adhoc \
+///     bench_bf16_all_families -- --nocapture --ignored     # after
+/// git stash && git checkout HEAD~1 && <same command>       # before
+/// ```
+#[test]
+#[ignore = "ad-hoc benchmark; run with --release --ignored --nocapture"]
+fn bench_bf16_all_families() {
+    eprintln!("\n=== bench_bf16_all_families (BF16 default path, best-of-5 median) ===");
+
+    // -- FP8 fine-grained: 4096 × 11008, one scale per 128×128 block ---------
+    {
+        const ROWS: usize = 4096;
+        const COLS: usize = 11008;
+        let weight: Vec<u8> = (0..ROWS * COLS)
+            .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+            .collect();
+        let scale_blocks = ROWS.div_ceil(128) * COLS.div_ceil(128);
+        let scales: Vec<u8> = (0..scale_blocks)
+            .flat_map(|i| (0.5_f32 + (i % 8) as f32 * 0.01).to_le_bytes())
+            .collect();
+        let samples = time_best_of_5(|| {
+            let out = anamnesis::dequantize_fp8_to_bf16(
+                &weight,
+                &scales,
+                ROWS,
+                COLS,
+                anamnesis::Dtype::F32,
+            )
+            .unwrap();
+            out[out.len() - 1]
+        });
+        eprintln!("fp8_fine_grained  {}", fmt_stats(&samples));
+    }
+
+    // -- BnB INT8: 4096 × 11008, one SCB per row -----------------------------
+    #[cfg(feature = "bnb")]
+    {
+        const OUT_F: usize = 4096;
+        const IN_F: usize = 11008;
+        let weight: Vec<u8> = (0..OUT_F * IN_F)
+            .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+            .collect();
+        let scb: Vec<u8> = (0..OUT_F)
+            .flat_map(|i| (1.0_f32 + (i % 16) as f32).to_le_bytes())
+            .collect();
+        let samples = time_best_of_5(|| {
+            let out = anamnesis::dequantize_bnb_int8_to_bf16(&weight, &scb, OUT_F, IN_F).unwrap();
+            out[out.len() - 1]
+        });
+        eprintln!("bnb_int8          {}", fmt_stats(&samples));
+    }
+
+    // -- BnB NF4: 45M elements, block_size 64 --------------------------------
+    #[cfg(feature = "bnb")]
+    {
+        const N: usize = 4096 * 11008;
+        const BLOCK: usize = 64;
+        let weight: Vec<u8> = (0..N / 2)
+            .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+            .collect();
+        let absmax: Vec<u8> = (0..N / BLOCK)
+            .flat_map(|i| (0.5_f32 + (i % 8) as f32 * 0.01).to_le_bytes())
+            .collect();
+        let quant_map: Vec<u8> = (0..16)
+            .flat_map(|i| ((i as f32 - 8.0) / 8.0).to_le_bytes())
+            .collect();
+        let samples = time_best_of_5(|| {
+            let out =
+                anamnesis::dequantize_bnb4_to_bf16(&weight, &absmax, &quant_map, N, BLOCK).unwrap();
+            out[out.len() - 1]
+        });
+        eprintln!("bnb_nf4           {}", fmt_stats(&samples));
+    }
+
+    // -- GPTQ INT4: 4096 in × 11008 out, group_size 128 ----------------------
+    #[cfg(feature = "gptq")]
+    {
+        const IN_F: usize = 4096;
+        const OUT_F: usize = 11008;
+        const GROUP: usize = 128;
+        let packed_rows = IN_F / 8;
+        let num_groups = IN_F / GROUP;
+        let qweight: Vec<u8> = (0..packed_rows * OUT_F * 4)
+            .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..num_groups * OUT_F)
+            .flat_map(|i| (0.01_f32 + (i % 8) as f32 * 0.001).to_le_bytes())
+            .collect();
+        let qzeros = vec![0x77u8; num_groups * (OUT_F / 8) * 4];
+        let samples = time_best_of_5(|| {
+            let out = anamnesis::dequantize_gptq_to_bf16(
+                &qweight,
+                &scales,
+                &qzeros,
+                None,
+                IN_F,
+                OUT_F,
+                GROUP,
+                4,
+                anamnesis::Dtype::F32,
+            )
+            .unwrap();
+            out[out.len() - 1]
+        });
+        eprintln!("gptq_int4         {}", fmt_stats(&samples));
+    }
+
+    // -- AWQ INT4: 4096 in × 11008 out, group_size 128 -----------------------
+    #[cfg(feature = "awq")]
+    {
+        const IN_F: usize = 4096;
+        const OUT_F: usize = 11008;
+        const GROUP: usize = 128;
+        let packed_cols = OUT_F / 8;
+        let num_groups = IN_F / GROUP;
+        let qweight: Vec<u8> = (0..IN_F * packed_cols * 4)
+            .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..num_groups * OUT_F)
+            .flat_map(|i| (0.01_f32 + (i % 8) as f32 * 0.001).to_le_bytes())
+            .collect();
+        let qzeros = vec![0x77u8; num_groups * packed_cols * 4];
+        let samples = time_best_of_5(|| {
+            let out = anamnesis::dequantize_awq_to_bf16(
+                &qweight,
+                &scales,
+                &qzeros,
+                IN_F,
+                OUT_F,
+                GROUP,
+                4,
+                anamnesis::Dtype::F32,
+            )
+            .unwrap();
+            out[out.len() - 1]
+        });
+        eprintln!("awq_int4          {}", fmt_stats(&samples));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GGUF: NEW (Vec::with_capacity + extend_from_slice) vs OLD
 // (vec![0u8; n] + sink-with-offset)
 // ---------------------------------------------------------------------------
