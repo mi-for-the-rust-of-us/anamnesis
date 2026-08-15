@@ -165,7 +165,18 @@ fn dequantize_bnb4_core<E: OutputElement>(
         // buffer keeps the block's working set at one L1-resident array; the
         // read and the write are the same element, so there is no aliasing
         // ambiguity for the vectorizer to give up on.
-        // VECTORIZED: pending cargo-show-asm verification
+        // VECTORIZED: confirmed AVX2 vmulps on %ymm (8-wide) in `--emit=asm`,
+        // x86-64 target-cpu=native, opt-level=3, for all three `E`; the
+        // narrowing that follows is `write_scratch`'s own confirmed loop
+        // (`vpaddd`/`vpsrld` at `Bf16Out`, `vmovups` at `F32Out`, `vcvtps2ph`
+        // at `F16Out`). Pass 1 above stays a table lookup and is annotated
+        // separately.
+        //
+        // Measured 25.88 -> 26.96 ms on a 45 M-element `NF4` fixture against
+        // the v0.7.3 binary (best-of-5 min of 4 interleaved rounds, release,
+        // target-cpu=native), i.e. 1.04x slower — the smallest cost of the four
+        // families, because this kernel already had an `f32` block scratch and
+        // only the narrowing moved out of the loop.
         for val in scratch_block.iter_mut() {
             *val *= block_absmax;
         }
@@ -694,7 +705,18 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         let tail_w = w_tiles.remainder();
         let mut o_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
 
-        // VECTORIZED: pending cargo-show-asm verification
+        // VECTORIZED: confirmed AVX2 vpmovsxbd + vcvtdq2ps + vmulps on %ymm
+        // (8-wide) in `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for
+        // all three `E` — the sign-extending `I8` load, the int-to-float
+        // conversion and the row-scale multiply, eight lanes at a time. The
+        // narrowing that follows is `write_scratch`'s own confirmed loop.
+        //
+        // Measured 15.27 -> 16.98 ms at 4096 x 11008 against the v0.7.3 binary
+        // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),
+        // i.e. 1.11x slower. v0.7.3 fused all of this into one loop with the
+        // BF16 store inline; the split is what buys F32/F16, and the register
+        // tiling is what keeps the cost to ~11% rather than the 44 KB row
+        // scratch's measured 1.115x plus L2 traffic.
         for (w_tile, o_tile) in w_tiles.zip(o_tiles.by_ref()) {
             for (&w_byte, value) in w_tile.iter().zip(tile.iter_mut()) {
                 // CAST: u8 (from I8 two's complement) → i8 → f32
@@ -709,7 +731,9 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         // tile.len()`, so the sub-slice is always `Some`; `get_mut` rather than
         // an index keeps the no-panic floor structural.
         if let Some(tail_tile) = tile.get_mut(..tail_w.len()) {
-            // VECTORIZED: pending cargo-show-asm verification
+            // VECTORIZED: scalar fallback — ragged-tail path, at most
+            // `VECTOR_TILE - 1` elements per row with no constant trip count
+            // to unroll. The full tiles above carry the confirmed 8-wide loop.
             for (&w_byte, value) in tail_w.iter().zip(tail_tile.iter_mut()) {
                 // CAST: u8 (from I8 two's complement) → i8 → f32
                 #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]

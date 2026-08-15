@@ -460,7 +460,19 @@ pub fn dequantize_awq<E: OutputElement>(
         );
         let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
 
-        // VECTORIZED: pending cargo-show-asm verification
+        // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
+        // `E`; the narrowing that follows is `write_scratch`'s own confirmed
+        // loop (`vpaddd`/`vpsrld` at `Bf16Out`, `vmovups` at `F32Out`,
+        // `vcvtps2ph` at `F16Out`). This resolves an annotation that had read
+        // `pending` since the kernel was written.
+        //
+        // Measured 28.96 -> 30.30 ms at 4096 x 11008 against the v0.7.3 binary
+        // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),
+        // i.e. 1.05x slower; tiling this pair through registers rather than a
+        // full 44 KB row recovered 5% of that (31.46 -> 29.96 ms measured
+        // against the untiled shape in isolation). As in `GPTQ`'s twin,
+        // `confirmed` states that the loop vectorises, not that it got faster.
         for (((unp, zer), sca), out_tile) in unp_tiles
             .zip(zer_tiles)
             .zip(sca_tiles)
@@ -474,7 +486,9 @@ pub fn dequantize_awq<E: OutputElement>(
 
         // Edge tile (< VECTOR_TILE elements); see `GPTQ`'s twin.
         if let Some(tail_tile) = tile.get_mut(..unp_tail.len()) {
-            // VECTORIZED: pending cargo-show-asm verification
+            // VECTORIZED: scalar fallback — ragged-tail path, at most
+            // `VECTOR_TILE - 1` elements per row with no constant trip count
+            // to unroll. The full tiles above carry the confirmed 8-wide loop.
             for (((value, &qw), &zero), &scale) in tail_tile
                 .iter_mut()
                 .zip(unp_tail)

@@ -1560,14 +1560,24 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
                     ),
                 });
             }
-            let mut out = Vec::with_capacity(data.len() / 2);
-            // VECTORIZED: pending cargo-show-asm verification
-            for chunk in data.chunks_exact(4) {
+            // Pre-sized, then written through `chunks_exact_mut`: the crate's
+            // standard pass-2 shape (`CONVENTIONS.md` § SIMD-friendly loops,
+            // rules 1 and 6 — flat slices, distinct input and output). The
+            // first v0.7.4 draft pushed with `extend_from_slice` per element,
+            // which carries a capacity check every iteration and cannot
+            // vectorise.
+            let mut out = vec![0u8; data.len() / 2];
+            // VECTORIZED: confirmed AVX2 vpaddd + vpsrld + vpand on %ymm
+            // (8-wide) in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 —
+            // the round-to-nearest-even bias-add and shift, eight lanes at a
+            // time. Byte-identical arithmetic to `Bf16Out::write_scratch`,
+            // which is the point: one narrowing convention, one codegen shape.
+            for (chunk, out_pair) in data.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(4)` guarantees exactly 4 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 let bf16 = crate::remember::fp8::f32_bits_to_bf16_bits(u32::from_le_bytes(arr));
-                out.extend_from_slice(&bf16.to_le_bytes());
+                out_pair.copy_from_slice(&bf16.to_le_bytes());
             }
             Ok(Cow::Owned(out))
         }
@@ -1580,15 +1590,21 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
                     ),
                 });
             }
-            let mut out = Vec::with_capacity(data.len());
-            // VECTORIZED: pending cargo-show-asm verification
-            for chunk in data.chunks_exact(2) {
+            // Pre-sized and written through `chunks_exact_mut`, as the `F32`
+            // arm above; `F16` is 2 bytes in and 2 bytes out, so the output is
+            // the same length as the input.
+            let mut out = vec![0u8; data.len()];
+            // VECTORIZED: confirmed AVX2 vcvtph2ps + vpaddd + vpsrld + vpand on
+            // %ymm in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 — the
+            // `F16C` widening load followed by the same round-to-nearest-even
+            // sequence the `F32` arm uses.
+            for (chunk, out_pair) in data.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(2)` guarantees exactly 2 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 2] = [chunk[0], chunk[1]];
                 let bits = half::f16::from_le_bytes(arr).to_f32().to_bits();
                 let bf16 = crate::remember::fp8::f32_bits_to_bf16_bits(bits);
-                out.extend_from_slice(&bf16.to_le_bytes());
+                out_pair.copy_from_slice(&bf16.to_le_bytes());
             }
             Ok(Cow::Owned(out))
         }

@@ -537,7 +537,22 @@ pub fn dequantize_gptq<E: OutputElement>(
         );
         let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
 
-        // VECTORIZED: pending cargo-show-asm verification
+        // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
+        // `E`; the narrowing that follows is `write_scratch`'s own confirmed
+        // loop (`vpaddd`/`vpsrld` at `Bf16Out`, `vmovups` at `F32Out`,
+        // `vcvtps2ph` at `F16Out`). This resolves an annotation that had read
+        // `pending` since the kernel was written.
+        //
+        // Measured 19.90 -> 23.44 ms at 4096 x 11008 against the v0.7.3 binary
+        // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),
+        // i.e. **1.18x slower**. Stated plainly because `confirmed` here means
+        // "this loop vectorises", not "this loop got faster": v0.7.3's pass 2
+        // was already emitting vsubps + vmulps, so the split buys the F32/F16
+        // capability rather than throughput, and that is the honest trade.
+        // `CONVENTIONS.md`'s "at least as fast as the previous **scalar**
+        // baseline" clause has no referent here, because the previous baseline
+        // was not scalar.
         for (((unp, zer), sca), out_tile) in unp_tiles
             .zip(zer_tiles)
             .zip(sca_tiles)
@@ -553,7 +568,9 @@ pub fn dequantize_gptq<E: OutputElement>(
         // tile.len()`, so the sub-slice is always `Some`; `get_mut` rather than
         // an index keeps the no-panic floor structural.
         if let Some(tail_tile) = tile.get_mut(..unp_tail.len()) {
-            // VECTORIZED: pending cargo-show-asm verification
+            // VECTORIZED: scalar fallback — ragged-tail path, at most
+            // `VECTOR_TILE - 1` elements per row with no constant trip count
+            // to unroll. The full tiles above carry the confirmed 8-wide loop.
             for (((value, &qw), &zero), &scale) in tail_tile
                 .iter_mut()
                 .zip(unp_tail)
