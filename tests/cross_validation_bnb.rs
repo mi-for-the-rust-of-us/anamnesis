@@ -20,19 +20,55 @@
 
 use std::time::Instant;
 
-use anamnesis::remember::bnb::dequantize_bnb4_double_quant_to_bf16;
-use anamnesis::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
+use anamnesis::remember::bnb::{
+    dequantize_bnb4_double_quant, dequantize_bnb4_double_quant_to_bf16,
+};
+use anamnesis::{
+    F32Out, dequantize_bnb_int8, dequantize_bnb_int8_to_bf16, dequantize_bnb4,
+    dequantize_bnb4_to_bf16,
+};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
 // ---------------------------------------------------------------------------
+
+/// Magic prefix identifying a v2 `BnB` fixture container.
+const FIXTURE_MAGIC: &[u8; 4] = b"AMNB";
+
+/// Container version this reader understands.
+const FIXTURE_VERSION: u32 = 2;
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
     u32::from_le_bytes(bytes)
 }
 
+/// Asserts the v2 container prefix shared by both `BnB` fixture layouts.
+///
+/// v1 carried neither magic nor version, so this is what lets a stale checkout
+/// fail loudly rather than read the header at the wrong offsets.
+fn check_container(data: &[u8]) {
+    assert_eq!(
+        &data[..4],
+        FIXTURE_MAGIC,
+        "fixture is not a v2 `AMNB` container — regenerate with \
+         tests/fixtures/bnb_reference/generate_bnb.py"
+    );
+    let version = read_u32_le(data, 4);
+    assert_eq!(
+        version, FIXTURE_VERSION,
+        "unsupported fixture container version {version} (this reader understands \
+         {FIXTURE_VERSION})"
+    );
+}
+
 /// Parsed `NF4`/`FP4` fixture (`format_id` = 0 or 2).
+///
+/// Both goldens come from the canonical `bitsandbytes` `CUDA` kernel. The `F32`
+/// one is a **separate** `dequantize_4bit` at `QuantState(dtype=float32)`, not
+/// a widening of the stock-dtype result: the kernel rounds at the output store,
+/// so widening a `bf16`/`f16` result yields a different number on 38-91 % of
+/// elements (measured per fixture by `generate_bnb.py`).
 struct Bnb4Fixture {
     format_id: u32,
     total_elements: usize,
@@ -46,30 +82,37 @@ struct Bnb4Fixture {
     nested_absmax_data: Vec<u8>,
     nested_quant_map_data: Vec<u8>,
     expected_bf16: Vec<u8>,
+    expected_f32: Vec<u8>,
 }
 
 /// Parsed `INT8` fixture (`format_id` = 1).
+///
+/// `int8_vectorwise_dequant` returns `f32`, so the `F32` golden is its result
+/// before the `BF16` narrowing — no second call needed.
 struct BnbInt8Fixture {
     out_features: usize,
     in_features: usize,
     weight_data: Vec<u8>,
     scb_data: Vec<u8>,
     expected_bf16: Vec<u8>,
+    expected_f32: Vec<u8>,
 }
 
 fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
-    let format_id = read_u32_le(data, 0);
-    let total_elements = read_u32_le(data, 4) as usize;
-    let block_size = read_u32_le(data, 8) as usize;
-    let weight_len = read_u32_le(data, 12) as usize;
-    let absmax_len = read_u32_le(data, 16) as usize;
-    let quant_map_len = read_u32_le(data, 20) as usize;
-    let nested_absmax_len = read_u32_le(data, 24) as usize;
-    let nested_quant_map_len = read_u32_le(data, 28) as usize;
-    let expected_len = read_u32_le(data, 32) as usize;
-    let nested_offset = f32::from_le_bytes(data[36..40].try_into().unwrap());
+    check_container(data);
+    let format_id = read_u32_le(data, 8);
+    let total_elements = read_u32_le(data, 12) as usize;
+    let block_size = read_u32_le(data, 16) as usize;
+    let weight_len = read_u32_le(data, 20) as usize;
+    let absmax_len = read_u32_le(data, 24) as usize;
+    let quant_map_len = read_u32_le(data, 28) as usize;
+    let nested_absmax_len = read_u32_le(data, 32) as usize;
+    let nested_quant_map_len = read_u32_le(data, 36) as usize;
+    let expected_len = read_u32_le(data, 40) as usize;
+    let f32_len = read_u32_le(data, 44) as usize;
+    let nested_offset = f32::from_le_bytes(data[48..52].try_into().unwrap());
 
-    let header_size = 40;
+    let header_size = 52;
     let mut offset = header_size;
 
     let weight_data = data[offset..offset + weight_len].to_vec();
@@ -83,6 +126,11 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
     let nested_quant_map_data = data[offset..offset + nested_quant_map_len].to_vec();
     offset += nested_quant_map_len;
     let expected_bf16 = data[offset..offset + expected_len].to_vec();
+    offset += expected_len;
+    let expected_f32 = data[offset..offset + f32_len].to_vec();
+
+    assert_eq!(expected_len, total_elements * 2, "BF16 golden length");
+    assert_eq!(f32_len, total_elements * 4, "F32 golden length");
 
     Bnb4Fixture {
         format_id,
@@ -95,18 +143,21 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
         nested_absmax_data,
         nested_quant_map_data,
         expected_bf16,
+        expected_f32,
     }
 }
 
 fn parse_int8_fixture(data: &[u8]) -> BnbInt8Fixture {
-    let _format_id = read_u32_le(data, 0); // = 1
-    let out_features = read_u32_le(data, 4) as usize;
-    let in_features = read_u32_le(data, 8) as usize;
-    let weight_len = read_u32_le(data, 12) as usize;
-    let scb_len = read_u32_le(data, 16) as usize;
-    let expected_len = read_u32_le(data, 20) as usize;
+    check_container(data);
+    let _format_id = read_u32_le(data, 8); // = 1
+    let out_features = read_u32_le(data, 12) as usize;
+    let in_features = read_u32_le(data, 16) as usize;
+    let weight_len = read_u32_le(data, 20) as usize;
+    let scb_len = read_u32_le(data, 24) as usize;
+    let expected_len = read_u32_le(data, 28) as usize;
+    let f32_len = read_u32_le(data, 32) as usize;
 
-    let header_size = 24;
+    let header_size = 36;
     let mut offset = header_size;
 
     let weight_data = data[offset..offset + weight_len].to_vec();
@@ -114,6 +165,15 @@ fn parse_int8_fixture(data: &[u8]) -> BnbInt8Fixture {
     let scb_data = data[offset..offset + scb_len].to_vec();
     offset += scb_len;
     let expected_bf16 = data[offset..offset + expected_len].to_vec();
+    offset += expected_len;
+    let expected_f32 = data[offset..offset + f32_len].to_vec();
+
+    assert_eq!(
+        expected_len,
+        out_features * in_features * 2,
+        "BF16 golden length"
+    );
+    assert_eq!(f32_len, out_features * in_features * 4, "F32 golden length");
 
     BnbInt8Fixture {
         out_features,
@@ -121,7 +181,77 @@ fn parse_int8_fixture(data: &[u8]) -> BnbInt8Fixture {
         weight_data,
         scb_data,
         expected_bf16,
+        expected_f32,
     }
+}
+
+// ---------------------------------------------------------------------------
+// F32 comparison
+// ---------------------------------------------------------------------------
+
+/// Compares `F32` output against `bitsandbytes` **bit for bit**.
+///
+/// No tolerance, by design. The `BF16` comparison carries a `ULP` budget
+/// because narrowing to 8 significand bits is a lossy step both sides perform.
+/// `F32` has no such excuse: both compute in `f32`, so identical operations in
+/// identical order must give identical bits.
+///
+/// **One documented exemption**, inherited from `compare_bf16`: `±0` are
+/// arithmetically identical, and anamnesis' `BnB4` decode deliberately emits
+/// `-0.0` where a codebook entry with the nibble high bit set collapsed to
+/// `+0.0` — the sign-of-zero preservation rule that lets encode round-trip the
+/// original nibble byte-exactly, while `bitsandbytes`' decode emits `+0.0`
+/// there. The count is reported separately so the exemption stays visibly
+/// narrow rather than quietly absorbing real mismatches.
+fn compare_f32_exact(name: &str, actual: &[u8], expected: &[u8]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{name}: F32 output length mismatch"
+    );
+
+    let mut mismatches = 0usize;
+    let mut signed_zeros = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for (i, (a_word, e_word)) in actual
+        .chunks_exact(4)
+        .zip(expected.chunks_exact(4))
+        .enumerate()
+    {
+        let a = f32::from_le_bytes([a_word[0], a_word[1], a_word[2], a_word[3]]);
+        let e = f32::from_le_bytes([e_word[0], e_word[1], e_word[2], e_word[3]]);
+        // Bit equality, not `==`: `NaN` payloads and signed zero must count.
+        if a.to_bits() == e.to_bits() {
+            continue;
+        }
+        // BITWISE: low 31 bits zero ⇒ value is +0 or -0 (sign-only diff), the
+        // f32 counterpart of `compare_bf16`'s low-15-bits test.
+        if a.to_bits().trailing_zeros() >= 31 && e.to_bits().trailing_zeros() >= 31 {
+            signed_zeros += 1;
+            continue;
+        }
+        mismatches += 1;
+        if first.is_none() {
+            first = Some((i, a, e));
+        }
+    }
+
+    eprintln!("  F32: {mismatches} mismatches, {signed_zeros} sign-of-zero-only differences");
+    if let Some((i, a, e)) = first {
+        eprintln!(
+            "  F32 element {i}: actual={a:e} (0x{:08X}), expected={e:e} (0x{:08X})",
+            a.to_bits(),
+            e.to_bits()
+        );
+    }
+    assert_eq!(
+        mismatches,
+        0,
+        "{name}: {mismatches}/{} F32 elements differ from bitsandbytes. This is NOT \
+         a tolerance question — both sides compute in f32. Treat it as a real \
+         finding before touching the test.",
+        actual.len() / 4
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -197,16 +327,17 @@ fn run_bnb4_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         fixture.block_size, fixture.total_elements,
     );
 
+    // Infer nested_block_size: absmax_count / nested_absmax_count
+    let absmax_count = fixture.absmax_data.len();
+    let nested_absmax_count = fixture.nested_absmax_data.len() / 4;
+    let nested_block_size = if nested_absmax_count > 0 {
+        absmax_count.div_ceil(nested_absmax_count)
+    } else {
+        256
+    };
+
     let start = Instant::now();
     let actual = if fixture.format_id == 2 {
-        // Infer nested_block_size: absmax_count / nested_absmax_count
-        let absmax_count = fixture.absmax_data.len();
-        let nested_absmax_count = fixture.nested_absmax_data.len() / 4;
-        let nested_block_size = if nested_absmax_count > 0 {
-            absmax_count.div_ceil(nested_absmax_count)
-        } else {
-            256
-        };
         dequantize_bnb4_double_quant_to_bf16(
             &fixture.weight_data,
             &fixture.absmax_data,
@@ -240,6 +371,31 @@ fn run_bnb4_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         mismatches, 0,
         "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})"
     );
+
+    let actual_f32 = if fixture.format_id == 2 {
+        dequantize_bnb4_double_quant::<F32Out>(
+            &fixture.weight_data,
+            &fixture.absmax_data,
+            &fixture.quant_map_data,
+            &fixture.nested_absmax_data,
+            &fixture.nested_quant_map_data,
+            fixture.nested_offset,
+            fixture.total_elements,
+            fixture.block_size,
+            nested_block_size,
+        )
+        .expect("BnB4 double-quant F32 dequantization failed")
+    } else {
+        dequantize_bnb4::<F32Out>(
+            &fixture.weight_data,
+            &fixture.absmax_data,
+            &fixture.quant_map_data,
+            fixture.total_elements,
+            fixture.block_size,
+        )
+        .expect("BnB4 F32 dequantization failed")
+    };
+    compare_f32_exact(name, &actual_f32, &fixture.expected_f32);
 }
 
 fn run_int8_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
@@ -271,6 +427,15 @@ fn run_int8_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         mismatches, 0,
         "{name}: {mismatches} BF16 mismatches (max ULP diff = {max_diff})"
     );
+
+    let actual_f32 = dequantize_bnb_int8::<F32Out>(
+        &fixture.weight_data,
+        &fixture.scb_data,
+        fixture.out_features,
+        fixture.in_features,
+    )
+    .expect("BnB INT8 F32 dequantization failed");
+    compare_f32_exact(name, &actual_f32, &fixture.expected_f32);
 }
 
 // ---------------------------------------------------------------------------

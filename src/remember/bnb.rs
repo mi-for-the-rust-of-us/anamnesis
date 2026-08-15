@@ -25,6 +25,29 @@
 use crate::error::AnamnesisError;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 
+/// Reciprocal of the `INT8` scale denominator, applied as `bitsandbytes` does.
+///
+/// `bitsandbytes`' `int8_vectorwise_dequant` is
+/// `A * stats.view(-1, 1) * 7.874015718698502e-3`. That decimal literal and
+/// `1.0 / 127.0` round to the **same** `f32` (`0x3C01_0204`), asserted below,
+/// so writing the exact quotient here costs no fidelity and reads honestly.
+/// What actually mattered was the multiply *order*, not the constant — see
+/// [`dequantize_bnb_int8`].
+const INV_127: f32 = 1.0 / 127.0;
+
+// The claim above is checked at compile time rather than trusted: if a future
+// bitsandbytes changed the literal, the assertion is where that surfaces.
+//
+// `excessive_precision` is allowed on purpose: the literal is quoted verbatim
+// from `bitsandbytes/_ops.py`, and its excess digits over `f32` are precisely
+// what the assertion exists to discharge. Trimming it to what `f32` can hold
+// would make the check tautological.
+#[allow(clippy::excessive_precision)]
+const _: () = {
+    assert!(INV_127.to_bits() == 0x3C01_0204);
+    assert!((7.874_015_718_698_502_e-3_f32).to_bits() == INV_127.to_bits());
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -138,9 +161,18 @@ fn dequantize_bnb4_core<E: OutputElement>(
         // round-trip is byte-exact rather than only decode-equivalent.
         // This is a no-op for `NF4` (codebook[8] = 0.0795…, never +0)
         // and for any codebook whose upper half lacks a +0.0 entry.
-        // VECTORIZED: pass 1 extracts nibbles and performs table lookup;
-        // pass 2 does pure f32 multiply + BF16 convert (verified: vmulps ymm
-        // with target-cpu=native).
+        // VECTORIZED: scalar fallback — Pass-1 of fission; the codebook lookup
+        // `quant_map[nibble]` is data-dependent indexing, which the compiler
+        // cannot turn into packed loads. Confirmed in `--emit=asm`, x86-64
+        // target-cpu=native, opt-level=3: this loop emits scalar `vmovss` table
+        // loads assembled lane-by-lane with `vinsertps` (12 of them), and no
+        // `vgatherdps` at all — consistent with Experiment 10's finding that the
+        // gather-bound kernels are the ones SIMD cannot help. Pass 2 below is
+        // the pass that vectorises, and carries its own annotation.
+        //
+        // (Before v0.7.4 this comment also described pass 2 as doing the `BF16`
+        // convert. That stopped being true when the narrowing moved into pass 3
+        // and became width-generic; it is stated once, below, where it happens.)
         // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
         #[allow(clippy::indexing_slicing)]
         let scratch_block = &mut scratch[..block_size];
@@ -599,8 +631,18 @@ pub fn dequantize_bnb_int8_to_bf16(
 
 /// Dequantizes `BitsAndBytes` `INT8` (`LLM.int8()`) quantized weights into `E`.
 ///
-/// Each `I8` weight value is dequantized via: `value = weight_i8 × (SCB / 127)`,
-/// where `SCB` is the per-row absolute maximum.
+/// Each `I8` weight value is dequantized via
+/// `value = (weight_i8 × SCB) × (1 / 127)`, where `SCB` is the per-row absolute
+/// maximum and the reciprocal is the `INV_127` constant.
+///
+/// **The association is load-bearing, not incidental.** Until v0.7.4 this
+/// kernel hoisted `SCB / 127` per row and computed `weight_i8 × scale`, which
+/// is the same real number but a different `f32` evaluation. Both round to the
+/// same `BF16`, so the `BF16` cross-validation reported 0/65536 mismatches and
+/// the divergence stayed invisible; comparing at `F32` against
+/// `bitsandbytes`' `int8_vectorwise_dequant` showed **17610/65536 (26.9 %)**
+/// elements off by exactly 1 `ULP`. Matching `bitsandbytes`' order restores
+/// bit-exactness at every output width. See `tests/cross_validation_bnb.rs`.
 ///
 /// # Arguments
 ///
@@ -679,8 +721,12 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         let scb_val = read_f32_le(scb_data, row * 4).ok_or_else(|| AnamnesisError::Parse {
             reason: format!("BnB INT8 SCB read out of bounds at row {row}"),
         })?;
-        // Precompute row scale: SCB / 127.0
-        let scale = scb_val / 127.0;
+        // No per-row `SCB / 127` hoist here: the multiply order is part of the
+        // contract with `bitsandbytes` (see this function's doc comment), and
+        // folding the reciprocal into a row scale is exactly the reassociation
+        // that cost 26.9 % of elements 1 ULP at `F32`. `INV_127` is loop-
+        // invariant and lands in a register, so the cost is one extra packed
+        // multiply per tile rather than a per-element division.
 
         // Pre-slice for branch-free inner loop (two-level bounds checking)
         let w_start = row * in_features;
@@ -706,10 +752,21 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         let mut o_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
 
         // VECTORIZED: confirmed AVX2 vpmovsxbd + vcvtdq2ps + vmulps on %ymm
-        // (8-wide) in `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for
-        // all three `E` — the sign-extending `I8` load, the int-to-float
-        // conversion and the row-scale multiply, eight lanes at a time. The
-        // narrowing that follows is `write_scratch`'s own confirmed loop.
+        // (8-wide) via cargo-show-asm, x86-64 target-cpu=native, opt-level=3,
+        // for all three `E` — each dumps 6 vpmovsxbd, 6 vcvtdq2ps and 12
+        // vmulps, i.e. exactly the two packed multiplies (× SCB, × INV_127)
+        // per sign-extending load, with no vdivps/vdivss anywhere: the v0.7.3
+        // per-row division is gone rather than merely hoisted. The 2 vmulss in
+        // each dump belong to the ragged-tail loop below, which is annotated
+        // scalar fallback. The narrowing that follows is `write_scratch`'s own
+        // confirmed loop.
+        //
+        // Cost of the association fix, measured because adding a multiply to a
+        // bandwidth-bound loop is a hypothesis until it is not: 16.82 -> 17.48
+        // ms at 4096 x 11008 (min over 10 interleaved before/after rounds of
+        // best-of-5, release, target-cpu=native), i.e. 1.04x slower. Accepted
+        // deliberately — it buys bit-exactness against bitsandbytes at F32,
+        // where the old association was 1 ULP out on 26.9 % of elements.
         //
         // Measured 15.27 -> 16.98 ms at 4096 x 11008 against the v0.7.3 binary
         // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),
@@ -722,7 +779,7 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
                 // CAST: u8 (from I8 two's complement) → i8 → f32
                 #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
                 let w_i8 = w_byte as i8;
-                *value = f32::from(w_i8) * scale;
+                *value = f32::from(w_i8) * scb_val * INV_127;
             }
             E::write_scratch(&tile, o_tile);
         }
@@ -738,7 +795,7 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
                 // CAST: u8 (from I8 two's complement) → i8 → f32
                 #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
                 let w_i8 = w_byte as i8;
-                *value = f32::from(w_i8) * scale;
+                *value = f32::from(w_i8) * scb_val * INV_127;
             }
             E::write_scratch(tail_tile, o_tiles.into_remainder());
         }

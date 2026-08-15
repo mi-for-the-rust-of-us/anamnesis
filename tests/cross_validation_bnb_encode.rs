@@ -61,9 +61,34 @@ use anamnesis::{encode_bnb_int8, encode_bnb4, encode_bnb4_double_quant};
 // Fixture parsing (mirrors tests/cross_validation_bnb.rs)
 // ---------------------------------------------------------------------------
 
+/// Magic prefix identifying a v2 `BnB` fixture container.
+const FIXTURE_MAGIC: &[u8; 4] = b"AMNB";
+
+/// Container version this reader understands.
+const FIXTURE_VERSION: u32 = 2;
+
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
     u32::from_le_bytes(bytes)
+}
+
+/// Asserts the v2 container prefix shared by both `BnB` fixture layouts.
+///
+/// v1 carried neither magic nor version, so this is what lets a stale checkout
+/// fail loudly rather than read the header at the wrong offsets.
+fn check_container(data: &[u8]) {
+    assert_eq!(
+        &data[..4],
+        FIXTURE_MAGIC,
+        "fixture is not a v2 `AMNB` container — regenerate with \
+         tests/fixtures/bnb_reference/generate_bnb.py"
+    );
+    let version = read_u32_le(data, 4);
+    assert_eq!(
+        version, FIXTURE_VERSION,
+        "unsupported fixture container version {version} (this reader understands \
+         {FIXTURE_VERSION})"
+    );
 }
 
 struct Bnb4Fixture {
@@ -91,18 +116,20 @@ struct BnbInt8Fixture {
 }
 
 fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
-    let format_id = read_u32_le(data, 0);
-    let total_elements = read_u32_le(data, 4) as usize;
-    let block_size = read_u32_le(data, 8) as usize;
-    let weight_len = read_u32_le(data, 12) as usize;
-    let absmax_len = read_u32_le(data, 16) as usize;
-    let quant_map_len = read_u32_le(data, 20) as usize;
-    let nested_absmax_len = read_u32_le(data, 24) as usize;
-    let nested_quant_map_len = read_u32_le(data, 28) as usize;
-    let _expected_len = read_u32_le(data, 32) as usize;
-    let nested_offset = f32::from_le_bytes(data[36..40].try_into().unwrap());
+    check_container(data);
+    let format_id = read_u32_le(data, 8);
+    let total_elements = read_u32_le(data, 12) as usize;
+    let block_size = read_u32_le(data, 16) as usize;
+    let weight_len = read_u32_le(data, 20) as usize;
+    let absmax_len = read_u32_le(data, 24) as usize;
+    let quant_map_len = read_u32_le(data, 28) as usize;
+    let nested_absmax_len = read_u32_le(data, 32) as usize;
+    let nested_quant_map_len = read_u32_le(data, 36) as usize;
+    let _expected_len = read_u32_le(data, 40) as usize;
+    let _f32_len = read_u32_le(data, 44) as usize;
+    let nested_offset = f32::from_le_bytes(data[48..52].try_into().unwrap());
 
-    let header_size = 40;
+    let header_size = 52;
     let mut offset = header_size;
 
     let weight_data = data[offset..offset + weight_len].to_vec();
@@ -129,14 +156,16 @@ fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
 }
 
 fn parse_int8_fixture(data: &[u8]) -> BnbInt8Fixture {
-    let _format_id = read_u32_le(data, 0);
-    let out_features = read_u32_le(data, 4) as usize;
-    let in_features = read_u32_le(data, 8) as usize;
-    let weight_len = read_u32_le(data, 12) as usize;
-    let scb_len = read_u32_le(data, 16) as usize;
-    let _expected_len = read_u32_le(data, 20) as usize;
+    check_container(data);
+    let _format_id = read_u32_le(data, 8);
+    let out_features = read_u32_le(data, 12) as usize;
+    let in_features = read_u32_le(data, 16) as usize;
+    let weight_len = read_u32_le(data, 20) as usize;
+    let scb_len = read_u32_le(data, 24) as usize;
+    let _expected_len = read_u32_le(data, 28) as usize;
+    let _f32_len = read_u32_le(data, 32) as usize;
 
-    let header_size = 24;
+    let header_size = 36;
     let mut offset = header_size;
 
     let weight_data = data[offset..offset + weight_len].to_vec();
