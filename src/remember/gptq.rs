@@ -21,7 +21,7 @@
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
-use crate::remember::output::{Bf16Out, OutputElement};
+use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 // ---------------------------------------------------------------------------
@@ -416,6 +416,10 @@ pub fn dequantize_gptq<E: OutputElement>(
     let mut scales_buf = vec![0.0_f32; out_features];
     let mut cached_group: Option<usize> = None;
 
+    // Register-sized tile for the arithmetic/narrowing pair, hoisted so it is
+    // initialised once rather than per row. See [`VECTOR_TILE`].
+    let mut tile = [0.0_f32; VECTOR_TILE];
+
     // --- Hot loop: row-by-row dequantization ---
     // Two-level bounds checking per CONVENTIONS.md: validate slices ONCE
     // before the inner loop, then iterate branch-free inside.
@@ -510,29 +514,56 @@ pub fn dequantize_gptq<E: OutputElement>(
             unpacked_row[j] = qw;
         }
 
-        // --- Pass 2: pure f32 arithmetic, BRANCH-FREE, IN PLACE ---
-        // Contiguous f32 reads (unpacked, zeros, scales), no byte manipulation
-        // and no narrowing — just sub + mul, the shape CONVENTIONS.md's
-        // loop-fission rule asks for.
+        // --- Pass 2 + 3: arithmetic then narrowing, TILED through registers ---
+        // `(qw - zero) * scale` into a [`VECTOR_TILE`]-sized stack tile, then
+        // `write_scratch` over that same tile, so the intermediate `f32`s never
+        // reach memory.
         //
-        // **In place over `unpacked_row`, not into a second buffer.** The first
-        // v0.7.4 draft wrote into a separate `out_features`-sized scratch, which
-        // doubled the row working set to ~88 KB at `out_features = 11008` and
-        // pushed it out of L1. CONVENTIONS.md's "separate input and output
-        // slices" rule is about aliasing *between distinct slices* defeating the
-        // vectorizer; element `i` here reads and writes only element `i` of the
-        // same slice, which raises no aliasing question at all.
+        // **Tiled rather than row-sized, and that is measured.** Earlier v0.7.4
+        // drafts ran this pair over the whole `out_features` row: first into a
+        // second row buffer (~88 KB of working set at `out_features = 11008`),
+        // then in place over `unpacked_row` (~44 KB). Both exceed L1, so the
+        // intermediate round-tripped through L2 and the pair cost 1.15× against
+        // the pre-v0.7.4 fused loop. The same tiling is what took `FP8` from
+        // 1.06× to 0.45×.
+        let unp_tiles = unpacked_row.chunks_exact(VECTOR_TILE);
+        let zer_tiles = zeros_row.chunks_exact(VECTOR_TILE);
+        let sca_tiles = scales_row.chunks_exact(VECTOR_TILE);
+        // Read the remainders before the iterators are consumed.
+        let (unp_tail, zer_tail, sca_tail) = (
+            unp_tiles.remainder(),
+            zer_tiles.remainder(),
+            sca_tiles.remainder(),
+        );
+        let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+
         // VECTORIZED: pending cargo-show-asm verification
-        for ((value, &zero), &scale) in unpacked_row
-            .iter_mut()
-            .zip(zeros_row.iter())
-            .zip(scales_row.iter())
+        for (((unp, zer), sca), out_tile) in unp_tiles
+            .zip(zer_tiles)
+            .zip(sca_tiles)
+            .zip(out_tiles.by_ref())
         {
-            *value = (*value - zero) * scale;
+            for (((value, &qw), &zero), &scale) in tile.iter_mut().zip(unp).zip(zer).zip(sca) {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(&tile, out_tile);
         }
 
-        // --- Pass 3: narrow to the caller's output width ---
-        E::write_scratch(unpacked_row, out_row);
+        // Edge tile (< VECTOR_TILE elements). `tail.len() < VECTOR_TILE ==
+        // tile.len()`, so the sub-slice is always `Some`; `get_mut` rather than
+        // an index keeps the no-panic floor structural.
+        if let Some(tail_tile) = tile.get_mut(..unp_tail.len()) {
+            // VECTORIZED: pending cargo-show-asm verification
+            for (((value, &qw), &zero), &scale) in tail_tile
+                .iter_mut()
+                .zip(unp_tail)
+                .zip(zer_tail)
+                .zip(sca_tail)
+            {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(tail_tile, out_tiles.into_remainder());
+        }
     }
 
     Ok(output)

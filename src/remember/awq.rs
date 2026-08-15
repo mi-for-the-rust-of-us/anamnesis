@@ -38,7 +38,7 @@
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
-use crate::remember::output::{Bf16Out, OutputElement};
+use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 /// `AWQ` 4-bit pack factor: 8 nibbles per packed `I32`.
@@ -349,6 +349,9 @@ pub fn dequantize_awq<E: OutputElement>(
     let mut scales_buf = vec![0.0_f32; out_features];
     let mut cached_group: Option<usize> = None;
 
+    // Register-sized tile for the arithmetic/narrowing pair; see [`VECTOR_TILE`].
+    let mut tile = [0.0_f32; VECTOR_TILE];
+
     // --- Precompute constants ---
     // BITWISE: mask for one 4-bit quantized value
     let mask = 0xFu32;
@@ -444,24 +447,44 @@ pub fn dequantize_awq<E: OutputElement>(
             }
         }
 
-        // --- Pass 2: pure f32 arithmetic, BRANCH-FREE, IN PLACE ---
-        // Contiguous f32 reads (unpacked, zeros, scales), no byte manipulation
-        // and no narrowing — just sub + mul.
-        //
-        // **In place over `unpacked_row`, not into a second buffer**, for the
-        // reason `GPTQ`'s twin of this loop documents: a separate scratch
-        // doubled the row working set past L1 for no benefit.
+        // --- Pass 2 + 3: arithmetic then narrowing, TILED through registers ---
+        // The twin of `GPTQ`'s loop; see that one for the measurement that
+        // settled tile-sized over row-sized.
+        let unp_tiles = unpacked_row.chunks_exact(VECTOR_TILE);
+        let zer_tiles = zeros_row.chunks_exact(VECTOR_TILE);
+        let sca_tiles = scales_row.chunks_exact(VECTOR_TILE);
+        let (unp_tail, zer_tail, sca_tail) = (
+            unp_tiles.remainder(),
+            zer_tiles.remainder(),
+            sca_tiles.remainder(),
+        );
+        let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+
         // VECTORIZED: pending cargo-show-asm verification
-        for ((value, &zero), &scale) in unpacked_row
-            .iter_mut()
-            .zip(zeros_row.iter())
-            .zip(scales_row.iter())
+        for (((unp, zer), sca), out_tile) in unp_tiles
+            .zip(zer_tiles)
+            .zip(sca_tiles)
+            .zip(out_tiles.by_ref())
         {
-            *value = (*value - zero) * scale;
+            for (((value, &qw), &zero), &scale) in tile.iter_mut().zip(unp).zip(zer).zip(sca) {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(&tile, out_tile);
         }
 
-        // --- Pass 3: narrow to the caller's output width ---
-        E::write_scratch(unpacked_row, out_row);
+        // Edge tile (< VECTOR_TILE elements); see `GPTQ`'s twin.
+        if let Some(tail_tile) = tile.get_mut(..unp_tail.len()) {
+            // VECTORIZED: pending cargo-show-asm verification
+            for (((value, &qw), &zero), &scale) in tail_tile
+                .iter_mut()
+                .zip(unp_tail)
+                .zip(zer_tail)
+                .zip(sca_tail)
+            {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(tail_tile, out_tiles.into_remainder());
+        }
     }
 
     Ok(output)
