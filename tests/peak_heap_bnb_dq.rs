@@ -55,6 +55,33 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// ---------------------------------------------------------------------------
+// dhat serialisation
+// ---------------------------------------------------------------------------
+
+/// Serialises the `dhat` profiler across this binary's tests.
+///
+/// `dhat` installs a global allocator wrapper and permits **one** live
+/// `Profiler` per process, but `cargo test` runs test functions on parallel
+/// threads by default. Without this guard a second test entering
+/// `Profiler::builder().build()` while the first is still live either panics
+/// ("optional dhat: only one Profiler can be running at a time") or, worse,
+/// silently attributes one test's allocations to another's peak.
+///
+/// That is not hypothetical. Before v0.7.4 this file held two tests and passed
+/// by luck; adding per-dtype cases made it fail with a reported scratch of
+/// `137 x out_features x 4` against a true `3 x`. `peak_heap_gguf.rs` had the
+/// same latent bug from v0.7.3, where it panicked outright under the default
+/// thread count.
+///
+/// Held for the profiler's whole lifetime: declare this **before** the
+/// `Profiler`, so the profiler (declared later) drops first.
+fn dhat_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use anamnesis::remember::bnb::dequantize_bnb4_double_quant_to_bf16;
 
 // ---------------------------------------------------------------------------
@@ -197,6 +224,10 @@ fn assert_peak_heap_within(total_elements: usize, output_bytes: usize, max_bytes
 #[test]
 #[ignore = "dhat peak-heap assertion; run with --ignored --nocapture"]
 fn peak_heap_bnb_dq_small_1m_elements() {
+    // Held for the whole body, not just the profiler: `dhat` counts every
+    // allocation in the process, so a concurrent test synthesising its own
+    // fixture would inflate this one's peak even with the profiler serialised.
+    let _dhat_guard = dhat_lock();
     let total_elements: usize = 1024 * 1024; // = 1_048_576
     let fixture = synth_bnb_dq_fixture(total_elements);
     let output_bytes = total_elements * 2;
@@ -231,6 +262,10 @@ fn peak_heap_bnb_dq_small_1m_elements() {
 #[test]
 #[ignore = "dhat peak-heap assertion; run with --ignored --nocapture"]
 fn peak_heap_bnb_dq_layer_45m_elements() {
+    // Held for the whole body, not just the profiler: `dhat` counts every
+    // allocation in the process, so a concurrent test synthesising its own
+    // fixture would inflate this one's peak even with the profiler serialised.
+    let _dhat_guard = dhat_lock();
     let total_elements: usize = 4096 * 11008; // = 45_088_768
     let fixture = synth_bnb_dq_fixture(total_elements);
     let output_bytes = total_elements * 2;

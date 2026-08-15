@@ -51,6 +51,33 @@ use std::io::Write;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// ---------------------------------------------------------------------------
+// dhat serialisation
+// ---------------------------------------------------------------------------
+
+/// Serialises the `dhat` profiler across this binary's tests.
+///
+/// `dhat` installs a global allocator wrapper and permits **one** live
+/// `Profiler` per process, but `cargo test` runs test functions on parallel
+/// threads by default. Without this guard a second test entering
+/// `Profiler::builder().build()` while the first is still live either panics
+/// ("optional dhat: only one Profiler can be running at a time") or, worse,
+/// silently attributes one test's allocations to another's peak.
+///
+/// That is not hypothetical. Before v0.7.4 this file held two tests and passed
+/// by luck; adding per-dtype cases made it fail with a reported scratch of
+/// `137 x out_features x 4` against a true `3 x`. `peak_heap_gguf.rs` had the
+/// same latent bug from v0.7.3, where it panicked outright under the default
+/// thread count.
+///
+/// Held for the profiler's whole lifetime: declare this **before** the
+/// `Profiler`, so the profiler (declared later) drops first.
+fn dhat_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Builds a `.pth` archive with `n` tiny STORED `archive/data/{i}` entries plus
 /// a valid empty-`state_dict` `archive/data.pkl` (`PROTO 2`, `EMPTY_DICT`,
 /// `STOP`). The tensor-data entries are unreferenced by the pickle, so
@@ -86,6 +113,11 @@ struct HeapSample {
 #[ignore = "dhat metadata-reduction measurement; run with --ignored --nocapture"]
 fn zip_container_metadata_reduction() {
     const N: usize = 50_000;
+
+    // Held for the whole body, not just the profiler: `dhat` counts every
+    // allocation in the process, so a concurrent test synthesising its own
+    // fixture would inflate this one's peak even with the profiler serialised.
+    let _dhat_guard = dhat_lock();
     let entries = N + 1;
     let tmp = build_many_entry_pth(N);
 

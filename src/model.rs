@@ -673,20 +673,31 @@ impl ParsedModel {
     ///
     /// # Memory
     ///
-    /// Peak heap is `O(total_dequantised_output_size)` ≈ `2 × n_parameters`
-    /// bytes (the output `BF16` tensors). The input file is memory-mapped
-    /// — pages are paged in by the kernel on access and may be dropped
-    /// under memory pressure — so the input side does not contribute to
-    /// the heap. **Every dequantised tensor's `Vec<u8>` is retained
-    /// simultaneously** until the underlying `safetensors::serialize_to_file`
-    /// call returns: the safetensors crate's writer itself streams tensor
-    /// bodies one at a time, but the eager buffering happens in this
-    /// method's caller-side `Vec` collection. The `GPTQ` / `AWQ`
-    /// orientation transpose holds one extra tensor-sized buffer
+    /// Peak heap is `O(total_dequantised_output_size)`, which is
+    /// `target.byte_size() × n_parameters` bytes: **`2 ×` at `BF16` or `F16`
+    /// and `4 ×` at `F32`**. Passthrough tensors contribute their source bytes
+    /// either way, so an `F32` request does not double the whole file, only the
+    /// dequantised share.
+    ///
+    /// The input file is memory-mapped — pages are paged in by the kernel on
+    /// access and may be dropped under memory pressure — so the input side does
+    /// not contribute to the heap. **Every dequantised tensor's `Vec<u8>` is
+    /// retained simultaneously** until the underlying
+    /// `safetensors::serialize_to_file` call returns: the safetensors crate's
+    /// writer itself streams tensor bodies one at a time, but the eager
+    /// buffering happens in this method's caller-side `Vec` collection. The
+    /// `GPTQ` / `AWQ` orientation transpose holds one extra tensor-sized buffer
     /// transiently (per tensor, dropped immediately) — the peak class is
-    /// unchanged. Comfortable for `≤ 7 B` models on a 32 GB system; tight
-    /// at 13 B; `OOM`s at 70 B+. A streaming output path (planned ROADMAP
-    /// Phase 10) will drop this to `O(largest_tensor_BF16)`.
+    /// unchanged, though at `F32` that transient is itself `4 ×` wider.
+    ///
+    /// At `BF16`: comfortable for `≤ 7 B` models on a 32 GB system; tight at
+    /// 13 B; `OOM`s at 70 B+. **At `F32` halve each of those thresholds.** A
+    /// streaming output path (planned ROADMAP Phase 10) will drop this to
+    /// `O(largest_tensor × target.byte_size())`.
+    ///
+    /// The per-kernel share of this claim is asserted to the byte by
+    /// `tests/peak_heap_{awq,gptq,bnb_dq,gguf}.rs`, which since v0.7.4 run at
+    /// every output width rather than only `BF16`.
     pub fn remember(
         &self,
         output_path: impl AsRef<Path>,
@@ -812,14 +823,19 @@ impl ParsedModel {
     /// # Memory
     ///
     /// Peak heap is **higher** than [`remember`](Self::remember)'s file path.
-    /// Both dequantize every tensor into owned `BF16` `Vec`s (`O(2 × n_parameters)`),
-    /// but where [`remember`](Self::remember) streams those bodies to disk one at
-    /// a time via `safetensors::serialize_to_file`, this method calls
-    /// `safetensors::serialize`, which copies every tensor into one contiguous
-    /// output buffer — so the per-tensor `Vec`s **and** the full output `Vec` are
-    /// live simultaneously (~`2 ×` the dequantised set transiently) before the
-    /// per-tensor `Vec`s drop. Comfortable for `≤ 7 B` models on a 32 GB system;
-    /// the streaming, peak-bounded `remember_to_writer` / `remember_to_sink`
+    /// Both dequantize every tensor into owned `Vec`s
+    /// (`O(target.byte_size() × n_parameters)`, so `2 ×` at `BF16` or `F16` and
+    /// `4 ×` at `F32`), but where [`remember`](Self::remember) streams those
+    /// bodies to disk one at a time via `safetensors::serialize_to_file`, this
+    /// method calls `safetensors::serialize`, which copies every tensor into one
+    /// contiguous output buffer — so the per-tensor `Vec`s **and** the full
+    /// output `Vec` are live simultaneously (~`2 ×` the dequantised set
+    /// transiently) before the per-tensor `Vec`s drop.
+    ///
+    /// The two multipliers compound: an `F32` request through this method peaks
+    /// at roughly `8 × n_parameters` against `BF16`'s `4 ×`. Comfortable for
+    /// `≤ 7 B` models on a 32 GB system at `BF16`; halve that at `F32`. The
+    /// streaming, peak-bounded `remember_to_writer` / `remember_to_sink`
     /// variants are planned for ROADMAP Phase 10.
     pub fn remember_to_bytes(&self, target: TargetDtype) -> crate::Result<Vec<u8>> {
         self.remember_to_bytes_with_options(target, RememberOptions::default())
