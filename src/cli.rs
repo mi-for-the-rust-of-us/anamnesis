@@ -45,7 +45,19 @@ enum Commands {
     Remember {
         /// Path to the input model file.
         path: PathBuf,
-        /// Target dtype (currently only `bf16`) or `safetensors` for `.pth`/`.gguf` conversion.
+        /// Output dtype for dequantised tensors: `bf16` (default), `f32`, or
+        /// `f16`. `safetensors` is accepted as an alias for `bf16` on
+        /// `.pth`/`.gguf` inputs, which always produce a safetensors file.
+        ///
+        /// `f32` emits the reference implementation's own `f32` with no
+        /// narrowing step of anamnesis's, at double the output bytes. `f16`
+        /// buys 3 significand bits over `bf16` and pays a far narrower exponent
+        /// range (it saturates at 65504).
+        ///
+        /// Applies to **dequantised** tensors only; passthrough tensors keep
+        /// their source dtype, so the output is legitimately mixed-dtype. On a
+        /// `.pth` input nothing is dequantised, so the value is accepted and
+        /// has no effect.
         #[arg(long, default_value = "bf16")]
         to: String,
         /// Output file path (derived from input if omitted).
@@ -107,9 +119,11 @@ enum Commands {
         /// biases, anything not block-quantised) keep their source dtype, so
         /// this is not "rewrite every tensor as f32".
         ///
-        /// v0.7.3 honours non-`bf16` values for `GGUF` input only; a quantised
-        /// safetensors input reports a clear error rather than silently
-        /// emitting `bf16`.
+        /// Honoured for **every** input format that dequantises, since v0.7.4.
+        /// (v0.7.3 accepted non-`bf16` values for `GGUF` input only and
+        /// reported a clear error for quantised safetensors; that restriction
+        /// is gone.) `NPZ` and `.pth` dequantise nothing, so the value is
+        /// accepted and has no effect there.
         #[arg(long, value_name = "DTYPE", default_value = "bf16")]
         out_dtype: String,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
@@ -416,14 +430,24 @@ fn run_remember(
         Format::Safetensors => run_remember_safetensors(path, to, output, threads),
         #[cfg(feature = "pth")]
         Format::Pth => {
+            // A `.pth` is already full precision, so `remember` copies its
+            // tensors through in their source dtype and dequantises nothing.
+            // `--to f32` / `--to f16` are therefore **vacuous rather than
+            // wrong** here, and are accepted for the same reason `convert`
+            // accepts `--out-dtype` on `NPZ` and `.pth`: refusing
+            // `--to f32` on a file that is already `F32` would be hostile.
+            // Anything that is not an output dtype or the format alias is
+            // still rejected.
             let to_lower = to.to_ascii_lowercase();
-            if to_lower != "safetensors" && to_lower != "bf16" {
+            let recognised = to_lower == "safetensors" || to_lower.parse::<TargetDtype>().is_ok();
+            if !recognised {
                 return Err(crate::AnamnesisError::Unsupported {
                     format: "pth".into(),
                     detail: format!(
                         "unsupported --to value `{to}` for .pth files \
-                         (supported: `safetensors`, `bf16` — .pth conversion \
-                         always produces safetensors)"
+                         (supported: `safetensors`, `bf16`, `f32`, `f16` — .pth \
+                         tensors are already full precision, so the dtype is \
+                         accepted but nothing is narrowed or widened)"
                     ),
                 });
             }
@@ -438,17 +462,25 @@ fn run_remember(
         }),
         #[cfg(feature = "gguf")]
         Format::Gguf => {
+            // Unlike `.pth`, a quantised `GGUF` really is dequantised here, so
+            // the dtype is **honoured** rather than vacuous. The 24 `GGUF`
+            // kernels became generic over `OutputElement` in v0.7.3; v0.7.4
+            // only had to thread the choice through this arm.
             let to_lower = to.to_ascii_lowercase();
-            if to_lower != "safetensors" && to_lower != "bf16" {
-                return Err(crate::AnamnesisError::Unsupported {
-                    format: "GGUF".into(),
-                    detail: format!(
-                        "unsupported --to value `{to}` for .gguf files \
-                         (supported: `safetensors`, `bf16`)"
-                    ),
-                });
-            }
-            run_remember_gguf(path, output)
+            let target = if to_lower == "safetensors" {
+                TargetDtype::BF16
+            } else {
+                to_lower
+                    .parse::<TargetDtype>()
+                    .map_err(|_| crate::AnamnesisError::Unsupported {
+                        format: "GGUF".into(),
+                        detail: format!(
+                            "unsupported --to value `{to}` for .gguf files \
+                             (supported: `safetensors`, `bf16`, `f32`, `f16`)"
+                        ),
+                    })?
+            };
+            run_remember_gguf(path, output, target)
         }
     }
 }
@@ -584,10 +616,17 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// `remember` for a `GGUF` input: dequantise every block-quantised tensor into
+/// `target` and pass scalar tensors through in their source dtype.
+///
+/// Gained the `target` parameter in v0.7.4. Before that it hard-coded `BF16`,
+/// which made `amn remember model.gguf --to f32` a rejection even though the
+/// 24 `GGUF` kernels had been generic over `OutputElement` since v0.7.3.
 #[cfg(feature = "gguf")]
 fn run_remember_gguf(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
+    target: TargetDtype,
 ) -> crate::Result<()> {
     let parsed = crate::parse_gguf(path)?;
     let info = parsed.inspect();
@@ -612,13 +651,20 @@ fn run_remember_gguf(
     );
     println!("  {} tensors", info.tensor_count);
 
-    // Dequantize quantized tensors to BF16; pass through non-quantized
+    // Dequantize quantized tensors to `target`; pass through non-quantized
     // tensors (F32, F16, BF16, integer types) with their original dtype.
     // Collect owned data because TensorView borrows data and all views
     // must be alive simultaneously for serialize_to_file.
     let mut tensor_data: Vec<(String, Vec<u8>, Vec<usize>, safetensors::Dtype)> =
         Vec::with_capacity(info.tensor_count);
     let mut dequantized_count: usize = 0;
+    // The single runtime boundary for this path: past here the width is a
+    // static type parameter, exactly as in `ParsedModel::remember`.
+    let target_st_dtype = match target {
+        TargetDtype::BF16 => safetensors::Dtype::BF16,
+        TargetDtype::F32 => safetensors::Dtype::F32,
+        TargetDtype::F16 => safetensors::Dtype::F16,
+    };
 
     for tensor in parsed.tensors() {
         // GGUF shape is most-significant-first; safetensors expects
@@ -637,13 +683,20 @@ fn run_remember_gguf(
                         tensor.name, tensor.shape
                     ),
                 })?;
-            let bf16_data = crate::dequantize_gguf_to_bf16(&tensor.data, tensor.dtype, n_elements)?;
-            tensor_data.push((
-                tensor.name.to_owned(),
-                bf16_data,
-                shape,
-                safetensors::Dtype::BF16,
-            ));
+            let data = match target {
+                TargetDtype::BF16 => crate::dequantize_gguf::<crate::Bf16Out>(
+                    &tensor.data,
+                    tensor.dtype,
+                    n_elements,
+                )?,
+                TargetDtype::F32 => {
+                    crate::dequantize_gguf::<crate::F32Out>(&tensor.data, tensor.dtype, n_elements)?
+                }
+                TargetDtype::F16 => {
+                    crate::dequantize_gguf::<crate::F16Out>(&tensor.data, tensor.dtype, n_elements)?
+                }
+            };
+            tensor_data.push((tensor.name.to_owned(), data, shape, target_st_dtype));
             dequantized_count += 1;
         } else {
             let st_dtype = gguf_type_to_safetensors_dtype(tensor.dtype)?;
@@ -659,7 +712,7 @@ fn run_remember_gguf(
     }
 
     println!(
-        "  {} dequantized to BF16, {} passed through",
+        "  {} dequantized to {target}, {} passed through",
         dequantized_count,
         tensor_data.len() - dequantized_count
     );

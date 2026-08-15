@@ -227,6 +227,92 @@ fn cli_dequantize_alias() {
     assert!(output_path.exists(), "output file not created");
 }
 
+/// `remember --to f32|f16` must reach the file, not just be accepted.
+///
+/// Asserts the *payload width* rather than the file size: a safetensors header
+/// is JSON whose length varies with the dtype string, so comparing file sizes
+/// would be off by a handful of bytes for reasons that have nothing to do with
+/// the tensor data. Reading the header back and checking the declared dtype is
+/// what actually pins the contract.
+#[test]
+fn cli_remember_honours_every_output_dtype() {
+    for (flag, want_dtype, want_elem_bytes) in [
+        ("bf16", "BF16", 2_usize),
+        ("f32", "F32", 4),
+        ("f16", "F16", 2),
+    ] {
+        let (dir, fixture) = create_test_fixture();
+        let output_path = dir.path().join(format!("out-{flag}.safetensors"));
+
+        let output = Command::new(binary_path())
+            .args([
+                "remember",
+                fixture.to_str().unwrap(),
+                "--to",
+                flag,
+                "--output",
+                output_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("failed to run binary");
+
+        assert!(
+            output.status.success(),
+            "remember --to {flag} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output_path.exists(), "--to {flag}: no output file");
+
+        // Re-parse and confirm the dequantised tensor really carries the
+        // requested width, header and payload agreeing.
+        let model = anamnesis::parse(&output_path).expect("re-parse output");
+        let quantised: Vec<_> = model
+            .header
+            .tensors
+            .iter()
+            .filter(|t| t.dtype.to_string() == want_dtype)
+            .collect();
+        assert!(
+            !quantised.is_empty(),
+            "--to {flag}: no tensor declared {want_dtype}"
+        );
+        for t in quantised {
+            let elements: usize = t.shape.iter().product();
+            assert_eq!(
+                t.byte_len(),
+                elements * want_elem_bytes,
+                "--to {flag}: tensor `{}` payload is not {want_elem_bytes} B/element",
+                t.name
+            );
+        }
+    }
+}
+
+/// The dtype must also reach the derived filename, since `derive_output_path`
+/// builds the suffix from `TargetDtype`'s `Display`. A silent `-bf16` suffix on
+/// an `F32` file would be exactly the failure v0.7.3's design note warned about.
+#[test]
+fn cli_remember_derives_the_dtype_suffix() {
+    for (flag, want_suffix) in [("bf16", "-bf16"), ("f32", "-f32"), ("f16", "-f16")] {
+        let (dir, fixture) = create_test_fixture();
+        let output = Command::new(binary_path())
+            .args(["remember", fixture.to_str().unwrap(), "--to", flag])
+            .current_dir(dir.path())
+            .output()
+            .expect("failed to run binary");
+        assert!(
+            output.status.success(),
+            "remember --to {flag} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(want_suffix),
+            "--to {flag}: expected `{want_suffix}` in the derived path; stdout: {stdout}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
