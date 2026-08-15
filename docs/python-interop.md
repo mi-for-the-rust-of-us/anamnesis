@@ -3,7 +3,7 @@
 <!-- Last updated: 2026-06-25, anamnesis v0.6.8 (Phase 6.13) -->
 
 This is the contract the [Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3)
-PyO3 bindings (`pip install anamnesis`) implement. It is written **before** the
+PyO3 bindings (`pip install anamnesis-quant`) implement. It is written **before** the
 bindings so the core can honour each guarantee and the API shape is frozen rather
 than retrofitted. The Rust core is hardened library-side (every guarantee below
 benefits Rust consumers too); this file records the Python-facing consequences.

@@ -63,7 +63,7 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I bound memory when parsing untrusted files?](#how-do-i-bound-memory-when-parsing-untrusted-files)
   - [Can a malformed file crash the process (panic or abort)?](#can-a-malformed-file-crash-the-process-panic-or-abort)
 - [Python](#python)
-  - [Is there a `pip install anamnesis`?](#is-there-a-pip-install-anamnesis)
+  - [Is there a `pip install` for Python?](#is-there-a-pip-install-for-python)
 
 ## About anamnesis
 
@@ -245,6 +245,6 @@ No. No public parse/inspect entry point panics or aborts on any input: a malform
 
 ## Python
 
-### Is there a `pip install anamnesis`?
+### Is there a `pip install` for Python?
 
-Not yet. Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after the throughput work in the `0.7.x` line so the published wheels actually deliver the advertised speed. That ordering is why `0.7.0` ships **multi-threading** rather than the SIMD pass originally planned: threads work regardless of the wheel's `target-cpu`, whereas compile-time SIMD would have been left on the table by any generic wheel a user `pip install`s. When the bindings land, this FAQ gains a Python section (installation, the exception hierarchy, and how the returned arrays map onto `NumPy` dtypes, though which output dtypes are offered is itself still open, see [Phase 7.4](../ROADMAP.md#phase-74-caller-chosen-output-dtype-remember-path)). Until then, use the CLI or the Rust library.
+Not yet. Python bindings (PyO3) are planned for **v0.8.0** ([Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3) on the roadmap), after the throughput work in the `0.7.x` line so the published wheels actually deliver the advertised speed. That ordering is why `0.7.0` ships **multi-threading** rather than the SIMD pass originally planned: threads work regardless of the wheel's `target-cpu`, whereas compile-time SIMD would have been left on the table by any generic wheel a user `pip install`s. The package will be **`anamnesis-quant`** rather than `anamnesis`: the bare name is already taken on PyPI by an unrelated project, so the distribution name differs from the Rust crate, which is unchanged. Which output dtypes are offered is **no longer open** — v0.7.4 settled it on both paths, so a Python caller will be able to ask for `bf16`, `f32` or `f16` and get a native NumPy array for the latter two with no optional dependency. When the bindings land, this FAQ gains a Python section (installation, the exception hierarchy, and how the returned arrays map onto `NumPy` dtypes). Until then, use the CLI or the Rust library.

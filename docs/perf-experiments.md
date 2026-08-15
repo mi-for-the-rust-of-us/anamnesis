@@ -42,7 +42,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 13 | Phase 7.3 caller-chosen output dtype — what `F32` and `F16` cost | **A capability, not a perf claim: `F32` is *expected* to be slower and is. Kernel level 1.79× slower than `BF16` against 2.00× of output bytes, so the cost is the doubled write and nothing else. End to end 1.54×/1.61× (1/4 threads), less than the kernel figure because fixed parse cost does not scale. The Phase 7.2 threading ratio shifts 1.19× → 1.14×, as a more bandwidth-bound path should. `BF16` default did not regress (`p = 0.41`, `p = 0.13`). All three writers vectorise: `Bf16Out` 8-wide AVX2, `F32Out` 8-wide stores, `F16Out` 4-wide F16C. Peak heap equals output exactly at every width, streaming peak is 0 B** | Shipped (v0.7.3, Phase 7.3) |
 | 14 | Phase 7.4 `remember`-path output dtype — what the arithmetic/narrowing split cost, and a bench that was measuring the wrong crate | **Two findings, one of them a real production bug. (a) The isolated `tests/` bench was measuring *external-caller* codegen: making `dequantize_*_to_bf16` an `#[inline]` generic wrapper let a downstream crate instantiate the kernel locally, where four private helpers could not inline — ~2.9× slower for every downstream caller, invisible to the whole-model bench. `#[inline]` on those four helpers fixed it (1.934 → 0.672 ms/Melem). (b) Post-fix the split is a net **win**: `FP8` 2.2× faster at the kernel, 1.8× whole-model; `BnB`/`AWQ`/`GPTQ` pay an honest 1.06–1.15×. Separately: whole-program code layout alone moves a kernel timing up to **23 %** on this host, which bounds every sub-20 % per-kernel claim made on it** | Shipped (v0.7.4, Phase 7.4) |
 | 15 | Phase 7.4 `BnB` `INT8` association fix — bit-exactness at `F32` versus one packed multiply | **A correctness fix with a measured price, kept anyway. `w × (SCB/127)` and `bitsandbytes`' `(w × SCB) × (1/127)` are the same real number and the same `BF16`, but differ by 1 `ULP` on **26.9 %** of elements at `F32` — which is why 0/65536 `BF16` cross-validation never caught it. Matching the canonical association costs **16.82 → 17.48 ms** at 4096 × 11008 (1.04×, min of 10 interleaved rounds) for one extra `vmulps` per 8 lanes. Not recoverable by hoisting: `w × (SCB × c)` is a *third* association, measured **worse** (17299/65536 mismatches)** | Shipped (v0.7.4, Phase 7.4) |
-| 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36×: the output write is ~60 % of the wall clock (Amdahl). Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
+| 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36× locally, and **0.99× on CodSpeed macro runners** (see the Experiment 14 postscript) — the output write is ~60 % of the wall clock (Amdahl) and is slower still on CI storage, so treat the end-to-end threading figure as host-dependent rather than a property of the code. Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 
 ---
 
@@ -1072,6 +1072,18 @@ disk** (not parallelised, and not parallelisable — it is one sequential file).
 output is 2.2 GB; at 1 thread the dequant stage is 695 ms of the 1886 ms total, so ~63 % of the
 wall clock is the write. Parallelising the remaining 37 % perfectly would cap the end-to-end gain
 at ~1.6×; the measured 1.36× is that ceiling minus allocator and page-fault cost.
+
+**Host-dependence, added 2026-08-15.** This figure does not survive a change of
+machine, and that is worth stating where the number lives rather than only in a
+later entry. CodSpeed walltime on macro runners measured the same benchmark at
+**167.60 → 168.41 ms** from 1 to 4 threads: **0.99×, no scaling at all**. The
+explanation is consistent with the Amdahl argument above rather than in tension
+with it — if the write is ~60 % of wall clock on this host, and CI storage is
+slower, the write is simply ~100 % of it there. The stage-isolated `read_hub`
+figures (1.90×/1.95×) are the ones that describe the *code*; the end-to-end
+figure describes the code **plus the storage it was measured on**. Quote them
+accordingly, and do not put a single blended threading number on a README or a
+PyPI page.
 
 **This is the number to quote for `convert()`, and the 1.9× is the number to quote for the
 reader.** Conflating them would overstate what a user sees.

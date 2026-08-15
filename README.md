@@ -33,7 +33,7 @@ between formats, all hardened for untrusted input.
 > - **I want to move a model to another format** → [Convert a model between formats](docs/tutorials/convert-between-formats.md): any input → `safetensors` / `gguf` / `bnb-nf4` in one command, quantized inputs auto-chained through `BF16`.
 > - **I'm parsing untrusted / user-uploaded files on a server** → [Parsing untrusted input](#parsing-untrusted-input): the `inspect → check → parse-under-limits` recipe: typed errors, no panic, no `SIGBUS`.
 > - **I'm calling anamnesis from Rust** → [Library quick start](#library-quick-start).
-> - **I'm waiting for Python** → `pip install anamnesis` lands in **v0.8.0** ([What's next](#whats-next)); the [interop contract](docs/python-interop.md) is already frozen.
+> - **I'm waiting for Python** → `pip install anamnesis-quant` lands in **v0.8.0** ([What's next](#whats-next)); the [interop contract](docs/python-interop.md) is already frozen.
 >
 > Common questions live in the [FAQ](docs/FAQ.md); every command and flag is in the [CLI Reference](docs/cli-reference.md).
 
@@ -258,7 +258,7 @@ but `pip install gguf numpy` and no model download.
 
 ## What's next
 
-- **Phase 8, Python bindings (v0.8.0):** `pip install anamnesis`, with typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen, and the dtype contract it depends on shipped in v0.7.3 / v0.7.4, so a Python caller can ask for a plain `np.float32` array without an optional dependency.
+- **Phase 8, Python bindings (v0.8.0):** `pip install anamnesis-quant` (the bare name is taken on PyPI; the Rust crate is unchanged), with typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen, and the dtype contract it depends on shipped in v0.7.3 / v0.7.4, so a Python caller can ask for a plain `np.float32` array without an optional dependency.
 - **Phase 8.5, Lethe encode completion:** the quantising direction, so `convert --to gguf-q4km` and the other quantised targets stop returning `Unsupported`.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).
