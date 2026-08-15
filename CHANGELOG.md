@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-08-15
+
+### Added
+
+- **The `remember` dequantisation output type is now caller-chosen**
+  (`src/model.rs`, `src/remember/{fp8,gptq,awq,bnb}.rs`). `TargetDtype` gains
+  `F32` and `F16`, and the four kernel families `remember` dispatches over
+  become generic over the `OutputElement` trait v0.7.3 introduced for `GGUF`.
+  The CLI spells it `amn remember <file> --to bf16|f32|f16`; the library takes
+  it as the existing `TargetDtype` argument. Every `dequantize_*_to_bf16` entry
+  point remains as an `#[inline]` `Bf16Out` wrapper, so **no existing caller
+  changes**.
+
+  With this, the output dtype is a caller-chosen parameter on *every* path the
+  crate exposes. `convert --out-dtype` also widens from `GGUF`-input-only to
+  every dequantising input, because the quantised-safetensors kernels that
+  blocked it are the ones this release generalises.
+
+- **`InspectOptions`**, a builder mirroring `RememberOptions` /
+  `ConvertOptions`, plus `ParsedModel::inspect_with_options`. The
+  dequantised-size estimate that feeds the inspect-before-parse policy gate is
+  only meaningful against a specific output width, so it can now be asked for
+  the width the caller actually intends. `InspectInfo::output_dtype` records
+  which width a figure was computed for.
+
+- **`F32` cross-validation for all four `remember` kernel families**, compared
+  against the canonical libraries bit for bit with no tolerance: `FP8` against
+  `PyTorch`, `GPTQ` against `GPTQModel`, `AWQ` against `AutoAWQ`, and `BnB`
+  against `bitsandbytes`. Every fixture container gained a magic prefix and a
+  version, and every generator gained a drift guard that refuses to overwrite a
+  committed `BF16` golden that no longer reproduces.
+
+- `remember_f32_whole_model` bench group in `benches/convert.rs`, added
+  alongside `remember_bf16_whole_model` rather than renaming it, so the `BF16`
+  CodSpeed history that serves as this phase's baseline survives.
+
+- `docs/tutorials/choosing-an-output-dtype.md`, plus four `FAQ` entries on
+  choosing a dtype, the size cost, the mixed-dtype passthrough policy, and
+  whether the crate is still bit-exact at `F32`.
+
+### Fixed
+
+- **`BnB` `INT8` dequantisation was 1 `ULP` out on 26.9 % of elements at `F32`**
+  (`src/remember/bnb.rs`). The kernel hoisted a per-row scale and computed
+  `w × (SCB / 127)`, while `bitsandbytes`' `int8_vectorwise_dequant` computes
+  `(w × SCB) × (1/127)`. Those are the same real number and round to the same
+  `BF16`, which is why five releases of `BF16` cross-validation reported
+  0/65536 mismatches and never saw it. Measured at full width against the
+  canonical kernel: **17610/65536 (26.9 %)** of elements differed, every one of
+  them by exactly 1 `ULP`. The constant was never the problem
+  (`f32(7.874015718698502e-3)` and `f32(1.0/127.0)` are the same bits, now
+  asserted at compile time); only the multiply order was. anamnesis now uses the
+  canonical association. **No `BF16` output byte changes.** Costs 1.04× on that
+  kernel (16.82 → 17.48 ms at 4096 × 11008), which is one extra packed multiply
+  and is the honest price of exactness at every width.
+
+- **Downstream callers of `dequantize_*_to_bf16` were ~2.9× slower than
+  v0.7.3** (`src/remember/{fp8,gptq}.rs`). Turning those entry points into
+  `#[inline]` generic wrappers meant an external crate instantiated the generic
+  in *its own* crate, where `e4m3_to_f32_bits`, `e4m3_to_scaled_f32`,
+  `f32_bits_to_bf16_bits` and `unpack_gptq` were private, non-`#[inline]` and
+  therefore opaque: a function call per element. `remember` never suffered it,
+  calling the generic from inside the library. Fixed by marking those four
+  helpers `#[inline]`.
+
+- **`InspectInfo`'s rendered size line claimed the wrong dtype**
+  (`src/inspect.rs`). The estimate became dtype-aware while `Display` still
+  printed a literal `(BF16)`, so asking for the `F32` figure rendered a doubled
+  number under a `BF16` label. The line now reads the width off
+  `output_dtype`, with a regression test.
+
+- **`amn remember --to f32` reported the `BF16` size** (`src/cli.rs`). The
+  summary line built its `InspectInfo` with `From<&SafetensorsHeader>`, which is
+  hard-wired to the `BF16` default, so every width printed the same figure: a
+  file holding 272 B of payload was announced as 144 B. The written file was
+  always correct; only the number beside it was wrong. It now sizes the estimate
+  at the requested width via `InspectOptions`.
+
+### Changed
+
+- `to_bf16_bytes` (the `bnb`-gated encode-side helper) now rounds to nearest
+  even, matching the crate's `f32_bits_to_bf16_bits` convention its own doc
+  comment already claimed; it previously truncated.
+
+- The `remember` per-dtype determinism tests now use a fixture sized off
+  `MIN_PARALLEL_BYTES`. The previous 32-byte fixture was far below the 4 `MiB`
+  parallel threshold, so every thread-count assertion had been exercising the
+  sequential path.
+
+- **`scripts/verify-claims.{ps1,sh}` counted the tests it ran, and the count
+  was always zero.** Both scripts invoked `cargo test -- --quiet` and then
+  counted lines matching `^test .* ok$`, but `--quiet` prints one dot per test
+  and never emits those lines, so every suite reported "PASS 0 tests". The
+  pass/fail verdict was real (it keyed off the exit status), but a suite that
+  compiled and ran *nothing* was indistinguishable from one that verified 22
+  kernels. That is a poor property for the script the README points readers at
+  to substantiate the correctness claims. Both now parse the `test result:`
+  summary line and **treat a zero count as a failure**. The suite descriptions
+  also said only `GGUF` was verified at `F32`; every dequantising family is,
+  as of this release.
+
 ## [0.7.3] - 2026-08-12
 
 ### Added
