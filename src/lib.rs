@@ -430,7 +430,7 @@ pub mod remember;
 
 pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
 pub use error::{AnamnesisError, Result};
-pub use inspect::{InspectInfo, format_bytes};
+pub use inspect::{InspectInfo, InspectOptions, format_bytes};
 #[cfg(feature = "bnb")]
 pub use lethe::{
     BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE, NF4_CODEBOOK, classify_inputs,
@@ -471,21 +471,26 @@ pub use parse::{
     parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits, parse_pth_from_reader,
     parse_pth_from_reader_with_limits, parse_pth_with_limits,
 };
-#[cfg(feature = "awq")]
-pub use remember::dequantize_awq_to_bf16;
-#[cfg(feature = "gptq")]
-pub use remember::dequantize_gptq_to_bf16;
 pub use remember::{Bf16Out, F16Out, F32Out, OutputElement};
+#[cfg(feature = "awq")]
+pub use remember::{dequantize_awq, dequantize_awq_to_bf16};
 #[cfg(feature = "bnb")]
-pub use remember::{dequantize_bnb_int8_to_bf16, dequantize_bnb4_to_bf16};
 pub use remember::{
-    dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8_to_bf16,
+    dequantize_bnb_int8, dequantize_bnb_int8_to_bf16, dequantize_bnb4,
+    dequantize_bnb4_double_quant, dequantize_bnb4_double_quant_to_bf16, dequantize_bnb4_to_bf16,
+};
+pub use remember::{
+    dequantize_fp8, dequantize_fp8_to_bf16, dequantize_per_channel_fp8,
+    dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8,
+    dequantize_per_tensor_fp8_to_bf16,
 };
 #[cfg(feature = "gguf")]
 pub use remember::{
     dequantize_gguf, dequantize_gguf_blocks, dequantize_gguf_blocks_to_bf16,
     dequantize_gguf_to_bf16,
 };
+#[cfg(feature = "gptq")]
+pub use remember::{dequantize_gptq, dequantize_gptq_to_bf16};
 #[cfg(feature = "npz")]
 pub use remember::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]

@@ -2,9 +2,9 @@
 
 *One command takes any input anamnesis reads — FP8 / GPTQ / AWQ / BnB safetensors, GGUF, NPZ, `.pth` — to `safetensors`, scalar `gguf`, or `bnb-nf4`, with quantized inputs recovered to `BF16` on the way through.*
 
-*~1000 words · about 4 min read*
+*~1100 words · about 4 min read*
 
-<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
+<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -107,7 +107,9 @@ Converting model.safetensors -> model-gguf.gguf
 
 **To `safetensors`** (plain `BF16`) is `--to safetensors` (alias `--to bf16`) — the same recovery `amn remember` does, exposed through the convert dispatch.
 
-Output paths are derived when you omit `-o`: a known quant suffix is stripped from the stem and `-{target}.{ext}` appended (`model-fp8.safetensors` → `model-bnb-nf4.safetensors`). Pass `-o <path>` to choose your own.
+The hub's dequantized width is `BF16` by default but is not fixed: `--out-dtype f32` or `--out-dtype f16` changes what the dequantized tensors are written as, for every input that dequantizes at all (`GGUF` since v0.7.3, quantized safetensors since v0.7.4). It governs dequantized tensors only, so passthrough tensors keep their source dtype either way. Which one to ask for, and what each costs, is in [Choosing an output dtype](choosing-an-output-dtype.md).
+
+Output paths are derived when you omit `-o`: a known quant suffix is stripped from the stem and `-{target}.{ext}` appended (`model-fp8.safetensors` → `model-bnb-nf4.safetensors`), and the derived name tracks the dtype so a file never claims a width it does not hold. Pass `-o <path>` to choose your own.
 
 ## Step 4 — Stamp GGUF metadata
 
@@ -162,8 +164,9 @@ What is **not** here yet: the **quantized GGUF target columns** (`gguf-q4km`, FP
 
 ## What you've learned
 
-- `amn convert <file> --to <target>` routes every input through one `BF16` hub, so any format anamnesis reads reaches `safetensors` / scalar `gguf` / `bnb-nf4` in a single command.
-- A quantized input **auto-chains** through `BF16` — the old dequantize-then-re-encode two-hop, and its temp file, are gone.
+- `amn convert <file> --to <target>` routes every input through one full-precision hub, so any format anamnesis reads reaches `safetensors` / scalar `gguf` / `bnb-nf4` in a single command.
+- A quantized input **auto-chains** through the hub — the old dequantize-then-re-encode two-hop, and its temp file, are gone.
+- The hub's dequantized width defaults to `BF16` but is caller-chosen: `--out-dtype f32` / `f16` (see [Choosing an output dtype](choosing-an-output-dtype.md)).
 - `amn inspect` is a free header-only preview; use it to read the scheme and the `BF16` size budget (peak ≈ 2× the model) *before* converting.
 - A `gguf` target is a scalar tensor container until you give it KV: `--gguf-kv` / `--gguf-metadata` stamp it verbatim, and a GGUF *source* has its KV inherited automatically.
 

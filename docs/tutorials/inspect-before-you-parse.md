@@ -2,7 +2,7 @@
 
 *Read a model file's header — counts, sizes, scheme — before committing to a full parse. The cheap, safe first move for any file you didn't create yourself.*
 
-*~1,000 words · about 5 min read*
+*~800 words · about 3 min read*
 
 <!-- Last updated: 2026-08-07, anamnesis v0.7.2 -->
 

@@ -1,17 +1,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `GPTQ` dequantization (INT4/INT8 with group-wise scale + zero-point) to `BF16`.
+//! `GPTQ` dequantization (INT4/INT8 with group-wise scale + zero-point).
 //!
 //! Converts packed integer weights with per-group scale factors and zero-points
-//! into `BF16` output bytes. Supports both 4-bit and 8-bit quantization, with
-//! optional activation-order group indices (`g_idx`).
+//! into output bytes of a caller-chosen width. Supports both 4-bit and 8-bit
+//! quantization, with optional activation-order group indices (`g_idx`).
+//!
+//! # Output width
+//!
+//! Since v0.7.4 [`dequantize_gptq`] is generic over
+//! [`OutputElement`]; `dequantize_gptq_to_bf16` remains as
+//! the `Bf16Out` wrapper. The kernel is a three-pass loop fission: unpack the
+//! packed `I32` row into `f32`, apply `(q - zero) × scale` into a second `f32`
+//! scratch, then hand that scratch to [`OutputElement::write_scratch`]. Before
+//! v0.7.4 the last two passes were fused and narrowed to `BF16` inline, which
+//! is what made the family `BF16`-only.
 //!
 //! Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
 //! Generative Pre-trained Transformers", ICLR 2023 (arXiv:2210.17323).
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
-use crate::remember::fp8::f32_bits_to_bf16_bits;
+use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 
 // ---------------------------------------------------------------------------
@@ -30,6 +40,7 @@ use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 /// * `shift` — precomputed `bits * pos` (number of bits to shift right).
 /// * `mask` — precomputed `(1 << bits) - 1` (bitmask for one value).
 #[must_use]
+#[inline]
 fn unpack_gptq(packed: u32, shift: u32, mask: u32) -> u32 {
     // BITWISE: extract unsigned integer at bit position `shift` with width `bits`
     (packed >> shift) & mask
@@ -175,8 +186,47 @@ fn parse_g_idx(g_idx_data: &[u8], in_features: usize) -> crate::Result<Vec<usize
 
 /// Dequantizes a `GPTQ`-quantized weight tensor to `BF16`.
 ///
+/// The [`Bf16Out`] special case of [`dequantize_gptq`], kept so that every
+/// pre-v0.7.4 caller compiles unchanged.
+///
+/// # Errors
+///
+/// See [`dequantize_gptq`].
+///
+/// # Memory
+///
+/// See [`dequantize_gptq`]; at `BF16` the output buffer is
+/// `in_features × out_features × 2` bytes.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn dequantize_gptq_to_bf16(
+    qweight_data: &[u8],
+    scales_data: &[u8],
+    qzeros_data: &[u8],
+    g_idx_data: Option<&[u8]>,
+    in_features: usize,
+    out_features: usize,
+    group_size: usize,
+    bits: u8,
+    scale_dtype: Dtype,
+) -> crate::Result<Vec<u8>> {
+    dequantize_gptq::<Bf16Out>(
+        qweight_data,
+        scales_data,
+        qzeros_data,
+        g_idx_data,
+        in_features,
+        out_features,
+        group_size,
+        bits,
+        scale_dtype,
+    )
+}
+
+/// Dequantizes a `GPTQ`-quantized weight tensor into `E`.
+///
 /// Unpacks INT4 or INT8 values from packed `I32` tensors, applies per-group
-/// scale factors and zero-points, and converts to `BF16`. Supports both
+/// scale factors and zero-points, and writes `E`. Supports both
 /// sequential group assignment and activation-order via `g_idx`.
 ///
 /// The standard `GPTQ` dequantization formula is:
@@ -196,8 +246,8 @@ fn parse_g_idx(g_idx_data: &[u8], in_features: usize) -> crate::Result<Vec<usize
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` of length `in_features × out_features × 2`, containing `BF16`
-/// values in little-endian byte order. Shape: `[in_features, out_features]`
+/// A `Vec<u8>` of length `in_features × out_features × E::BYTES`, in
+/// little-endian byte order. Shape: `[in_features, out_features]`
 /// — the **GEMM-native** orientation the canonical `GPTQModel` kernel
 /// produces (and the cross-validation fixtures anchor). Note this is the
 /// transpose of a standard `nn.Linear.weight` (`[out, in]`);
@@ -214,12 +264,15 @@ fn parse_g_idx(g_idx_data: &[u8], in_features: usize) -> crate::Result<Vec<usize
 /// # Memory
 ///
 /// Allocates per-group scratch buffers for zero-points and scales
-/// (`out_features × 4` bytes each), an unpacking scratch buffer
-/// (`out_features × 4` bytes), plus the output buffer
-/// (`in_features × out_features × 2` bytes). Group data is computed
-/// lazily — only the current group's row is live at any time.
+/// (`out_features × 4` bytes each), an unpacking scratch buffer and a values
+/// scratch buffer (`out_features × 4` bytes each), plus the output buffer
+/// (`in_features × out_features × E::BYTES` bytes). Group data is computed
+/// lazily — only the current group's row is live at any time. The values
+/// scratch is new in v0.7.4: it is what lets the narrowing move out of the
+/// arithmetic loop and into [`OutputElement::write_scratch`], and at
+/// `out_features × 4` bytes it is L1-resident and independent of model size.
 #[allow(clippy::too_many_arguments)]
-pub fn dequantize_gptq_to_bf16(
+pub fn dequantize_gptq<E: OutputElement>(
     qweight_data: &[u8],
     scales_data: &[u8],
     qzeros_data: &[u8],
@@ -342,7 +395,7 @@ pub fn dequantize_gptq_to_bf16(
     // --- Allocate output ---
     let out_byte_len = in_features
         .checked_mul(out_features)
-        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_mul(E::BYTES))
         .ok_or_else(|| AnamnesisError::Parse {
             reason: "output size overflow".into(),
         })?;
@@ -362,6 +415,10 @@ pub fn dequantize_gptq_to_bf16(
     let mut zeros_buf = vec![0.0_f32; out_features];
     let mut scales_buf = vec![0.0_f32; out_features];
     let mut cached_group: Option<usize> = None;
+
+    // Register-sized tile for the arithmetic/narrowing pair, hoisted so it is
+    // initialised once rather than per row. See [`VECTOR_TILE`].
+    let mut tile = [0.0_f32; VECTOR_TILE];
 
     // --- Hot loop: row-by-row dequantization ---
     // Two-level bounds checking per CONVENTIONS.md: validate slices ONCE
@@ -414,15 +471,15 @@ pub fn dequantize_gptq_to_bf16(
         let zeros_row = &zeros_buf[..];
         let scales_row = &scales_buf[..];
 
-        // Output row: contiguous BF16 bytes.
+        // Output row: contiguous `E` bytes.
         let out_row_start = i
             .checked_mul(out_features)
-            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_mul(E::BYTES))
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {i} offset overflow"),
             })?;
         let out_row_end = out_features
-            .checked_mul(2)
+            .checked_mul(E::BYTES)
             .and_then(|row_bytes| out_row_start.checked_add(row_bytes))
             .ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("output row {i} end overflow"),
@@ -435,9 +492,21 @@ pub fn dequantize_gptq_to_bf16(
                 })?;
 
         // --- Unpack qweight row into contiguous f32 values ---
-        // Separates byte→u32 extraction (hard to vectorize) from the
-        // arithmetic (easy to vectorize). The compiler auto-vectorizes
-        // the second loop: pure f32 sub+mul+convert pipeline.
+        // Separates byte→u32 extraction from the arithmetic, so each pass has a
+        // uniform data flow the compiler can vectorise independently.
+        //
+        // VECTORIZED: confirmed AVX2 `vmovdqu` + `vpsrld`/`vpand` + `vcvtdq2ps`
+        // + `vmovups` on %ymm in `cargo asm --rust`, x86-64 target-cpu=native,
+        // opt-level=3, attributed per source line: 4 packed loads, 4 packed
+        // int→float converts and 4 packed stores, with a single scalar
+        // `vcvtsi2ss`/`vmovss` pair left for the ragged tail.
+        //
+        // This corrects a claim that stood here until v0.7.4 ("byte→u32
+        // extraction (hard to vectorize)"). It is the *sequential* store index
+        // `j` that lets this pass vectorise; `AWQ`'s twin loop writes through
+        // the `AWQ_ORDER` permutation instead and is a genuine scalar fallback,
+        // annotated as such at its own site. The two kernels are twins from
+        // pass 2 onward, not before it.
         // INDEX: unpacked_buf.len() == out_features, allocated before the outer loop
         let unpacked_row =
             unpacked_buf
@@ -457,19 +526,72 @@ pub fn dequantize_gptq_to_bf16(
             unpacked_row[j] = qw;
         }
 
-        // --- Hot inner loop: pure f32 arithmetic, BRANCH-FREE ---
-        // Contiguous f32 reads (unpacked, zeros, scales) and contiguous
-        // BF16 writes. No byte manipulation — just sub + mul + bf16 convert.
-        // VECTORIZED: pending cargo-show-asm verification
-        for (((out_pair, &qw), &zero), &scale) in out_row
-            .chunks_exact_mut(2)
-            .zip(unpacked_row.iter())
-            .zip(zeros_row.iter())
-            .zip(scales_row.iter())
+        // --- Pass 2 + 3: arithmetic then narrowing, TILED through registers ---
+        // `(qw - zero) * scale` into a [`VECTOR_TILE`]-sized stack tile, then
+        // `write_scratch` over that same tile, so the intermediate `f32`s never
+        // reach memory.
+        //
+        // **Tiled rather than row-sized, and that is measured.** Earlier v0.7.4
+        // drafts ran this pair over the whole `out_features` row: first into a
+        // second row buffer (~88 KB of working set at `out_features = 11008`),
+        // then in place over `unpacked_row` (~44 KB). Both exceed L1, so the
+        // intermediate round-tripped through L2 and the pair cost 1.15× against
+        // the pre-v0.7.4 fused loop. The same tiling is what took `FP8` from
+        // 1.06× to 0.45×.
+        let unp_tiles = unpacked_row.chunks_exact(VECTOR_TILE);
+        let zer_tiles = zeros_row.chunks_exact(VECTOR_TILE);
+        let sca_tiles = scales_row.chunks_exact(VECTOR_TILE);
+        // Read the remainders before the iterators are consumed.
+        let (unp_tail, zer_tail, sca_tail) = (
+            unp_tiles.remainder(),
+            zer_tiles.remainder(),
+            sca_tiles.remainder(),
+        );
+        let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+
+        // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
+        // `E`; the narrowing that follows is `write_scratch`'s own confirmed
+        // loop (`vpaddd`/`vpsrld` at `Bf16Out`, `vmovups` at `F32Out`,
+        // `vcvtps2ph` at `F16Out`). This resolves an annotation that had read
+        // `pending` since the kernel was written.
+        //
+        // Measured 19.90 -> 23.44 ms at 4096 x 11008 against the v0.7.3 binary
+        // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),
+        // i.e. **1.18x slower**. Stated plainly because `confirmed` here means
+        // "this loop vectorises", not "this loop got faster": v0.7.3's pass 2
+        // was already emitting vsubps + vmulps, so the split buys the F32/F16
+        // capability rather than throughput, and that is the honest trade.
+        // `CONVENTIONS.md`'s "at least as fast as the previous **scalar**
+        // baseline" clause has no referent here, because the previous baseline
+        // was not scalar.
+        for (((unp, zer), sca), out_tile) in unp_tiles
+            .zip(zer_tiles)
+            .zip(sca_tiles)
+            .zip(out_tiles.by_ref())
         {
-            let val = (qw - zero) * scale;
-            let bf16 = f32_bits_to_bf16_bits(val.to_bits());
-            out_pair.copy_from_slice(&bf16.to_le_bytes());
+            for (((value, &qw), &zero), &scale) in tile.iter_mut().zip(unp).zip(zer).zip(sca) {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(&tile, out_tile);
+        }
+
+        // Edge tile (< VECTOR_TILE elements). `tail.len() < VECTOR_TILE ==
+        // tile.len()`, so the sub-slice is always `Some`; `get_mut` rather than
+        // an index keeps the no-panic floor structural.
+        if let Some(tail_tile) = tile.get_mut(..unp_tail.len()) {
+            // VECTORIZED: scalar fallback — ragged-tail path, at most
+            // `VECTOR_TILE - 1` elements per row with no constant trip count
+            // to unroll. The full tiles above carry the confirmed 8-wide loop.
+            for (((value, &qw), &zero), &scale) in tail_tile
+                .iter_mut()
+                .zip(unp_tail)
+                .zip(zer_tail)
+                .zip(sca_tail)
+            {
+                *value = (qw - zero) * scale;
+            }
+            E::write_scratch(tail_tile, out_tiles.into_remainder());
         }
     }
 
@@ -491,6 +613,10 @@ pub fn dequantize_gptq_to_bf16(
 )]
 mod tests {
     use super::*;
+    // The kernel itself no longer narrows (v0.7.4 moved that to
+    // `OutputElement::write_scratch`), but the `BF16` expectations these tests
+    // assert still have to be built the same way the writer builds them.
+    use crate::remember::fp8::f32_bits_to_bf16_bits;
 
     // -- unpack_gptq ---------------------------------------------------------
 

@@ -21,14 +21,22 @@
 
 use std::time::Instant;
 
-use anamnesis::{Dtype, dequantize_gptq_to_bf16};
+use anamnesis::{Dtype, F32Out, dequantize_gptq, dequantize_gptq_to_bf16};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
 // ---------------------------------------------------------------------------
 
+/// Magic prefix identifying a v2 `GPTQ` fixture container.
+const FIXTURE_MAGIC: &[u8; 4] = b"AMNQ";
+
+/// Container version this reader understands.
+const FIXTURE_VERSION: u32 = 2;
+
 /// Binary fixture layout (all little-endian):
 ///
+/// - 4 bytes: magic `AMNQ`
+/// - 4 bytes: container version (`u32`, currently 2)
 /// - 4 bytes: bits (`u32`)
 /// - 4 bytes: `group_size` (`u32`)
 /// - 4 bytes: `in_features` (`u32`)
@@ -39,8 +47,18 @@ use anamnesis::{Dtype, dequantize_gptq_to_bf16};
 /// - 4 bytes: scales byte count (`u32`)
 /// - 4 bytes: qzeros byte count (`u32`)
 /// - 4 bytes: `g_idx` byte count (`u32`)
-/// - 4 bytes: expected byte count (`u32`)
-/// - qweight bytes, scales bytes, qzeros bytes, `g_idx` bytes, expected `BF16` bytes
+/// - 4 bytes: golden `BF16` byte count (`u32`)
+/// - 4 bytes: golden `F32` byte count (`u32`)
+/// - qweight, scales, qzeros, `g_idx`, expected `BF16`, expected `F32`
+///
+/// v1 carried neither magic nor version and stopped after the `BF16` golden, so
+/// the magic is what lets a stale checkout fail loudly here rather than read the
+/// header at the wrong offsets.
+///
+/// **Both goldens come from `GPTQModel`**: the `F32` one is taken from its
+/// `dequantize_weight()` result *before* the `BF16` narrowing, never by widening
+/// the `BF16` back, which would make the comparison circular with anamnesis'
+/// own rounding.
 struct GptqFixture {
     bits: u8,
     group_size: usize,
@@ -52,6 +70,7 @@ struct GptqFixture {
     qzeros_data: Vec<u8>,
     g_idx_data: Option<Vec<u8>>,
     expected_bf16: Vec<u8>,
+    expected_f32: Vec<u8>,
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
@@ -60,24 +79,46 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 }
 
 fn parse_gptq_fixture(data: &[u8]) -> GptqFixture {
-    let bits = read_u32_le(data, 0) as u8;
-    let group_size = read_u32_le(data, 4) as usize;
-    let in_features = read_u32_le(data, 8) as usize;
-    let out_features = read_u32_le(data, 12) as usize;
-    let scale_dtype_id = read_u32_le(data, 16);
-    let has_g_idx = read_u32_le(data, 20) != 0;
-    let qweight_len = read_u32_le(data, 24) as usize;
-    let scales_len = read_u32_le(data, 28) as usize;
-    let qzeros_len = read_u32_le(data, 32) as usize;
-    let g_idx_len = read_u32_le(data, 36) as usize;
-    let expected_len = read_u32_le(data, 40) as usize;
+    assert_eq!(
+        &data[..4],
+        FIXTURE_MAGIC,
+        "fixture is not a v2 `AMNQ` container — regenerate with \
+         tests/fixtures/gptq_reference/generate_gptq.py"
+    );
+    let version = read_u32_le(data, 4);
+    assert_eq!(
+        version, FIXTURE_VERSION,
+        "unsupported fixture container version {version} (this reader understands \
+         {FIXTURE_VERSION})"
+    );
 
-    let header_size = 44;
+    let bits = read_u32_le(data, 8) as u8;
+    let group_size = read_u32_le(data, 12) as usize;
+    let in_features = read_u32_le(data, 16) as usize;
+    let out_features = read_u32_le(data, 20) as usize;
+    let scale_dtype_id = read_u32_le(data, 24);
+    let has_g_idx = read_u32_le(data, 28) != 0;
+    let qweight_len = read_u32_le(data, 32) as usize;
+    let scales_len = read_u32_le(data, 36) as usize;
+    let qzeros_len = read_u32_le(data, 40) as usize;
+    let g_idx_len = read_u32_le(data, 44) as usize;
+    let expected_len = read_u32_le(data, 48) as usize;
+    let f32_len = read_u32_le(data, 52) as usize;
+
+    let header_size = 56;
     let qw_start = header_size;
     let sc_start = qw_start + qweight_len;
     let qz_start = sc_start + scales_len;
     let gi_start = qz_start + qzeros_len;
     let ex_start = gi_start + g_idx_len;
+    let f32_start = ex_start + expected_len;
+
+    assert_eq!(
+        expected_len,
+        in_features * out_features * 2,
+        "BF16 golden length"
+    );
+    assert_eq!(f32_len, in_features * out_features * 4, "F32 golden length");
 
     let scale_dtype = match scale_dtype_id {
         0 => Dtype::F32,
@@ -103,7 +144,72 @@ fn parse_gptq_fixture(data: &[u8]) -> GptqFixture {
         qzeros_data: data[qz_start..qz_start + qzeros_len].to_vec(),
         g_idx_data,
         expected_bf16: data[ex_start..ex_start + expected_len].to_vec(),
+        expected_f32: data[f32_start..f32_start + f32_len].to_vec(),
     }
+}
+
+/// Compares `GPTQ` `F32` output against `GPTQModel` **bit for bit**.
+///
+/// No tolerance, by design. The `BF16` comparison carries a `ULP` budget
+/// because narrowing to 8 significand bits is a lossy step both sides perform.
+/// `F32` has no such excuse: both compute in `f32`, so identical operations in
+/// identical order must give identical bits. A difference here is a real
+/// disagreement about the arithmetic — the `(qw - (qz + 1)) × scale`
+/// association, a lost widening, a contraction — and 77-96 % of these fixtures'
+/// values carry mantissa bits `BF16` could not show.
+fn compare_gptq_f32_exact(name: &str, fx: &GptqFixture) {
+    let actual = dequantize_gptq::<F32Out>(
+        &fx.qweight_data,
+        &fx.scales_data,
+        &fx.qzeros_data,
+        fx.g_idx_data.as_deref(),
+        fx.in_features,
+        fx.out_features,
+        fx.group_size,
+        fx.bits,
+        fx.scale_dtype,
+    )
+    .expect("GPTQ F32 dequant failed");
+
+    assert_eq!(
+        actual.len(),
+        fx.expected_f32.len(),
+        "{name}: F32 output length mismatch"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for (i, (a_word, e_word)) in actual
+        .chunks_exact(4)
+        .zip(fx.expected_f32.chunks_exact(4))
+        .enumerate()
+    {
+        let a = f32::from_le_bytes([a_word[0], a_word[1], a_word[2], a_word[3]]);
+        let e = f32::from_le_bytes([e_word[0], e_word[1], e_word[2], e_word[3]]);
+        // Bit equality, not `==`: `NaN` payloads and signed zero must count.
+        if a.to_bits() != e.to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, a, e));
+            }
+        }
+    }
+
+    if let Some((i, a, e)) = first {
+        eprintln!(
+            "  F32 element {i}: actual={a:e} (0x{:08X}), expected={e:e} (0x{:08X})",
+            a.to_bits(),
+            e.to_bits()
+        );
+    }
+    assert_eq!(
+        mismatches,
+        0,
+        "{name}: {mismatches}/{} F32 elements differ from GPTQModel. This is NOT \
+         a tolerance question — both sides compute in f32. Treat it as a real \
+         finding before touching the test.",
+        actual.len() / 4
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +301,8 @@ fn run_gptq_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
         mismatches, 0,
         "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
     );
+
+    compare_gptq_f32_exact(name, &fixture);
 }
 
 // ---------------------------------------------------------------------------

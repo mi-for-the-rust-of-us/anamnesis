@@ -673,21 +673,24 @@ fn write_hub(
 // ---------------------------------------------------------------------------
 
 /// Reads a safetensors file into the hub, dequantising quantised tensors to
-/// `BF16` and passing scalar tensors through in their original dtype. Carries
-/// the source `__metadata__`.
+/// `out_dtype` and passing scalar tensors through in their original dtype.
+/// Carries the source `__metadata__`.
 ///
-/// `out_dtype` must be [`Dtype::BF16`] whenever this file actually contains
-/// something to dequantise. The four kernel families this path dispatches over
-/// (`FP8`, `GPTQ`, `AWQ`, `BnB`) fuse the narrowing into their hot loops rather
-/// than sharing a writer the way the 24 `GGUF` kernels do, so they are
-/// generalised in v0.7.4 rather than v0.7.3.
+/// `out_dtype` selects the element type the **dequantised** tensors are written
+/// in ([`Dtype::BF16`], [`Dtype::F32`] or [`Dtype::F16`]); passthrough tensors
+/// keep their source dtype regardless. Resolved to a static type parameter once,
+/// here, so the choice costs no per-tensor branch and no per-element branch.
+///
+/// Until v0.7.4 this rejected every non-`BF16` request that met a quantised
+/// input, because the four kernel families it dispatches over (`FP8`, `GPTQ`,
+/// `AWQ`, `BnB`) fused the narrowing into their hot loops. Phase 7.4 made them
+/// generic over `OutputElement`, so the rejection is gone and this path now
+/// behaves exactly like the `GGUF` one.
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `out_dtype` is not
-/// [`Dtype::BF16`] **and** the input carries quantised tensors. An unquantised
-/// safetensors file dequantises nothing, so the request is vacuous and is
-/// allowed through rather than refused on a technicality.
+/// Propagates parse and dequantisation errors. `resolve_output_dtype` has
+/// already rejected any dtype that is not an output width.
 fn read_safetensors(
     path: &Path,
     limits: &ParseLimits,
@@ -695,18 +698,21 @@ fn read_safetensors(
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
-    if out_dtype != Dtype::BF16 && model.header.quantized_count() > 0 {
-        return Err(AnamnesisError::Unsupported {
-            format: "safetensors".into(),
-            detail: format!(
-                "{out_dtype} output is not yet available for quantised safetensors input: \
-                 the FP8/GPTQ/AWQ/BnB kernels narrow inside their hot loops and are \
-                 generalised in v0.7.4 (ROADMAP Phase 7.4). v0.7.3 covers the GGUF input \
-                 path; re-run without --out-dtype to emit BF16"
-            ),
-        });
-    }
-    let (tensors, dequantized) = model.hub_tensors(threads)?;
+    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
+    // already rejected everything outside these three, so the wildcard is
+    // defence in depth rather than a reachable path.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let (tensors, dequantized) = match out_dtype {
+        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads)?,
+        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads)?,
+        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads)?,
+        other => {
+            return Err(AnamnesisError::Unsupported {
+                format: "safetensors".into(),
+                detail: format!("{other} is not a dequantisation output width"),
+            });
+        }
+    };
     Ok(Hub {
         tensors,
         st_metadata: model.header.metadata.clone(),
@@ -1518,8 +1524,19 @@ fn hub_dtype_to_gguf(dtype: Dtype) -> crate::Result<crate::GgufType> {
 }
 
 /// Converts a float tensor's bytes to `BF16` for the `BnB-NF4` encoder.
-/// `BF16` input is **borrowed unchanged** (no copy); `F32` / `F16` are truncated
-/// to the upper 16 bits, matching the crate's `f32_bits_to_bf16_bits` convention.
+/// `BF16` input is **borrowed unchanged** (no copy); `F32` / `F16` are narrowed
+/// with round-to-nearest-even via
+/// [`f32_bits_to_bf16_bits`](crate::remember::fp8), the crate's single
+/// narrowing convention.
+///
+/// **Fixed in v0.7.4.** Both arms previously did `bits >> 16`, a plain
+/// truncation, while this doc comment already claimed they matched
+/// `f32_bits_to_bf16_bits`. The code was wrong, not the comment: truncation
+/// biases every inexact value toward zero by up to one `BF16` `ULP`, where
+/// round-to-nearest-even is unbiased and is what every other narrowing site in
+/// the crate does. The change is reachable from `convert --to bnb-nf4` with an
+/// `F32`/`F16` source, and became more reachable in v0.7.4 because
+/// `--out-dtype f32` can now feed this helper from the hub.
 ///
 /// Returns a [`Cow`] so the common already-`BF16` case (a `.pth` / plain-`BF16`
 /// source, or any tensor the hub already dequantised) does not allocate a
@@ -1543,16 +1560,24 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
                     ),
                 });
             }
-            let mut out = Vec::with_capacity(data.len() / 2);
-            for chunk in data.chunks_exact(4) {
+            // Pre-sized, then written through `chunks_exact_mut`: the crate's
+            // standard pass-2 shape (`CONVENTIONS.md` § SIMD-friendly loops,
+            // rules 1 and 6 — flat slices, distinct input and output). The
+            // first v0.7.4 draft pushed with `extend_from_slice` per element,
+            // which carries a capacity check every iteration and cannot
+            // vectorise.
+            let mut out = vec![0u8; data.len() / 2];
+            // VECTORIZED: confirmed AVX2 vpaddd + vpsrld + vpand on %ymm
+            // (8-wide) in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 —
+            // the round-to-nearest-even bias-add and shift, eight lanes at a
+            // time. Byte-identical arithmetic to `Bf16Out::write_scratch`,
+            // which is the point: one narrowing convention, one codegen shape.
+            for (chunk, out_pair) in data.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(4)` guarantees exactly 4 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                let bits = u32::from_le_bytes(arr);
-                // CAST: BF16 is the upper 16 bits of an f32 — truncation intended.
-                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-                let bf16 = (bits >> 16) as u16;
-                out.extend_from_slice(&bf16.to_le_bytes());
+                let bf16 = crate::remember::fp8::f32_bits_to_bf16_bits(u32::from_le_bytes(arr));
+                out_pair.copy_from_slice(&bf16.to_le_bytes());
             }
             Ok(Cow::Owned(out))
         }
@@ -1565,16 +1590,21 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
                     ),
                 });
             }
-            let mut out = Vec::with_capacity(data.len());
-            for chunk in data.chunks_exact(2) {
+            // Pre-sized and written through `chunks_exact_mut`, as the `F32`
+            // arm above; `F16` is 2 bytes in and 2 bytes out, so the output is
+            // the same length as the input.
+            let mut out = vec![0u8; data.len()];
+            // VECTORIZED: confirmed AVX2 vcvtph2ps + vpaddd + vpsrld + vpand on
+            // %ymm in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 — the
+            // `F16C` widening load followed by the same round-to-nearest-even
+            // sequence the `F32` arm uses.
+            for (chunk, out_pair) in data.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(2)` guarantees exactly 2 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 2] = [chunk[0], chunk[1]];
                 let bits = half::f16::from_le_bytes(arr).to_f32().to_bits();
-                // CAST: BF16 is the upper 16 bits of an f32 — truncation intended.
-                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-                let bf16 = (bits >> 16) as u16;
-                out.extend_from_slice(&bf16.to_le_bytes());
+                let bf16 = crate::remember::fp8::f32_bits_to_bf16_bits(bits);
+                out_pair.copy_from_slice(&bf16.to_le_bytes());
             }
             Ok(Cow::Owned(out))
         }
@@ -1706,6 +1736,85 @@ mod gguf_metadata_tests {
 
         assert!(parse_gguf_kv_arg("no-equals").is_err());
         assert!(parse_gguf_kv_arg("=empty-key").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "bnb"))]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod to_bf16_bytes_tests {
+    use super::{Dtype, to_bf16_bytes};
+
+    /// The `F32` arm must **round to nearest even**, not truncate.
+    ///
+    /// Until v0.7.4 it did `bits >> 16`, which is what these three values
+    /// distinguish: each is chosen so truncation and round-to-nearest-even
+    /// disagree, which a value with a zero low half would not catch.
+    #[test]
+    fn f32_arm_rounds_to_nearest_even() {
+        // (f32 bits, expected BF16 under RNE, what truncation would give)
+        let cases = [
+            // Just above the midpoint between 1.0 and the next BF16: rounds up.
+            (0x3F80_9000_u32, 0x3F81_u16, 0x3F80_u16),
+            // Exactly the midpoint with an even LSB: stays put (ties-to-even).
+            (0x3F80_8000, 0x3F80, 0x3F80),
+            // Exactly the midpoint with an odd LSB: rounds up to even.
+            (0x3F81_8000, 0x3F82, 0x3F81),
+        ];
+        let mut input = Vec::new();
+        for (bits, _, _) in cases {
+            input.extend_from_slice(&bits.to_le_bytes());
+        }
+
+        let out = to_bf16_bytes(&input, Dtype::F32, "w").expect("F32 narrowing");
+        for (i, (bits, want_rne, would_truncate)) in cases.into_iter().enumerate() {
+            // INDEX: `out` is 2 bytes per input element by construction.
+            #[allow(clippy::indexing_slicing)]
+            let got = u16::from_le_bytes([out[i * 2], out[i * 2 + 1]]);
+            assert_eq!(got, want_rne, "0x{bits:08X} should round to nearest even");
+            if want_rne != would_truncate {
+                assert_ne!(got, would_truncate, "0x{bits:08X} must not truncate");
+            }
+        }
+    }
+
+    /// `BF16` input is borrowed, never copied and never re-rounded.
+    #[test]
+    fn bf16_arm_borrows_unchanged() {
+        let input = vec![0x34_u8, 0x12, 0x78, 0x56];
+        let out = to_bf16_bytes(&input, Dtype::BF16, "w").expect("BF16 passthrough");
+        assert_eq!(&*out, &input[..]);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "must not copy"
+        );
+    }
+
+    /// The `F16` arm rounds too.
+    ///
+    /// Picking a witness here needs care, which is why the value is given as
+    /// raw bits rather than a decimal literal. `f16` has 10 mantissa bits, so
+    /// widening to `f32` shifts them up by 13 and leaves the low 13 bits zero.
+    /// The discarded half is therefore `0x0000`, `0x2000`, `0x4000`, `0x6000`,
+    /// `0x8000`, … and only values **strictly above** `0x8000` make rounding
+    /// and truncation disagree. `0x3C05` is `1 + 5/1024`, whose `f32` form is
+    /// `0x3F80_A000`: discarded half `0xA000 > 0x8000`, so it rounds up to
+    /// `0x3F81` while truncation would give `0x3F80`. The first draft of this
+    /// test used `1 + 1/1024` (`0x3F80_2000`), where both answers coincide and
+    /// the test proved nothing.
+    #[test]
+    fn f16_arm_rounds_to_nearest_even() {
+        let value = half::f16::from_bits(0x3C05);
+        let input = value.to_le_bytes();
+        let out = to_bf16_bytes(&input, Dtype::F16, "w").expect("F16 narrowing");
+        // INDEX: exactly one element in, two bytes out.
+        #[allow(clippy::indexing_slicing)]
+        let got = u16::from_le_bytes([out[0], out[1]]);
+        let widened = value.to_f32().to_bits();
+        // CAST: u32 -> u16, this *is* the truncation the fix replaced.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let truncated = (widened >> 16) as u16;
+        assert_eq!(got, crate::remember::fp8::f32_bits_to_bf16_bits(widened));
+        assert_ne!(got, truncated, "F16 arm must not truncate either");
     }
 }
 

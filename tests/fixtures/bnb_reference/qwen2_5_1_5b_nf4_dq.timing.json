@@ -1,5 +1,5 @@
 {
-  "pytorch_quantize_ns": 343100,
+  "pytorch_quantize_ns": 304600,
   "pytorch_quantize_iters": 5,
   "operation": "bitsandbytes.functional.quantize_4bit (cuda, compress_statistics=True)"
 }

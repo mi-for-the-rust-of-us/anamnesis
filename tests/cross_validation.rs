@@ -19,7 +19,8 @@
 use std::time::Instant;
 
 use anamnesis::{
-    Dtype, dequantize_fp8_to_bf16, dequantize_per_channel_fp8_to_bf16,
+    Dtype, F32Out, dequantize_fp8, dequantize_fp8_to_bf16, dequantize_per_channel_fp8,
+    dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8,
     dequantize_per_tensor_fp8_to_bf16,
 };
 
@@ -27,16 +28,36 @@ use anamnesis::{
 // Fixture parsing
 // ---------------------------------------------------------------------------
 
+/// Magic prefix identifying a v2 `FP8` fixture container.
+const FIXTURE_MAGIC: &[u8; 4] = b"AMNF";
+
+/// Container version this reader understands.
+const FIXTURE_VERSION: u32 = 2;
+
 /// Binary fixture layout (all little-endian):
 ///
+/// - 4 bytes: magic `AMNF`
+/// - 4 bytes: container version (`u32`, currently 2)
 /// - 4 bytes: scheme (0 = fine-grained, 1 = per-tensor, 2 = per-channel)
 /// - 4 bytes: scale dtype (0 = `F32`, 1 = `BF16`, 2 = `F16`)
 /// - 4 bytes: rows (`u32`)
 /// - 4 bytes: cols (`u32`)
 /// - 4 bytes: weight byte count (`u32`)
 /// - 4 bytes: scale byte count (`u32`)
-/// - 4 bytes: expected byte count (`u32`)
-/// - weight bytes, scale bytes, expected `BF16` bytes
+/// - 4 bytes: golden `BF16` byte count (`u32`)
+/// - 4 bytes: golden `F32` byte count (`u32`)
+/// - weight bytes, scale bytes, expected `BF16` bytes, expected `F32` bytes
+///
+/// v1 had neither magic nor version and carried only the `BF16` golden, so the
+/// magic is what lets a stale checkout fail loudly here rather than read the
+/// header at the wrong offsets and report nonsense. The `F32` golden added in
+/// v0.7.4 is what lets the kernels be checked at full width for the first time.
+///
+/// **Both goldens come from `PyTorch`.** The `BF16` one is not derived by
+/// rounding the `F32` one in Rust: that would compare anamnesis' output against
+/// a golden produced by anamnesis' own rounding. `regolden_f32.py` computes
+/// both from the raw bytes and refuses to write unless the `BF16` it re-derives
+/// reproduces the one already committed.
 struct Fixture {
     scheme: u32,
     scale_dtype: Dtype,
@@ -45,6 +66,7 @@ struct Fixture {
     weight_data: Vec<u8>,
     scale_data: Vec<u8>,
     expected_bf16: Vec<u8>,
+    expected_f32: Vec<u8>,
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
@@ -53,18 +75,36 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 }
 
 fn parse_fixture(data: &[u8]) -> Fixture {
-    let scheme = read_u32_le(data, 0);
-    let scale_dtype_id = read_u32_le(data, 4);
-    let rows = read_u32_le(data, 8) as usize;
-    let cols = read_u32_le(data, 12) as usize;
-    let weight_len = read_u32_le(data, 16) as usize;
-    let scale_len = read_u32_le(data, 20) as usize;
-    let expected_len = read_u32_le(data, 24) as usize;
+    assert_eq!(
+        &data[..4],
+        FIXTURE_MAGIC,
+        "fixture is not a v2 `AMNF` container — regenerate with \
+         tests/fixtures/fp8_reference/regolden_f32.py"
+    );
+    let version = read_u32_le(data, 4);
+    assert_eq!(
+        version, FIXTURE_VERSION,
+        "unsupported fixture container version {version} (this reader understands \
+         {FIXTURE_VERSION})"
+    );
 
-    let header_size = 28;
+    let scheme = read_u32_le(data, 8);
+    let scale_dtype_id = read_u32_le(data, 12);
+    let rows = read_u32_le(data, 16) as usize;
+    let cols = read_u32_le(data, 20) as usize;
+    let weight_len = read_u32_le(data, 24) as usize;
+    let scale_len = read_u32_le(data, 28) as usize;
+    let bf16_len = read_u32_le(data, 32) as usize;
+    let f32_len = read_u32_le(data, 36) as usize;
+
+    let header_size = 40;
     let weight_start = header_size;
     let scale_start = weight_start + weight_len;
-    let expected_start = scale_start + scale_len;
+    let bf16_start = scale_start + scale_len;
+    let f32_start = bf16_start + bf16_len;
+
+    assert_eq!(bf16_len, rows * cols * 2, "BF16 golden length");
+    assert_eq!(f32_len, rows * cols * 4, "F32 golden length");
 
     let scale_dtype = match scale_dtype_id {
         0 => Dtype::F32,
@@ -80,7 +120,8 @@ fn parse_fixture(data: &[u8]) -> Fixture {
         cols,
         weight_data: data[weight_start..weight_start + weight_len].to_vec(),
         scale_data: data[scale_start..scale_start + scale_len].to_vec(),
-        expected_bf16: data[expected_start..expected_start + expected_len].to_vec(),
+        expected_bf16: data[bf16_start..bf16_start + bf16_len].to_vec(),
+        expected_f32: data[f32_start..f32_start + f32_len].to_vec(),
     }
 }
 
@@ -155,6 +196,79 @@ fn read_scalar_scale(data: &[u8], dtype: Dtype) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Sensitivity of the F32 comparison
+// ---------------------------------------------------------------------------
+
+/// Demonstrates that the `F32` comparison detects what the `BF16` one cannot.
+///
+/// A passing test proves nothing on its own: if every golden value happened to
+/// be `BF16`-representable, the new `F32` arm would be a no-op dressed up as
+/// rigour. This asserts the gap directly on a real fixture, in two parts.
+///
+/// 1. **Most values carry mantissa bits `BF16` cannot hold.** Measured on this
+///    fixture at 78 %, so the `F32` golden is mostly new information.
+/// 2. **A one-bit perturbation is caught at `F32` and invisible at `BF16`.**
+///    Flipping the lowest mantissa bit of one element changes that element's
+///    `f32` bits, so a bit-exact comparison sees exactly one difference; the
+///    same two values narrowed to `BF16` are identical, so the pre-v0.7.4
+///    comparison would have waved it through.
+#[test]
+fn f32_comparison_detects_what_bf16_hides() {
+    let data = include_bytes!("fixtures/fp8_reference/exaone_fine_grained.bin");
+    let fixture = parse_fixture(data);
+
+    let golden: Vec<f32> = fixture
+        .expected_f32
+        .chunks_exact(4)
+        .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+
+    // Part 1: how much the F32 golden adds over the BF16 one.
+    let informative = golden
+        .iter()
+        .filter(|&&v| {
+            let narrowed = half::bf16::from_f32(v).to_f32();
+            narrowed.to_bits() != v.to_bits()
+        })
+        .count();
+    // CAST: usize → f64, element counts here are 65 536 and 65 536, far inside
+    // f64's 53-bit exact-integer range; this is a display percentage.
+    #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+    let pct = 100.0 * informative as f64 / golden.len() as f64;
+    eprintln!(
+        "sensitivity: {informative}/{} ({pct:.1} %) values are not BF16-representable",
+        golden.len()
+    );
+    assert!(
+        pct > 50.0,
+        "F32 golden adds little over BF16 here ({pct:.1} %); the comparison \
+         would have no teeth on this fixture"
+    );
+
+    // Part 2: a one-bit change, seen at F32 and hidden at BF16. Pick an element
+    // whose low mantissa bit is actually discarded by narrowing, so the flip is
+    // guaranteed to fall inside the bits BF16 drops.
+    let idx = golden
+        .iter()
+        .position(|&v| v != 0.0 && half::bf16::from_f32(v).to_f32().to_bits() != v.to_bits())
+        .expect("fixture has at least one non-BF16-representable value");
+    let original = golden[idx];
+    let mutated = f32::from_bits(original.to_bits() ^ 1);
+
+    assert_ne!(
+        original.to_bits(),
+        mutated.to_bits(),
+        "the mutation must change the f32 bits"
+    );
+    assert_eq!(
+        half::bf16::from_f32(original).to_bits(),
+        half::bf16::from_f32(mutated).to_bits(),
+        "element {idx}: a low-mantissa-bit flip must be invisible at BF16 — \
+         that invisibility is exactly what the F32 golden exists to remove"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Unified test runner
 // ---------------------------------------------------------------------------
 
@@ -201,6 +315,88 @@ fn run_cross_validation(name: &str, data: &[u8], max_ulp: u16) {
     assert_eq!(
         mismatches, 0,
         "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
+    );
+
+    compare_f32_exact(name, &fixture);
+}
+
+/// Compares `F32` output against the `PyTorch` reference **bit for bit**, with
+/// no tolerance at all.
+///
+/// The `BF16` comparison above allows a `ULP` budget because narrowing to 8
+/// significand bits is a lossy step both sides perform, and a one-`ULP`
+/// disagreement there can come from rounding rather than from the arithmetic.
+/// `F32` has no such excuse: anamnesis computes in `f32` and `PyTorch` computes
+/// in `f32`, so identical operations in an identical order must produce
+/// identical bits. Any difference is a real disagreement about the arithmetic —
+/// an associativity change, a contraction, a lost widening — and is exactly
+/// what 16 discarded mantissa bits have been hiding since the first fixture.
+fn compare_f32_exact(name: &str, fixture: &Fixture) {
+    let actual = match fixture.scheme {
+        0 => dequantize_fp8::<F32Out>(
+            &fixture.weight_data,
+            &fixture.scale_data,
+            fixture.rows,
+            fixture.cols,
+            fixture.scale_dtype,
+        )
+        .expect("fine-grained F32 dequant failed"),
+        1 => {
+            let scale = read_scalar_scale(&fixture.scale_data, fixture.scale_dtype);
+            dequantize_per_tensor_fp8::<F32Out>(&fixture.weight_data, scale)
+                .expect("per-tensor F32 dequant failed")
+        }
+        2 => dequantize_per_channel_fp8::<F32Out>(
+            &fixture.weight_data,
+            &fixture.scale_data,
+            fixture.rows,
+            fixture.cols,
+            fixture.scale_dtype,
+        )
+        .expect("per-channel F32 dequant failed"),
+        other => panic!("unknown scheme: {other}"),
+    };
+
+    assert_eq!(
+        actual.len(),
+        fixture.expected_f32.len(),
+        "{name}: F32 output length mismatch"
+    );
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, f32, f32)> = None;
+    for (i, (a_word, e_word)) in actual
+        .chunks_exact(4)
+        .zip(fixture.expected_f32.chunks_exact(4))
+        .enumerate()
+    {
+        let a = f32::from_le_bytes([a_word[0], a_word[1], a_word[2], a_word[3]]);
+        let e = f32::from_le_bytes([e_word[0], e_word[1], e_word[2], e_word[3]]);
+        // Bit equality, not `==`: this must treat `NaN` payloads and the sign
+        // of zero as differences, both of which `==` would wave through.
+        if a.to_bits() != e.to_bits() {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, a, e));
+            }
+        }
+    }
+
+    if let Some((i, a, e)) = first {
+        eprintln!(
+            "  F32 element {i}: actual={a:e} (0x{:08X}), expected={e:e} (0x{:08X})",
+            a.to_bits(),
+            e.to_bits()
+        );
+    }
+    assert_eq!(
+        mismatches,
+        0,
+        "{name}: {mismatches}/{} F32 elements differ from the PyTorch reference. \
+         This is NOT a tolerance question — both sides compute in f32, so \
+         identical operations in identical order must give identical bits. \
+         Treat it as a real finding before touching the test.",
+        actual.len() / 4
     );
 }
 

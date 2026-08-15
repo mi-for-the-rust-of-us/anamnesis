@@ -337,9 +337,21 @@ fn encode_bnb4_core(
         // INDEX: scratch_view.len() == block_size, paired with chunks_exact(2)
         #[allow(clippy::indexing_slicing)]
         let scratch_view = &scratch[..block_size];
-        // VECTORIZED: pending cargo-show-asm verification — gather over
-        // 16-entry codebook is the candidate for explicit SIMD if benches
-        // show it as a hot path.
+        // VECTORIZED: scalar fallback — the codebook search does not
+        // auto-vectorise and will not in this shape. Verified in `--emit=asm`,
+        // x86-64 target-cpu=native, opt-level=3: `encode_bnb4_core` emits **no**
+        // packed float instruction for this loop and instead makes two `call`s
+        // to `nearest_codebook_index`, which stays out of line because it is a
+        // data-dependent linear search over 16 entries. The `%ymm` traffic that
+        // does appear in this function (`vpmovzxwd` + `vpslld`) is pass 1's
+        // `BF16` → `f32` widening, not this loop.
+        //
+        // Escalating would mean an explicit gather or a 16-way blend tree
+        // (`CONVENTIONS.md` § when auto-vectorization is not enough, rung 1),
+        // which Experiment 10 says to attempt only after a roofline shows the
+        // loop is compute-bound. It is on the encode path, which no benchmark
+        // currently reports as hot, so the honest state is `scalar fallback`
+        // rather than a speculative rewrite.
         for (pair, out_byte) in scratch_view.chunks_exact(2).zip(out_block.iter_mut()) {
             // INDEX: chunks_exact(2) guarantees exactly 2 f32 per pair
             #[allow(clippy::indexing_slicing)]
@@ -918,9 +930,23 @@ pub fn encode_bnb_int8(
             })?;
 
         // Hot loop: 1:1 BF16 → i8, scale hoisted.
-        // VECTORIZED: pending cargo-show-asm verification — divide +
-        // round-to-nearest + clamp is the candidate shape for explicit
-        // SIMD if benches show it as a hot path.
+        // VECTORIZED: confirmed AVX2 vdivps + vroundps + vmaxps + vminps +
+        // vpackusdw on %ymm (8-wide) in `--emit=asm`, x86-64
+        // target-cpu=native, opt-level=3. The whole encode kernel vectorises:
+        // `vpmovzxwd` + `vpslld` widen `BF16` to `f32`, `vdivps` applies the
+        // hoisted row scale, `vroundps $11` is round-to-nearest-even (mode 3
+        // with the precision-exception mask), `vmaxps`/`vminps` are the
+        // ±127 clamp, and `vpackusdw` narrows back to bytes.
+        //
+        // The `scale == 0.0` test inside the loop body is loop-invariant, so
+        // `LLVM` hoists it and emits two loop versions rather than a per-element
+        // branch; the residual scalar float instructions in this function are
+        // that second version plus the ragged tail, not the main path.
+        //
+        // This annotation had read `pending` since the kernel was written, which
+        // `CONVENTIONS.md` makes a release blocker at the next `vX.Y.0`. It is
+        // resolved here rather than at v0.8.0 so the Python bindings do not
+        // inherit an open one.
         for (bf16_pair, out_byte) in bf16_row.chunks_exact(2).zip(out_row.iter_mut()) {
             // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
             #[allow(clippy::indexing_slicing)]

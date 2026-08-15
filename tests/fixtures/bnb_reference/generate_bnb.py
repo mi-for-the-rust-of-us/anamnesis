@@ -31,7 +31,9 @@ the tensors live there). This is deliberate:
 Only *generation* needs the GPU; the committed `.bin` fixture and the Rust
 cross-validation tests remain 100 % CPU.
 
-Fixture binary format — NF4/FP4 (all little-endian):
+Fixture binary format — NF4/FP4, container v2 (all little-endian):
+  4 bytes: magic "AMNB"
+  4 bytes: container version (u32, currently 2)
   4 bytes: format_id (u32) — 0=NF4/FP4, 1=INT8, 2=NF4/FP4 double-quant
   4 bytes: total_elements (u32) — number of dequantized elements
   4 bytes: block_size (u32) — elements per absmax block (typically 64)
@@ -40,14 +42,16 @@ Fixture binary format — NF4/FP4 (all little-endian):
   4 bytes: quant_map_len (u32) — bytes of quant_map data (F32[16] = 64 bytes)
   4 bytes: nested_absmax_len (u32) — bytes of nested absmax (0 if not double-quant)
   4 bytes: nested_quant_map_len (u32) — bytes of nested quant_map (0 if not double-quant)
-  4 bytes: expected_len (u32) — bytes of expected BF16 output
+  4 bytes: bf16_len (u32) — bytes of expected BF16 output
+  4 bytes: f32_len (u32) — bytes of expected F32 output
   4 bytes: nested_offset (f32) — double-quant absmax offset (0.0 if not double-quant)
   [weight_len bytes]: raw U8 weight data
   [absmax_len bytes]: raw absmax data
   [quant_map_len bytes]: raw quant_map data
   [nested_absmax_len bytes]: raw nested absmax (empty if not double-quant)
   [nested_quant_map_len bytes]: raw nested quant_map (empty if not double-quant)
-  [expected_len bytes]: expected BF16 output
+  [bf16_len bytes]: expected BF16 output
+  [f32_len bytes]: expected F32 output
 
 The `nested_offset` field is new in v0.6.4: real bitsandbytes double-quant
 recovers `absmax = dequantize_blockwise(absmax_u8, state2) + offset`, where
@@ -56,16 +60,48 @@ recovers `absmax = dequantize_blockwise(absmax_u8, state2) + offset`, where
 reference omitted it — circularly hiding the same omission in the Rust
 decoder.
 
-Fixture binary format — INT8 (unchanged):
+Fixture binary format — INT8, container v2:
+  4 bytes: magic "AMNB"
+  4 bytes: container version (u32, currently 2)
   4 bytes: format_id (u32) — 1
   4 bytes: out_features (u32)
   4 bytes: in_features (u32)
   4 bytes: weight_len (u32) — bytes of I8 weight data
   4 bytes: scb_len (u32) — bytes of SCB data (F32)
-  4 bytes: expected_len (u32) — bytes of expected BF16 output
+  4 bytes: bf16_len (u32) — bytes of expected BF16 output
+  4 bytes: f32_len (u32) — bytes of expected F32 output
   [weight_len bytes]: raw I8 weight data
   [scb_len bytes]: raw SCB data
-  [expected_len bytes]: expected BF16 output
+  [bf16_len bytes]: expected BF16 output
+  [f32_len bytes]: expected F32 output
+
+The F32 golden (v0.7.4)
+-----------------------
+Every comparison before v0.7.4 rounded the reference to BF16 first, discarding
+16 mantissa bits, which hid most of the available signal. The F32 golden is
+what lets the kernel be compared at full width.
+
+**It must come from a dequant that produced f32 directly** — never by widening
+the BF16 (or the f16/bf16 `QuantState`) result back:
+
+- NF4/FP4: `dequantize_4bit` takes its output dtype from the `QuantState`, and
+  the CUDA kernel rounds at the output store. Widening the stock-dtype result
+  is therefore a *different number*, not a wider view of the same one —
+  measured to differ on **93 %** of elements, against only 7 % once both are
+  narrowed to BF16, which is exactly why it went unnoticed. So a second
+  `QuantState(dtype=torch.float32)` is built and dequantized separately; the
+  per-fixture divergence is printed as evidence.
+- INT8: `int8_vectorwise_dequant` already returns f32, so the F32 golden is
+  simply its result before the BF16 narrowing.
+
+v1 (pre-v0.7.4) had no magic and no version, and stopped after the BF16 golden.
+The magic is what lets the Rust readers reject a stale fixture with a clear
+message instead of reading the header at the wrong offsets.
+
+**Drift guard.** Regenerating rewrites the BF16 golden that every existing
+cross-validation asserts against, so a bitsandbytes/torch upgrade could
+silently re-anchor the suite. This script compares the regenerated BF16
+against what is already committed and REFUSES to write on any difference.
 
 Sidecar timing file (PyTorch quantize baseline for encode cross-validation):
 Each fixture also emits `<name>.timing.json` with:
@@ -103,7 +139,62 @@ from bitsandbytes.functional import (
 
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
 
+# v2 container (v0.7.4): magic + version prefix, and an F32 golden appended
+# after the BF16 one. v1 had neither, so the magic is what lets the Rust readers
+# reject a stale fixture with a clear message instead of reading the header at
+# the wrong offsets. See the module docstring for how the F32 golden is taken.
+FIXTURE_MAGIC = b"AMNB"
+FIXTURE_VERSION = 2
+
 TORCH_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
+
+def check_bf16_drift(output_path: Path, expected_bytes: bytes, bf16_len_offset: int,
+                     payload_offset_v1: int, payload_offset_v2: int) -> None:
+    """Refuse to overwrite a fixture whose committed BF16 golden has drifted.
+
+    Regenerating rewrites the golden that every existing cross-validation
+    asserts against, so a bitsandbytes/torch upgrade since the fixture was made
+    would silently re-anchor the suite. A real convention change should be an
+    explicit decision, not a side effect of adding the F32 golden.
+
+    `bf16_len_offset` is the v2 header offset of the `bf16_len` field; the v1
+    offsets are 8 bytes lower because v1 had no magic + version prefix.
+    """
+    if not output_path.exists():
+        return
+    old = output_path.read_bytes()
+    if old[:4] == FIXTURE_MAGIC:
+        (o_bf16_len,) = struct.unpack_from("<I", old, bf16_len_offset)
+        o_start = payload_offset_v2
+    else:
+        (o_bf16_len,) = struct.unpack_from("<I", old, bf16_len_offset - 8)
+        o_start = payload_offset_v1
+    old_bf16 = old[o_start : o_start + o_bf16_len]
+    if old_bf16 != expected_bytes:
+        n = sum(1 for a, b in zip(old_bf16, expected_bytes) if a != b)
+        raise SystemExit(
+            f"REFUSING to overwrite {output_path.name}: the regenerated BF16 golden "
+            f"differs from the committed one in {n} bytes. The library stack has "
+            f"drifted since this fixture was made. Investigate before re-goldening "
+            f"— that is a finding, not a formality."
+        )
+    print("  Drift guard: regenerated BF16 golden matches the committed one")
+
+
+def report_f32_informativeness(result_bf16_cpu: torch.Tensor, result_f32_cpu: torch.Tensor) -> None:
+    """Print how much the F32 golden adds over the BF16 one.
+
+    If this were ~0 the new comparison would have no teeth, so it is measured
+    rather than assumed.
+    """
+    widened = result_bf16_cpu.float()
+    informative = int((widened != result_f32_cpu).sum())
+    total = result_f32_cpu.numel()
+    print(
+        f"  F32 golden: {informative}/{total} "
+        f"({100.0 * informative / total:.1f} %) values are not BF16-representable"
+    )
 
 
 def find_snapshot(model_dir: Path) -> Path:
@@ -271,33 +362,38 @@ def generate_bnb4_fixture(model_info: dict) -> None:
     print(f"  Slice: {slice_elements} elements ({slice_bytes} bytes, {slice_blocks} blocks)")
 
     # ---- Build the QuantState for the REAL bitsandbytes dequant (CUDA) ----
-    if is_double_quant:
-        state2 = QuantState(
-            absmax=nested_absmax_slice.float().cuda(),
-            code=nested_quant_map_slice.float().cuda(),
-            blocksize=nested_block_size,
-            dtype=torch.float32,
-        )
-        qstate = QuantState(
-            absmax=absmax_slice.cuda(),
-            shape=(slice_elements, 1),
-            code=quant_map.float().cuda(),
-            blocksize=block_size,
-            quant_type=quant_type,
-            dtype=out_dtype,
-            offset=torch.tensor(nested_offset, dtype=torch.float32).cuda(),
-            state2=state2,
-        )
-    else:
-        qstate = QuantState(
+    # Parameterised by output dtype: `dequantize_4bit` reads the dtype off the
+    # QuantState and the CUDA kernel rounds at the output store, so the F32
+    # golden needs its own state rather than a widening of the stock-dtype
+    # result. See the module docstring.
+    def build_qstate(target_dtype: torch.dtype) -> QuantState:
+        if is_double_quant:
+            state2 = QuantState(
+                absmax=nested_absmax_slice.float().cuda(),
+                code=nested_quant_map_slice.float().cuda(),
+                blocksize=nested_block_size,
+                dtype=torch.float32,
+            )
+            return QuantState(
+                absmax=absmax_slice.cuda(),
+                shape=(slice_elements, 1),
+                code=quant_map.float().cuda(),
+                blocksize=block_size,
+                quant_type=quant_type,
+                dtype=target_dtype,
+                offset=torch.tensor(nested_offset, dtype=torch.float32).cuda(),
+                state2=state2,
+            )
+        return QuantState(
             absmax=absmax_slice.float().cuda(),
             shape=(slice_elements, 1),
             code=quant_map.float().cuda(),
             blocksize=block_size,
             quant_type=quant_type,
-            dtype=out_dtype,
+            dtype=target_dtype,
         )
 
+    qstate = build_qstate(out_dtype)
     weight_cuda = weight_slice.reshape(-1, 1).cuda()
 
     # Dequantize with the canonical kernel and time it (best of 5)
@@ -320,6 +416,29 @@ def generate_bnb4_fixture(model_info: dict) -> None:
         f"  bitsandbytes dequantize_4bit (cuda): {best_us:.1f} µs "
         f"(best of 5, {slice_elements} elements)"
     )
+
+    # ---- The F32 golden: a SEPARATE dequant at float32 output dtype ----
+    result_f32 = (
+        dequantize_4bit(weight_cuda, build_qstate(torch.float32), quant_type=quant_type)
+        .reshape(-1)
+        .float()
+        .cpu()
+    )
+    expected_f32_bytes = result_f32.contiguous().view(torch.uint8).numpy().tobytes()
+
+    # Evidence for why the F32 golden may not be taken by widening the
+    # stock-dtype result: for an f16/bf16 QuantState the kernel already rounded
+    # at the store, so the widened value is a different number. Printed rather
+    # than asserted because a float32-dtype checkpoint would legitimately give 0.
+    widened_stock = result.reshape(-1).float().cpu()
+    stock_divergence = int((widened_stock != result_f32).sum())
+    print(
+        f"  Stock-dtype ({qs_meta['dtype']}) result widened to f32 differs from the "
+        f"true f32 dequant on {stock_divergence}/{result_f32.numel()} "
+        f"({100.0 * stock_divergence / result_f32.numel():.1f} %) elements "
+        f"— this is why the F32 golden gets its own QuantState"
+    )
+    report_f32_informativeness(result_bf16, result_f32)
 
     # ---- Time the REAL quantize kernel for the encode-side sidecar ----
     quantize_iters_ns: list[int] = []
@@ -359,7 +478,19 @@ def generate_bnb4_fixture(model_info: dict) -> None:
 
     # Write fixture
     output_path = Path(__file__).parent / f"{name}.bin"
+    payload_len = len(w_bytes) + len(a_bytes) + len(qm_bytes) + len(na_bytes) + len(nqm_bytes)
+    # v1 header: 9 u32 + 1 f32 = 40 bytes. v2: magic + version + 10 u32 + 1 f32 = 52.
+    check_bf16_drift(
+        output_path,
+        expected_bytes,
+        bf16_len_offset=8 + 8 * 4,
+        payload_offset_v1=40 + payload_len,
+        payload_offset_v2=52 + payload_len,
+    )
+
     with open(output_path, "wb") as out:
+        out.write(FIXTURE_MAGIC)
+        out.write(struct.pack("<I", FIXTURE_VERSION))
         out.write(struct.pack("<I", format_id))
         out.write(struct.pack("<I", slice_elements))
         out.write(struct.pack("<I", block_size))
@@ -369,6 +500,7 @@ def generate_bnb4_fixture(model_info: dict) -> None:
         out.write(struct.pack("<I", len(na_bytes)))
         out.write(struct.pack("<I", len(nqm_bytes)))
         out.write(struct.pack("<I", len(expected_bytes)))
+        out.write(struct.pack("<I", len(expected_f32_bytes)))
         out.write(struct.pack("<f", nested_offset))
         out.write(w_bytes)
         out.write(a_bytes)
@@ -376,6 +508,7 @@ def generate_bnb4_fixture(model_info: dict) -> None:
         out.write(na_bytes)
         out.write(nqm_bytes)
         out.write(expected_bytes)
+        out.write(expected_f32_bytes)
 
     print(f"  Written: {output_path.name} ({output_path.stat().st_size} bytes)")
 
@@ -443,6 +576,18 @@ def generate_int8_fixture(model_info: dict) -> None:
         f"(best of 5, {slice_out}×{slice_in} = {slice_out * slice_in} elements)"
     )
 
+    # ---- The F32 golden ----
+    # `int8_vectorwise_dequant` is documented and typed as returning float32, so
+    # unlike the 4-bit path this needs no second call: the golden is simply the
+    # result before the BF16 narrowing above. Asserted rather than assumed,
+    # because the whole point is that no rounding of ours has touched it.
+    assert result_f32.dtype == torch.float32, (
+        f"expected int8_vectorwise_dequant to return float32, got {result_f32.dtype}"
+    )
+    result_f32_cpu = result_f32.reshape(-1).cpu()
+    expected_f32_bytes = result_f32_cpu.contiguous().view(torch.uint8).numpy().tobytes()
+    report_f32_informativeness(result_bf16.reshape(-1), result_f32_cpu)
+
     # ---- Time the inverse (quantize) for the encode-side sidecar ----
     # int8_vectorwise_quant is the canonical row-wise int8 quantizer.
     from bitsandbytes.functional import int8_vectorwise_quant
@@ -465,16 +610,30 @@ def generate_int8_fixture(model_info: dict) -> None:
     scb_bytes = scb_slice.numpy().tobytes()
 
     output_path = Path(__file__).parent / f"{name}.bin"
+    payload_len = len(w_bytes) + len(scb_bytes)
+    # v1 header: 6 u32 = 24 bytes. v2: magic + version + 7 u32 = 36.
+    check_bf16_drift(
+        output_path,
+        expected_bytes,
+        bf16_len_offset=8 + 5 * 4,
+        payload_offset_v1=24 + payload_len,
+        payload_offset_v2=36 + payload_len,
+    )
+
     with open(output_path, "wb") as out:
+        out.write(FIXTURE_MAGIC)
+        out.write(struct.pack("<I", FIXTURE_VERSION))
         out.write(struct.pack("<I", 1))  # format_id = INT8
         out.write(struct.pack("<I", slice_out))
         out.write(struct.pack("<I", slice_in))
         out.write(struct.pack("<I", len(w_bytes)))
         out.write(struct.pack("<I", len(scb_bytes)))
         out.write(struct.pack("<I", len(expected_bytes)))
+        out.write(struct.pack("<I", len(expected_f32_bytes)))
         out.write(w_bytes)
         out.write(scb_bytes)
         out.write(expected_bytes)
+        out.write(expected_f32_bytes)
 
     print(f"  Written: {output_path.name} ({output_path.stat().st_size} bytes)")
 

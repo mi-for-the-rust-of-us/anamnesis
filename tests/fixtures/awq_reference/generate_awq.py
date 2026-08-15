@@ -34,7 +34,9 @@ Note: AutoAWQ's GEMM format is 4-bit only (``raise NotImplementedError``
 for any other width), so every fixture here is 4-bit and the Rust decoder
 rejects other widths.
 
-Fixture binary format (all little-endian):
+Fixture binary format, container v2 (all little-endian):
+  4 bytes: magic "AMNA"
+  4 bytes: container version (u32, currently 2)
   4 bytes: bits (u32) — 4
   4 bytes: group_size (u32)
   4 bytes: in_features (u32)
@@ -43,11 +45,33 @@ Fixture binary format (all little-endian):
   4 bytes: qweight_len (u32)
   4 bytes: scales_len (u32)
   4 bytes: qzeros_len (u32)
-  4 bytes: expected_len (u32)
+  4 bytes: bf16_len (u32) — bytes of expected BF16 output
+  4 bytes: f32_len (u32) — bytes of expected F32 output
   [qweight_len bytes]: raw packed qweight data
   [scales_len bytes]: raw scale data
   [qzeros_len bytes]: raw packed qzeros data
-  [expected_len bytes]: expected BF16 output
+  [bf16_len bytes]: expected BF16 output
+  [f32_len bytes]: expected F32 output
+
+The F32 golden (v0.7.4) is what lets the kernel be compared at full width.
+Every comparison before it rounded the reference to BF16 first, discarding 16
+mantissa bits — and the great majority of the values in these fixtures carry
+bits BF16 cannot hold, so that was hiding most of the available signal. The
+exact percentage is printed per fixture.
+
+**The F32 golden is taken from `result_f32` before the BF16 narrowing**, never
+by widening the BF16 back, which would make the comparison circular with our
+own rounding.
+
+v1 (pre-v0.7.4) had no magic and no version, and stopped after the BF16 golden.
+The magic is what lets the Rust reader reject a stale fixture with a clear
+message instead of reading the header at the wrong offsets.
+
+**Drift guard.** Regenerating rewrites the BF16 golden that every existing
+cross-validation asserts against, so an AutoAWQ/torch upgrade could silently
+re-anchor the suite. This script compares the regenerated BF16 against what is
+already committed and REFUSES to write on any difference. As of 2026-08-15,
+AutoAWQ 0.2.9 + torch 2.10.0 reproduce both committed goldens byte for byte.
 
 Usage:
   python generate_awq.py
@@ -65,6 +89,14 @@ from awq.utils.packing_utils import dequantize_gemm, reverse_awq_order, unpack_a
 
 
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
+
+# v2 container (v0.7.4): magic + version prefix, and an F32 golden appended
+# after the BF16 one. v1 had neither, so the magic is what lets the Rust reader
+# reject a stale fixture with a clear message instead of reading the header at
+# the wrong offsets. Both goldens come from AutoAWQ's own unpack/reorder; the
+# F32 one is taken before the BF16 narrowing, never by widening the BF16 back.
+FIXTURE_MAGIC = b"AMNA"
+FIXTURE_VERSION = 2
 
 SCALE_DTYPE_MAP = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 SCALE_DTYPE_NAMES = {0: "F32", 1: "BF16", 2: "F16"}
@@ -222,11 +254,54 @@ def generate_fixture(model_info: dict) -> None:
         f"guard vs dequantize_gemm f16: max|diff|={max_diff:.2e}"
     )
 
-    expected_bytes = result_bf16.view(torch.uint8).reshape(-1).numpy().tobytes()
+    expected_bytes = result_bf16.contiguous().view(torch.uint8).reshape(-1).numpy().tobytes()
+    # The F32 golden, added in v0.7.4. Taken from `result_f32` **before** the
+    # narrowing above, not by widening `result_bf16` back: the whole point is a
+    # golden that no rounding of ours has touched.
+    expected_f32_bytes = (
+        result_f32.contiguous().view(torch.uint8).reshape(-1).numpy().tobytes()
+    )
 
-    # Write fixture
+    # How much the F32 golden adds over the BF16 one. If this were ~0 the new
+    # comparison would have no teeth, so it is measured rather than assumed.
+    widened = result_bf16.float()
+    informative = int((widened != result_f32).sum())
+    total = result_f32.numel()
+    print(
+        f"  F32 golden: {informative}/{total} "
+        f"({100.0 * informative / total:.1f} %) values are not BF16-representable"
+    )
+
     output_path = Path(__file__).parent / f"{name}.bin"
+
+    # Drift guard. Regenerating rewrites the BF16 golden that every existing
+    # cross-validation asserts against, so an AutoAWQ/torch upgrade since the
+    # fixture was made would silently re-anchor the suite. Compare against what
+    # is committed and refuse rather than overwrite; a real convention change
+    # should be an explicit decision, not a side effect of adding F32.
+    if output_path.exists():
+        old = output_path.read_bytes()
+        old_is_v2 = old[:4] == FIXTURE_MAGIC
+        if old_is_v2:
+            (o_bf16_len,) = struct.unpack_from("<I", old, 8 + 8 * 4)
+            o_start = 8 + 10 * 4 + len(qw_bytes) + len(sc_bytes) + len(qz_bytes)
+        else:
+            (o_bf16_len,) = struct.unpack_from("<I", old, 8 * 4)
+            o_start = 9 * 4 + len(qw_bytes) + len(sc_bytes) + len(qz_bytes)
+        old_bf16 = old[o_start : o_start + o_bf16_len]
+        if old_bf16 != expected_bytes:
+            n = sum(1 for a, b in zip(old_bf16, expected_bytes) if a != b)
+            raise SystemExit(
+                f"REFUSING to overwrite {output_path.name}: the regenerated BF16 "
+                f"golden differs from the committed one in {n} bytes. The library "
+                f"stack has drifted since this fixture was made. Investigate before "
+                f"re-goldening — that is a finding, not a formality."
+            )
+        print("  Drift guard: regenerated BF16 golden matches the committed one")
+
     with open(output_path, "wb") as out:
+        out.write(FIXTURE_MAGIC)
+        out.write(struct.pack("<I", FIXTURE_VERSION))
         out.write(struct.pack("<I", bits))
         out.write(struct.pack("<I", group_size))
         out.write(struct.pack("<I", slice_in))
@@ -236,10 +311,12 @@ def generate_fixture(model_info: dict) -> None:
         out.write(struct.pack("<I", len(sc_bytes)))
         out.write(struct.pack("<I", len(qz_bytes)))
         out.write(struct.pack("<I", len(expected_bytes)))
+        out.write(struct.pack("<I", len(expected_f32_bytes)))
         out.write(qw_bytes)
         out.write(sc_bytes)
         out.write(qz_bytes)
         out.write(expected_bytes)
+        out.write(expected_f32_bytes)
 
     print(f"  Written: {output_path.name} ({output_path.stat().st_size} bytes)")
 

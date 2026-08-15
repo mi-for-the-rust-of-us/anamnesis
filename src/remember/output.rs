@@ -49,9 +49,62 @@
 //! `cargo-show-asm`. A per-element hook would put a slice-length check on every
 //! element and leave one generic loop whose codegen would have to be inspected
 //! three times anyway.
+//!
+//! **v0.7.4 tested that claim rather than inheriting it, and it held.** The
+//! four `remember` families narrow inside their hot loops, so routing them
+//! through `write_scratch` costs an `f32` intermediate the `GGUF` kernels never
+//! pay. A `write_one(value: f32, out: &mut [u8])` hook was implemented in full
+//! and benchmarked against the pre-v0.7.4 baseline binary, interleaved, on an
+//! idle machine:
+//!
+//! | family | `write_one` | with `write_scratch` + register tiles |
+//! |---|---:|---:|
+//! | `AWQ` | 0.98× | 1.04× |
+//! | `BnB` `NF4` | 1.00× | 1.04× |
+//! | `BnB` `INT8` | 1.01× | 1.09× |
+//! | `FP8` fine-grained | **1.46×** | 1.06× |
+//! | `GPTQ` `INT4` | **4.25×** | 1.09× |
+//!
+//! Three kernels reached parity and two collapsed. `--emit=asm` on the
+//! `Bf16Out` monomorphisations shows why: `GPTQ`'s pass 2 emitted scalar
+//! `vsubss` / `vmulss` where it had emitted `vsubps` / `vmulps` on `%ymm`, and
+//! `FP8` likewise fell to scalar `vmulss`. The `copy_from_slice` inside
+//! `write_one` carries a length check that `LLVM` eliminates for some callers
+//! and not others, because the chunk width comes from the generic `E::BYTES`
+//! rather than the literal the pre-v0.7.4 loops used. **Only the implementation
+//! can supply a literal chunk width**, which is exactly the property
+//! `write_scratch` has and a per-element hook cannot.
+//!
+//! So the trade is a uniform, predictable 1.04–1.09× against a bimodal
+//! 0.98×–4.25×, and the design note stands. See `docs/perf-experiments.md` for
+//! the full numbers.
 
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
+
+/// Elements a fused-narrowing kernel hands to [`OutputElement::write_scratch`]
+/// per call.
+///
+/// **Calibrated, not guessed, and the reason v0.7.4's split is nearly free.**
+/// The four `remember` families (`FP8`, `GPTQ`, `AWQ`, `BnB`) narrowed inside
+/// their hot loops before v0.7.4. Splitting that into an arithmetic pass plus a
+/// narrowing pass introduces an `f32` intermediate, and where that intermediate
+/// goes decides the whole cost:
+///
+/// - **Row-sized** (the first draft: `out_features × 4` = 44 KB at
+///   `out_features = 11008`) the `f32`s reach memory between the passes.
+///   Measured 1.115× against the pre-v0.7.4 fused kernel on `BnB` `INT8`.
+/// - **Register-sized** (this constant) they stay in `ymm` registers, because
+///   32 `f32`s is four AVX2 vectors and both loops fully unroll. `FP8`
+///   fine-grained went from 1.43× to **1.06×** across this change plus hoisting
+///   its buffer out of the per-block call.
+///
+/// 32 rather than 8 is measured too: an 8-element tile left more loop-setup
+/// overhead per element than the register pressure it saved.
+///
+/// Not feature-gated: the always-on `FP8` family uses it, so it is live in
+/// every build. Contrast [`MAX_OUTPUT_BYTES`], which is a `GGUF`-only concept.
+pub(crate) const VECTOR_TILE: usize = 32;
 
 /// Widest output element in bytes, over every [`OutputElement`] implementation.
 ///
@@ -63,12 +116,19 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 /// those three the complete set.
 ///
 /// Feature-gated with its consumer. Those two runners are the only code that
-/// needs it today, so without `gguf` it is genuinely dead — and on the MSRV
+/// needs it, so without `gguf` it is genuinely dead — and on the MSRV
 /// toolchain, provably so: rustc 1.88's dead-code analysis does **not** count
 /// the reference from the `const` assertion block below as a use, while current
 /// stable does. Gating it here rather than reaching for `#[allow(dead_code)]`
-/// keeps the lint meaningful. Phase 7.4 widens the gate when the `FP8` / `GPTQ`
-/// / `AWQ` / `BnB` families start sizing buffers from it too.
+/// keeps the lint meaningful.
+///
+/// v0.7.3 expected v0.7.4 to widen this gate once `FP8` / `GPTQ` / `AWQ` /
+/// `BnB` went generic. **It did not, and the gate is correct as it stands.**
+/// Those four families tile through an **`f32` scratch** and hand it to
+/// [`OutputElement::write_scratch`], so their scratch is sized in `f32`s and
+/// never in output bytes; only the `GGUF` runners build a byte tile up front,
+/// because their kernels write into a fixed `[f32; QK]` and the output buffer
+/// has to be materialised beside it. The constant stays a `GGUF` concept.
 #[cfg(feature = "gguf")]
 pub(crate) const MAX_OUTPUT_BYTES: usize = 4;
 
