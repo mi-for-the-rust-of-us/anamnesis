@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-07, anamnesis v0.7.2 -->
+<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ. Keep growth consistent.
@@ -54,7 +54,10 @@ A living list of the questions we and our early users have actually run into. If
   - [How do I convert between formats?](#how-do-i-convert-between-formats)
   - [Can I control how many threads anamnesis uses?](#can-i-control-how-many-threads-anamnesis-uses)
   - [Why is the output `BF16` and not `float32`?](#why-is-the-output-bf16-and-not-float32)
-  - [Does `--out-dtype f32` rewrite every tensor as `float32`?](#does---out-dtype-f32-rewrite-every-tensor-as-float32)
+  - [Which output dtype should I ask for?](#which-output-dtype-should-i-ask-for)
+  - [Why is my `f32` output twice the size of the `bf16` one?](#why-is-my-f32-output-twice-the-size-of-the-bf16-one)
+  - [Does asking for `f32` rewrite every tensor as `float32`?](#does-asking-for-f32-rewrite-every-tensor-as-float32)
+  - [Is anamnesis still bit-exact against PyTorch at `f32`?](#is-anamnesis-still-bit-exact-against-pytorch-at-f32)
 - [Parsing untrusted input](#parsing-untrusted-input)
   - [Is it safe to parse a model file from a stranger?](#is-it-safe-to-parse-a-model-file-from-a-stranger)
   - [How do I bound memory when parsing untrusted files?](#how-do-i-bound-memory-when-parsing-untrusted-files)
@@ -166,7 +169,7 @@ amn convert model-Q4_K_M.gguf --to safetensors --threads 8
 
 ### Why is the output `BF16` and not `float32`?
 
-Since v0.7.3 on the `convert` path, it does not have to be. `amn convert model.gguf --to safetensors --out-dtype f32` emits `float32`, and `--out-dtype f16` emits IEEE half. `bf16` remains the default, so nothing changes unless you ask.
+It does not have to be. `amn convert model.gguf --to safetensors --out-dtype f32` emits `float32`, and `--out-dtype f16` emits IEEE half. `bf16` remains the default, so nothing changes unless you ask.
 
 `BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8. Measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value, for which you need `float32`.
 
@@ -174,15 +177,57 @@ Since v0.7.3 on the `convert` path, it does not have to be. `amn convert model.g
 
 `f16` is not simply "the better 2-byte option". It buys 3 significand bits over `bf16` (11 versus 8) and pays a far narrower exponent range: `bf16` shares `f32`'s range, while `f16` overflows to infinity above 65504 and flushes to zero below about `2⁻²⁴`. anamnesis follows plain IEEE semantics there rather than saturating, so its output matches what NumPy and PyTorch produce for the same conversion.
 
-The `remember` path (`amn remember --to ...`) is still `bf16`-only; its four kernel families fuse the narrowing into their inner loops and are generalized in [Phase 7.4](../ROADMAP.md#phase-74-caller-chosen-output-dtype-remember-path). Asking `convert` for `f32` with a *quantized safetensors* input therefore reports a clear error rather than silently giving you `bf16`.
+Since v0.7.4 the `remember` path offers the same choice, spelled `--to`:
 
-### Does `--out-dtype f32` rewrite every tensor as `float32`?
+```
+amn remember model-fp8.safetensors --to f32
+```
 
-No. It governs the tensors anamnesis **dequantizes**, and nothing else.
+Until then `remember` was `bf16`-only, because its four kernel families (`FP8`, `GPTQ`, `AWQ`, `BnB`) fused the narrowing step into their inner loops. Those loops are now generic over the output width, so every format anamnesis reads can be dequantized at any of the three.
 
-Both `remember` and `convert` have always produced mixed-dtype files: dequantized tensors came out `BF16`, while passthrough tensors (norms, biases, embeddings, anything not block-quantized) kept whatever dtype the source held. `--out-dtype` changes the first group only. An `F16` norm in the source is still an `F16` norm in the output, and an `F32` tensor stays byte-identical.
+### Which output dtype should I ask for?
+
+Stay on `bf16` unless you have a specific reason not to. It is what the safetensors and Hugging Face ecosystem serves weights in, it is what candle, burn, and tch expect, and at 2 bytes per element it keeps memory traffic down on a path that is bandwidth-bound.
+
+Ask for `f32` when you want the reference value itself rather than a rounded copy of it: cross-validating against PyTorch, debugging a numerical discrepancy, or feeding a downstream pipeline that computes in `float32` anyway. It costs double the output bytes and runs slower, which is the price of the precision.
+
+Ask for `f16` only when a consumer specifically requires IEEE half and you know your values fit inside its range. It is not the better 2-byte option by default, for the reasons in the entry above.
+
+The longer version, with the decision written out and the numbers behind it, is in [Choosing an output dtype](tutorials/choosing-an-output-dtype.md).
+
+### Why is my `f32` output twice the size of the `bf16` one?
+
+Because `float32` is 4 bytes per element and `bfloat16` is 2. The doubling is the dtype, not overhead: nothing is being padded or duplicated.
+
+Only the tensors anamnesis **dequantizes** double. Passthrough tensors keep their source dtype and their exact bytes, so a real model grows by somewhat less than 2x overall, depending on how much of it was quantized in the first place.
+
+Expect it to be slower as well as bigger. These kernels are bandwidth-bound, so writing twice the bytes costs roughly what you would guess. If you want the size before you commit to the run, `InspectOptions` will compute the estimate at the width you actually intend:
+
+```rust
+use anamnesis::{InspectOptions, TargetDtype, parse};
+
+let model = parse("model-fp8.safetensors")?;
+let info = model.inspect_with_options(
+    InspectOptions::new().with_output_dtype(TargetDtype::F32),
+);
+println!("{}", info.dequantized_size);
+```
+
+### Does asking for `f32` rewrite every tensor as `float32`?
+
+No. `--to` on `remember` and `--out-dtype` on `convert` govern the tensors anamnesis **dequantizes**, and nothing else.
+
+Both commands have always produced mixed-dtype files: dequantized tensors came out `BF16`, while passthrough tensors (norms, biases, embeddings, anything not block-quantized) kept whatever dtype the source held. Asking for a wider output changes the first group only. An `F16` norm in the source is still an `F16` norm in the output, and an `F32` tensor stays byte-identical.
 
 That is deliberate. A passthrough tensor is copied, never decoded, so widening it would invent precision that was never in the file while doubling its size. If you want a single-dtype file, what you want is a cast pass, which is a different operation from dequantization.
+
+### Is anamnesis still bit-exact against PyTorch at `f32`?
+
+Yes, and as of v0.7.4 that is tested rather than assumed. Every kernel family is cross-validated at full `f32` width against the canonical library's own output, compared bit for bit with no tolerance: `FP8` against PyTorch, `GPTQ` against GPTQModel, `AWQ` against AutoAWQ, `BnB` against bitsandbytes, and `GGUF` against `gguf-py`.
+
+This mattered more than it sounds, because exactness at `BF16` never implied exactness at `f32`. Rounding the reference to `BF16` before comparing discards 16 mantissa bits, and in these fixtures 38 to 98 percent of values carry bits `BF16` cannot represent, most families sitting above 77 percent. The comparison was throwing away most of the available signal.
+
+Widening it found a real defect. The `BnB` `INT8` kernel computed `w * (SCB / 127)` where bitsandbytes computes `(w * SCB) * (1 / 127)`. Those are the same real number and the same `BF16`, but they differ by 1 ULP on 26.9 percent of elements at `f32`. Five releases of `BF16` cross-validation had reported 0 mismatches. v0.7.4 matches the canonical association, so the kernel is now exact at every output width.
 
 ## Parsing untrusted input
 

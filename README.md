@@ -53,7 +53,7 @@ you need via feature flags (`gptq`, `awq`, `bnb`, `npz`, `pth`, `gguf`, `ollama`
 |---------|---|
 | `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`, `.gguf`) |
 | `amn inspect <file>` | Show format, tensor counts, size estimates, dtypes, byte order |
-| `amn remember <file>` | Dequantize to BF16 (safetensors) or convert `.pth`/`.gguf` → `.safetensors` |
+| `amn remember <file>` | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf` → `.safetensors` |
 | `amn convert <file> --to <target>` | Convert any input to `safetensors` / `gguf` / `bnb-nf4` through one dispatch |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`. Format
@@ -252,14 +252,14 @@ but `pip install gguf numpy` and no model download.
 | [Tutorial: Inspect before you parse](docs/tutorials/inspect-before-you-parse.md) | The `inspect → check → parse` safety pattern; rejecting a hostile file; bounding memory with `ParseLimits` |
 | [Tutorial: Dequantize a GGUF model to BF16](docs/tutorials/dequantize-a-gguf-model.md) | `inspect` → `remember` → verify: a GGUF k-quant becomes standard `BF16` safetensors |
 | [Tutorial: Convert a model between formats](docs/tutorials/convert-between-formats.md) | `amn convert --to`: any input → `safetensors` / `gguf` / `bnb-nf4` through the BF16 hub, with GGUF-KV stamping |
+| [Tutorial: Choosing an output dtype](docs/tutorials/choosing-an-output-dtype.md) | When `f32` earns its 2× size, why `f16` is a trap, and why a `remember` output is legitimately mixed-dtype |
 | [Python interop contract](docs/python-interop.md) | The frozen v0.8.0 binding contract: panic-safety, the NumPy/BF16 ownership model |
 | [Performance experiments](docs/perf-experiments.md) | Measured perf hypotheses, methods, and outcomes (incl. rejected ones) |
 
 ## What's next
 
-- **Phase 7.3, caller-chosen output dtype for `convert` (v0.7.3):** the dequantisation output type becomes a parameter (`BF16` / `F32` / `F16`), monomorphised like a C++ template argument, with a runtime dispatch at the API edge. `F32` drops the narrowing step entirely, so the output is the reference `f32` itself (today's `BF16` rounds 80–97 % of values), cross-validated against `gguf-py` with no rounding in between for the first time.
-- **Phase 7.4, the same for `remember` (v0.7.4):** `TargetDtype` gains `F32` and `F16`, and the FP8 / GPTQ / AWQ / BnB kernels become generic over the output type. Lands before the bindings freeze a dtype contract, so a Python caller can ask for a plain `np.float32` array without an optional dependency.
-- **Phase 8, Python bindings (v0.8.0):** `pip install anamnesis`, with typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen.
+- **Phase 8, Python bindings (v0.8.0):** `pip install anamnesis`, with typed exceptions, owned NumPy arrays, `ml_dtypes.bfloat16`. The [interop contract](docs/python-interop.md) is already frozen, and the dtype contract it depends on shipped in v0.7.3 / v0.7.4, so a Python caller can ask for a plain `np.float32` array without an optional dependency.
+- **Phase 8.5, Lethe encode completion:** the quantising direction, so `convert --to gguf-q4km` and the other quantised targets stop returning `Unsupported`.
 
 Full plan in [ROADMAP.md](ROADMAP.md); progress in [CHANGELOG.md](CHANGELOG.md).
 

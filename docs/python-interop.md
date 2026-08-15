@@ -107,6 +107,47 @@ is a first-class variant, and the NPZ parser already reads the JAX void-`V2`
 `bfloat16` convention. All other dtypes (`F16`, `F32`, `I32`, …) map to their
 native NumPy types.
 
+**Restated for the caller-chosen output dtype (v0.7.3 / v0.7.4).** The contract
+above was frozen when `BF16` was the *only* thing a dequantising call could
+return, so it reads as a workaround for a NumPy gap. It is worth separating the
+two halves now that it is not the only option:
+
+- **The no-silent-widening rule is unchanged and is not negotiable.** If the
+  caller asks for `BF16` and gets `BF16` bytes, the binding hands back exactly
+  those bytes. Widening behind the caller's back would double memory and destroy
+  the exact-bytes property that the cross-validation suites exist to guarantee.
+- **What changed is that widening is now a request rather than a workaround.**
+  `remember` (v0.7.4) and `convert` (v0.7.3) both take the output dtype as a
+  parameter, so a caller who wants `float32` asks for it *up front* and the
+  kernels produce `f32` directly. That is strictly better than widening after the
+  fact: there is no narrowing step to undo, and the result is the reference
+  implementation's own `f32` rather than a `BF16` value with zeros in the low
+  bits.
+
+The practical consequence for the wheel is that `ml_dtypes` moves **off the
+common path**. A NumPy user who wants a plain `np.float32` array asks for `f32`
+and gets one with no optional dependency at all; `ml_dtypes` is needed only by
+callers who specifically want `bfloat16` back. That was the Phase 8 de-risking
+the 7.3 / 7.4 pair was meant to buy, and it is now bought.
+
+Two things the binding must therefore expose, and one it must not:
+
+- The output dtype must be a parameter on the dequantising entry points, spelled
+  the way the rest of the API spells it (`bf16` / `f32` / `f16`).
+- The returned array's dtype must reflect what was actually produced, never a
+  fixed assumption. The core already learned this the hard way in v0.7.4: an
+  `inspect` size estimate was rendered under a hard-coded `BF16` label after the
+  figure itself became dtype-aware.
+- It must **not** offer a "give me whatever is cheapest" mode. The caller chooses
+  the width, or gets the documented default (`bf16`); an output whose dtype
+  depends on what the input happened to be is not a contract.
+
+**Passthrough tensors keep their source dtype**, whatever is requested. A
+`remember` result is legitimately a mixed-dtype mapping, and the binding should
+surface it as such rather than flattening it, because flattening would either
+invent precision or discard it. See the
+[FAQ](FAQ.md#does-asking-for-f32-rewrite-every-tensor-as-float32).
+
 See also the *Panic safety* section above and the README "Parsing untrusted
 input" error taxonomy — together they are the safety contract the bindings ship
 against.

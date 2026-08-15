@@ -1,126 +1,165 @@
-# Phase 7.4 handoff, end of 2026-08-13
+# Phase 7.4 handoff (updated 2026-08-15, mid-D1)
 
-Working state for `anamnesis` v0.7.4 (`remember`-path caller-chosen output
-dtype). Read this first, then
-[`phase-7.4-bf16-perf-discrepancy.md`](phase-7.4-bf16-perf-discrepancy.md) for
-the one open question.
+Branch `phase-7.4-remember-output-dtype`. **There are UNCOMMITTED changes in the
+working tree** — Éric asked for no commits and no pushes until the consistency
+pass. Do not `git checkout`/`stash` without reading this first.
 
-## Where things stand
+## Committed so far
 
-Branch `phase-7.4-remember-output-dtype`, 5 commits ahead of `main`, working
-tree clean, **not pushed**. Full suite green: 498 lib tests plus every
-cross-validation suite, `cargo clippy --all-targets --all-features -D warnings`
-clean, `cargo fmt` clean.
+**14 commits ahead of `main`**, oldest first, all green at commit time:
 
-| commit | what |
-|---|---|
-| `bc11d0f` | the four families generic over `OutputElement`; `TargetDtype::{F32,F16}`; boundary dispatch; `convert`'s v0.7.4 gate removed |
-| `587fb80` | recover most of the `BF16` regression (hoist FP8 tile, register tiles, GPTQ/AWQ in place) |
-| `66bb10b` | tile `BnB` `INT8`; share `VECTOR_TILE`; record the code-layout finding |
-| `eac4793` | **reject** the per-element `write_one` hook, with the asm evidence |
-| `36e3c8a` | whole-model threaded bench; record the perf contradiction |
-
-## Done
-
-- **A1–A4** kernels: `FP8`, `GPTQ`, `AWQ`, `BnB` all generic over
-  `OutputElement`. Eight new generic entry points; every `*_to_bf16` name kept
-  as an `#[inline]` `Bf16Out` wrapper, so **no existing caller changes**.
-- **A5** investigated and *closed as not-needed*: `MAX_OUTPUT_BYTES` correctly
-  stays `gguf`-gated. v0.7.3 predicted the gate would widen; the chosen design
-  routes the four families through an `f32` scratch, so they never size a byte
-  buffer. Doc comment records this instead of the prediction.
-- **B1** output-side plumbing: `build_views::<E>` takes `E::DTYPE`,
-  `hub_tensors::<E>`, and `read_safetensors` in `src/convert.rs` now dispatches
-  over the dtype instead of rejecting non-`BF16` on quantised safetensors input.
-  *(This step was not in the ROADMAP; without it `convert --out-dtype f32`
-  would still fail on the exact input the phase exists to serve.)*
-
-## Next up, in order
-
-1. **Settle the perf discrepancy** (agreed for 2026-08-14). See the companion
-   doc. Start with the allocation-control experiment, then CodSpeed.
-2. **Vectorisation annotations.** Four `// VECTORIZED: pending` remain in
-   `src/remember/` (`fp8.rs`, `gptq.rs`, `awq.rs`, `bnb.rs`) on loops this phase
-   touched. Asm was already inspected once and all five kernels vectorise
-   8-wide at every width, with `vcvtps2ph` for `F16`; what blocks writing
-   `confirmed` is `CONVENTIONS.md`'s second requirement, a measurement showing
-   at-least-parity, which is exactly what the open question governs.
-3. **B2** CLI: `remember --to f32|f16`; thread the dtype into
-   `run_remember_gguf`; the `.pth` / `.gguf` `--to` validation arms at
-   `src/cli.rs` ~419 and ~441. Decisions already taken: honour the dtype for
-   `.gguf` (7.3 made those kernels generic), accept it as vacuous for `.pth`
-   (nothing is dequantised), matching `convert`'s documented `NPZ`/`.pth`
-   policy.
-4. **B3** `InspectOptions` builder (`InspectOptions::new().with_output_dtype()`
-   plus `ParsedModel::inspect_with_options`), mirroring `RememberOptions` /
-   `ConvertOptions`. Also give `InspectInfo` `#[non_exhaustive]` while it is
-   open, before Phase 8 freezes its shape.
-5. **B4** `to_bf16_bytes` in `src/convert.rs` must round to nearest even, not
-   truncate. Decided: fix the code, not the doc.
-6. **C1** `# Memory` sections and the three `peak_heap_*` tests per dtype.
-7. **D1/D2** re-golden `F32` fixtures and cross-validate. Environment is ready
-   (see below).
-8. **D3, E1/E2, F1/F2/F3** per the plan file.
-
-## Environment, verified 2026-08-13
-
-Everything needed for D1 is installed; **nothing to install**.
-
-| tool | version | for |
+| # | hash | what |
 |---|---|---|
-| Python | 3.14.0 | |
-| `torch` | 2.10.0+cu130, CUDA on RTX 5060 Ti | `FP8` goldens |
-| `gptqmodel` | 7.1.0 | `GPTQ` goldens (`TorchLinear`, v1→v2 conversion) |
-| `autoawq` | 0.2.9 | `AWQ` goldens |
-| `bitsandbytes` | 0.49.1 | `BnB` goldens |
-| `numpy` / `safetensors` / `gguf` | 2.4.2 / 0.7.0 / 0.18.0 | fixture I/O |
-| `pypcre` | 0.3.2 | the `pcre` shim `generate_gptq.py` needs on 3.14 Windows |
+| 1 | `bc11d0f` | four kernel families generic over `OutputElement`; `TargetDtype::{F32,F16}`; boundary dispatch; `convert`'s v0.7.4 gate removed |
+| 2 | `587fb80` | recover most of the BF16 regression the fission split introduced |
+| 3 | `66bb10b` | tile BnB INT8; share `VECTOR_TILE`; record the ~23 % code-layout finding |
+| 4 | `eac4793` | **`write_one` REJECTED** on asm evidence |
+| 5 | `36e3c8a` | whole-model threaded bench; record the perf contradiction |
+| 6 | `c65ae63` | handoff + discrepancy docs |
+| 7 | `d7bd7fa` | **cross-crate inlining fix** — the root cause, and a real downstream bug |
+| 8 | `a39690d` | tile GPTQ/AWQ pass 2/3 (AWQ 5 % win, GPTQ neutral) |
+| 9 | `e98e090` | B4 — `to_bf16_bytes` rounds to nearest even |
+| 10 | `6ce07ba` | B2 — CLI `remember --to f32\|f16` |
+| 11 | `2b28ff4` | B3 — `InspectOptions`, dtype-aware size estimate |
+| 12 | `80b3b1d` | C1 — peak-heap per dtype + `dhat` parallelism fix |
+| 13 | `137c413` | every `VECTORIZED: pending` resolved on asm evidence |
+| 14 | `33d5151` | **FP8 F32 cross-validation** (7/7 exact, first run) |
 
-`ml_dtypes` is **absent**. Not needed for v0.7.4; it is a **Phase 8**
-prerequisite (the `bfloat16` NumPy return contract).
+Suite at this point: **504 tests green**, clippy clean, rustdoc clean.
 
-### Two findings that shape the re-golden scripts
+## UNCOMMITTED work in the tree right now
 
-1. **The `BnB` `F32` golden cannot be derived from the existing one.**
-   `generate_bnb.py` builds its `QuantState` with `dtype=out_dtype`, which is
-   `torch.float16` for the `FP4` fixtures. Widening that f16 result to `F32` is
-   **not** the canonical `F32`. Measured on this box: an f32 `QuantState` and a
-   widened f16 one differ on **3811/4096 elements (93 %)**; at `BF16` width they
-   differ on only 279/4096, which is why nobody noticed. The `F32` golden must
-   come from a `dtype=torch.float32` `QuantState`, asked of the same canonical
-   kernel.
-2. **`BnB` re-goldening must run on CUDA.** The generator anchors to the GPU
-   kernel deliberately: bitsandbytes 0.49's CPU kernel double-rounds and
-   diverges by 1 `ULP` on ~19 % of elements. Re-goldening on CPU would silently
-   re-anchor the whole family.
+Exactly seven modified files, all part of one coherent change plus this doc:
 
-Expect `BnB` to be the family most likely to fail the first `F32`
-cross-validation run, and treat a failure as a finding, not a test bug.
+```
+ M docs/phase-7.4-handoff.md                                  <- this file
+ M tests/cross_validation_gptq.rs                             <- v2 reader + F32 arm
+ M tests/fixtures/gptq_reference/generate_gptq.py             <- v2 container + drift guard
+ M tests/fixtures/gptq_reference/falcon3_1b_int4.bin          <- regenerated
+ M tests/fixtures/gptq_reference/falcon3_1b_int8.bin          <- regenerated
+ M tests/fixtures/gptq_reference/llama_3_2_1b_int4.bin        <- regenerated
+ M tests/fixtures/gptq_reference/llama_3_2_1b_gptqmodel_int8.bin <- regenerated
+```
 
-## Open decisions already made (do not re-litigate)
+**GPTQ F32 cross-validation, complete and passing (4/4).** Full suite green
+(504) with these changes in the tree, so this is a committable unit whenever
+Éric lifts the hold.
 
-- Narrowing mechanism: **`write_scratch`**, not a per-element hook. `write_one`
-  was implemented in full and rejected on asm evidence (`GPTQ` and `FP8`
-  de-vectorised to scalar `vsubss`/`vmulss`; 4.25× and 1.46×). The reasoning is
-  in `src/remember/output.rs`'s module docs so it is not re-litigated a third
-  time.
-- `F32` goldens: re-golden from the raw bytes already inside each committed
-  `.bin` fixture, no model re-download.
-- `to_bf16_bytes`: fix the code to round.
-- `InspectOptions` builder rather than a parameterised `From` or an accessor.
+- `tests/fixtures/gptq_reference/generate_gptq.py` — extended to emit a v2
+  `AMNQ` container (magic + version + F32 golden appended after BF16), with a
+  **drift guard** that refuses to overwrite if the regenerated BF16 differs from
+  the committed one. Docstring updated.
+- `tests/fixtures/gptq_reference/*.bin` — 4 fixtures regenerated to v2.
+  Drift guard PASSED on all four: GPTQModel 7.1.0 + torch 2.10.0 reproduce the
+  committed BF16 goldens byte for byte. 77–96 % of values are not
+  BF16-representable.
+- `tests/cross_validation_gptq.rs` — reader accepts v2 only (asserts magic +
+  version), new `compare_gptq_f32_exact` (bit equality, no tolerance).
+- **Result: 4/4 pass the exact F32 comparison, first run.**
 
-## Still to raise with Éric
+## Method that worked, reuse it for AWQ and BnB
 
-- **FAQ entries and a tutorial** for the docs pass (F1/F2). Proposal to bring:
-  one new tutorial on choosing an output dtype, plus FAQ entries on which dtype
-  to ask for, why `F32` output is twice the size, and why a `remember` output
-  file is legitimately mixed-dtype (the passthrough policy, most likely to
-  surprise).
-- **ROADMAP amendments.** Four items its Phase 7.4 text does not name: the
-  `convert.rs` gate (done, `bc11d0f`), `transpose_bf16` as a fifth `× 2` site
-  (done), `run_remember_gguf` as a `BF16`-hardcoded duplicate (pending, B2), and
-  the `MAX_OUTPUT_BYTES` gate item, which needs **rewriting rather than
-  ticking** because the prediction was wrong.
-- **Before v0.8.0**, unrelated to this phase: `src/lethe/bnb.rs:340` and `:921`
-  still carry `// VECTORIZED: pending`, which `CONVENTIONS.md` calls a release
-  blocker at the next `vX.Y.0`. One commit.
+**All 13 source models ARE present in the HF cache** (verified). That changed
+the approach from the originally-agreed "re-golden from the committed .bin" to
+"extend `generate_*.py` in place" — necessary for GPTQ because the fixture does
+not store `sym` / `desc_act` / `checkpoint_format`, which `TorchLinear` needs.
+Tell Éric this was a means-level change; it produces a strictly more canonical
+fixture. FP8 used the .bin route (its `regolden_f32.py` still exists and works).
+
+Per family the recipe is:
+
+1. Add `FIXTURE_MAGIC` (`AMNF`/`AMNQ`/`AMNA`/`AMNB`) + `FIXTURE_VERSION = 2`.
+2. Capture the reference's f32 result **before** any `.to(bfloat16)`.
+3. Print the not-BF16-representable percentage (proves the comparison has teeth).
+4. Drift guard: compare regenerated BF16 against committed, refuse on mismatch.
+5. Write magic, version, existing header fields, `bf16_len`, `f32_len`, payloads.
+6. Rust reader: assert magic + version, add `expected_f32`, add an exact
+   bit-equality comparison whose failure message says this is NOT a tolerance
+   question.
+
+## Status 2026-08-15 (end of session 2)
+
+**Everything through F2 is done.** All ten ROADMAP Phase 7.4 bullets are ticked
+and the phase has an Outcome section. Suite: **509 tests green**, clippy clean
+across 12 feature combos plus MSRV 1.88, rustdoc clean across 13 combos.
+
+Done this session, beyond the list below: AWQ + BnB `F32` cross-validation
+(BnB found a real 1-`ULP` kernel defect in `INT8`, fixed); D3; E1; E2
+(Experiments 14 + 15); the consistency pass, brought forward at Éric's request
+(three malformed/missing `VECTORIZED` annotations, plus an `InspectInfo::Display`
+bug that labelled an `F32` estimate `(BF16)`); item 6 docs; F1/F2.
+
+**Only F3 remains**: the release gauntlet (stable + MSRV 1.88, `cargo publish
+--dry-run`, the two packaging checks) and the tag. Still **no commits and no
+pushes** on Éric's standing instruction.
+
+## Still to do, in order (historical, session-2 plan)
+
+1. **AWQ** — `tests/fixtures/awq_reference/generate_awq.py` + `cross_validation_awq.rs`.
+   Magic `AMNA`. Reference is AutoAWQ `dequantize_gemm`.
+2. **BnB** — the hard one. Magic `AMNB`. Two traps, both verified this session:
+   - The F32 golden **must** come from a `QuantState(dtype=torch.float32)`, not
+     from widening the existing f16-QuantState result. Measured: they differ on
+     **93 %** of elements (vs 7 % at BF16 width, which is why nobody noticed).
+   - Re-goldening **must run on CUDA** (RTX 5060 Ti present). bitsandbytes 0.49's
+     CPU kernel double-rounds and diverges by 1 ULP on ~19 % of elements;
+     `generate_bnb.py` deliberately anchors to the GPU kernel.
+   - Expect this family to be the one that fails first. Treat a failure as a
+     finding, not a test bug.
+3. **D3** — determinism across thread counts {1,2,4} *per dtype*, plus
+   end-to-end dtype tests on `remember` (mirror the three in `src/convert.rs`).
+4. **E1** — add `remember_f32_whole_model` to `benches/convert.rs` beside the
+   existing `remember_bf16_whole_model`. ADD, never rename (CodSpeed history).
+5. **E2** — `docs/perf-experiments.md` entry. Numbers are settled now; see
+   `docs/phase-7.4-bf16-perf-discrepancy.md` (RESOLVED) for the honest table.
+6. **Docs check-in with Éric** — I owe a proposal before writing prose:
+   one tutorial on choosing an output dtype; FAQ entries on which dtype to ask
+   for, why F32 output is twice the size, and why a `remember` output file is
+   legitimately mixed-dtype (the passthrough policy — most likely to surprise).
+7. **F1/F2** — python-interop.md restated, README, cli-reference.md (several
+   "bf16-only until v0.7.4" lines now live), CHANGELOG `[Unreleased]` opened,
+   ROADMAP amendments **including rewriting the A5 item** (the
+   `MAX_OUTPUT_BYTES` gate correctly stays; v0.7.3's prediction was wrong).
+8. **STOP at the consistency pass.** Éric's instruction: proceed to it, not
+   through it. No commits, no pushes before then.
+
+## Settled decisions — do not re-litigate
+
+- **Re-goldening extends `generate_*.py` in place** rather than deriving from
+  the committed `.bin`. Confirmed by Éric 2026-08-15 as the standing rule. Used
+  for GPTQ, AWQ and BnB; FP8 keeps its `.bin` route (`regolden_f32.py`) because
+  it already worked. This is not merely convenient: re-goldening from the
+  `.bin` **could not** have produced the BnB F32 golden at all, because that
+  needs a `QuantState(dtype=torch.float32)` the fixture never stored.
+- **Docs plan approved** (item 6): one tutorial (*Choosing an output dtype*)
+  plus four FAQ entries — which dtype to ask for, why F32 output is twice the
+  size, why a `remember` output file is legitimately mixed-dtype (the
+  passthrough policy), and whether anamnesis is still bit-exact against
+  `PyTorch` at F32 (where the BnB INT8 finding is told honestly).
+
+- `write_scratch`, not `write_one`. Rejected on asm evidence (GPTQ 4.25×, FP8
+  1.46× de-vectorised to scalar). Recorded in `src/remember/output.rs`.
+- `MAX_OUTPUT_BYTES` stays `gguf`-gated.
+- `to_bf16_bytes` rounds to nearest even.
+- `InspectOptions` builder, mirroring RememberOptions/ConvertOptions.
+- Perf story is RESOLVED and is a net **win**: FP8 2.2× faster, others
+  1.04–1.18× slower, whole-model FP8 1.8× faster. The root cause of the earlier
+  confusion was a cross-crate inlining regression (`d7bd7fa`), a real bug that
+  made downstream callers ~2.9× slower.
+
+## Environment
+
+Python 3.14, torch 2.10.0+cu130 (CUDA, RTX 5060 Ti), gptqmodel 7.1.0,
+autoawq 0.2.9, bitsandbytes 0.49.1, numpy 2.4.2, safetensors 0.7.0, pypcre.
+`ml_dtypes` absent — Phase 8 prerequisite only.
+
+## Verification one-liners
+
+```powershell
+cargo fmt; cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+$env:RUSTDOCFLAGS="-D warnings"; cargo doc --all-features --no-deps; $env:RUSTDOCFLAGS=$null
+```
+
+Run clippy **before** committing, not alongside: a missing `// CAST:`
+annotation on a `usize → f64` in test code slipped into one commit this session.

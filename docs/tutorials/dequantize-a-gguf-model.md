@@ -4,7 +4,7 @@
 
 *~1000 words · about 4 min read*
 
-<!-- Last updated: 2026-08-12, anamnesis v0.7.3 -->
+<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -112,7 +112,7 @@ Note the derived filename ends in `-f32`, not `-bf16`: it tracks the dtype, so a
 
 There is also `--out-dtype f16`, which buys 3 significand bits over `bf16` at the same 2 bytes — but pays for them with a much narrower exponent range, overflowing to infinity above 65504 where `bf16` matches `f32`'s range. It is not simply the better 2-byte choice.
 
-Note this is `amn convert`, not `amn remember`: the `remember` path stays `BF16`-only until v0.7.4, when its other kernel families get the same treatment.
+Since v0.7.4 `amn remember` offers the same choice, spelled `--to` (there is no output *format* to pick on that path, so the flag is free to mean the dtype): `amn remember model.gguf --to f32`. Which dtype to ask for, and what each one costs, is written out in [Choosing an output dtype](choosing-an-output-dtype.md).
 
 ## Step 4 — Verify the result
 
@@ -142,6 +142,6 @@ let vb = VarBuilder::from_mmaped_safetensors(&["smol-bf16.safetensors"], DType::
 - `amn inspect` is a free, header-only preview — use it to read the dtype mix and size *before* spending disk on a full dequantization.
 - A `Q4_K_M` file is a mix of block types, and the tensors GGUF left in `F32` simply pass through untouched.
 - Dequantization trades size for compatibility (here 99 MB → 257 MB), so check the numbers up front.
-- Since v0.7.3, `amn convert --out-dtype f32` skips the `BF16` narrowing entirely when you need the reference `float32`, at twice the bytes and ~1.5× the time.
+- `amn convert --out-dtype f32` (v0.7.3) and `amn remember --to f32` (v0.7.4) skip the `BF16` narrowing entirely when you need the reference `float32`, at twice the bytes and ~1.5× the time.
 
 For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs. And to change *container* rather than just recover precision — GGUF → `bnb-nf4`, or writing a scalar GGUF with your own metadata — see [Convert a model between formats](convert-between-formats.md).
