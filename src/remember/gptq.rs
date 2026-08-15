@@ -40,6 +40,7 @@ use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
 /// * `shift` — precomputed `bits * pos` (number of bits to shift right).
 /// * `mask` — precomputed `(1 << bits) - 1` (bitmask for one value).
 #[must_use]
+#[inline]
 fn unpack_gptq(packed: u32, shift: u32, mask: u32) -> u32 {
     // BITWISE: extract unsigned integer at bit position `shift` with width `bits`
     (packed >> shift) & mask

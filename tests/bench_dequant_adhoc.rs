@@ -303,6 +303,237 @@ fn bench_bf16_all_families() {
 ///
 /// Uses only `remember_to_bytes_with_options` + `RememberOptions`, both present
 /// before v0.7.4, so the identical test runs on the parent commit's binary.
+///
+/// Diagnostic for the open discrepancy in
+/// `docs/phase-7.4-bf16-perf-discrepancy.md`: puts the isolated kernel and the
+/// whole-model path **in one process on one fixture**, so the internal
+/// contradiction (end to end faster *per element* than the kernel it contains)
+/// can be resolved without any before/after comparison at all.
+///
+/// Reports, in order:
+///
+/// 1. the `QuantScheme` the header actually classified to, ruling out the
+///    possibility that the two benches run different kernels;
+/// 2. the kernel alone, called `TENSORS` times exactly as `dequantize_all`
+///    calls it, so the element count matches the whole-model figure;
+/// 3. the same again but writing into **one reused output buffer**, which
+///    isolates per-iteration allocation and first-touch page-fault cost;
+/// 4. the whole-model path at 1 and 4 threads.
+///
+/// If (2) exceeds (4), the isolated bench is not measuring what its name says.
+/// If (3) is far below (2), the gap is allocation, not kernel.
+#[test]
+#[ignore = "ad-hoc diagnostic; run with --release --ignored --nocapture"]
+fn diag_kernel_vs_whole_model_same_process() {
+    use anamnesis::{Dtype, RememberOptions, TargetDtype};
+
+    const TENSORS: usize = 4;
+    const ROWS: usize = 4096;
+    const COLS: usize = 4096;
+    const BLOCK: usize = 128;
+    const ELEMS: usize = ROWS * COLS;
+    let melem = (TENSORS * ELEMS) as f64 / 1.0e6;
+
+    // Same bytes the whole-model fixture uses, built once.
+    let weight: Vec<u8> = (0..ELEMS)
+        .map(|i| ((i as u64 * 0x9E37_79B9) >> 24) as u8)
+        .collect();
+    let scale_rows = ROWS.div_ceil(BLOCK);
+    let scale_cols = COLS.div_ceil(BLOCK);
+    let scales: Vec<u8> = (0..scale_rows * scale_cols)
+        .flat_map(|k| (0.125_f32 + (k % 8) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..TENSORS {
+        let w_off = data.len();
+        data.extend_from_slice(&weight);
+        header.insert(
+            format!("layer.{i}.weight"),
+            serde_json::json!({
+                "dtype": "F8_E4M3",
+                "shape": [ROWS, COLS],
+                "data_offsets": [w_off, data.len()],
+            }),
+        );
+        let s_off = data.len();
+        data.extend_from_slice(&scales);
+        header.insert(
+            format!("layer.{i}.weight_scale"),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": [scale_rows, scale_cols],
+                "data_offsets": [s_off, data.len()],
+            }),
+        );
+    }
+    let header_json = serde_json::to_string(&header).unwrap();
+    let mut file_bytes = Vec::new();
+    file_bytes.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+    file_bytes.extend_from_slice(header_json.as_bytes());
+    file_bytes.extend_from_slice(&data);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diag-fp8.safetensors");
+    std::fs::write(&path, &file_bytes).unwrap();
+    let model = anamnesis::parse(&path).unwrap();
+
+    eprintln!("\n=== diag_kernel_vs_whole_model_same_process ===");
+    eprintln!(
+        "fixture: {TENSORS} x {ROWS}x{COLS} FP8 = {melem:.1} Melem, scheme = {:?}",
+        model.header.scheme
+    );
+    // The whole-model path only dequantises tensors the classifier tagged
+    // `Quantized`. If it tagged them `Passthrough`, `remember` copies bytes and
+    // never calls a kernel, which would make every whole-model figure here a
+    // measurement of `memcpy`.
+    eprintln!(
+        "roles: quantized={} scales={} passthrough={}",
+        model.header.quantized_count(),
+        model.header.scale_count(),
+        model.header.passthrough_count()
+    );
+    let out_len = model
+        .remember_to_bytes(TargetDtype::BF16)
+        .map_or(0, |b| b.len());
+    eprintln!(
+        "remember output = {out_len} B; BF16 of all weights would be {} B",
+        TENSORS * ELEMS * 2
+    );
+
+    // (2) kernel alone, TENSORS calls per iteration, fresh output each call.
+    let s = time_best_of_5(|| {
+        let mut last = 0u8;
+        for _ in 0..TENSORS {
+            let out = anamnesis::dequantize_fp8_to_bf16(&weight, &scales, ROWS, COLS, Dtype::F32)
+                .unwrap();
+            last = out[out.len() - 1];
+        }
+        last
+    });
+    eprintln!(
+        "kernel_fresh_alloc    {}  [{:.3} ms/Melem]",
+        fmt_stats(&s),
+        s[2] / melem
+    );
+
+    // (2b) the same work, but through the **generic** entry point rather than
+    // the non-generic `*_to_bf16` wrapper. `dequantize_fp8::<Bf16Out>` is
+    // instantiated in *this* crate, so LLVM can inline and specialise it the
+    // way it does for `remember`'s lib-internal call. The wrapper is an opaque
+    // cross-crate call by comparison. If this arm is much faster than (2), then
+    // arm (2) never measured what `remember` executes.
+    let s_generic = time_best_of_5(|| {
+        let mut last = 0u8;
+        for _ in 0..TENSORS {
+            let out = anamnesis::dequantize_fp8::<anamnesis::Bf16Out>(
+                &weight,
+                &scales,
+                ROWS,
+                COLS,
+                Dtype::F32,
+            )
+            .unwrap();
+            last = out[out.len() - 1];
+        }
+        last
+    });
+    eprintln!(
+        "kernel_generic_inline {}  [{:.3} ms/Melem]",
+        fmt_stats(&s_generic),
+        s_generic[2] / melem
+    );
+
+    // (2c) four *distinct* input buffers, matching the whole-model path, which
+    // reads four separate mmap regions. Arms (2) and (2b) reuse one 16.7 MB
+    // buffer four times; if that reuse creates a cache-conflict pattern against
+    // the 33.5 MB output, this arm will be much faster and the reuse is the
+    // artefact.
+    let weights: Vec<Vec<u8>> = (0..TENSORS).map(|_| weight.clone()).collect();
+    let s_distinct = time_best_of_5(|| {
+        let mut last = 0u8;
+        for w in &weights {
+            let out =
+                anamnesis::dequantize_fp8_to_bf16(w, &scales, ROWS, COLS, Dtype::F32).unwrap();
+            last = out[out.len() - 1];
+        }
+        last
+    });
+    eprintln!(
+        "kernel_distinct_bufs  {}  [{:.3} ms/Melem]",
+        fmt_stats(&s_distinct),
+        s_distinct[2] / melem
+    );
+
+    // (2d) one call only, to check the per-tensor cost is linear rather than
+    // degrading across repeated 33.5 MB allocate/write/free cycles.
+    let s_one = time_best_of_5(|| {
+        let out =
+            anamnesis::dequantize_fp8_to_bf16(&weight, &scales, ROWS, COLS, Dtype::F32).unwrap();
+        out[out.len() - 1]
+    });
+    eprintln!(
+        "kernel_single_call    {}  [{:.3} ms/Melem]",
+        fmt_stats(&s_one),
+        s_one[2] / (ELEMS as f64 / 1.0e6)
+    );
+
+    // (3) the allocation control: same total bytes, no kernel work at all.
+    let s_alloc = time_best_of_5(|| {
+        let mut last = 0u8;
+        for _ in 0..TENSORS {
+            let out = vec![0u8; ELEMS * 2];
+            last = out[out.len() - 1];
+        }
+        last
+    });
+    eprintln!(
+        "alloc_only_control    {}  [{:.3} ms/Melem]",
+        fmt_stats(&s_alloc),
+        s_alloc[2] / melem
+    );
+
+    // (3b) the same whole-model work, but with the input in an **owned heap
+    // buffer** instead of an mmap (`parse_bytes` vs `parse`). That is the last
+    // structural difference between the isolated arms, which read a `Vec`, and
+    // the whole-model arm, which reads a memory map.
+    {
+        let owned = anamnesis::parse_bytes(file_bytes.clone()).unwrap();
+        let s_owned = time_best_of_5(|| {
+            let bytes = owned
+                .remember_to_bytes_with_options(
+                    TargetDtype::BF16,
+                    RememberOptions::new().with_threads(1),
+                )
+                .unwrap();
+            bytes[bytes.len() - 1]
+        });
+        eprintln!(
+            "whole_model_owned_t1  {}  [{:.3} ms/Melem]",
+            fmt_stats(&s_owned),
+            s_owned[2] / melem
+        );
+    }
+
+    // (4) whole model.
+    for threads in [1usize, 4] {
+        let s = time_best_of_5(|| {
+            let bytes = model
+                .remember_to_bytes_with_options(
+                    TargetDtype::BF16,
+                    RememberOptions::new().with_threads(threads),
+                )
+                .unwrap();
+            bytes[bytes.len() - 1]
+        });
+        eprintln!(
+            "whole_model_t{threads:<9} {}  [{:.3} ms/Melem]",
+            fmt_stats(&s),
+            s[2] / melem
+        );
+    }
+}
+
 #[test]
 #[ignore = "ad-hoc benchmark; run with --release --ignored --nocapture"]
 fn bench_remember_whole_model_threaded() {

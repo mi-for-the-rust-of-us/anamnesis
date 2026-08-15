@@ -65,6 +65,7 @@ const SUBNORMAL_TABLE: [u32; 8] = [
 /// - Subnormal (exp=0): `(-1)^s × mant × 2^(-9)`
 /// - `NaN`: exp=15, mant=7 (byte `0x7F` or `0xFF`)
 #[must_use]
+#[inline]
 pub(crate) fn e4m3_to_f32_bits(byte: u8) -> u32 {
     let b = u32::from(byte);
 
@@ -114,6 +115,7 @@ pub(crate) fn e4m3_to_f32_bits(byte: u8) -> u32 {
 /// representable values, it rounds to the one with an even least
 /// significant bit.
 #[must_use]
+#[inline]
 pub(crate) fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
     // BITWISE: round-to-nearest-even for f32 → BF16
     // The rounding bias is 0x7FFF plus the LSB of the BF16 result.
@@ -136,6 +138,7 @@ pub(crate) fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
 /// this function was `e4m3_to_scaled_bf16` and fused the narrowing in, which is
 /// what made the family `BF16`-only.
 #[must_use]
+#[inline]
 fn e4m3_to_scaled_f32(byte: u8, scale: f32) -> f32 {
     let value_bits = e4m3_to_f32_bits(byte);
     f32::from_bits(value_bits) * scale
