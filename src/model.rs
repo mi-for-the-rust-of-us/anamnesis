@@ -1889,11 +1889,26 @@ mod tests {
     /// quantized weights (each a 2×2 `F8_E4M3` block with its own scalar `F32`
     /// scale) plus one `BF16` passthrough norm. Each weight carries different
     /// FP8 bytes and a different scale, so a mis-ordered parallel reassembly
-    /// would corrupt the output — making this a sharp determinism probe. With
-    /// `n_weights > 1` the multi-threaded dequant path is genuinely exercised.
+    /// would corrupt the output — making this a sharp determinism probe.
+    ///
+    /// **This size exercises the sequential path only.** At 4 bytes per weight
+    /// it is orders of magnitude below [`crate::parallel::MIN_PARALLEL_BYTES`],
+    /// so `map_indexed` never spawns no matter what thread budget is requested.
+    /// That is fine for the ordering and round-trip tests, but a determinism
+    /// test that means to prove something about the *parallel* dispatch must use
+    /// [`build_multi_fp8_fixture_sized`] and clear the threshold — see
+    /// `remember_fixture_crosses_the_parallel_threshold`.
     fn build_multi_fp8_fixture(n_weights: usize) -> Vec<u8> {
+        build_multi_fp8_fixture_sized(n_weights, 2, 2)
+    }
+
+    /// [`build_multi_fp8_fixture`] with a caller-chosen weight shape, so a test
+    /// can size the fixture off [`crate::parallel::MIN_PARALLEL_BYTES`] rather
+    /// than hope it clears it.
+    fn build_multi_fp8_fixture_sized(n_weights: usize, rows: usize, cols: usize) -> Vec<u8> {
         let mut header_map = serde_json::Map::new();
         let mut data = Vec::new();
+        let elems = rows * cols;
 
         for i in 0..n_weights {
             // Distinct FP8 payload per weight: E4M3 values 0x38 (1.0), 0x40
@@ -1901,11 +1916,11 @@ mod tests {
             // INDEX: fixed small table, index is `i % 3` in bounds.
             let fp8_byte = [0x38u8, 0x40, 0x48][i % 3];
             let w_off = data.len();
-            data.extend_from_slice(&[fp8_byte; 4]); // 2×2
+            data.extend(std::iter::repeat_n(fp8_byte, elems));
 
             let mut w_info = serde_json::Map::new();
             w_info.insert("dtype".into(), "F8_E4M3".into());
-            w_info.insert("shape".into(), serde_json::json!([2, 2]));
+            w_info.insert("shape".into(), serde_json::json!([rows, cols]));
             w_info.insert(
                 "data_offsets".into(),
                 serde_json::json!([w_off, data.len()]),
@@ -1955,9 +1970,17 @@ mod tests {
 
     /// The thread count is a performance knob, never a correctness variable:
     /// `remember_to_bytes_with_options` must produce **byte-identical** output
-    /// for every thread budget. Exercises the multi-tensor parallel dequant path
-    /// (8 distinct FP8 weights) across `n ∈ {1, 2, 4}` and asserts the serialized
-    /// bytes match the single-threaded baseline exactly.
+    /// for every thread budget, including the environment-resolved default.
+    ///
+    /// **Scope, stated precisely.** This fixture is 8 weights of 4 bytes, which
+    /// is far below [`crate::parallel::MIN_PARALLEL_BYTES`], so `map_indexed`
+    /// takes the sequential loop at every budget here. What it therefore covers
+    /// is that the *budget itself* changes nothing — option plumbing and
+    /// in-order reassembly with 8 distinct payloads. Coverage of the genuinely
+    /// threaded dispatch lives in
+    /// `remember_output_dtype_is_deterministic_across_thread_counts`, whose
+    /// fixture clears the gate on purpose. (Until Phase 7.4 this comment claimed
+    /// the parallel path; it never ran it.)
     #[test]
     fn remember_bytes_deterministic_across_thread_counts() {
         let file_bytes = build_multi_fp8_fixture(8);
@@ -1994,6 +2017,238 @@ mod tests {
             default_out, baseline,
             "default thread budget must match the single-threaded baseline"
         );
+
+        std::fs::remove_file(&tmp_in).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Caller-chosen output dtype on the `remember` path (Phase 7.4)
+    //
+    // The three tests below mirror, one for one, the trio `src/convert.rs`
+    // grew in Phase 7.3 (`convert_honours_every_output_dtype_end_to_end`,
+    // `output_dtype_changes_the_dequantised_payload_width`,
+    // `output_dtype_is_deterministic_across_thread_counts`). `remember` is a
+    // separate entry point with its own dispatch, so the guarantees are
+    // re-established here rather than assumed to carry over from `convert`.
+    // -----------------------------------------------------------------------
+
+    /// Weight count for the parallel-path fixture. Prime, and deliberately not a
+    /// multiple of any plausible thread budget, so a static equal-count split
+    /// would leave a remainder and an off-by-one in the reassembly would show.
+    const PARALLEL_FIXTURE_WEIGHTS: usize = 17;
+
+    /// Per-weight shape for the parallel-path fixture: 256 × 1024 = 256 `KiB` of
+    /// `F8_E4M3` input each, so 17 of them clear the 4 `MiB` gate with headroom.
+    const PARALLEL_FIXTURE_ROWS: usize = 256;
+    const PARALLEL_FIXTURE_COLS: usize = 1024;
+
+    /// Builds the fixture whose quantised span exceeds
+    /// [`crate::parallel::MIN_PARALLEL_BYTES`].
+    fn build_parallel_fp8_fixture() -> Vec<u8> {
+        build_multi_fp8_fixture_sized(
+            PARALLEL_FIXTURE_WEIGHTS,
+            PARALLEL_FIXTURE_ROWS,
+            PARALLEL_FIXTURE_COLS,
+        )
+    }
+
+    /// The determinism fixture must clear [`crate::parallel::MIN_PARALLEL_BYTES`],
+    /// or every thread-count assertion below runs on the sequential path and
+    /// proves nothing about the parallel dispatch.
+    ///
+    /// This is `CONVENTIONS.md` § *Verify parallelism* point 5, made executable.
+    /// It is not hypothetical here: the pre-existing `remember` determinism test
+    /// used a 4-bytes-per-weight fixture, which is ~130 000× below the gate, so
+    /// it was a green test of a code path it never entered.
+    #[test]
+    fn remember_fixture_crosses_the_parallel_threshold() {
+        // CAST: usize → u64, a compile-time fixture size of a few MiB; lossless
+        // widening on every supported target.
+        #[allow(clippy::as_conversions)]
+        let quantised_bytes =
+            (PARALLEL_FIXTURE_WEIGHTS * PARALLEL_FIXTURE_ROWS * PARALLEL_FIXTURE_COLS) as u64;
+        assert!(
+            quantised_bytes >= crate::parallel::MIN_PARALLEL_BYTES,
+            "fixture holds {quantised_bytes} B of quantised weight but \
+             MIN_PARALLEL_BYTES is {} B — the determinism tests would not \
+             exercise the parallel path",
+            crate::parallel::MIN_PARALLEL_BYTES
+        );
+
+        // And the fixture really does parse as that many quantised tensors.
+        let tmp = std::env::temp_dir().join("test_remember_parallel_threshold.safetensors");
+        std::fs::write(&tmp, build_parallel_fp8_fixture()).unwrap();
+        let model = parse(&tmp).unwrap();
+        assert_eq!(model.inspect().quantized, PARALLEL_FIXTURE_WEIGHTS);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Parses a `remember` output and returns `(tensor name -> (dtype, bytes))`.
+    ///
+    /// Reads through the public safetensors reader rather than the header
+    /// offsets, because the output contract this phase cares about is what a
+    /// *consumer* sees — the v0.6.4 meta-lesson that an orientation bug hid
+    /// behind offset-level assertions.
+    fn remember_output_tensors(bytes: &[u8]) -> Vec<(String, safetensors::Dtype, Vec<u8>)> {
+        let parsed = safetensors::SafeTensors::deserialize(bytes).unwrap();
+        let mut out: Vec<(String, safetensors::Dtype, Vec<u8>)> = parsed
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| (name, view.dtype(), view.data().to_vec()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Every supported output dtype round-trips through `remember`, and each
+    /// dequantised tensor matches the kernel called directly at that same width.
+    ///
+    /// Also pins the **passthrough policy**: the `BF16` norm is not a
+    /// dequantised tensor, so it keeps its dtype and its exact bytes no matter
+    /// what the caller asks for. That asymmetry is the single most surprising
+    /// thing about a `remember` output file, so it is asserted, not described.
+    #[test]
+    fn remember_honours_every_output_dtype_end_to_end() {
+        let file_bytes = build_multi_fp8_fixture(8);
+        let tmp_in = std::env::temp_dir().join("test_remember_dtype_end_to_end.safetensors");
+        std::fs::write(&tmp_in, &file_bytes).unwrap();
+        let model = parse(&tmp_in).unwrap();
+
+        for (target, expected_st) in [
+            (TargetDtype::BF16, safetensors::Dtype::BF16),
+            (TargetDtype::F32, safetensors::Dtype::F32),
+            (TargetDtype::F16, safetensors::Dtype::F16),
+        ] {
+            let bytes = model
+                .remember_to_bytes(target)
+                .unwrap_or_else(|e| panic!("remember at {target}: {e}"));
+
+            for (name, dtype, data) in remember_output_tensors(&bytes) {
+                if name == "norm.weight" {
+                    assert_eq!(
+                        dtype,
+                        safetensors::Dtype::BF16,
+                        "passthrough must ignore the requested {target}"
+                    );
+                    assert_eq!(data, vec![0x80, 0x3F], "passthrough bytes must be verbatim");
+                    continue;
+                }
+
+                assert_eq!(dtype, expected_st, "{name} at {target}");
+
+                // Rebuild the kernel's answer for this tensor directly. The
+                // fixture's weights are 2×2 FP8 with a per-tensor scale of
+                // `1.0 + i`, cycling the byte pattern [0x38, 0x40, 0x48].
+                let i: usize = name
+                    .strip_prefix("layer.")
+                    .and_then(|s| s.strip_suffix(".weight"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                // INDEX: fixed 3-entry table, `i % 3` is in bounds.
+                let fp8_byte = [0x38u8, 0x40, 0x48][i % 3];
+                // CAST: usize → f32, small test index; exact.
+                #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+                let scale = 1.0_f32 + i as f32;
+                let expected = match target {
+                    TargetDtype::BF16 => {
+                        crate::dequantize_per_tensor_fp8::<crate::Bf16Out>(&[fp8_byte; 4], scale)
+                    }
+                    TargetDtype::F32 => {
+                        crate::dequantize_per_tensor_fp8::<crate::F32Out>(&[fp8_byte; 4], scale)
+                    }
+                    TargetDtype::F16 => {
+                        crate::dequantize_per_tensor_fp8::<crate::F16Out>(&[fp8_byte; 4], scale)
+                    }
+                }
+                .unwrap();
+                assert_eq!(data, expected, "{name} at {target} vs the kernel directly");
+            }
+        }
+
+        std::fs::remove_file(&tmp_in).ok();
+    }
+
+    /// `F32` output really is twice the dequantised payload, and `F16` really is
+    /// the same width as `BF16`.
+    ///
+    /// A structural check that catches a whole class of plumbing mistake: if the
+    /// dtype were dropped anywhere between [`TargetDtype`] and the writer, all
+    /// three payloads would collapse to one size. It sums the **dequantised
+    /// tensors' payload bytes** rather than whole-file sizes, for the reason
+    /// `convert`'s counterpart records: the safetensors header spells each dtype
+    /// out, so `"BF16"` and `"F16"` differ by a byte per tensor and a file-size
+    /// comparison fails for a reason that has nothing to do with the claim.
+    #[test]
+    fn remember_output_dtype_changes_the_dequantised_payload_width() {
+        let file_bytes = build_multi_fp8_fixture(8);
+        let tmp_in = std::env::temp_dir().join("test_remember_dtype_width.safetensors");
+        std::fs::write(&tmp_in, &file_bytes).unwrap();
+        let model = parse(&tmp_in).unwrap();
+
+        let mut payloads = Vec::new();
+        for target in [TargetDtype::BF16, TargetDtype::F16, TargetDtype::F32] {
+            let bytes = model.remember_to_bytes(target).unwrap();
+            let dequantised: usize = remember_output_tensors(&bytes)
+                .iter()
+                .filter(|(name, _, _)| name != "norm.weight")
+                .map(|(_, _, data)| data.len())
+                .sum();
+            payloads.push(dequantised);
+        }
+
+        assert_eq!(
+            payloads[0], payloads[1],
+            "BF16 and F16 are both 2 bytes per element"
+        );
+        assert_eq!(
+            payloads[2],
+            payloads[0] * 2,
+            "F32 is exactly twice BF16: {payloads:?}"
+        );
+
+        std::fs::remove_file(&tmp_in).ok();
+    }
+
+    /// Determinism is preserved at **every** output dtype, not just the default.
+    ///
+    /// `CONVENTIONS.md` requires byte-identical output across thread counts for
+    /// every parallelised path. Phase 7.4 adds a second axis to `remember`, so
+    /// the guarantee is re-established per dtype rather than inherited from the
+    /// `BF16`-only test above.
+    ///
+    /// Uses [`build_parallel_fp8_fixture`], not the 4-byte one: below
+    /// [`crate::parallel::MIN_PARALLEL_BYTES`] no threads are spawned at any
+    /// budget, and the test would pass without ever entering the code it names.
+    #[test]
+    fn remember_output_dtype_is_deterministic_across_thread_counts() {
+        let file_bytes = build_parallel_fp8_fixture();
+        let tmp_in = std::env::temp_dir().join("test_remember_dtype_determinism.safetensors");
+        std::fs::write(&tmp_in, &file_bytes).unwrap();
+        let model = parse(&tmp_in).unwrap();
+
+        for target in [TargetDtype::BF16, TargetDtype::F32, TargetDtype::F16] {
+            let baseline = model
+                .remember_to_bytes_with_options(target, RememberOptions::new().with_threads(1))
+                .unwrap();
+
+            for n in [1usize, 2, 4] {
+                let out = model
+                    .remember_to_bytes_with_options(target, RememberOptions::new().with_threads(n))
+                    .unwrap();
+                assert_eq!(
+                    out, baseline,
+                    "{target} output must be byte-identical at {n} threads"
+                );
+            }
+
+            // The default (env-resolved) budget must agree too.
+            let default_out = model.remember_to_bytes(target).unwrap();
+            assert_eq!(
+                default_out, baseline,
+                "{target} default thread budget vs the sequential baseline"
+            );
+        }
 
         std::fs::remove_file(&tmp_in).ok();
     }

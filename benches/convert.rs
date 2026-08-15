@@ -28,6 +28,11 @@
 //! - `remember_bf16_whole_model` calls `remember_to_bytes_with_options`, which
 //!   returns a `Vec<u8>` and touches **no filesystem** — so it is the cleaner
 //!   signal of the two, and the one that tracks Phase 7's headline number.
+//! - `remember_f32_whole_model` (Phase 7.4) is the same measurement at the
+//!   wider output dtype. Both groups key `Throughput` on **input** bytes, so
+//!   the `F32` series is expected to sit below the `BF16` one by roughly the
+//!   cost of writing twice the output — that gap is the measurement, not a
+//!   regression.
 //!
 //! # Fixtures
 //!
@@ -394,9 +399,59 @@ fn bench_remember_bf16_whole_model(c: &mut Criterion) {
     group.finish();
 }
 
+/// Whole-model `FP8` → `F32` through `remember_to_bytes_with_options`, the
+/// Phase 7.4 counterpart of [`bench_remember_bf16_whole_model`].
+///
+/// **A new group, not a new id inside the `BF16` one, and never a rename.**
+/// `convert`'s F32 arm could join its existing group because that group is
+/// named for a conversion (`convert_gguf_to_safetensors`) rather than a width;
+/// this one is named `remember_bf16_whole_model`, so an `f32` id inside it
+/// would read as a contradiction. Either way the rule is the same: the `BF16`
+/// series is the baseline this phase must not regress, and renaming its group
+/// or its `threads_{n}` ids would orphan the CodSpeed history that makes the
+/// comparison possible at all.
+///
+/// **What the pair is for.** `F32` writes twice the output bytes for identical
+/// arithmetic — the kernels already compute in `f32`, and at this width the
+/// narrowing step is simply absent. On a bandwidth-bound path the honest
+/// expectation is therefore *not* parity but a widening-shaped cost, and the
+/// two groups together are what turn that from an argument into a measurement.
+/// A change that made `F32` mysteriously *cheap* would be as suspicious as one
+/// that made it slow.
+///
+/// `F16` gets no arm: it is the same 2 bytes per element as `BF16` and shares
+/// its `write_scratch` shape, so it would track the `BF16` series rather than
+/// add an axis. The width contrast is the one worth paying CI time for.
+fn bench_remember_f32_whole_model(c: &mut Criterion) {
+    let (_dir, input) = build_fp8_fixture();
+    let model = anamnesis::parse(&input).expect("parse fp8 fixture");
+    let input_bytes = std::fs::metadata(&input).expect("stat fixture").len();
+
+    let mut group = c.benchmark_group("remember_f32_whole_model");
+    // Throughput is keyed on **input** bytes, exactly as the BF16 group is, so
+    // the two series are directly comparable. Keying it on output bytes would
+    // silently normalise away the very doubling this arm exists to show.
+    group.throughput(Throughput::Bytes(input_bytes));
+    for threads in BUDGETS {
+        group.bench_function(format!("threads_{threads}"), |b| {
+            b.iter(|| {
+                let bytes = model
+                    .remember_to_bytes_with_options(
+                        TargetDtype::F32,
+                        RememberOptions::new().with_threads(black_box(threads)),
+                    )
+                    .expect("remember to bytes f32");
+                black_box(bytes);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_convert_gguf_to_safetensors,
     bench_remember_bf16_whole_model,
+    bench_remember_f32_whole_model,
 );
 criterion_main!(benches);

@@ -40,6 +40,8 @@ perf-claim change**. This file catalogs what's been tested.
 | 10 | Phase 7 SIMD exhaustion — is explicit AVX2 worth it anywhere in the dequant kernels? | **No. Bit-exact hand-written AVX2 `f32x8_to_bf16x8` gains 1.02×/1.04× (null) — writer is bandwidth-bound. FP8 already auto-AVX2 yet compute-bound; GPTQ/AWQ arithmetic already vectorizes; slowest kernels (IQ2/IQ3) are gather-bound (AVX2 gather slow on Zen 3). Compiler already captures the SIMD; limits are memory bandwidth + codebook gathers. Real headroom = multi-threading (single-threaded on 16 cores)** | SIMD exhausted with evidence, no product `unsafe` shipped (branch `phase-7-cpu-simd`); bench harness kept as proof; next = multi-threaded dequant |
 | 11 | Phase 7 multi-threaded dequant — prototype scaling (`std::thread::scope`) | **Real but bounded, ~3–4× (not core-count-linear): FP8 (memory-heavy) 2.9×, IQ3_S (compute/gather-heavy) 4.0× at 16 threads — both plateau (bandwidth + all-core-clock ceilings). Per-thread `Vec` alloc caps FP8 at 2.2×; the disjoint `split_at_mut` output pattern (no alloc, no zero-fill) recovers it to 2.9×** | Prototype (branch `phase-7-cpu-simd`) — confirms multi-threading is the real lever and that the disjoint-output-slice pattern matters; corrects an earlier "4–16×" over-estimate |
 | 13 | Phase 7.3 caller-chosen output dtype — what `F32` and `F16` cost | **A capability, not a perf claim: `F32` is *expected* to be slower and is. Kernel level 1.79× slower than `BF16` against 2.00× of output bytes, so the cost is the doubled write and nothing else. End to end 1.54×/1.61× (1/4 threads), less than the kernel figure because fixed parse cost does not scale. The Phase 7.2 threading ratio shifts 1.19× → 1.14×, as a more bandwidth-bound path should. `BF16` default did not regress (`p = 0.41`, `p = 0.13`). All three writers vectorise: `Bf16Out` 8-wide AVX2, `F32Out` 8-wide stores, `F16Out` 4-wide F16C. Peak heap equals output exactly at every width, streaming peak is 0 B** | Shipped (v0.7.3, Phase 7.3) |
+| 14 | Phase 7.4 `remember`-path output dtype — what the arithmetic/narrowing split cost, and a bench that was measuring the wrong crate | **Two findings, one of them a real production bug. (a) The isolated `tests/` bench was measuring *external-caller* codegen: making `dequantize_*_to_bf16` an `#[inline]` generic wrapper let a downstream crate instantiate the kernel locally, where four private helpers could not inline — ~2.9× slower for every downstream caller, invisible to the whole-model bench. `#[inline]` on those four helpers fixed it (1.934 → 0.672 ms/Melem). (b) Post-fix the split is a net **win**: `FP8` 2.2× faster at the kernel, 1.8× whole-model; `BnB`/`AWQ`/`GPTQ` pay an honest 1.06–1.15×. Separately: whole-program code layout alone moves a kernel timing up to **23 %** on this host, which bounds every sub-20 % per-kernel claim made on it** | Shipped (v0.7.4, Phase 7.4) |
+| 15 | Phase 7.4 `BnB` `INT8` association fix — bit-exactness at `F32` versus one packed multiply | **A correctness fix with a measured price, kept anyway. `w × (SCB/127)` and `bitsandbytes`' `(w × SCB) × (1/127)` are the same real number and the same `BF16`, but differ by 1 `ULP` on **26.9 %** of elements at `F32` — which is why 0/65536 `BF16` cross-validation never caught it. Matching the canonical association costs **16.82 → 17.48 ms** at 4096 × 11008 (1.04×, min of 10 interleaved rounds) for one extra `vmulps` per 8 lanes. Not recoverable by hoisting: `w × (SCB × c)` is a *third* association, measured **worse** (17299/65536 mismatches)** | Shipped (v0.7.4, Phase 7.4) |
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36×: the output write is ~60 % of the wall clock (Amdahl). Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 
 ---
@@ -1269,3 +1271,163 @@ path's four fused-narrowing families) is a separate tag.
 **Verdict:** shipped (v0.7.3, Phase 7.3). `F32` costs 1.79× at the kernel and 1.54–1.61×
 end to end, for output that is bit-identical to `gguf-py`'s own `f32`. Optimising it is a
 follow-up, not a gate.
+
+---
+
+## Experiment 14 — Phase 7.4 `remember`-path output dtype: the split's cost, and a bench measuring the wrong crate
+
+**Hypothesis under test:** that making the four `remember`-path kernel families
+(`FP8`, `GPTQ`, `AWQ`, `BnB`) generic over the output element — splitting each
+fused per-element loop into an arithmetic pass plus a `write_scratch` narrowing
+pass — leaves the `BF16` default path's performance essentially unchanged.
+
+**Method:** two ad-hoc benches, both release, `target-cpu=native`, binaries
+built once and run **alternately** (never A-then-B), min across rounds. Baseline
+binary at `6697599`, the commit before the phase opened.
+[`tests/bench_dequant_adhoc.rs`](../tests/bench_dequant_adhoc.rs)
+`bench_bf16_all_families` (isolated kernels) and
+`bench_remember_whole_model_threaded` (whole model, 4 × 4096² fine-grained
+`FP8` through `remember_to_bytes_with_options`).
+
+### The two benches disagreed by ~1.9×, and the disagreement was the finding
+
+The isolated bench reported the split costing ~1.06×; the whole-model bench
+reported it *gaining* 0.56×. The tell was arithmetic, not statistical: end to
+end ran at **1.003 ms/Melem** while the isolated kernel it *contains* ran at
+**1.547**. A path doing strictly more work (parse, per-tensor dispatch,
+`build_views`, `serialize`) cannot beat one of its own components.
+
+**Root cause: the ad-hoc bench in `tests/` is an *external* crate.** Before
+v0.7.4, `dequantize_fp8_to_bf16` was a plain non-generic `pub fn` — one
+lib-compiled, fully optimised symbol called opaquely from outside. v0.7.4 made
+it an `#[inline]` wrapper around `dequantize_fp8::<Bf16Out>`, so an external
+caller inlined the wrapper and instantiated the generic *in its own crate*,
+where `e4m3_to_f32_bits`, `e4m3_to_scaled_f32`, `f32_bits_to_bf16_bits` and
+`unpack_gptq` were private, non-`#[inline]` and therefore opaque cross-crate
+symbols: a function call per element. `remember` never suffered it, calling the
+generic from inside the library where everything inlines. Both benches were
+correct about different things.
+
+**This was a real production bug, not a harness artefact.** Any downstream crate
+calling `anamnesis::dequantize_*_to_bf16` would have got the un-inlined version,
+roughly **2.9× slower than v0.7.3** for the same call. Fixed by `#[inline]` on
+those four helpers (commit `d7bd7fa`):
+
+| arm | without the fix | with the fix |
+|---|---:|---:|
+| `kernel_fresh_alloc` (4 × 4096²) | 1.934 ms/Melem | **0.672** |
+| `kernel_single_call` | 2.013 | **0.731** |
+
+### The honest numbers, after the fix
+
+Isolated kernels, interleaved, min of 4:
+
+| family | before | after | ratio |
+|---|---:|---:|---:|
+| `fp8_fg` 4096 × 11008 | 65.60 ms | 29.67 | **0.452× (2.2× faster)** |
+| `fp8_fg` 4096 × 4096 | 24.50 | 10.87 | **0.444×** |
+| `bnb_nf4` | 25.26 | 26.72 | 1.058× |
+| `bnb_int8` | 15.23 | 16.78 | 1.102× |
+| `awq_int4` | 28.22 | 31.43 | 1.114× |
+| `gptq_int4` | 19.96 | 22.88 | 1.146× |
+
+Whole-model `remember`, 4 × 4096² fine-grained `FP8`:
+
+| threads | before | after | ratio |
+|---|---:|---:|---:|
+| 1 | 120.61 ms | 66.70 | 0.553× |
+| 4 | 49.93 | 38.57 | 0.772× |
+
+Mutually consistent at last: `FP8` gains 2.2× at the kernel, diluted to ~1.8×
+end to end by serialization, because the `VECTOR_TILE` restructure vectorises
+better than the per-element fused loop it replaced. The other three families pay
+a genuine **1.06–1.15×**, the honest cost of the arithmetic/narrowing split.
+
+### A second-order result worth more than the first
+
+**Whole-program code layout moves a kernel's timing by up to 23 % on this host.**
+`FP8` with byte-identical source measured 1.060× in one build and 1.308× in
+another, the only difference being that an *unrelated* module changed size
+(recorded in `66bb10b`). This bounds the precision of every per-kernel claim
+made on this machine: a sub-20 % difference cannot be attributed to the source
+that was edited without an independent control.
+
+**Method notes, learned the hard way, and binding on the next ad-hoc bench:**
+
+- Alternate the binaries. A-then-B on this host gave *inverted* results.
+- Take the **min** across rounds, not the median of one round.
+- Watch for per-iteration allocation dominating: these kernels `vec![0u8; n]` a
+  90 MB output per call, so a naive loop measures page faults as much as maths.
+- Once a public entry point becomes a thin generic wrapper, a bench in `tests/`
+  stops measuring what the library executes internally. Either mark every
+  hot-loop helper `#[inline]`, or bench through a whole-model entry point.
+
+**Verdict:** shipped (v0.7.4, Phase 7.4). The split is a net win, and the
+investigation that looked like chasing a 5 % regression surfaced a 2.9×
+downstream bug instead.
+
+---
+
+## Experiment 15 — Phase 7.4 `BnB` `INT8`: bit-exactness at `F32` versus one packed multiply
+
+**Hypothesis under test:** that anamnesis' `BnB` `INT8` dequant, validated at
+0/65536 `BF16` mismatches against `bitsandbytes` since v0.5.0, is also
+bit-exact at `F32`.
+
+**It is not, and the reason is instructive.** anamnesis hoisted a per-row scale
+and computed `w × (SCB / 127)`. `bitsandbytes`' `int8_vectorwise_dequant` is
+`A * stats.view(-1, 1) * 7.874015718698502e-3` — the same real number, a
+different `f32` evaluation. Measured on the committed `llama_1b_int8` fixture:
+
+| comparison | mismatches vs the canonical `f32` output |
+|---|---:|
+| `(w × SCB) × c` — `bitsandbytes`' own association | **0 / 65536** |
+| `w × (SCB × c)` — the obvious hoist | 17299 / 65536 |
+| `w × (SCB / 127)` — what anamnesis shipped | **17610 / 65536 (26.9 %)** |
+
+Every mismatch was exactly **1 `ULP`**, and every one vanished on narrowing to
+`BF16` — which is precisely why five releases of `BF16` cross-validation never
+saw it. The constant is *not* the variable: `f32(7.874015718698502e-3)` and
+`f32(1.0 / 127.0)` are the same bits (`0x3C01_0204`), now asserted at compile
+time in `src/remember/bnb.rs`. Only the association matters.
+
+**The fix costs one multiply per element** — the reciprocal can no longer be
+folded into a per-row scale, because folding it *is* the rejected
+`w × (SCB × c)` association. Measured with the interleaved protocol from
+Experiment 14, `bench_bf16_all_families` `bnb_int8` at 4096 × 11008, min over
+**10** interleaved before/after rounds (the box was noisy enough that two rounds
+were visibly contaminated — 37.8 ms and 44.9 ms against a ~17 ms floor — so the
+min is the only defensible statistic):
+
+| variant | min over 10 rounds |
+|---|---:|
+| `w × (SCB / 127)` (v0.7.3) | **16.82 ms** |
+| `(w × SCB) × INV_127` (v0.7.4) | **17.48 ms** |
+
+**1.04× slower**, i.e. +0.66 ms. Confirmed in the disassembly as exactly what
+was intended: all three monomorphisations dump 6 `vpmovsxbd`, 6 `vcvtdq2ps` and
+**12 `vmulps`** — two packed multiplies per sign-extending load — with no
+`vdivps`/`vdivss` anywhere, so the v0.7.3 per-row *division* is gone rather than
+merely relocated. The ratio also flatters the arithmetic: the kernel allocates a
+90 MB output inside the timed region, so page-fault cost sits in the denominator
+(see Experiment 14's method notes). The trustworthy figure is the absolute
++0.66 ms.
+
+**Why it shipped despite a measured slowdown.** `CLAUDE.md` scopes the "no
+measured win, no commit" rule to *perf-claim* commits;
+`feedback-capability-before-speed` records that a measured slowdown does not
+block a correctness feature. This is a correctness fix: it makes the kernel
+bit-exact against the canonical library at every output width, and no `BF16`
+output byte changed (all 7 `BnB` fixtures still report 0 mismatches).
+
+**Do not re-propose** hoisting `SCB × INV_127` per row to recover the 4 %. It is
+the middle row of the table above, and it is measurably worse than the bug it
+would be trying to optimise.
+
+**Verdict:** shipped (v0.7.4, Phase 7.4). The generalisable lesson is the one
+this file exists for: **exactness at a narrow output width does not imply
+exactness at a wide one.** A `BF16` comparison discards 16 mantissa bits, and on
+these fixtures 38–98 % of values carry bits it cannot show (the low end is the
+`BnB` `FP4` pair at 38.4 % / 43.9 %, whose 16-entry codebook lands on
+`BF16`-representable values more often; `GPTQ`, `AWQ` and `BnB` `NF4` all sit
+above 77 %). Every family's `F32` golden in Phase 7.4 exists because of that.
