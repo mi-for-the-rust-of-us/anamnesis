@@ -9,14 +9,14 @@
 //! # Output width
 //!
 //! Since v0.7.4 the three entry points are generic over
-//! [`OutputElement`](crate::OutputElement): `Bf16Out` (the default and the only
+//! [`OutputElement`]: `Bf16Out` (the default and the only
 //! width before v0.7.4), `F32Out` (no narrowing step at all, so the emitted
 //! value *is* the one the kernel computed) and `F16Out`. The `*_to_bf16` names
 //! remain as `#[inline]` `Bf16Out` wrappers, so no existing caller changes.
 //!
 //! The narrowing is **not** fused into the arithmetic. Each entry point tiles
 //! its work into `BLOCK_SIZE`-element runs through a stack `f32` scratch
-//! ([`fp8_run_to_output`]) and hands the scratch to
+//! (`fp8_run_to_output`) and hands the scratch to
 //! [`OutputElement::write_scratch`], which is where every output width in this
 //! crate is produced. That keeps the kernel arithmetic identical across output
 //! types and gives each width one loop to verify rather than three per family.

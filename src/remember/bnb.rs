@@ -9,7 +9,7 @@
 //!
 //! Since v0.7.4 [`dequantize_bnb4`], `dequantize_bnb4_double_quant` and
 //! [`dequantize_bnb_int8`] are generic over
-//! [`OutputElement`](crate::OutputElement); the `*_to_bf16` names remain as
+//! [`OutputElement`]; the `*_to_bf16` names remain as
 //! `Bf16Out` wrappers. Both kernels end in
 //! [`OutputElement::write_scratch`]: the `NF4`/`FP4` path already had an `f32`
 //! block scratch and simply stopped narrowing inside pass 2, and the `INT8`

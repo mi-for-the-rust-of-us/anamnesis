@@ -9,7 +9,7 @@
 //! # Output width
 //!
 //! Since v0.7.4 [`dequantize_gptq`] is generic over
-//! [`OutputElement`](crate::OutputElement); `dequantize_gptq_to_bf16` remains as
+//! [`OutputElement`]; `dequantize_gptq_to_bf16` remains as
 //! the `Bf16Out` wrapper. The kernel is a three-pass loop fission: unpack the
 //! packed `I32` row into `f32`, apply `(q - zero) × scale` into a second `f32`
 //! scratch, then hand that scratch to [`OutputElement::write_scratch`]. Before

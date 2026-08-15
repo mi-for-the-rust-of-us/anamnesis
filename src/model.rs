@@ -28,7 +28,7 @@ use std::str::FromStr;
 use crate::ParseLimits;
 use crate::backing::Backing;
 use crate::error::AnamnesisError;
-use crate::inspect::InspectInfo;
+use crate::inspect::{InspectInfo, InspectOptions};
 use crate::parse::safetensors::{
     Dtype, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
     parse_safetensors_header_with_limits,
@@ -96,7 +96,7 @@ pub enum TargetDtype {
     /// `BF16` shares `f32`'s range, while `F16` saturates at 65504 and flushes
     /// to zero below about `2⁻²⁴`. Out-of-range values follow plain IEEE
     /// semantics (infinity, flush-to-zero), never saturation — see
-    /// [`F16Out`](crate::F16Out) for why.
+    /// [`F16Out`] for why.
     F16,
 }
 
@@ -477,12 +477,41 @@ impl RememberOptions {
 }
 
 impl ParsedModel {
-    /// Returns inspection info (format, tensor counts, size estimates).
+    /// Returns inspection info (format, tensor counts, size estimates), sizing
+    /// the dequantised estimate for the default `BF16` output.
     ///
-    /// Delegates to [`InspectInfo::from`]. No I/O — purely derived from
-    /// the parsed header.
+    /// The [`InspectOptions::default`] special case of
+    /// [`inspect_with_options`](Self::inspect_with_options), mirroring how
+    /// [`remember`](Self::remember) relates to
+    /// [`remember_with_options`](Self::remember_with_options). No I/O — purely
+    /// derived from the parsed header.
     pub fn inspect(&self) -> InspectInfo {
-        InspectInfo::from(&self.header)
+        self.inspect_with_options(InspectOptions::new())
+    }
+
+    /// Returns inspection info with a caller-supplied [`InspectOptions`].
+    ///
+    /// The reason to reach for this over [`inspect`](Self::inspect) is
+    /// [`InspectInfo::dequantized_size`], which feeds the inspect-before-parse
+    /// policy gate. That figure is only meaningful against a specific output
+    /// width, so a caller who intends `remember(.., TargetDtype::F32)` should
+    /// ask for the `F32` estimate rather than doubling the `BF16` one by hand:
+    ///
+    /// ```rust,no_run
+    /// use anamnesis::{InspectOptions, TargetDtype, parse};
+    ///
+    /// let model = parse("model-fp8.safetensors")?;
+    /// let info = model.inspect_with_options(
+    ///     InspectOptions::new().with_output_dtype(TargetDtype::F32),
+    /// );
+    /// // `info.dequantized_size` now sizes an F32 request, and
+    /// // `info.output_dtype` records which width it assumed.
+    /// # Ok::<(), anamnesis::AnamnesisError>(())
+    /// ```
+    ///
+    /// No I/O — purely derived from the parsed header.
+    pub fn inspect_with_options(&self, options: InspectOptions) -> InspectInfo {
+        InspectInfo::with_options(&self.header, options)
     }
 
     /// Returns the raw bytes for a tensor from the memory-mapped file

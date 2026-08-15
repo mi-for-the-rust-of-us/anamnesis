@@ -2,13 +2,77 @@
 
 use std::fmt;
 
+use crate::model::TargetDtype;
 use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRole};
+
+/// Caller-supplied options for [`ParsedModel::inspect_with_options`](crate::ParsedModel::inspect_with_options).
+///
+/// Currently carries only the output dtype the size estimate should assume; the
+/// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
+/// change. Construct with [`InspectOptions::new`] (or
+/// [`InspectOptions::default`], which is identical) and chain the setters:
+///
+/// ```rust
+/// use anamnesis::{InspectOptions, TargetDtype};
+///
+/// let opts = InspectOptions::new().with_output_dtype(TargetDtype::F32);
+/// assert_eq!(opts.output_dtype, TargetDtype::F32);
+/// ```
+///
+/// The builder shape deliberately mirrors
+/// [`RememberOptions`](crate::RememberOptions) and
+/// [`ConvertOptions`](crate::ConvertOptions): one spelling for one concept
+/// across the three option types.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectOptions {
+    /// Output dtype the dequantised-size estimate assumes.
+    ///
+    /// Defaults to [`TargetDtype::BF16`], matching
+    /// [`ParsedModel::remember`](crate::ParsedModel::remember)'s own default,
+    /// so `inspect()` and an unqualified `remember()` always agree.
+    pub output_dtype: TargetDtype,
+}
+
+impl InspectOptions {
+    /// Returns options with the built-in defaults (a `BF16` size estimate).
+    ///
+    /// `const`: the struct is a single `Copy` enum, so there is nothing to
+    /// allocate.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            output_dtype: TargetDtype::BF16,
+        }
+    }
+
+    /// Sets the output dtype the dequantised-size estimate assumes.
+    #[must_use]
+    pub const fn with_output_dtype(mut self, dtype: TargetDtype) -> Self {
+        self.output_dtype = dtype;
+        self
+    }
+}
+
+impl Default for InspectOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Summary information produced by inspecting a parsed `.safetensors` file.
 ///
 /// Built on [`SafetensorsHeader`] — no file I/O, no re-read. All fields are
 /// derived from the parsed header metadata.
+///
+/// `#[non_exhaustive]` since v0.7.4: the Python bindings freeze this shape in
+/// Phase 8, and a struct whose fields are all `pub` cannot otherwise gain one
+/// without a breaking change. Construct it through
+/// [`ParsedModel::inspect`](crate::ParsedModel::inspect) or
+/// [`ParsedModel::inspect_with_options`](crate::ParsedModel::inspect_with_options)
+/// rather than a literal.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct InspectInfo {
     /// Detected quantization scheme (e.g., `FineGrainedFp8`, `PerTensorFp8`).
@@ -31,23 +95,35 @@ pub struct InspectInfo {
     pub nested_scales: usize,
     /// Total tensor data size in bytes (as stored in the file).
     pub current_size: u64,
-    /// Estimated tensor data size in bytes after dequantization to `BF16`.
-    pub dequantized_size: u64,
-}
-
-impl InspectInfo {
-    /// Returns the number of bytes of precision that Lethe took
-    /// (difference between dequantized and current size).
+    /// Estimated tensor data size in bytes after dequantization to
+    /// [`output_dtype`](Self::output_dtype).
     ///
-    /// Zero when the model is unquantized.
-    #[must_use]
-    pub fn lethe_took(&self) -> u64 {
-        self.dequantized_size.saturating_sub(self.current_size)
-    }
+    /// Feeds the inspect-before-parse policy gate, so it has to track the width
+    /// the caller will actually request: at `F32` the figure is double the
+    /// `BF16` one for the dequantised share, while passthrough tensors keep
+    /// their source dtype and contribute the same bytes either way.
+    pub dequantized_size: u64,
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// `BF16` unless the caller asked otherwise via
+    /// [`InspectOptions::with_output_dtype`]. Recorded on the struct so a
+    /// figure can never be read without the width it was computed for.
+    pub output_dtype: TargetDtype,
 }
 
 impl From<&SafetensorsHeader> for InspectInfo {
+    /// The `BF16` special case of `InspectInfo::with_options`, preserved so
+    /// every pre-v0.7.4 caller compiles unchanged.
     fn from(header: &SafetensorsHeader) -> Self {
+        Self::with_options(header, InspectOptions::new())
+    }
+}
+
+impl InspectInfo {
+    /// Builds the summary, sizing [`dequantized_size`](Self::dequantized_size)
+    /// for `options.output_dtype`.
+    pub(crate) fn with_options(header: &SafetensorsHeader, options: InspectOptions) -> Self {
+        let out_bytes = u64::try_from(options.output_dtype.byte_size()).unwrap_or(2);
         let quantized = header.quantized_count();
         let scales = header.scale_count();
         let passthrough = header.passthrough_count();
@@ -74,18 +150,22 @@ impl From<&SafetensorsHeader> for InspectInfo {
 
             match entry.role {
                 TensorRole::Quantized => {
-                    // BnB NF4/FP4: each U8 byte packs 2 values → 2 BF16 = 4 bytes output.
-                    // All other schemes: 1 element → 1 BF16 = 2 bytes output.
+                    // BnB NF4/FP4: each U8 byte packs 2 values, so the element
+                    // count is 2 × byte_len. Every other scheme is 1 element per
+                    // stored element. Both then multiply by the *requested*
+                    // output width rather than a hard-coded 2 — the v0.7.4
+                    // change, without which `--to f32` would under-report this
+                    // estimate by exactly 2× in the one place whose whole job is
+                    // telling a caller how big the result will be.
                     // CAST: usize → u64, element count fits in u64 for any realistic model
                     #[allow(clippy::as_conversions)]
-                    let deq_bytes =
+                    let out_elements =
                         if header.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
-                            // 2 NF4/FP4 values per byte → output is byte_len * 2 * 2
-                            entry.byte_len() as u64 * 4
+                            entry.byte_len() as u64 * 2
                         } else {
-                            entry.num_elements() as u64 * 2
+                            entry.num_elements() as u64
                         };
-                    dequantized_size += deq_bytes;
+                    dequantized_size += out_elements * out_bytes;
                 }
                 TensorRole::Scale
                 | TensorRole::ZeroPoint
@@ -115,7 +195,17 @@ impl From<&SafetensorsHeader> for InspectInfo {
             nested_scales,
             current_size,
             dequantized_size,
+            output_dtype: options.output_dtype,
         }
+    }
+
+    /// Returns the number of bytes of precision that Lethe took
+    /// (difference between dequantized and current size).
+    ///
+    /// Zero when the model is unquantized.
+    #[must_use]
+    pub const fn lethe_took(&self) -> u64 {
+        self.dequantized_size.saturating_sub(self.current_size)
     }
 }
 
@@ -381,6 +471,100 @@ mod tests {
         assert_eq!(info.dequantized_size, 2_097_152 + 2048);
     }
 
+    // -- Dtype-aware size estimate (v0.7.4) ----------------------------------
+
+    /// Builds the fine-grained `FP8` header the estimate tests share.
+    fn fp8_header() -> SafetensorsHeader {
+        SafetensorsHeader {
+            tensors: vec![
+                make_entry(
+                    "layer.weight",
+                    Dtype::F8E4M3,
+                    TensorRole::Quantized,
+                    &[2048, 2048],
+                ),
+                make_entry(
+                    "layer.weight_scale_inv",
+                    Dtype::F32,
+                    TensorRole::Scale,
+                    &[16, 16],
+                ),
+                make_entry("norm.weight", Dtype::BF16, TensorRole::Passthrough, &[2048]),
+            ],
+            scheme: QuantScheme::FineGrainedFp8,
+            metadata: None,
+            header_size: 0,
+            gptq_config: None,
+            awq_config: None,
+            bnb_config: None,
+        }
+    }
+
+    /// The estimate must scale with the requested width for the **dequantised**
+    /// share, and leave the passthrough share alone. Getting this wrong is a 2×
+    /// under-report in the one figure whose entire job is telling a caller how
+    /// big the result will be.
+    #[test]
+    fn dequantized_size_scales_with_output_dtype() {
+        let header = fp8_header();
+        let quantized_elements: u64 = 2048 * 2048;
+        let passthrough_bytes: u64 = 2048 * 2; // BF16 norm, copied as-is
+
+        for (target, width) in [
+            (TargetDtype::BF16, 2_u64),
+            (TargetDtype::F16, 2),
+            (TargetDtype::F32, 4),
+        ] {
+            let info =
+                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            assert_eq!(
+                info.dequantized_size,
+                quantized_elements * width + passthrough_bytes,
+                "{target}: dequantised share must be {width} B/element and the \
+                 passthrough share must not move"
+            );
+            assert_eq!(info.output_dtype, target, "{target}: width not recorded");
+        }
+    }
+
+    /// `inspect()` and `inspect_with_options(default)` must agree, so the
+    /// no-argument call keeps meaning exactly what `remember` defaults to.
+    #[test]
+    fn default_options_match_the_bare_from_impl() {
+        let header = fp8_header();
+        let bare = InspectInfo::from(&header);
+        let explicit = InspectInfo::with_options(&header, InspectOptions::new());
+        assert_eq!(bare.dequantized_size, explicit.dequantized_size);
+        assert_eq!(bare.output_dtype, TargetDtype::BF16);
+    }
+
+    /// `BnB4` packs two values per stored byte, so its element count is
+    /// `2 × byte_len` rather than `num_elements`. That factor must survive the
+    /// v0.7.4 rewrite independently of the width multiplier.
+    #[test]
+    fn bnb4_keeps_its_two_values_per_byte_factor() {
+        let header = SafetensorsHeader {
+            tensors: vec![make_entry(
+                "layer.weight",
+                Dtype::U8,
+                TensorRole::Quantized,
+                &[1024, 1],
+            )],
+            scheme: QuantScheme::Bnb4,
+            metadata: None,
+            header_size: 0,
+            gptq_config: None,
+            awq_config: None,
+            bnb_config: None,
+        };
+        // 1024 stored bytes -> 2048 values.
+        for (target, want) in [(TargetDtype::BF16, 2048 * 2), (TargetDtype::F32, 2048 * 4)] {
+            let info =
+                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            assert_eq!(info.dequantized_size, want, "{target}");
+        }
+    }
+
     // -- Display output ------------------------------------------------------
 
     #[test]
@@ -397,6 +581,7 @@ mod tests {
             nested_scales: 0,
             current_size: 4_672 * 1024 * 1024,
             dequantized_size: 8_269 * 1024 * 1024,
+            output_dtype: TargetDtype::BF16,
         };
         let output = info.to_string();
 
@@ -421,6 +606,7 @@ mod tests {
             nested_scales: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
+            output_dtype: TargetDtype::BF16,
         };
         let output = info.to_string();
 
@@ -444,6 +630,7 @@ mod tests {
             nested_scales: 0,
             current_size: 1_310 * 1024 * 1024,
             dequantized_size: 2_580 * 1024 * 1024,
+            output_dtype: TargetDtype::BF16,
         };
         let output = info.to_string();
 
@@ -465,6 +652,7 @@ mod tests {
             nested_scales: 0,
             current_size: 1024 * 1024 * 1024,
             dequantized_size: 1024 * 1024 * 1024,
+            output_dtype: TargetDtype::BF16,
         };
         let output = info.to_string();
 

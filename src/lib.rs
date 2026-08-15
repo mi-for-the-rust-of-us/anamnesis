@@ -430,7 +430,7 @@ pub mod remember;
 
 pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
 pub use error::{AnamnesisError, Result};
-pub use inspect::{InspectInfo, format_bytes};
+pub use inspect::{InspectInfo, InspectOptions, format_bytes};
 #[cfg(feature = "bnb")]
 pub use lethe::{
     BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE, NF4_CODEBOOK, classify_inputs,
