@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use crate::convert::{ConvertOptions, ConvertTarget, Format, detect_format};
-use crate::{InspectInfo, TargetDtype, format_bytes, parse};
+use crate::{InspectInfo, InspectOptions, TargetDtype, format_bytes, parse};
 
 /// Parse any format, recover any precision.
 #[derive(Parser)]
@@ -494,7 +494,15 @@ fn run_remember_safetensors(
     let target: TargetDtype = to.parse()?;
 
     let model = parse(path)?;
-    let info = InspectInfo::from(&model.header);
+    // Size the estimate at the width the caller actually asked for. `From` is
+    // the `BF16` default, so using it here made `--to f32` report the `BF16`
+    // figure: the summary line claimed 144 B beside a file holding 272 B of
+    // payload. `InspectOptions` exists precisely so a size can be computed for
+    // a stated width, and this is its most obvious consumer.
+    let info = InspectInfo::with_options(
+        &model.header,
+        InspectOptions::new().with_output_dtype(target),
+    );
 
     let total = model.header.tensors.len();
     let quantized = model.header.quantized_count();

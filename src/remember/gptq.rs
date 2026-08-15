@@ -492,9 +492,21 @@ pub fn dequantize_gptq<E: OutputElement>(
                 })?;
 
         // --- Unpack qweight row into contiguous f32 values ---
-        // Separates byte→u32 extraction (hard to vectorize) from the
-        // arithmetic (easy to vectorize). The compiler auto-vectorizes
-        // the second loop: pure f32 sub+mul+convert pipeline.
+        // Separates byte→u32 extraction from the arithmetic, so each pass has a
+        // uniform data flow the compiler can vectorise independently.
+        //
+        // VECTORIZED: confirmed AVX2 `vmovdqu` + `vpsrld`/`vpand` + `vcvtdq2ps`
+        // + `vmovups` on %ymm in `cargo asm --rust`, x86-64 target-cpu=native,
+        // opt-level=3, attributed per source line: 4 packed loads, 4 packed
+        // int→float converts and 4 packed stores, with a single scalar
+        // `vcvtsi2ss`/`vmovss` pair left for the ragged tail.
+        //
+        // This corrects a claim that stood here until v0.7.4 ("byte→u32
+        // extraction (hard to vectorize)"). It is the *sequential* store index
+        // `j` that lets this pass vectorise; `AWQ`'s twin loop writes through
+        // the `AWQ_ORDER` permutation instead and is a genuine scalar fallback,
+        // annotated as such at its own site. The two kernels are twins from
+        // pass 2 onward, not before it.
         // INDEX: unpacked_buf.len() == out_features, allocated before the outer loop
         let unpacked_row =
             unpacked_buf

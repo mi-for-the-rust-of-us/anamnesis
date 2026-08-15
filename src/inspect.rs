@@ -272,11 +272,19 @@ impl fmt::Display for InspectInfo {
             | QuantScheme::PerChannelFp8
             | QuantScheme::PerTensorFp8 => "FP8",
         };
+        // The width label is read off `output_dtype`, never hard-coded. Until
+        // v0.7.4 this printed a literal `(BF16)`, which was correct only while
+        // `BF16` was the sole possible answer; once `InspectOptions` could ask
+        // for an `F32` estimate, the same line rendered a doubled figure under a
+        // `BF16` label. That is the failure mode `output_dtype` exists to make
+        // impossible, and it is worse than an unlabelled number rather than
+        // merely unhelpful.
         write!(
             f,
-            "\nSize:        {} ({scheme_label}) -> {} (BF16)",
+            "\nSize:        {} ({scheme_label}) -> {} ({})",
             format_bytes(self.current_size),
             format_bytes(self.dequantized_size),
+            self.output_dtype,
         )?;
 
         if self.format != QuantScheme::Unquantized {
@@ -566,6 +574,58 @@ mod tests {
     }
 
     // -- Display output ------------------------------------------------------
+
+    /// The rendered size line names the width the estimate was computed for.
+    ///
+    /// Regression guard for a real defect this phase introduced and then fixed.
+    /// `dequantized_size` became dtype-aware in v0.7.4 while `Display` still
+    /// printed a literal `(BF16)`, so asking for the `F32` estimate rendered a
+    /// doubled figure under a `BF16` label. `output_dtype` is carried on the
+    /// struct precisely so that cannot happen, which only helps if the renderer
+    /// actually reads it.
+    #[test]
+    fn display_size_line_names_the_dtype_it_assumed() {
+        for (target, label, want_bytes) in [
+            (TargetDtype::BF16, "(BF16)", 2_048_u64),
+            (TargetDtype::F32, "(F32)", 4_096),
+            (TargetDtype::F16, "(F16)", 2_048),
+        ] {
+            let header = SafetensorsHeader {
+                tensors: vec![make_entry(
+                    "layer.weight",
+                    Dtype::F8E4M3,
+                    TensorRole::Quantized,
+                    &[32, 32],
+                )],
+                scheme: QuantScheme::PerTensorFp8,
+                metadata: None,
+                header_size: 0,
+                gptq_config: None,
+                awq_config: None,
+                bnb_config: None,
+            };
+            let info =
+                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+
+            assert_eq!(info.output_dtype, target);
+            assert_eq!(info.dequantized_size, want_bytes, "{target}");
+
+            let rendered = info.to_string();
+            assert!(
+                rendered.contains(label),
+                "{target}: size line must carry {label}, got:\n{rendered}"
+            );
+            // And must not carry a *different* width's label.
+            for other in ["(BF16)", "(F32)", "(F16)"] {
+                if other != label {
+                    assert!(
+                        !rendered.contains(other),
+                        "{target}: size line must not claim {other}, got:\n{rendered}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn display_per_tensor_fp8() {

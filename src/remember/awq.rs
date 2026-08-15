@@ -424,6 +424,18 @@ pub fn dequantize_awq<E: OutputElement>(
         // AWQ packs along out_features: each I32 contains pack_factor output
         // features in the AutoAWQ interleave — the nibble at bit position
         // 4 × pos belongs at logical column offset AWQ_ORDER[pos].
+        //
+        // VECTORIZED: scalar fallback — Pass-1 of fission, and specifically the
+        // one place this kernel is NOT `GPTQ`'s twin. The store index carries
+        // the `AWQ_ORDER` permutation, so the writes are a scatter the compiler
+        // cannot pack. Confirmed per source line in `cargo asm --rust`, x86-64
+        // target-cpu=native, opt-level=3: the `qw as f32` line emits 6 scalar
+        // `vcvtsi2ss` against a single packed `vcvtdq2ps`, and the store line
+        // emits 6 scalar `vmovss`. `GPTQ`'s otherwise-identical pass 1 stores to
+        // a sequential `j` and therefore *does* vectorise (4 × `vcvtdq2ps`,
+        // 4 × `vmovups`) — the interleave is the whole difference, so do not
+        // "fix" this by copying that annotation across. Pass 2 below is where
+        // both kernels converge and vectorise alike.
         #[allow(clippy::indexing_slicing)]
         for (packed_col, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
             // INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk

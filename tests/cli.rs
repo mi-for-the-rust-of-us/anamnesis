@@ -288,6 +288,50 @@ fn cli_remember_honours_every_output_dtype() {
     }
 }
 
+/// The size the summary line reports must be the size of the file it just
+/// wrote, at the width the caller asked for.
+///
+/// Regression guard for a defect found by running the documented command rather
+/// than by reading the code: `run_remember_safetensors` built its `InspectInfo`
+/// with `From<&SafetensorsHeader>`, which is hard-wired to the `BF16` default,
+/// so `--to f32` printed the `BF16` estimate. The file was correct; only the
+/// number beside it was wrong, which is the more insidious of the two.
+///
+/// The expected figures are arithmetic, not golden: the fixture holds 4
+/// dequantised `FP8` elements plus a 1-element `BF16` passthrough norm, so the
+/// estimate is `4 × E::BYTES + 2`. The `F32` line must therefore differ from
+/// the `BF16` one, which is precisely what the bug prevented.
+#[test]
+fn cli_remember_reports_the_size_of_the_dtype_it_wrote() {
+    for (flag, want) in [("bf16", "10 B"), ("f32", "18 B"), ("f16", "10 B")] {
+        let (dir, fixture) = create_test_fixture();
+        let output_path = dir.path().join(format!("sized-{flag}.safetensors"));
+
+        let output = Command::new(binary_path())
+            .args([
+                "remember",
+                fixture.to_str().unwrap(),
+                "--to",
+                flag,
+                "--output",
+                output_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("failed to run binary");
+        assert!(output.status.success(), "remember --to {flag} failed");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let summary = stdout
+            .lines()
+            .find(|l| l.starts_with("Output:"))
+            .unwrap_or_else(|| panic!("--to {flag}: no `Output:` line in\n{stdout}"));
+        assert!(
+            summary.contains(&format!("({want})")),
+            "--to {flag}: summary must report {want}, got `{summary}`"
+        );
+    }
+}
+
 /// The dtype must also reach the derived filename, since `derive_output_path`
 /// builds the suffix from `TargetDtype`'s `Display`. A silent `-bf16` suffix on
 /// an `F32` file would be exactly the failure v0.7.3's design note warned about.
