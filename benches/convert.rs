@@ -419,6 +419,23 @@ fn bench_remember_bf16_whole_model(c: &mut Criterion) {
 /// A change that made `F32` mysteriously *cheap* would be as suspicious as one
 /// that made it slow.
 ///
+/// **And the measurement immediately corrected the expectation.** "A
+/// widening-shaped cost" (~2×) holds only single-threaded. The first CodSpeed
+/// walltime run of this pair, on macro runners:
+///
+/// | | `BF16` | `F32` | ratio |
+/// |---|---:|---:|---:|
+/// | `threads_1` | 78.17 ms | 165.44 ms | 2.12× |
+/// | `threads_4` | 20.83 ms | 81.60 ms | **3.92×** |
+///
+/// `F32` scales to 4 threads at **2.03×** where `BF16` reaches **3.75×**:
+/// writing twice the bytes saturates memory bandwidth sooner, so threading buys
+/// roughly half as much. Quoting the ~2× output-byte ratio as the expected
+/// *time* cost is therefore wrong above one thread, and the gap widens with the
+/// thread budget rather than staying constant. This is precisely the effect the
+/// `walltime` instrument exists to catch and a CPU-simulation instrument would
+/// have missed.
+///
 /// `F16` gets no arm: it is the same 2 bytes per element as `BF16` and shares
 /// its `write_scratch` shape, so it would track the `BF16` series rather than
 /// add an axis. The width contrast is the one worth paying CI time for.

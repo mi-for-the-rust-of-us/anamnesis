@@ -1431,3 +1431,51 @@ these fixtures 38–98 % of values carry bits it cannot show (the low end is the
 `BnB` `FP4` pair at 38.4 % / 43.9 %, whose 16-entry codebook lands on
 `BF16`-representable values more often; `GPTQ`, `AWQ` and `BnB` `NF4` all sit
 above 77 %). Every family's `F32` golden in Phase 7.4 exists because of that.
+
+### Postscript — the first CodSpeed data point, and what it corrected
+
+Experiments 14 and 15 were measured locally with the interleaved best-of-N
+protocol. The branch was never pushed while the work was in progress, so
+CodSpeed saw none of it until the v0.7.4 merge landed on `main`. Its first run
+is worth recording, for two reasons.
+
+**It confirmed the `BF16` result on independent hardware.** CodSpeed walltime,
+macro runners, `remember_bf16_whole_model`:
+
+| | v0.7.3 | v0.7.4 | change |
+|---|---:|---:|---:|
+| `threads_1` | 81.353 ms | **78.173 ms** | −3.9 % |
+| `threads_4` | 21.207 ms | **20.827 ms** | −1.8 % |
+
+The default path did not regress; it improved slightly. `convert_gguf_to_safetensors`,
+which Phase 7.4 never touched, serves as the control and moved **under 0.05 %**
+across the same two runs (167.54 → 167.60 ms; f32 315.43 → 315.36 ms). An
+untouched series flat to 0.05 % while a touched one moves 3.9 % is what makes
+the latter signal rather than drift.
+
+**It corrected a claim this file's own Experiment 13 invites.** That entry
+reports `F32` costing 1.79× at the kernel against 2.00× of output bytes, and
+concludes "the cost is the doubled write and nothing else". True at one thread.
+The new `remember_f32_whole_model` arm shows it does not survive threading:
+
+| | `BF16` | `F32` | `F32`/`BF16` |
+|---|---:|---:|---:|
+| `threads_1` | 78.17 ms | 165.44 ms | 2.12× |
+| `threads_4` | 20.83 ms | 81.60 ms | **3.92×** |
+
+`F32` scales to 4 threads at **2.03×** where `BF16` reaches **3.75×**. Twice the
+output bytes saturates memory bandwidth sooner, so the thread budget buys about
+half as much, and the `F32` penalty *grows* with thread count instead of holding
+at the output-byte ratio. **Do not quote 2× as the expected wall-clock cost of
+`F32` above one thread**, and do not quote Phase 7.2's threading ratios for it
+either, for the same reason Experiment 13 already warned about at `GGUF`.
+
+Two method notes worth carrying forward:
+
+- The local ad-hoc benches never produced this. Whole-model `remember` at `F32`
+  was never measured locally, only the kernels and the `BF16` whole-model path.
+  A gap in a bench suite is invisible until something else fills it.
+- This is the effect the `walltime` instrument exists for. A CPU-simulation
+  instrument counts work, not stalls, so it would have reported `F32` at roughly
+  its instruction ratio and missed the bandwidth ceiling entirely — the same
+  failure mode `codspeed.yml`'s header warns about for Experiment 10.
