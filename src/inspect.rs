@@ -142,11 +142,23 @@ impl InspectInfo {
         let mut current_size: u64 = 0;
         let mut dequantized_size: u64 = 0;
 
+        // All accumulation here is `saturating_*`, not raw `+`/`*`. Both
+        // `byte_len` and `num_elements` derive from a header-declared shape and
+        // already saturate to `usize::MAX` on overflow; feeding those into a raw
+        // `out_elements * out_bytes` (up to ×4 at F32) and a running `+=` could
+        // exceed `u64::MAX` — a debug-build panic and a silent release wrap of
+        // the very figure the inspect-before-parse gate reads. `SafetensorsHeader`
+        // has public fields and is not `#[non_exhaustive]`, so a caller can hand
+        // us such a header directly, bypassing the upstream `safetensors`
+        // validation that guards the file-parse fronts. Saturating keeps this in
+        // line with the crate-wide "checked/saturating on every header-derived
+        // value" invariant and, on an absurd shape, yields `u64::MAX` — which the
+        // policy gate reads as "too big", the fail-closed direction.
         for entry in &header.tensors {
             // CAST: usize → u64, byte lengths fit in u64 for any realistic model
             #[allow(clippy::as_conversions)]
             let byte_len = entry.byte_len() as u64;
-            current_size += byte_len;
+            current_size = current_size.saturating_add(byte_len);
 
             match entry.role {
                 TensorRole::Quantized => {
@@ -161,11 +173,12 @@ impl InspectInfo {
                     #[allow(clippy::as_conversions)]
                     let out_elements =
                         if header.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
-                            entry.byte_len() as u64 * 2
+                            (entry.byte_len() as u64).saturating_mul(2)
                         } else {
                             entry.num_elements() as u64
                         };
-                    dequantized_size += out_elements * out_bytes;
+                    dequantized_size =
+                        dequantized_size.saturating_add(out_elements.saturating_mul(out_bytes));
                 }
                 TensorRole::Scale
                 | TensorRole::ZeroPoint
@@ -178,7 +191,7 @@ impl InspectInfo {
                 }
                 TensorRole::Passthrough => {
                     // Passthrough tensors are copied as-is.
-                    dequantized_size += byte_len;
+                    dequantized_size = dequantized_size.saturating_add(byte_len);
                 }
             }
         }
@@ -544,6 +557,51 @@ mod tests {
         let explicit = InspectInfo::with_options(&header, InspectOptions::new());
         assert_eq!(bare.dequantized_size, explicit.dequantized_size);
         assert_eq!(bare.output_dtype, TargetDtype::BF16);
+    }
+
+    /// A header-derived shape large enough that the dequantised-size estimate
+    /// would overflow `u64` must **saturate**, never panic (debug) or wrap
+    /// silently (release). `SafetensorsHeader` has public fields, so a caller can
+    /// construct this directly, bypassing the upstream `safetensors` validation
+    /// that guards the file-parse fronts; the size arithmetic must stand on its
+    /// own. The suite runs in debug, where the pre-fix `*`/`+=` would panic on
+    /// overflow — so this test failing to panic *is* the guard.
+    #[test]
+    fn oversized_shape_saturates_rather_than_overflowing() {
+        // One F8 tensor (1 byte/element) whose element count is usize::MAX, so
+        // the estimate overflows u64 at every width (×2 for BF16/F16, ×4 for F32)
+        // and must saturate to u64::MAX rather than wrap or panic.
+        let n = usize::MAX;
+        let header = SafetensorsHeader {
+            tensors: vec![TensorEntry {
+                name: "layer.weight".to_owned(),
+                dtype: Dtype::F8E4M3,
+                shape: vec![n],
+                data_offsets: (0, n),
+                role: TensorRole::Quantized,
+            }],
+            scheme: QuantScheme::PerTensorFp8,
+            metadata: None,
+            header_size: 0,
+            gptq_config: None,
+            awq_config: None,
+            bnb_config: None,
+        };
+
+        for target in [TargetDtype::BF16, TargetDtype::F16, TargetDtype::F32] {
+            let info =
+                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            // The exact figure is meaningless once saturated; the contract is
+            // only that we reached here without a panic/wrap and produced the
+            // fail-closed sentinel.
+            assert_eq!(
+                info.dequantized_size,
+                u64::MAX,
+                "{target}: an overflowing estimate must saturate to u64::MAX (fail-closed)"
+            );
+            // `lethe_took` must stay panic-free on the saturated figures too.
+            let _ = info.lethe_took();
+        }
     }
 
     /// `BnB4` packs two values per stored byte, so its element count is

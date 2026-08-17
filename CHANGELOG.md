@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`InspectInfo` size estimate now saturates instead of overflowing on an
+  absurd header-declared shape** (`src/inspect.rs`). The `current_size` /
+  `dequantized_size` accumulation used raw `+`/`*`, the lone exception to the
+  crate's "checked/saturating on every header-derived value" invariant: a shape
+  whose element count approaches `usize::MAX`, multiplied by the output width (up
+  to ×4 at `F32`), could exceed `u64::MAX` — a debug-build panic and a silent
+  release wrap of the very figure the inspect-before-parse gate reads. Because
+  `SafetensorsHeader` has public fields and is not `#[non_exhaustive]`, a caller
+  can construct such a header directly, bypassing the upstream `safetensors`
+  validation that guards the file-parse fronts. The arithmetic is now
+  `saturating_*`, so an overflowing estimate yields `u64::MAX` (fail-closed: the
+  policy gate reads it as "too big"). Regression test:
+  `oversized_shape_saturates_rather_than_overflowing`.
+
 ## [0.7.4] - 2026-08-15
 
 ### Added
