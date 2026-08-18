@@ -544,23 +544,55 @@ impl ParsedPth {
     /// bounds checking that [`tensors()`](Self::tensors) performs.
     #[must_use]
     pub fn tensor_info(&self) -> Vec<PthTensorInfo> {
-        self.meta
-            .iter()
-            .map(|m| {
-                let n_elements: usize = m
-                    .shape
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                    .unwrap_or(usize::MAX);
-                PthTensorInfo {
-                    name: m.name.clone(),
-                    shape: m.shape.clone(),
-                    dtype: m.dtype,
-                    byte_len: n_elements.saturating_mul(m.dtype.byte_size()),
-                }
-            })
-            .collect()
+        build_pth_tensor_info(&self.meta)
     }
+}
+
+/// Maps parsed pickle metadata to the lightweight [`PthTensorInfo`] shape.
+///
+/// Shared by [`ParsedPth::tensor_info`] (mmap-backed path) and
+/// [`parse_pth_front_matter_from_reader_with_limits`] (reader-generic path)
+/// so there is exactly one place that turns a [`TensorMeta`] into a
+/// [`PthTensorInfo`] — any future change to the byte-length computation
+/// applies to both entry points identically.
+///
+/// Uses the same never-short-circuiting `u64` `saturating_mul` fold as
+/// [`build_pth_inspect_info`], narrowed to `usize` at the end, rather than a
+/// `checked_mul` `try_fold` that stops at the first overflowing dimension:
+/// a shape with a zero dimension *after* an earlier overflow (e.g.
+/// `[2^33, 2^33, 0]`) has zero elements regardless of how large the earlier
+/// dimensions are, and a short-circuiting fold would never see the trailing
+/// zero, reporting `usize::MAX` instead of `0`. Consistency with
+/// `build_pth_inspect_info` matters beyond this function's own correctness:
+/// [`build_front_matter_inspect_info`] sums this function's `byte_len`
+/// output, so a divergence here would make
+/// `PthFrontMatter::inspect().total_bytes` disagree with
+/// `inspect_pth_from_reader(...).total_bytes` on the same adversarial file.
+fn build_pth_tensor_info(meta: &[TensorMeta]) -> Vec<PthTensorInfo> {
+    meta.iter()
+        .map(|m| {
+            // CAST: usize → u64, shape dims and dtype byte size fit in u64
+            #[allow(clippy::as_conversions)]
+            let n_elements: u64 = m
+                .shape
+                .iter()
+                .copied()
+                .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
+            // CAST: usize → u64, byte size of a single element is ≤ 8 → fits
+            #[allow(clippy::as_conversions)]
+            let byte_size = m.dtype.byte_size() as u64;
+            let byte_len_u64 = n_elements.saturating_mul(byte_size);
+            // Saturating narrow: `usize::MAX` on a 32-bit target where
+            // `byte_len_u64` exceeds `usize::MAX`; exact on 64-bit targets.
+            let byte_len = usize::try_from(byte_len_u64).unwrap_or(usize::MAX);
+            PthTensorInfo {
+                name: m.name.clone(),
+                shape: m.shape.clone(),
+                dtype: m.dtype,
+                byte_len,
+            }
+        })
+        .collect()
 }
 
 /// Lightweight per-tensor metadata from a parsed `.pth` file.
@@ -2610,17 +2642,49 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// independent of the file's total size — a torchvision 300 MB `.pth`
 /// inspects with ~150 KiB peak heap.
 pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthInspectInfo> {
-    let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader)?;
     // The inspect path is intentionally limit-free: it reports the totals a host
     // checks against its policy (the inspect-before-parse gate), then calls
     // `parse_pth_with_limits` for enforcement. Use the unbounded default.
-    let meta = interpret_pickle_to_meta(&pkl_bytes, &ParseLimits::default())?;
+    let (big_endian, meta) = read_pth_meta(reader, &ParseLimits::default())?;
     Ok(build_pth_inspect_info(&meta, big_endian))
 }
 
-/// I/O step of [`inspect_pth_from_reader`]: separates legacy-format
-/// detection, ZIP-archive open, byte-order resolution, and `data.pkl`
-/// materialisation from the format-agnostic pickle interpretation.
+/// Reads and interprets a `.pth` archive's `data.pkl`, returning the byte
+/// order and the full per-tensor metadata.
+///
+/// Composes [`read_pth_archive_for_inspect`] (I/O) and
+/// [`interpret_pickle_to_meta`] (pickle VM) so [`inspect_pth_from_reader`]
+/// and [`parse_pth_front_matter_from_reader_with_limits`] share this step
+/// by construction — the same shape as [`interpret_pickle_to_meta`]'s own
+/// sharing rationale. `limits` bounds both the ZIP central-directory walk
+/// and the `data.pkl` size cap; `inspect_pth_from_reader` passes
+/// [`ParseLimits::default`] (identical to [`ParseLimits::unbounded`], so
+/// this preserves that function's existing limit-free behaviour exactly).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] / [`AnamnesisError::Parse`] /
+/// [`AnamnesisError::LimitExceeded`] / [`AnamnesisError::Unsupported`] /
+/// [`AnamnesisError::DisallowedGlobal`] under the same conditions
+/// documented on [`inspect_pth_from_reader`].
+fn read_pth_meta<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<(bool, Vec<TensorMeta>)> {
+    let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader, limits)?;
+    let meta = interpret_pickle_to_meta(&pkl_bytes, limits)?;
+    Ok((big_endian, meta))
+}
+
+/// I/O step of [`inspect_pth_from_reader`] and
+/// [`parse_pth_front_matter_from_reader_with_limits`] (via [`read_pth_meta`]):
+/// separates legacy-format detection, ZIP-archive open, byte-order
+/// resolution, and `data.pkl` materialisation from the format-agnostic
+/// pickle interpretation.
+///
+/// `limits` bounds the ZIP central-directory walk and the `data.pkl` size
+/// cap (on top of the permanent `MAX_PKL_SIZE` / `ZIP_MAX_ENTRIES` floors,
+/// which always apply regardless of `limits`).
 ///
 /// Returns `(big_endian, pkl_bytes)`. Splitting the I/O step keeps
 /// [`inspect_pth_from_reader`] readable as three short calls (read bytes,
@@ -2630,9 +2694,13 @@ pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthIn
 ///
 /// Returns [`AnamnesisError::Io`] if reading or seeking fails.
 ///
-/// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::Unsupported`]
-/// under the same conditions documented on [`inspect_pth_from_reader`].
-fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(bool, Vec<u8>)> {
+/// Returns [`AnamnesisError::Parse`] / [`AnamnesisError::LimitExceeded`] /
+/// [`AnamnesisError::Unsupported`] under the same conditions documented on
+/// [`inspect_pth_from_reader`].
+fn read_pth_archive_for_inspect<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<(bool, Vec<u8>)> {
     let mut src = crate::parse::zip::ReaderSource::new(reader)?;
     let total_len = src.total_len();
     if total_len < 4 {
@@ -2664,11 +2732,10 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
     // Walk the central directory once over the vendored reader to locate
     // `data.pkl` and (optional) `byteorder` by suffix — same suffix-stripping
     // convention as `build_entry_index`, so both newer-style `archive/data.pkl`
-    // and older-style `{model_name}/data.pkl` archives are accepted.
-    // Inspect path is intentionally limit-free (it reports totals for the
-    // host's inspect-before-parse gate); the permanent ZIP_MAX_ENTRIES floor
-    // still applies inside the reader.
-    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
+    // and older-style `{model_name}/data.pkl` archives are accepted. Bounded
+    // by the caller's `limits` (the permanent ZIP_MAX_ENTRIES floor always
+    // applies inside the reader regardless).
+    let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
     let mut pkl_entry: Option<&crate::parse::zip::ZipEntry> = None;
     let mut byteorder_entry: Option<&crate::parse::zip::ZipEntry> = None;
     for entry in &entries {
@@ -2683,14 +2750,9 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
         reason: "ZIP entry `data.pkl` not found".into(),
     })?;
 
-    // Inspect path is intentionally limit-free (it reports totals for the host's
-    // inspect-before-parse gate); unbounded default keeps the permanent
-    // MAX_PKL_SIZE cap as the only bound here.
-    enforce_pkl_size_cap(
-        pkl_entry.uncompressed_size,
-        "data.pkl",
-        &ParseLimits::default(),
-    )?;
+    // Bounded by the caller's `limits`, layered on top of the permanent
+    // MAX_PKL_SIZE cap enforced inside `enforce_pkl_size_cap` itself.
+    enforce_pkl_size_cap(pkl_entry.uncompressed_size, "data.pkl", limits)?;
 
     let big_endian = match byteorder_entry {
         Some(entry) => {
@@ -2725,6 +2787,125 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(reader: R) -> crate::Result<(boo
 
     let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry)?;
     Ok((big_endian, pkl_bytes))
+}
+
+/// Full front matter of a parsed `.pth` file — every tensor's name, shape,
+/// dtype, and byte length, plus the archive's byte order — read from any
+/// `Read + Seek` source without touching the tensor-data files.
+///
+/// The full-detail counterpart to [`PthInspectInfo`]: where that type
+/// reports aggregate statistics for a cheap inspect-before-parse policy
+/// gate, `PthFrontMatter` carries the same per-tensor list that
+/// [`ParsedPth::tensor_info`] exposes for the mmap-backed path. Produced by
+/// [`parse_pth_front_matter_from_reader`] / `_with_limits`.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct PthFrontMatter {
+    /// Per-tensor metadata (name, shape, dtype, byte length) in
+    /// `state_dict` order.
+    pub tensors: Vec<PthTensorInfo>,
+    /// Whether the file uses big-endian storage.
+    pub big_endian: bool,
+}
+
+impl PthFrontMatter {
+    /// Reduces this front matter to the aggregate [`PthInspectInfo`]
+    /// summary. No I/O.
+    pub fn inspect(&self) -> PthInspectInfo {
+        build_front_matter_inspect_info(&self.tensors, self.big_endian)
+    }
+}
+
+/// Parses full `.pth` front matter from any `Read + Seek` source — the
+/// complete per-tensor list, without materialising any tensor-data files.
+///
+/// The full-detail counterpart to [`inspect_pth_from_reader`]. Both are the
+/// [`ParseLimits::default`] (unbounded) special case of their `_with_limits`
+/// form, so the two are **limits-equivalent** — only the permanent `.pth`
+/// caps (`MAX_PKL_SIZE`, `MAX_BYTEORDER_SIZE`, `MAX_PICKLE_WORKING_SET`,
+/// `MAX_PICKLE_VM_DEPTH`, `ZIP_MAX_ENTRIES`) bound this call. What differs
+/// is what survives the parse: the aggregate summary, or every tensor name
+/// and shape handed to the caller.
+///
+/// **Prefer [`parse_pth_front_matter_from_reader_with_limits`] for
+/// untrusted input.** Because this entry point returns every parsed tensor
+/// name and shape instead of reducing them to counts, its exposure at a
+/// given budget is strictly larger than [`inspect_pth_from_reader`]'s, and
+/// an explicit [`ParseLimits`] is the only thing that bounds it below the
+/// permanent caps. This mirrors [`parse_pth_from_reader`] /
+/// [`parse_pth_from_reader_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] / [`AnamnesisError::Parse`] /
+/// [`AnamnesisError::LimitExceeded`] / [`AnamnesisError::Unsupported`] /
+/// [`AnamnesisError::DisallowedGlobal`] under the same conditions
+/// documented on [`inspect_pth_from_reader`].
+///
+/// # Memory
+///
+/// Same footprint class as [`inspect_pth_from_reader`]:
+/// `O(pkl_size + n_tensors)`, independent of the file's total size. The
+/// retained [`PthFrontMatter::tensors`] additionally clones each tensor's
+/// name `String` and shape `Vec<usize>` (proportional to `n_tensors`, not
+/// to file size) rather than discarding them into aggregate counters.
+pub fn parse_pth_front_matter_from_reader<R: Read + Seek>(
+    reader: R,
+) -> crate::Result<PthFrontMatter> {
+    parse_pth_front_matter_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses full `.pth` front matter from any `Read + Seek` source under a
+/// caller-supplied [`ParseLimits`] budget — the bounded, reader-generic
+/// full-detail path.
+///
+/// # Errors
+///
+/// Returns the same error conditions as
+/// [`parse_pth_front_matter_from_reader`], with `limits` additionally
+/// bounding the ZIP central-directory walk and the `data.pkl` size cap.
+///
+/// # Memory
+///
+/// Same footprint as [`parse_pth_front_matter_from_reader`].
+pub fn parse_pth_front_matter_from_reader_with_limits<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<PthFrontMatter> {
+    let (big_endian, meta) = read_pth_meta(reader, limits)?;
+    Ok(PthFrontMatter {
+        tensors: build_pth_tensor_info(&meta),
+        big_endian,
+    })
+}
+
+/// Builds a [`PthInspectInfo`] from parsed front-matter tensor info.
+///
+/// Kept deliberately separate from [`build_pth_inspect_info`] (which
+/// reduces from [`TensorMeta`] instead): [`ParsedPth`] keeps only the lean
+/// `TensorMeta` on the struct and builds the heavier [`PthTensorInfo`]
+/// (which clones every tensor name and shape) only on demand via
+/// [`ParsedPth::tensor_info`]. Routing [`ParsedPth::inspect`] and
+/// [`inspect_pth_from_reader`] through this reduction instead would force
+/// that heavier allocation onto both, for a summary that doesn't need it.
+fn build_front_matter_inspect_info(tensors: &[PthTensorInfo], big_endian: bool) -> PthInspectInfo {
+    let mut total_bytes: u64 = 0;
+    let mut dtypes: Vec<PthDtype> = Vec::new();
+    for t in tensors {
+        // CAST: usize → u64, byte lengths fit in u64
+        #[allow(clippy::as_conversions)]
+        let byte_len = t.byte_len as u64;
+        total_bytes = total_bytes.saturating_add(byte_len);
+        if !dtypes.contains(&t.dtype) {
+            dtypes.push(t.dtype);
+        }
+    }
+    PthInspectInfo {
+        tensor_count: tensors.len(),
+        total_bytes,
+        dtypes,
+        big_endian,
+    }
 }
 
 /// Reads a `.pth` ZIP entry's contents into a `Vec`, inflating `DEFLATE`
@@ -4096,6 +4277,181 @@ mod tests {
         assert!(
             msg.contains("byteorder") && (msg.contains("exceeds") || msg.contains("cap")),
             "expected byteorder cap violation, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Reader-generic full front matter — substrate-equivalence (Phase 7.5)
+    // -----------------------------------------------------------------
+
+    /// `parse_pth_front_matter_from_reader` over an in-memory `Cursor`
+    /// returns tensors matching `parse_pth(path).tensor_info()` over the
+    /// same archive on disk, on the empty-`state_dict` fixture — the
+    /// front-matter counterpart of `inspect_from_reader_matches_path_empty_dict`.
+    #[test]
+    fn front_matter_from_reader_matches_path_empty_dict() {
+        let bytes = build_minimal_empty_pth();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
+        let path_tensors = parse_pth(tmp.path()).unwrap().tensor_info();
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+
+        assert_eq!(path_tensors.len(), front.tensors.len());
+        assert!(front.tensors.is_empty(), "empty state_dict → no tensors");
+        assert!(!front.big_endian);
+    }
+
+    /// `parse_pth_front_matter_from_reader` honours the `byteorder` archive
+    /// entry when present, propagating it into `PthFrontMatter::big_endian`
+    /// identically to `inspect_pth_from_reader`.
+    #[test]
+    fn front_matter_from_reader_honours_byteorder_entry() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+            zip.start_file("archive/byteorder", opts).unwrap();
+            zip.write_all(b"big").unwrap();
+            zip.finish().unwrap();
+        }
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert!(front.big_endian);
+        assert!(front.tensors.is_empty());
+    }
+
+    /// `parse_pth_front_matter_from_reader` propagates the same parse
+    /// errors as `inspect_pth_from_reader` — both delegate to the same
+    /// `read_pth_meta` core, so neither should swallow or re-classify a
+    /// rejection the other surfaces.
+    #[test]
+    fn front_matter_from_reader_propagates_parse_errors() {
+        // Legacy pre-1.6 raw-pickle format.
+        let legacy: &[u8] = &[0x80, 0x02, 0x00, 0x00, 0x00];
+        let err = parse_pth_front_matter_from_reader(std::io::Cursor::new(legacy)).unwrap_err();
+        match err {
+            AnamnesisError::Unsupported { format, detail } => {
+                assert_eq!(format, "pth");
+                assert!(detail.contains("legacy"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        // Wrong magic (not a ZIP archive).
+        let bad_magic: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04];
+        let err = parse_pth_front_matter_from_reader(std::io::Cursor::new(bad_magic)).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }));
+        assert!(err.to_string().contains("not a ZIP archive"));
+
+        // Missing `data.pkl` entry.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/not_a_pkl.txt", opts).unwrap();
+            zip.write_all(b"hello").unwrap();
+            zip.finish().unwrap();
+        }
+        let err = parse_pth_front_matter_from_reader(std::io::Cursor::new(&buf)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data.pkl") && msg.contains("not found"),
+            "expected `data.pkl not found`, got: {msg}"
+        );
+    }
+
+    /// `PthFrontMatter::inspect()` reduces to the same `PthInspectInfo` as
+    /// `inspect_pth_from_reader` on identical bytes — ties the two
+    /// reader-generic entry points together despite their separate
+    /// reduction helpers (`build_front_matter_inspect_info` vs
+    /// `build_pth_inspect_info`).
+    #[test]
+    fn front_matter_inspect_matches_inspect_pth_from_reader() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(b"\x80\x02}.").unwrap();
+            zip.start_file("archive/byteorder", opts).unwrap();
+            zip.write_all(b"little").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        let summary_via_front = front.inspect();
+        let summary_direct = inspect_pth_from_reader(std::io::Cursor::new(&buf)).unwrap();
+
+        assert_pth_inspect_eq(&summary_via_front, &summary_direct);
+    }
+
+    /// A `DEFLATE`-compressed `data.pkl` still parses through the
+    /// front-matter path: the zip-bomb guard in `read_pth_entry_bytes`
+    /// bounds the inflation to the declared `uncompressed_size`, same as
+    /// `inspect_pth_from_reader`.
+    #[test]
+    fn front_matter_from_reader_accepts_deflate_data_pkl() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("archive/data.pkl", opts).unwrap();
+            zip.write_all(&[0x80, 0x02, b'}', b'.']).unwrap();
+            zip.finish().unwrap();
+        }
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&buf)).unwrap();
+        assert!(front.tensors.is_empty());
+    }
+
+    /// A shape whose leading dimensions overflow `u64` when multiplied but
+    /// whose trailing dimension is zero has **zero** elements — the zero
+    /// wins regardless of how large the earlier dimensions are. Regression
+    /// test for a divergence found in review: `build_pth_tensor_info` used
+    /// to short-circuit to `usize::MAX` on the first overflowing dimension
+    /// (via `try_fold` + `checked_mul`), never seeing the trailing zero,
+    /// while `build_pth_inspect_info` folded every dimension with
+    /// `saturating_mul` and correctly landed on zero. That meant
+    /// `PthFrontMatter::inspect().total_bytes` and
+    /// `inspect_pth_from_reader(...).total_bytes` could disagree by
+    /// approximately `u64::MAX` on the same adversarial file — exactly the
+    /// two entry points this phase's `front_matter_inspect_matches_inspect_pth_from_reader`
+    /// test is meant to tie together, just on a shape that test didn't
+    /// exercise. `build_pth_tensor_info` now uses the same
+    /// never-short-circuiting fold as `build_pth_inspect_info`.
+    #[test]
+    fn front_matter_total_bytes_matches_inspect_on_overflowing_shape() {
+        let meta = vec![TensorMeta {
+            name: "huge".to_owned(),
+            shape: vec![1usize << 33, 1usize << 33, 0],
+            dtype: PthDtype::F32,
+            storage_key: "0".to_owned(),
+            storage_offset: 0,
+            strides: vec![0, 0, 0],
+        }];
+
+        let via_inspect = build_pth_inspect_info(&meta, false);
+        let tensors = build_pth_tensor_info(&meta);
+        let via_front_matter = build_front_matter_inspect_info(&tensors, false);
+
+        assert_eq!(
+            tensors[0].byte_len, 0,
+            "a trailing zero dimension must zero the byte length, not saturate to usize::MAX"
+        );
+        assert_eq!(via_inspect.total_bytes, 0);
+        assert_eq!(
+            via_inspect.total_bytes, via_front_matter.total_bytes,
+            "inspect_pth_from_reader and PthFrontMatter::inspect() must agree on total_bytes \
+             for the same tensor metadata"
         );
     }
 

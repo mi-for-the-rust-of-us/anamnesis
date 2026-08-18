@@ -26,7 +26,10 @@
 
 use std::path::PathBuf;
 
-use anamnesis::{PthInspectInfo, inspect_pth_from_reader, parse_pth};
+use anamnesis::{
+    PthInspectInfo, PthTensorInfo, inspect_pth_from_reader, parse_pth,
+    parse_pth_front_matter_from_reader,
+};
 
 /// Minimal JSON reference structure (deserialized with serde).
 #[derive(serde::Deserialize)]
@@ -334,5 +337,103 @@ fn substrate_equivalence_algzoo_fixtures() {
         assert_pth_inspect_eq(&format!("{name} path vs cursor"), &path_info, &cursor_info);
         assert_pth_inspect_eq(&format!("{name} path vs file"), &path_info, &file_info);
         assert_pth_inspect_eq(&format!("{name} cursor vs file"), &cursor_info, &file_info);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader-generic full front matter — substrate equivalence on the AlgZoo
+// fixtures (Phase 7.5)
+// ---------------------------------------------------------------------------
+//
+// Sibling to `substrate_equivalence_algzoo_fixtures` above, but for the
+// full-detail `parse_pth_front_matter_from_reader` entry point: asserts its
+// per-tensor `PthTensorInfo` list matches `parse_pth(path).tensor_info()`
+// field-by-field, on real populated-tensor pickle data rather than the
+// hand-built empty-dict fixtures the in-module unit tests use.
+
+/// Asserts every field of two `PthTensorInfo` values is equal.
+fn assert_pth_tensor_info_eq(label: &str, a: &PthTensorInfo, b: &PthTensorInfo) {
+    assert_eq!(a.name, b.name, "{label}: name");
+    assert_eq!(a.shape, b.shape, "{label}: shape");
+    assert_eq!(a.dtype, b.dtype, "{label}: dtype");
+    assert_eq!(a.byte_len, b.byte_len, "{label}: byte_len");
+}
+
+/// Compares full `.pth` front matter across three substrates — the
+/// mmap-backed `parse_pth(path).tensor_info()`, a `Cursor<&[u8]>`, and a
+/// real `std::fs::File` — on every `AlgZoo` fixture, and spot-checks the
+/// result against the known tensor names in the cross-validation JSON
+/// references so this isn't just comparing two equal-but-wrong outputs.
+#[test]
+fn substrate_equivalence_front_matter_algzoo_fixtures() {
+    let fixtures = [
+        ("algzoo_rnn_small.pth", "algzoo_rnn_small_reference.json"),
+        (
+            "algzoo_transformer_small.pth",
+            "algzoo_transformer_small_reference.json",
+        ),
+        ("algzoo_rnn_blog.pth", "algzoo_rnn_blog_reference.json"),
+    ];
+
+    for (name, json_name) in fixtures {
+        let path = fixture_dir().join(name);
+
+        // Substrate 1: path-based (mmap-backed).
+        let path_tensors = parse_pth(&path)
+            .unwrap_or_else(|e| panic!("parse_pth({name}) failed: {e}"))
+            .tensor_info();
+
+        // Substrate 2: in-memory `Cursor<&[u8]>`.
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read({name}) failed: {e}"));
+        let cursor_front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&bytes))
+            .unwrap_or_else(|e| {
+                panic!("parse_pth_front_matter_from_reader(Cursor) on {name} failed: {e}")
+            });
+
+        // Substrate 3: real `std::fs::File`.
+        let file =
+            std::fs::File::open(&path).unwrap_or_else(|e| panic!("open({name}) failed: {e}"));
+        let file_front = parse_pth_front_matter_from_reader(file).unwrap_or_else(|e| {
+            panic!("parse_pth_front_matter_from_reader(File) on {name} failed: {e}")
+        });
+
+        assert_eq!(
+            path_tensors.len(),
+            cursor_front.tensors.len(),
+            "{name}: tensor count"
+        );
+        assert_eq!(
+            path_tensors.len(),
+            file_front.tensors.len(),
+            "{name}: tensor count"
+        );
+        assert_eq!(
+            cursor_front.big_endian, file_front.big_endian,
+            "{name}: big_endian"
+        );
+
+        for ((path_t, cursor_t), file_t) in path_tensors
+            .iter()
+            .zip(&cursor_front.tensors)
+            .zip(&file_front.tensors)
+        {
+            assert_pth_tensor_info_eq(&format!("{name} path vs cursor"), path_t, cursor_t);
+            assert_pth_tensor_info_eq(&format!("{name} path vs file"), path_t, file_t);
+        }
+
+        // Spot-check against the known-correct reference tensor names, so a
+        // bug that happened to produce equal-length lists on both sides
+        // wouldn't slip through.
+        let reference = load_reference(json_name);
+        for (front_t, py_ref) in cursor_front.tensors.iter().zip(&reference.tensors) {
+            assert_eq!(
+                front_t.name, py_ref.name,
+                "{name}: tensor name vs reference"
+            );
+            assert_eq!(
+                front_t.shape, py_ref.shape,
+                "{name}: tensor shape vs reference"
+            );
+        }
     }
 }

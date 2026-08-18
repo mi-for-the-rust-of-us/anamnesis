@@ -61,7 +61,7 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use anamnesis::{
     GgufType, GgufWriteTensor, inspect_gguf_from_reader, inspect_npz_from_reader,
     inspect_pth_from_reader, parse_gguf_front_matter_from_reader,
-    parse_safetensors_header_from_reader, write_gguf,
+    parse_pth_front_matter_from_reader, parse_safetensors_header_from_reader, write_gguf,
 };
 
 // ---------------------------------------------------------------------------
@@ -296,6 +296,34 @@ fn bench_pth_inspect(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sibling of [`bench_pth_inspect`]: the full-detail
+/// [`parse_pth_front_matter_from_reader`] entry point (v0.7.5) shares the
+/// [`read_pth_meta`](anamnesis) core with `inspect_pth_from_reader`, so this
+/// bench guards the full-tensor-list path against a regression the
+/// summary-only bench above wouldn't catch. Uses the same tiny fixture, so
+/// (per the crate's `# Memory` doc on `build_pth_fixture`) it reports
+/// per-call latency dominated by fixed overhead rather than tensor-count
+/// throughput, unlike its `NPZ` / safetensors / `GGUF` siblings.
+fn bench_pth_front_matter(c: &mut Criterion) {
+    let (_dir, path) = build_pth_fixture();
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+        eprintln!("  skipping parse_pth_front_matter: AlgZoo fixture not present");
+        return;
+    }
+    let total_bytes = std::fs::metadata(&path).expect("stat fixture").len();
+
+    let mut group = c.benchmark_group("parse_pth_front_matter");
+    group.throughput(Throughput::Bytes(total_bytes));
+    group.bench_function("algzoo_rnn_small", |b| {
+        b.iter(|| {
+            let file = std::fs::File::open(black_box(&path)).expect("open pth");
+            let front = parse_pth_front_matter_from_reader(file).expect("parse pth front matter");
+            let _ = black_box(front);
+        });
+    });
+    group.finish();
+}
+
 fn bench_gguf_inspect(c: &mut Criterion) {
     let (_dir, path) = build_gguf_fixture();
     let total_bytes = std::fs::metadata(&path).expect("stat fixture").len();
@@ -345,6 +373,7 @@ criterion_group!(
     bench_safetensors_header,
     bench_npz_inspect,
     bench_pth_inspect,
+    bench_pth_front_matter,
     bench_gguf_inspect,
     bench_gguf_front_matter,
 );

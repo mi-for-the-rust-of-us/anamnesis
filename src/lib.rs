@@ -255,7 +255,7 @@
 //! use anamnesis::{
 //!     inspect_gguf_from_reader, inspect_npz_from_reader,
 //!     inspect_pth_from_reader, parse_gguf_front_matter_from_reader,
-//!     parse_safetensors_header_from_reader,
+//!     parse_pth_front_matter_from_reader, parse_safetensors_header_from_reader,
 //! };
 //!
 //! let st_header = parse_safetensors_header_from_reader(
@@ -266,11 +266,18 @@
 //! let pth_info = inspect_pth_from_reader(std::fs::File::open("model.pth")?)?;
 //!
 //! // Aggregate summary not enough? Take the full per-tensor table instead,
-//! // still without reading the data segment (0.7.1):
+//! // still without reading the data segment (`GGUF` since 0.7.1, `.pth`
+//! // since 0.7.5):
 //! let gguf_front = parse_gguf_front_matter_from_reader(
 //!     std::fs::File::open("model.gguf")?,
 //! )?;
 //! for t in &gguf_front.tensor_infos {
+//!     println!("{} {:?} {:?}", t.name, t.shape, t.dtype);
+//! }
+//! let pth_front = parse_pth_front_matter_from_reader(
+//!     std::fs::File::open("model.pth")?,
+//! )?;
+//! for t in &pth_front.tensors {
 //!     println!("{} {:?} {:?}", t.name, t.shape, t.dtype);
 //! }
 //! # let _ = (st_header, npz_info, gguf_info, pth_info);
@@ -326,14 +333,20 @@
 //!   `GgufFrontMatter` — the complete metadata table and per-tensor list
 //!   (name, shape, dtype, offset), matching what `ParsedGguf` exposes for
 //!   the mmap-backed path (requires `gguf` feature)
-//! - `parse_pth()` / `inspect_pth_from_reader()` — `PyTorch` `.pth` parsing
-//!   / inspection. The path-based variant memory-maps the file and returns
-//!   a `ParsedPth` with zero-copy `tensors()`; the reader-generic variant
-//!   accepts any `Read + Seek` substrate and returns just the
-//!   `PthInspectInfo` summary, so a torchvision-class `.pth` is inspectable
-//!   in a single `<100 KiB` range fetch over the ZIP central directory and
-//!   `data.pkl` entry — no tensor-data files inside the archive are read
-//!   (requires `pth` feature)
+//! - `parse_pth()` / `inspect_pth_from_reader()` /
+//!   `parse_pth_front_matter_from_reader()` — `PyTorch` `.pth` parsing /
+//!   inspection. The path-based variant memory-maps the file and returns a
+//!   `ParsedPth` with zero-copy `tensors()`. Both reader-generic variants
+//!   accept any `Read + Seek` substrate and read only the ZIP central
+//!   directory and `data.pkl` entry — no tensor-data files inside the
+//!   archive are read — so a torchvision-class `.pth` is inspectable in a
+//!   single `<100 KiB` range fetch; they differ in what they return:
+//!   `inspect_pth_from_reader` reduces to the aggregate `PthInspectInfo`
+//!   (the cheap inspect-before-parse policy gate), while
+//!   `parse_pth_front_matter_from_reader` (0.7.5) returns the full
+//!   `PthFrontMatter` — the complete per-tensor list (name, shape, dtype,
+//!   byte length), matching what `ParsedPth::tensor_info()` exposes for the
+//!   mmap-backed path (requires `pth` feature)
 //! - `pth_to_safetensors()` / `pth_to_safetensors_bytes()` — lossless
 //!   `.pth` → `.safetensors` conversion (requires `pth` feature)
 //! - `npz_to_safetensors()` / `npz_to_safetensors_bytes()` — lossless
@@ -467,9 +480,10 @@ pub use parse::{
 };
 #[cfg(feature = "pth")]
 pub use parse::{
-    ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo, inspect_pth_from_reader,
-    parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits, parse_pth_from_reader,
-    parse_pth_from_reader_with_limits, parse_pth_with_limits,
+    ParsedPth, PthDtype, PthFrontMatter, PthInspectInfo, PthTensor, PthTensorInfo,
+    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
+    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_front_matter_from_reader,
+    parse_pth_front_matter_from_reader_with_limits, parse_pth_with_limits,
 };
 pub use remember::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(feature = "awq")]

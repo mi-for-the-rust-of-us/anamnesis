@@ -5,10 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.5] - 2026-08-18
+
+### Added
+
+- **Reader-generic full `.pth` front matter** (`src/parse/pth.rs`) —
+  `parse_pth_front_matter_from_reader<R: Read + Seek>` /
+  `parse_pth_front_matter_from_reader_with_limits`, plus the new
+  **`PthFrontMatter`** type (`tensors: Vec<PthTensorInfo>`, `big_endian`).
+  This is the full-detail counterpart to the summary-only
+  `inspect_pth_from_reader` (0.6.x, `PthInspectInfo`): that type reports
+  aggregate statistics for a cheap inspect-before-parse policy gate but
+  carries no per-tensor list, which turned out to be insufficient for
+  `hf-fm` v0.11.4's planned remote `.pth` inspect — that feature needs the
+  same per-tensor name/shape/dtype table the mmap-backed
+  `parse_pth(path).tensor_info()` exposes, without downloading the
+  tensor-data files inside the archive. Direct `.pth` counterpart to
+  0.7.1's `GgufFrontMatter`, surfaced by
+  `docs/dogfooding-feedbacks/pth-front-matter-for-hf-fm-remote-inspect.md`.
+  Implemented as a thin public wrapper over a new shared private core,
+  `read_pth_meta` (composing the existing `read_pth_archive_for_inspect` +
+  `interpret_pickle_to_meta` steps) — no new parsing logic, so
+  `inspect_pth_from_reader` and the new front-matter functions remain
+  substrate-equivalent by construction, and `inspect_pth_from_reader`'s
+  output is unchanged byte-for-byte. `read_pth_archive_for_inspect` also
+  gains a `limits: &ParseLimits` parameter (previously hard-coded to
+  `ParseLimits::unbounded()` / `::default()`, which are equal, so this is
+  not a behaviour change), so the new `_with_limits` entry point can
+  actually bound the ZIP central-directory walk and the `data.pkl` size
+  cap. Adds `PthFrontMatter::inspect()` to reduce a full front matter to
+  the aggregate `PthInspectInfo` summary, via a reduction kept
+  deliberately separate from the existing `build_pth_inspect_info`: unlike
+  `GGUF`'s `ParsedGguf`, `ParsedPth` keeps only the lean `TensorMeta` on
+  the struct and builds the heavier `PthTensorInfo` only on demand, so
+  unifying the two reductions would have added an allocation cost to
+  `ParsedPth::inspect()` it does not pay today. 5 new unit tests
+  (`front_matter_from_reader_*`, mirroring the existing
+  `inspect_from_reader_*` family) plus a
+  `substrate_equivalence_front_matter_algzoo_fixtures` integration test
+  (`tests/cross_validation_pth.rs`, exercising real populated-tensor
+  pickle data across the `Cursor`/`File` substrates), a new
+  `fuzz_pth_front_matter` target, extended `tests/no_panic.rs` coverage,
+  and a `bench_pth_front_matter` CodSpeed benchmark (`benches/parsing.rs`,
+  sharing `bench_pth_inspect`'s fixture) guarding the full-tensor-list path
+  against a regression the existing summary-only benchmark wouldn't catch.
 
 ### Fixed
 
+- **`ParsedPth::tensor_info()` (and the new front-matter path built on it)
+  could report `byte_len: usize::MAX` for a tensor with zero elements**
+  (`src/parse/pth.rs`). Found during a consistency pass on the front-matter
+  work above. The per-tensor element-count fold used `try_fold` +
+  `checked_mul`, which stops at the *first* overflowing shape dimension; a
+  shape with a large-but-overflowing leading dimension and a **zero**
+  trailing dimension (e.g. `[2^33, 2^33, 0]`) — mathematically zero
+  elements, since any zero factor zeroes the product — short-circuited to
+  `usize::MAX` before ever reaching the zero, instead of the correct `0`.
+  `build_pth_inspect_info` (used by `inspect_pth_from_reader` and
+  `ParsedPth::inspect()`) already folded every dimension with
+  `saturating_mul` and got this right, so the two "equivalent" entry points
+  could disagree by roughly `u64::MAX` on `total_bytes` for the same
+  adversarial file — exactly the divergence the new
+  `front_matter_inspect_matches_inspect_pth_from_reader` test is meant to
+  rule out, on a shape that test didn't happen to exercise.
+  `build_pth_tensor_info` now uses the same never-short-circuiting fold.
+  Regression test: `front_matter_total_bytes_matches_inspect_on_overflowing_shape`.
 - **`InspectInfo` size estimate now saturates instead of overflowing on an
   absurd header-declared shape** (`src/inspect.rs`). The `current_size` /
   `dequantized_size` accumulation used raw `+`/`*`, the lone exception to the

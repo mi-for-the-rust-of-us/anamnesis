@@ -57,9 +57,10 @@ pub use npz::{
 pub use ollama::resolve_ollama_model;
 #[cfg(feature = "pth")]
 pub use pth::{
-    ParsedPth, PthDtype, PthInspectInfo, PthTensor, PthTensorInfo, inspect_pth_from_reader,
-    parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits, parse_pth_from_reader,
-    parse_pth_from_reader_with_limits, parse_pth_with_limits,
+    ParsedPth, PthDtype, PthFrontMatter, PthInspectInfo, PthTensor, PthTensorInfo,
+    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
+    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_front_matter_from_reader,
+    parse_pth_front_matter_from_reader_with_limits, parse_pth_with_limits,
 };
 pub use safetensors::{
     AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,

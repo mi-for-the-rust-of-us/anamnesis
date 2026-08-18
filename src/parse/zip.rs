@@ -496,8 +496,12 @@ struct CentralDirInfo {
 /// checked against `max_item_count` and the central-directory byte read against
 /// `max_single_alloc_bytes` — both **before** any allocation, fail-fast — so a
 /// tight-budget caller bounds the container metadata, not just the permanent
-/// [`ZIP_MAX_ENTRIES`] floor (CWE-770). The inspect paths pass
-/// [`ParseLimits::unbounded`].
+/// [`ZIP_MAX_ENTRIES`] floor (CWE-770). The summary-only inspect paths
+/// (`inspect_npz_from_reader`, `inspect_pth_from_reader`) pass
+/// [`ParseLimits::unbounded`]; the full-detail `.pth` front-matter path
+/// (`parse_pth_front_matter_from_reader_with_limits`) is also inspect-style
+/// (no tensor-data read) but passes the caller's real budget through, so it
+/// is bounded here too.
 ///
 /// # Errors
 ///

@@ -59,6 +59,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_pth_front_matter"
+path = "fuzz_targets/fuzz_pth_front_matter.rs"
+test = false
+doc = false
+bench = false
+
 # Phase 6.12: the vendored ZIP central-directory reader, exercised over every
 # public entry point that routes through it (mmap + reader substrates).
 [[bin]]

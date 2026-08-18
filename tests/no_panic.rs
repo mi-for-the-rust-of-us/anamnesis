@@ -303,7 +303,9 @@ fn gguf_entry_points_never_panic() {
 fn pth_entry_points_never_panic() {
     use anamnesis::{
         inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
-        parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_with_limits,
+        parse_pth_from_reader, parse_pth_from_reader_with_limits,
+        parse_pth_front_matter_from_reader, parse_pth_front_matter_from_reader_with_limits,
+        parse_pth_with_limits,
     };
     use std::io::Cursor;
 
@@ -329,6 +331,18 @@ fn pth_entry_points_never_panic() {
         assert_no_panic(&format!("pth inspect_from_reader / {label}"), || {
             inspect_pth_from_reader(Cursor::new(bytes.clone()))
         });
+        // The full-detail sibling of `inspect_pth_from_reader` (v0.7.5): same
+        // core, but every parsed tensor name and shape is handed back to the
+        // caller rather than reduced to counts, so it gets its own coverage
+        // here.
+        assert_no_panic(
+            &format!("pth parse_pth_front_matter_from_reader / {label}"),
+            || parse_pth_front_matter_from_reader(Cursor::new(bytes.clone())),
+        );
+        assert_no_panic(
+            &format!("pth parse_pth_front_matter_from_reader_with_limits[tight] / {label}"),
+            || parse_pth_front_matter_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
         stage(path, &bytes);
         assert_no_panic(&format!("pth parse_pth(path) / {label}"), || {
             parse_pth(path)

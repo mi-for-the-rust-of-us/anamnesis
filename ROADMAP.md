@@ -2,8 +2,8 @@
 
 > *Parse any format, recover any precision.*
 
-**Date:** March 20, 2026 (updated August 5, 2026)
-**Status:** Phases 1–7.2 complete (v0.7.1 on crates.io; **7.2 implemented, pending release as v0.7.2**). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels — plus reader-generic inspection across every format (`inspect_npz_from_reader<R: Read + Seek>`, `parse_safetensors_header_from_reader<R: Read>` cross-validated against the upstream `safetensors` Python library, and the GGUF / `.pth` counterparts from Phases 4.9–4.10, joined at v0.7.1 by full-detail `parse_gguf_front_matter_from_reader`), an mmap-based always-on `parse()` (~3236× faster on a 11.6 GiB safetensors shard), the completed v0.6.x security-hardening line — caller-configurable `ParseLimits` untrusted-input governance (Phase 6.8), a working-set-bounded pickle VM (Phase 6.11), a vendored read-only ZIP container reader (Phase 6.12), and Python-readiness hardening: copy-based mmap-free parse paths, a finer `AnamnesisError` taxonomy (`LimitExceeded` / `DisallowedGlobal`), a panic/abort-freedom invariant + `unwind` extension profile, and the locked `NumPy`/`BF16` data-ownership contract (Phase 6.13) — the completed convert matrix through the `BF16` hub (Phase 6.14, v0.6.9), and multi-threaded per-tensor dequant (Phase 7, v0.7.0: ~3–4×, byte-identical at any thread count; explicit SIMD was measured and rejected), extended in Phase 7.2 to the `GGUF`-input `convert` path (~1.9× on the reader stage) behind one shared work-stealing dispatch, with the first CI coverage of quantised-`GGUF` conversion, a `--threads` CLI flag, continuous CodSpeed benchmarking of the threaded paths, and a documented (manual-only) ThreadSanitizer job. **Next:** Phase 7.3 (caller-chosen output dtype, `GGUF` / `convert` path, v0.7.3) → Phase 7.4 (caller-chosen output dtype, `remember` path, v0.7.4) → Phase 8 (Python bindings / PyO3, v0.8.0) → Phase 8.5 (Lethe encode completion, v0.8.5).
+**Date:** March 20, 2026 (updated August 18, 2026)
+**Status:** Phases 1–7.5 complete (v0.7.4 on crates.io; **7.5 implemented, pending release as v0.7.5**). FP8/GPTQ/AWQ/BnB dequantization + NPZ parsing + PyTorch `.pth` parsing + GGUF parsing & dequantization — all 22 of 22 production block-quant kernels — plus reader-generic inspection across every format (`inspect_npz_from_reader<R: Read + Seek>`, `parse_safetensors_header_from_reader<R: Read>` cross-validated against the upstream `safetensors` Python library, and the GGUF / `.pth` counterparts from Phases 4.9–4.10, joined at v0.7.1 by full-detail `parse_gguf_front_matter_from_reader` and, at v0.7.5, by its direct `.pth` counterpart `parse_pth_front_matter_from_reader`), an mmap-based always-on `parse()` (~3236× faster on a 11.6 GiB safetensors shard), the completed v0.6.x security-hardening line — caller-configurable `ParseLimits` untrusted-input governance (Phase 6.8), a working-set-bounded pickle VM (Phase 6.11), a vendored read-only ZIP container reader (Phase 6.12), and Python-readiness hardening: copy-based mmap-free parse paths, a finer `AnamnesisError` taxonomy (`LimitExceeded` / `DisallowedGlobal`), a panic/abort-freedom invariant + `unwind` extension profile, and the locked `NumPy`/`BF16` data-ownership contract (Phase 6.13) — the completed convert matrix through the `BF16` hub (Phase 6.14, v0.6.9), and multi-threaded per-tensor dequant (Phase 7, v0.7.0: ~3–4×, byte-identical at any thread count; explicit SIMD was measured and rejected), extended in Phase 7.2 to the `GGUF`-input `convert` path (~1.9× on the reader stage) behind one shared work-stealing dispatch, with the first CI coverage of quantised-`GGUF` conversion, a `--threads` CLI flag, continuous CodSpeed benchmarking of the threaded paths, and a ThreadSanitizer job (gating once an instrumented `std` made it usable under `cargo test`, shortly after the v0.7.2 tag) — followed by the dequantisation output dtype becoming a caller-chosen parameter (`BF16`/`F32`/`F16`, monomorphised through a sealed `OutputElement` trait) across the `GGUF`/`convert` path (Phase 7.3, v0.7.3) and the `remember` path (Phase 7.4, v0.7.4), whose full-width cross-validation caught a real 1-ULP `BnB` `INT8` association bug five releases of `BF16`-only testing had missed, and reader-generic full `.pth` front matter (Phase 7.5, v0.7.5) closing the last format-parity gap `GGUF`'s own front matter (Phase 7.1) left open. **Next:** Phase 8 (Python bindings / PyO3, v0.8.0) → Phase 8.5 (Lethe encode completion, v0.8.5).
 **Context:** The Rust ML ecosystem (candle, burn, tch) cannot load quantized models (FP8, GPTQ, AWQ) or NumPy weight archives (NPZ/NPY for SAEs). The only workaround is a Python script. anamnesis fills this gap: a framework-agnostic, pure-Rust crate that parses tensor formats and recovers precision when needed. Used by hf-fetch-model (download + transform pipeline) and candle-mi (MI framework).
 
 ---
@@ -47,6 +47,7 @@
   - [Phase 7.2: GGUF-Reader Parallelisation + Fine-Tuning](#phase-72-gguf-reader-parallelisation--fine-tuning)
   - [Phase 7.3: Caller-Chosen Output Dtype (GGUF / `convert` path)](#phase-73-caller-chosen-output-dtype-gguf--convert-path)
   - [Phase 7.4: Caller-Chosen Output Dtype (`remember` path)](#phase-74-caller-chosen-output-dtype-remember-path)
+  - [Phase 7.5: PTH Reader-Generic Front Matter](#phase-75-pth-reader-generic-front-matter)
   - [Phase 8: Python Bindings (PyO3)](#phase-8-python-bindings-pyo3)
   - [Phase 8.5: Lethe Encode Completion](#phase-85-lethe-encode-completion)
   - [Phase 9: Emerging Quantization Formats](#phase-9-emerging-quantization-formats)
@@ -1010,6 +1011,164 @@ One correction to this phase's own text, for the next reader: "all 24 `GGUF` ker
 Two corrections to earlier text, for the next reader: the `VECTORIZED` annotation on `BnB4` pass 1 was malformed (it opened with neither `confirmed`, `scalar fallback`, nor `pending`, which is why the "resolve every pending" sweep never saw it) and its content still described the pre-v0.7.4 pass structure; and `GPTQ`'s pass-1 comment asserted the byte extraction was "hard to vectorize" when per-line disassembly shows it vectorises (4 × `vcvtdq2ps`, 4 × `vmovups`). `AWQ`'s otherwise-identical pass 1 genuinely does not, because its store index carries the `AWQ_ORDER` permutation. The two kernels are twins from pass 2 onward, not before it, and both sites now say so.
 
 **New dependencies:** None (`half` already provides `f16`).
+
+### Phase 7.5: PTH Reader-Generic Front Matter
+
+**Goal:** Unblock `hf-fm` v0.11.4 (remote `.pth` inspect) with full
+per-tensor-table parity, the same gap [Phase 7.1](#phase-71-gguf-reader-generic-full-front-matter)
+closed for `GGUF` four phases earlier.
+
+**Context.** `hf-fm`'s remote inspect renders a full per-tensor table
+(name/shape/dtype) for every format it supports remotely — `NPZ` (v0.11.0),
+safetensors (v0.11.1), and `GGUF` (v0.11.2, via Phase 7.1's `GgufFrontMatter`)
+— sourced from an anamnesis reader-generic entry point that already returns
+the complete tensor list. `.pth` is the one format still missing:
+`inspect_pth_from_reader` ([Phase 4.10](#phase-410-reader-generic-pth-inspection))
+is deliberately summary-only (tensor count, total bytes, distinct dtypes,
+byte order), scoped as a cheap inspect-before-parse policy gate, not a
+rendering source. `hf-fm`'s CLI dispatch already gates `.pth` to
+`--cached`-only with an explicit "planned for v0.11.4" error message, and
+its `inspect_pth_cached` function already contains the
+`Vec<PthTensorInfo> → Vec<TensorInfo>` mapping loop the remote path will
+reuse verbatim — the gap is entirely on the anamnesis side. Surfaced in
+[`docs/dogfooding-feedbacks/pth-front-matter-for-hf-fm-remote-inspect.md`](docs/dogfooding-feedbacks/pth-front-matter-for-hf-fm-remote-inspect.md)
+while scoping `hf-fm`'s v0.11.4 roadmap line — written, and reviewed
+line-by-line against the source tree, the same way [Phase 7.1](#phase-71-gguf-reader-generic-full-front-matter)'s
+own dogfooding ask was.
+
+**The full per-tensor data already exists and is thrown away.**
+`inspect_pth_from_reader`'s current shape: `read_pth_archive_for_inspect`
+(I/O — opens the ZIP, locates `data.pkl` / `byteorder`, enforces
+`MAX_PKL_SIZE`) → `interpret_pickle_to_meta` (pickle VM, returns the
+**full** `Vec<TensorMeta>` — name, shape, dtype, storage key/offset,
+strides, for every tensor) → `build_pth_inspect_info` reduces that full
+list down to four aggregate fields **and discards the per-tensor detail**
+one call before returning. `PthTensorInfo` (name, shape, dtype, byte_len)
+— the exact shape a caller like `hf-fm` needs — already exists as
+`ParsedPth::tensor_info()`'s return type for the mmap-backed path; this
+phase makes the same shape reachable from the reader-generic path.
+
+- [x] **`PthFrontMatter`** (`tensors: Vec<PthTensorInfo>`, `big_endian: bool`)
+  — the reader-generic counterpart to what `ParsedPth::tensor_info()`
+  exposes for the mmap-backed path.
+- [x] **`parse_pth_front_matter_from_reader<R: Read + Seek>`** /
+  **`_with_limits`** — new public entry points. `read_pth_archive_for_inspect`
+  grows a `limits: &ParseLimits` parameter, threaded to both the
+  central-directory walk and `enforce_pkl_size_cap` (replacing the two
+  hard-coded `ParseLimits::unbounded()` / `::default()` calls —
+  behaviourally identical today since `ParseLimits::default() ==
+  ParseLimits::unbounded()`, but the caller's tightened budget now reaches
+  both checks for the new `_with_limits` entry point). A new private core,
+  `read_pth_meta`, composes `read_pth_archive_for_inspect` +
+  `interpret_pickle_to_meta` so both `inspect_pth_from_reader` and the new
+  front-matter function share it by construction — mirroring
+  `interpret_pickle_to_meta`'s own "shared by construction" rationale.
+  `inspect_pth_from_reader` becomes a thin wrapper over the same core,
+  matching the direction [Phase 7.1](#phase-71-gguf-reader-generic-full-front-matter)
+  set for `GGUF`: summary delegates to the shared core rather than
+  computing full detail and discarding it, while still calling the
+  **unchanged** `build_pth_inspect_info(&meta, big_endian)` so its output
+  stays provably byte-for-byte identical to today.
+- [x] **`PthFrontMatter::inspect()`** — reduces to the aggregate
+  `PthInspectInfo`, via a small dedicated reduction
+  (`build_front_matter_inspect_info`, sourced from each `PthTensorInfo`'s
+  precomputed `byte_len`) kept **separate** from the existing
+  `build_pth_inspect_info(&[TensorMeta], ...)`. Not unified into one shared
+  helper: `ParsedPth` deliberately keeps only the lean `TensorMeta` on the
+  struct and builds the heavier `PthTensorInfo` (which clones every tensor
+  name and shape) only on demand via `tensor_info()` — unlike `GGUF`, where
+  `ParsedGguf` already stores `Vec<GgufTensorInfo>` eagerly, so
+  `GgufFrontMatter::inspect()` and `ParsedGguf::inspect()` share
+  `build_inspect_info` for free. Forcing `PthInspectInfo`'s existing two
+  callers (`ParsedPth::inspect()`, `inspect_pth_from_reader`) through the
+  heavier type would regress the summary-only mmap path's allocation
+  profile for no benefit; two small, independently-obviously-correct
+  reductions cost less than that regression.
+- [x] 5 new unit tests in `src/parse/pth.rs` mirroring
+  [Phase 7.1](#phase-71-gguf-reader-generic-full-front-matter)'s
+  `front_matter_from_reader_*` set (empty dict, byteorder honoured,
+  parse-error propagation, `DEFLATE` `data.pkl`, `PthFrontMatter::inspect()`
+  tying to `inspect_pth_from_reader`), plus a
+  `substrate_equivalence_front_matter_algzoo_fixtures` integration test in
+  `tests/cross_validation_pth.rs` — sibling to the existing Phase 4.10
+  `substrate_equivalence_algzoo_fixtures` test, but comparing
+  `parse_pth_front_matter_from_reader(...).tensors` against
+  `parse_pth(path).tensor_info()` field-by-field on all three real
+  `AlgZoo` fixtures, so the populated-tensor case is exercised against real
+  pickle data rather than only the hand-built empty-dict fixtures the
+  in-module tests use. `tests/no_panic.rs`'s `pth_entry_points_never_panic`
+  battery extended to both new entry points too (mirroring 0.7.1's own
+  panic-freedom-coverage bullet for `GGUF`'s front matter).
+- [x] `fuzz/fuzz_targets/fuzz_pth_front_matter.rs` + `fuzz/Cargo.toml`
+  entry, mirroring `fuzz_gguf_front_matter.rs`. Exercises no new parsing
+  logic (same pickle VM, same caps) — one more sibling target over the
+  existing PTH fuzz corpus strategy (`fuzz_pth.rs`, `fuzz_pth_bytes.rs`,
+  `fuzz_pth_limits.rs`, `fuzz_pth_parse.rs`).
+- [x] `bench_pth_front_matter` in `benches/parsing.rs`, alongside the
+  existing `bench_pth_inspect`, mirroring `bench_gguf_front_matter` next to
+  `bench_gguf_inspect`. Reuses `build_pth_fixture()`'s existing
+  `algzoo_rnn_small.pth`-based fixture (3 tensors, 555 bytes) — flagged in
+  the dogfooding ask as reporting per-call latency dominated by fixed
+  overhead rather than tensor-count throughput, unlike its `NPZ` /
+  safetensors / `GGUF` siblings which scale a synthetic fixture to
+  `N_TENSORS = 128`; not fixed here, since scaling it needs a from-scratch
+  pickle encoder that is out of scope for this phase.
+- [x] `src/lib.rs` — new items added to the `#[cfg(feature = "pth")] pub
+  use` block and the crate-level doc's format-by-format list and
+  reader-generic example, following the `GgufFrontMatter` precedent.
+- [x] `CHANGELOG.md` — `[Unreleased]` → `Added` entry — **commit** —
+  **PUSH + tag `v0.7.5`**
+- [ ] **At tag time:** add a `v0.7.5` entry to
+  [`docs/validation.md`](docs/validation.md)'s Robustness hardening
+  timeline, documenting the `build_pth_tensor_info` overflow-consistency
+  fix found by the post-implementation `/code-review high` pass (see
+  Outcome below) — that section's convention only documents already-tagged
+  releases, so it's deliberately left off the checklist above and noted
+  here instead of added now. `docs/rust-ecosystem-comparison.md` does
+  **not** need a v0.7.5 entry: it's a dated competitor-landscape survey
+  refreshed on its own cadence, and the direct GGUF precedent
+  (`GgufFrontMatter`, v0.7.1) never appears in it either — checked, not
+  assumed.
+
+**Deliverable:** `anamnesis` v0.7.5 — reader-generic full `.pth` front
+matter, closing the parity gap `inspect_pth_from_reader` left open, and
+unblocking `hf-fm` v0.11.4's remote `.pth` inspect. — **PUSH + tag `v0.7.5`**
+
+**Outcome (implemented, not yet committed).** Every bullet above is done and
+the full pre-commit gauntlet is green (`cargo build --features cli`,
+`cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo test --all-features` — 516 lib tests + all integration suites incl.
+the new `substrate_equivalence_front_matter_algzoo_fixtures`, plus doctests,
+all passing; `cargo doc --all-features` and `--features pth` alone both
+clean under `RUSTDOCFLAGS="-D warnings"`). The byte-for-byte-identical-output
+design for `inspect_pth_from_reader` (proved via `ParseLimits::default() ==
+ParseLimits::unbounded()`, not merely assumed) held on the first try, and the
+existing 90 `pth` unit tests plus 3 `AlgZoo` cross-validation fixtures all
+stayed green throughout the refactor.
+
+A follow-up consistency pass (`/code-review high` on the working-tree diff)
+did surface one real bug, since fixed: `build_pth_tensor_info` (extracted
+verbatim from the pre-existing `ParsedPth::tensor_info()`, unmodified in
+this phase's first pass) short-circuited its element-count fold on the
+first overflowing shape dimension via `try_fold` + `checked_mul`, so a
+shape with a trailing **zero** dimension after an earlier overflow (e.g.
+`[2^33, 2^33, 0]` — mathematically zero elements) reported `byte_len:
+usize::MAX` instead of `0`. `build_pth_inspect_info` already folded every
+dimension with `saturating_mul` and got this right, so wiring the two
+together via `PthFrontMatter::inspect()` exposed a pre-existing latent
+inconsistency in `ParsedPth::tensor_info()` that predates this phase: the
+two "equivalent" reader-generic entry points could report `total_bytes`
+differing by roughly `u64::MAX` on the same adversarial file. Fixed by
+giving `build_pth_tensor_info` the same never-short-circuiting fold, with a
+new regression test
+(`front_matter_total_bytes_matches_inspect_on_overflowing_shape`) and a
+`CHANGELOG.md` `### Fixed` entry. A second, smaller finding — a stale
+`src/parse/zip.rs` doc comment claiming "the inspect paths pass
+`ParseLimits::unbounded`", made inaccurate by the new bounded front-matter
+path — was also corrected. Changes sit in the working tree, intentionally
+**not committed** — commit / push / tag is a separate, later step.
+
+**New dependencies:** None.
 
 ### Phase 8: Python Bindings (PyO3)
 
