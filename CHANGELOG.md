@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING: every type the crate returns is now `#[non_exhaustive]`**
+  (Phase 7.6, item 4). Twenty public structs gain the attribute: the parsed
+  headers (`SafetensorsHeader`, `TensorEntry`), the quantisation configs
+  (`GptqConfig`, `AwqConfig`, `BnbConfig`) and companion sets
+  (`GptqCompanions`, `AwqCompanions`, `Bnb4Companions`), the `GGUF` types
+  (`GgufTensorInfo`, `GgufTensor`, `GgufInspectInfo`, `GgufFrontMatter`), the
+  `NPZ` types (`NpzTensor`, `NpzTensorInfo`, `NpzInspectInfo`), the `.pth`
+  types (`PthTensor`, `PthTensorInfo`, `PthInspectInfo`, `PthFrontMatter`),
+  and `BnbNf4WriteStats`. Every public **enum** has carried the attribute
+  since it was introduced, and `InspectInfo` was marked at v0.7.4 with the
+  rationale *"the Python bindings freeze this shape in Phase 8, and a struct
+  whose fields are all `pub` cannot otherwise gain one without a breaking
+  change"* — that reasoning applies to all of its siblings, and this release
+  applies it. It has to happen now: v0.8.0 mirrors this surface into a `PyPI`
+  package where a signature change is far more expensive than on `crates.io`,
+  and adding the attribute afterwards would itself be the breaking change.
+  Phase 7.6's next commit depends on it directly, since it grows
+  `GgufInspectInfo` by two fields.
+
+  **What breaks:** an external crate can no longer write a struct literal for
+  these types, nor destructure one exhaustively. Reading fields, cloning, and
+  pattern-matching with `..` are all unaffected, which covers every documented
+  usage. A side effect worth naming: the external-construction path the
+  v0.7.4 readiness audit's F-1 finding leaned on — building a
+  `SafetensorsHeader` by hand and passing it to `InspectInfo::from` to bypass
+  the upstream `safetensors` validation — is now closed at the type level as
+  well as by the saturating arithmetic that fixed it.
+
+  **Deliberately exempt:** `BnbWriteInput` and `GgufWriteTensor` stay
+  literal-constructible because callers must build them to call
+  `write_bnb_nf4_safetensors` / `write_gguf`. `ParsedModel`, `ParsedGguf` and
+  `ParsedPth` are already unconstructible through private fields.
+
+### Added
+
+- **`NpzTensor::new` and `PthTensor::new`** — both types are *returned* by
+  `parse_npz` / `ParsedPth::tensors` **and** consumed by
+  `npz_to_safetensors[_bytes]` / `pth_to_safetensors[_bytes]`, so marking them
+  `#[non_exhaustive]` without a constructor would have silently removed a
+  capability the public encode API offers. The constructors are the
+  construction path that absorbs any field added later without breaking the
+  callers that synthesise tensors.
+- **Crate-level `# API evolution` section** (`src/lib.rs`) stating the rule
+  once — return types are non-exhaustive, encode-side inputs are not — so the
+  policy is discoverable rather than inferred from twenty attributes.
+
 ## [0.7.5] - 2026-08-18
 
 ### Added

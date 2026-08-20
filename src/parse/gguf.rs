@@ -888,6 +888,7 @@ impl GgufMetadataArray {
 /// source is — not the relative offset stored in the `gguf_tensor_info_t`
 /// on disk; the parser has already added the tensor-data section start.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GgufTensorInfo {
     /// Tensor name (e.g., `"blk.0.attn_q.weight"`).
     pub name: String,
@@ -927,6 +928,7 @@ pub struct GgufTensorInfo {
 /// never aliases bytes the owning [`ParsedGguf`] can drop. See
 /// `docs/python-interop.md` (ownership contract).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GgufTensor<'a> {
     /// Tensor name (e.g., `"blk.0.attn_q.weight"`).
     pub name: &'a str,
@@ -948,6 +950,7 @@ pub struct GgufTensor<'a> {
 ///
 /// Produced by [`ParsedGguf::inspect`]. No I/O — derived from metadata.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct GgufInspectInfo {
     /// `GGUF` version read from the header (currently 2 or 3).
@@ -2143,6 +2146,7 @@ fn read_gguf_structure<R: Read + Seek>(
 /// `Cursor` over its mmap) and [`inspect_gguf_from_reader`] /
 /// [`parse_gguf_front_matter_from_reader`] (via the caller-supplied reader).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct GgufFrontMatter {
     /// `GGUF` version read from the header (currently 2 or 3).

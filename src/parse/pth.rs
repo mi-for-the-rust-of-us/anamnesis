@@ -275,6 +275,7 @@ impl fmt::Display for PthDtype {
 /// `data.into_owned()` first, so the array never aliases bytes the owning
 /// [`ParsedPth`] can drop. See `docs/python-interop.md` (ownership contract).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PthTensor<'a> {
     /// Tensor name (`state_dict` key, e.g. `"linear.weight"`).
     pub name: String,
@@ -289,6 +290,37 @@ pub struct PthTensor<'a> {
     /// transformation was required (non-contiguous strides or
     /// big-endian byte-swap).
     pub data: Cow<'a, [u8]>,
+}
+
+impl<'a> PthTensor<'a> {
+    /// Builds a tensor view from its parts.
+    ///
+    /// The construction path for callers that *synthesise* `.pth` tensors to
+    /// feed `pth_to_safetensors` (or the `_bytes` form), rather than obtaining
+    /// them from [`ParsedPth::tensors`]. It exists because the struct is
+    /// `#[non_exhaustive]` since v0.7.6: a literal cannot be written from
+    /// outside the crate, and this constructor absorbs any field added later
+    /// without breaking the callers that build one.
+    ///
+    /// The arguments are moved, not validated: `data` is trusted to be
+    /// `product(shape) × dtype.byte_size()` bytes in row-major, native-endian
+    /// order, exactly as [`ParsedPth::tensors`] produces it. Pass
+    /// `Cow::Owned` to hand over a buffer, `Cow::Borrowed` to lend one for
+    /// `'a`.
+    #[must_use]
+    pub const fn new(
+        name: String,
+        shape: Vec<usize>,
+        dtype: PthDtype,
+        data: Cow<'a, [u8]>,
+    ) -> Self {
+        Self {
+            name,
+            shape,
+            dtype,
+            data,
+        }
+    }
 }
 
 /// Tensor metadata extracted from the pickle stream (no data).
@@ -600,6 +632,7 @@ fn build_pth_tensor_info(meta: &[TensorMeta]) -> Vec<PthTensorInfo> {
 /// Produced by [`ParsedPth::tensor_info`]. Contains only metadata —
 /// no data access, no mmap slicing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PthTensorInfo {
     /// Tensor name (`state_dict` key).
     pub name: String,
@@ -615,6 +648,7 @@ pub struct PthTensorInfo {
 ///
 /// Produced by [`ParsedPth::inspect`]. No I/O — derived from metadata.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct PthInspectInfo {
     /// Number of tensors in the `state_dict`.
@@ -2799,6 +2833,7 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
 /// [`ParsedPth::tensor_info`] exposes for the mmap-backed path. Produced by
 /// [`parse_pth_front_matter_from_reader`] / `_with_limits`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct PthFrontMatter {
     /// Per-tensor metadata (name, shape, dtype, byte length) in

@@ -226,7 +226,27 @@
 //! built with a separate `panic = "unwind"` profile so `PyO3` can surface a panic
 //! as a catchable `PanicException`; see `docs/python-interop.md`.
 //!
-//! # Quick Start
+//! # API evolution
+//!
+//! Every type this crate *returns* is `#[non_exhaustive]`, so it can gain a
+//! field without a breaking change: the parsed headers ([`SafetensorsHeader`],
+//! [`TensorEntry`]), the per-format inspect summaries and front matter, the
+//! per-tensor views, and the quantisation configs. Construct them by calling a
+//! parse or inspect entry point, never by writing a struct literal, and read
+//! them by field or accessor. The two types a caller legitimately *builds* are
+//! exempt and stay literal-constructible (`BnbWriteInput`, `GgufWriteTensor`,
+//! both encode-side inputs); the two that are both produced and consumed
+//! (`NpzTensor`, `PthTensor`) are non-exhaustive but carry a `new`
+//! constructor for the encode direction.
+//!
+//! Public enums have carried `#[non_exhaustive]` since they were introduced,
+//! for the same reason plus the obvious one: new dtypes and new formats arrive.
+//! Match them with a wildcard arm.
+//!
+//! The rule exists because v0.8.0 mirrors this surface into a `PyPI` package,
+//! where a signature change is far more expensive than on `crates.io`, and
+//! adding the attribute later would itself be the breaking change.
+//!//! # Quick Start
 //!
 //! Path-based dequantisation (FP8 → BF16):
 //!

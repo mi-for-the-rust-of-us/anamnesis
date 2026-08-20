@@ -148,6 +148,7 @@ impl fmt::Display for NpzDtype {
 /// row-major (C) order. Framework consumers can interpret `data` directly
 /// according to `dtype` and `shape`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NpzTensor {
     /// Tensor name as stored in the archive (without `.npy` extension).
     /// Matches the `HashMap` key returned by [`parse_npz`].
@@ -159,6 +160,31 @@ pub struct NpzTensor {
     /// Raw bytes in row-major (C) order, little-endian.
     /// Length equals `product(shape) × dtype.byte_size()`.
     pub data: Vec<u8>,
+}
+
+impl NpzTensor {
+    /// Builds a tensor from its parts.
+    ///
+    /// The construction path for callers that *synthesise* `NPZ` tensors to
+    /// feed `npz_to_safetensors` (or the `_bytes` form), rather than obtaining
+    /// them from [`parse_npz`]. It exists because the struct is
+    /// `#[non_exhaustive]` since v0.7.6: a literal cannot be written from
+    /// outside the crate, and this constructor absorbs any field added later
+    /// without breaking the callers that build one.
+    ///
+    /// The arguments are moved, not validated: `data` is trusted to be
+    /// `product(shape) × dtype.byte_size()` bytes in little-endian, row-major
+    /// (C) order, exactly as [`parse_npz`] produces it. A mismatch surfaces
+    /// downstream, where the safetensors writer checks it.
+    #[must_use]
+    pub const fn new(name: String, shape: Vec<usize>, dtype: NpzDtype, data: Vec<u8>) -> Self {
+        Self {
+            name,
+            shape,
+            dtype,
+            data,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +632,7 @@ fn open_npz_entry_reader<'a, R: Read + Seek>(
 /// Produced by [`inspect_npz`]. Contains only `NPY` header information —
 /// no tensor data is read from the archive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NpzTensorInfo {
     /// Tensor name (without `.npy` extension).
     pub name: String,
@@ -623,6 +650,7 @@ pub struct NpzTensorInfo {
 /// is proportional to the number of tensors (metadata only), not the
 /// file size.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct NpzInspectInfo {
     /// Per-tensor metadata.
