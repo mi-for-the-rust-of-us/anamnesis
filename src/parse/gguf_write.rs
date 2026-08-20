@@ -236,6 +236,7 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
             other @ (AnamnesisError::Unsupported { .. }
             | AnamnesisError::LimitExceeded { .. }
             | AnamnesisError::DisallowedGlobal { .. }
+            | AnamnesisError::Cancelled
             | AnamnesisError::Io(_)) => other,
         })?;
         write_string(&mut tensor_info_block, tensor.name)?;

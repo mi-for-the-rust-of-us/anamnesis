@@ -111,6 +111,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CancelToken`, and `AnamnesisError::Cancelled`** (Phase 7.6, item 5).
+  Attach a token through `RememberOptions::with_cancel` or
+  `ConvertOptions::with_cancel`, keep a clone, and call `cancel()` from any
+  thread; the run stops at the next tensor boundary. Nothing in the API could
+  be interrupted before this, which mattered specifically for v0.8.0: the
+  bindings release the `GIL` around a large call, and a released `GIL` means
+  `KeyboardInterrupt` is not delivered until Rust returns — so a notebook user
+  could not `Ctrl-C` a multi-minute conversion and a web worker could not
+  honour a request timeout.
+
+  **Why a token and not a callback return value.** The obvious design is to let
+  the existing progress hook say *stop*, and it cannot work here: on the
+  parallel path that hook fires on the calling thread as each worker **joins**,
+  which is deliberate (an `FnMut` closing over a progress bar never crosses a
+  thread boundary) and which means it is not called at all while work is in
+  flight. The token is read by the workers themselves, once per tensor at the
+  point the scheduling cursor hands one out — the same once-per-item,
+  never-inside-a-kernel discipline `CONVENTIONS.md` already sanctions for the
+  cursor. Cancellation is therefore prompt (bounded by one tensor) even though
+  progress is coarse.
+
+  A cancelled run **writes no output file**: every path builds its result in
+  memory before serialising, so the check lands strictly before any byte
+  reaches the filesystem, and there is nothing to clean up. An *uncancelled*
+  token changes no output byte at any thread count. Both are tested. Costs
+  nothing when unused: `None` allocates no token and the poll is a `None`
+  check.
+
+- **`convert_with_progress`** — `remember` has had a per-tensor progress hook
+  since v0.7.2 and `convert` had none, so a caller converting a 70 B model had
+  no way to show that anything was happening. Same output bytes, same errors.
+  Documented honestly: on the parallel path it fires as each worker joins, so
+  progress arrives in bursts, which is exactly why cancellation is a token
+  rather than a return value from this callback.
+
 - **`parse_npz_bytes`, `parse_npz_bytes_with_limits`, `parse_npz_from_reader`,
   `parse_npz_from_reader_with_limits`** (Phase 7.6, item 3). `NPZ` was the one
   format with no in-memory or streamed parse: safetensors, `.pth` and `GGUF`

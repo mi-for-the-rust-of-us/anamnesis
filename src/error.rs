@@ -72,6 +72,21 @@ pub enum AnamnesisError {
         name: String,
     },
 
+    /// The caller asked an in-flight `remember` or `convert` to stop, through a
+    /// `CancelToken` on its options.
+    ///
+    /// Not a failure of the input: the artefact may be perfectly valid and the
+    /// same call may succeed on a retry. A dedicated variant (not
+    /// [`Self::Parse`]) so a host can tell a user-initiated abort from a bad
+    /// file, and so a Python binding can map it to `KeyboardInterrupt` rather
+    /// than to a `ParseError` that would misreport what happened.
+    ///
+    /// **No output file is written.** Every path builds its result in memory
+    /// before serialising, so the cancellation check happens strictly before
+    /// any byte reaches the filesystem; there is nothing to clean up.
+    #[error("operation cancelled by the caller")]
+    Cancelled,
+
     /// A file system error. Maps to Python builtin `OSError`.
     #[error(transparent)]
     Io(#[from] std::io::Error),

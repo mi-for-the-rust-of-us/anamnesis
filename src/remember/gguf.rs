@@ -2104,16 +2104,20 @@ impl crate::ParsedGguf {
         target: crate::TargetDtype,
         opts: crate::RememberOptions,
     ) -> crate::Result<crate::convert::Hub> {
+        // Split the builder into its two knobs before spending it, exactly as
+        // `ParsedModel::remember_with_progress_and_options` does.
+        let cancel = opts.cancel.clone();
+        let cancel = cancel.as_ref();
         let threads = opts.resolved_threads();
         match target {
             crate::TargetDtype::BF16 => {
-                crate::convert::hub_from_gguf::<crate::Bf16Out>(self, threads)
+                crate::convert::hub_from_gguf::<crate::Bf16Out>(self, threads, cancel, &mut || {})
             }
             crate::TargetDtype::F32 => {
-                crate::convert::hub_from_gguf::<crate::F32Out>(self, threads)
+                crate::convert::hub_from_gguf::<crate::F32Out>(self, threads, cancel, &mut || {})
             }
             crate::TargetDtype::F16 => {
-                crate::convert::hub_from_gguf::<crate::F16Out>(self, threads)
+                crate::convert::hub_from_gguf::<crate::F16Out>(self, threads, cancel, &mut || {})
             }
         }
     }

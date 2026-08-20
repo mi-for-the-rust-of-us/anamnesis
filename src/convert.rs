@@ -143,6 +143,15 @@ pub struct ConvertOptions {
     /// is a packaging concern for a downstream crate.
     #[cfg(feature = "gguf")]
     pub gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
+    /// Cooperative cancellation handle, polled once per tensor.
+    ///
+    /// `None` (the default) means the run cannot be cancelled and costs
+    /// nothing: no token is allocated and the poll is a `None` check. `Some`
+    /// makes the run stop at the next tensor boundary once
+    /// [`CancelToken::cancel`](crate::CancelToken::cancel) is called from any
+    /// thread, returning [`AnamnesisError::Cancelled`] with no output file
+    /// written.
+    pub cancel: Option<crate::CancelToken>,
     /// Element type written for tensors this conversion **dequantises**.
     /// `None` (the default) means [`Dtype::BF16`], which is what every release
     /// before v0.7.3 emitted unconditionally.
@@ -195,6 +204,17 @@ impl ConvertOptions {
     #[must_use]
     pub fn with_limits(mut self, limits: ParseLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Attaches a cancellation handle, polled once per tensor.
+    ///
+    /// Keep a clone: the token is how another thread — a signal handler, a
+    /// watchdog, a request-timeout task — reaches an in-flight call. See
+    /// [`crate::cancel`] for the `PyO3` shape this exists for.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -574,7 +594,46 @@ pub fn convert(
     output: &Path,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
-    let hub = read_hub(input, options)?;
+    convert_with_progress(input, target, output, options, || {})
+}
+
+/// Converts `input` into `target`, reporting per-tensor progress.
+///
+/// Behaves identically to [`convert`] — same output bytes, same errors — but
+/// calls `on_tensor` once per tensor the reader produces. New in v0.7.6:
+/// `remember` has had a progress hook since v0.7.2 and `convert` had none, so a
+/// caller converting a 70 B model had no way to show that anything was
+/// happening.
+///
+/// **`on_tensor` fires on the calling thread, and on the parallel path it fires
+/// as each worker joins rather than as each tensor completes**, so progress
+/// arrives in bursts. That is deliberate — an `FnMut` closing over a progress
+/// bar never crosses a thread boundary — and it is why *cancellation* is a
+/// [`CancelToken`](crate::CancelToken) on the options rather than a return
+/// value from this callback: the token is polled by the workers themselves and
+/// so takes effect within one tensor, while this hook could not.
+///
+/// # Errors
+///
+/// As [`convert`].
+///
+/// # Memory
+///
+/// As [`convert`]: the hook adds nothing.
+pub fn convert_with_progress<F>(
+    input: &Path,
+    target: ConvertTarget,
+    output: &Path,
+    options: &ConvertOptions,
+    mut on_tensor: F,
+) -> crate::Result<ConvertStats>
+where
+    F: FnMut(),
+{
+    // TRAIT_OBJECT: the hook threads through several private readers with
+    // different generic parameters; one `&mut dyn FnMut()` keeps a single
+    // signature instead of a type parameter on each of them.
+    let hub = read_hub(input, options, &mut on_tensor)?;
     write_hub(&hub, target, output, options)
 }
 
@@ -613,11 +672,23 @@ fn resolve_output_dtype(options: &ConvertOptions) -> crate::Result<Dtype> {
 /// cannot honour a non-`BF16` request rejects it here rather than silently
 /// emitting `BF16`, so the caller never receives a file whose dtype differs
 /// from what they asked for.
-fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
+fn read_hub(
+    input: &Path,
+    options: &ConvertOptions,
+    on_tensor: &mut dyn FnMut(),
+) -> crate::Result<Hub> {
     let threads = crate::model::resolve_thread_budget(options.threads);
+    let cancel = options.cancel.as_ref();
     let out_dtype = resolve_output_dtype(options)?;
     match detect_format(input)? {
-        Format::Safetensors => read_safetensors(input, &options.limits, threads, out_dtype),
+        Format::Safetensors => read_safetensors(
+            input,
+            &options.limits,
+            threads,
+            cancel,
+            on_tensor,
+            out_dtype,
+        ),
         // NPZ and `.pth` dequantise nothing: every tensor is already full
         // precision and is passed through in its source dtype. A non-`BF16`
         // `output_dtype` is therefore vacuous rather than wrong, and is
@@ -628,7 +699,14 @@ fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
         #[cfg(feature = "npz")]
         Format::Npz => read_npz(input, &options.limits),
         #[cfg(feature = "gguf")]
-        Format::Gguf => read_gguf(input, &options.limits, threads, out_dtype),
+        Format::Gguf => read_gguf(
+            input,
+            &options.limits,
+            threads,
+            cancel,
+            on_tensor,
+            out_dtype,
+        ),
     }
 }
 
@@ -695,6 +773,8 @@ fn read_safetensors(
     path: &Path,
     limits: &ParseLimits,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
@@ -703,9 +783,9 @@ fn read_safetensors(
     // defence in depth rather than a reachable path.
     #[allow(clippy::wildcard_enum_match_arm)]
     let (tensors, dequantized) = match out_dtype {
-        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads)?,
-        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads)?,
-        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads)?,
+        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads, cancel, on_tensor)?,
+        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads, cancel, on_tensor)?,
+        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads, cancel, on_tensor)?,
         other => {
             return Err(AnamnesisError::Unsupported {
                 format: "safetensors".into(),
@@ -809,6 +889,8 @@ fn read_gguf(
     path: &Path,
     limits: &ParseLimits,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
     // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
@@ -816,9 +898,9 @@ fn read_gguf(
     // defence in depth rather than a reachable path.
     #[allow(clippy::wildcard_enum_match_arm)]
     match out_dtype {
-        Dtype::BF16 => read_gguf_as::<crate::Bf16Out>(path, limits, threads),
-        Dtype::F32 => read_gguf_as::<crate::F32Out>(path, limits, threads),
-        Dtype::F16 => read_gguf_as::<crate::F16Out>(path, limits, threads),
+        Dtype::BF16 => read_gguf_as::<crate::Bf16Out>(path, limits, threads, cancel, on_tensor),
+        Dtype::F32 => read_gguf_as::<crate::F32Out>(path, limits, threads, cancel, on_tensor),
+        Dtype::F16 => read_gguf_as::<crate::F16Out>(path, limits, threads, cancel, on_tensor),
         other => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!(
@@ -835,9 +917,11 @@ fn read_gguf_as<E: crate::OutputElement>(
     path: &Path,
     limits: &ParseLimits,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
 ) -> crate::Result<Hub> {
     let parsed = crate::parse_gguf_with_limits(path, limits)?;
-    hub_from_gguf::<E>(&parsed, threads)
+    hub_from_gguf::<E>(&parsed, threads, cancel, on_tensor)
 }
 
 /// Normalises an already-parsed `GGUF` into the hub: quantised tensors
@@ -868,6 +952,8 @@ fn read_gguf_as<E: crate::OutputElement>(
 pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     parsed: &crate::ParsedGguf,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
 ) -> crate::Result<Hub> {
     // Materialise the tensor views up front so the dispatch has an indexable
     // slice. The views borrow the mapped bytes (name, shape and data are all
@@ -887,6 +973,7 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
         &views,
         threads,
         work_bytes,
+        cancel,
         |_, tensor| {
             let mut shape: Vec<usize> = tensor.shape.to_vec();
             shape.reverse();
@@ -923,7 +1010,7 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
                 })
             }
         },
-        |_| {},
+        |_| on_tensor(),
     )?;
 
     // Counted from the inputs rather than incremented during the dispatch, so no
@@ -1979,7 +2066,8 @@ mod stats_tests {
 )]
 mod quantized_gguf_tests {
     use super::{
-        ConvertOptions, ConvertTarget, convert, derive_output_path, derive_output_path_for_dtype,
+        AnamnesisError, ConvertOptions, ConvertTarget, convert, convert_with_progress,
+        derive_output_path, derive_output_path_for_dtype,
     };
     use crate::GgufType;
     use crate::parallel::MIN_PARALLEL_BYTES;
@@ -2423,6 +2511,136 @@ mod quantized_gguf_tests {
                 &format!("remember_to_bytes vs convert at {label}"),
             );
         }
+    }
+
+    /// A cancelled run returns `Cancelled` and writes **no output file**.
+    ///
+    /// The "no file" half is the part worth pinning: every path builds its
+    /// result in memory before serialising, so the check lands strictly before
+    /// any byte reaches the filesystem. If that ever stops being true, a
+    /// cancelled convert starts leaving truncated safetensors behind, and the
+    /// failure would be silent.
+    #[test]
+    fn a_cancelled_convert_writes_nothing() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let out = dir_out.path().join("cancelled.safetensors");
+
+        let token = crate::CancelToken::new();
+        token.cancel();
+
+        let err = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &out,
+            &ConvertOptions::new().with_cancel(token).with_threads(4),
+        )
+        .expect_err("a cancelled convert must not succeed");
+
+        assert!(
+            matches!(err, AnamnesisError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            !out.exists(),
+            "a cancelled convert must not leave an output file behind"
+        );
+    }
+
+    /// Cancellation is observed at every thread count, sequential included.
+    ///
+    /// The sequential path polls at the top of its loop and the parallel path
+    /// polls where the cursor hands out an item; both have to agree, or
+    /// cancellation would be a feature of the thread budget.
+    #[test]
+    fn cancellation_is_observed_at_every_thread_count() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        for n in [1usize, 2, 4, 8] {
+            let token = crate::CancelToken::new();
+            token.cancel();
+            let err = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new()
+                        .with_threads(n)
+                        .with_cancel(token),
+                )
+                .expect_err("a cancelled remember must not succeed");
+            assert!(
+                matches!(err, AnamnesisError::Cancelled),
+                "at {n} threads: expected Cancelled, got {err:?}"
+            );
+        }
+    }
+
+    /// An **uncancelled** token changes nothing: same bytes as no token at all.
+    ///
+    /// The regression this guards is a poll placed somewhere that skips work
+    /// rather than stopping it.
+    #[test]
+    fn an_uncancelled_token_changes_no_byte() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let baseline = parsed
+            .remember_to_bytes(crate::TargetDtype::BF16)
+            .expect("baseline remember");
+
+        for n in [1usize, 4] {
+            let with_token = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new()
+                        .with_threads(n)
+                        .with_cancel(crate::CancelToken::new()),
+                )
+                .expect("remember with a live token");
+            assert_bytes_eq(
+                &with_token,
+                &baseline,
+                &format!("an uncancelled token at {n} threads"),
+            );
+        }
+    }
+
+    /// `convert_with_progress` fires once per tensor and produces the same file.
+    #[test]
+    fn convert_with_progress_counts_tensors_and_changes_no_byte() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let plain = dir_out.path().join("plain.safetensors");
+        let hooked = dir_out.path().join("hooked.safetensors");
+
+        let stats = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &plain,
+            &ConvertOptions::new().with_threads(4),
+        )
+        .expect("plain convert");
+
+        let mut seen = 0usize;
+        let hooked_stats = convert_with_progress(
+            &path,
+            ConvertTarget::Safetensors,
+            &hooked,
+            &ConvertOptions::new().with_threads(4),
+            || seen += 1,
+        )
+        .expect("convert with progress");
+
+        assert_eq!(
+            seen, stats.tensors,
+            "the hook must fire once per tensor the reader produced"
+        );
+        assert_eq!(hooked_stats.tensors, stats.tensors);
+        assert_bytes_eq(
+            &std::fs::read(&hooked).expect("read hooked output"),
+            &std::fs::read(&plain).expect("read plain output"),
+            "a progress hook must not change an output byte",
+        );
     }
 
     /// `GgufInspectInfo::dequantized_size` predicts what `remember` actually
@@ -2916,12 +3134,12 @@ mod hub_scaling_bench {
             let options = ConvertOptions::new().with_threads(threads);
             // Warm-up: also pages the mmap in, so the timed samples measure
             // dequant rather than first-touch page faults.
-            drop(read_hub(&input, &options).expect("warm-up read_hub"));
+            drop(read_hub(&input, &options, &mut || {}).expect("warm-up read_hub"));
 
             let mut samples: Vec<f64> = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
                 let start = Instant::now();
-                let hub = read_hub(&input, &options).expect("read_hub");
+                let hub = read_hub(&input, &options, &mut || {}).expect("read_hub");
                 samples.push(start.elapsed().as_secs_f64() * 1000.0);
                 drop(hub);
             }

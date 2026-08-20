@@ -74,6 +74,11 @@ pub(crate) const MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
 /// Maps `f` over `items`, in parallel when it is worth it, returning the results
 /// **in `items` order regardless of thread count**.
 ///
+/// `cancel`, when present, is polled once per item immediately after the
+/// cursor hands it out (and at the top of each sequential iteration), so a
+/// cancelled run stops within one item's work rather than at the end. See
+/// [`crate::cancel`] for why the progress hook could not carry this.
+///
 /// `f` receives `(index, &item)` and must be a pure function of its arguments
 /// plus shared-**immutable** captured state: it allocates and writes only the
 /// value it returns. `on_result` fires on the **calling** thread only, once per
@@ -117,6 +122,7 @@ pub(crate) fn map_indexed<T, R, F, P>(
     items: &[T],
     threads: usize,
     work_bytes: u64,
+    cancel: Option<&crate::CancelToken>,
     f: F,
     mut on_result: P,
 ) -> crate::Result<Vec<R>>
@@ -132,7 +138,7 @@ where
 
     #[cfg(feature = "parallel")]
     if worth_spawning {
-        return map_indexed_parallel(items, threads, &f, &mut on_result);
+        return map_indexed_parallel(items, threads, cancel, &f, &mut on_result);
     }
 
     // With the `parallel` feature off the verdict is computed and discarded —
@@ -142,6 +148,9 @@ where
 
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
+        // Polled before the item, not after, so a token set before the call
+        // stops the run without doing any work at all.
+        crate::cancel::check(cancel)?;
         let result = f(idx, item)?;
         on_result(&result);
         out.push(result);
@@ -159,6 +168,7 @@ where
 fn map_indexed_parallel<T, R, F, P>(
     items: &[T],
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
     f: &F,
     on_result: &mut P,
 ) -> crate::Result<Vec<R>>
@@ -198,6 +208,15 @@ where
                     loop {
                         let idx = cursor.fetch_add(1, Ordering::Relaxed);
                         let Some(item) = items.get(idx) else { break };
+                        // One relaxed load per *item*, at the same point the
+                        // cursor hands one out and never inside a kernel — the
+                        // shape CONVENTIONS.md sanctions for the cursor itself.
+                        // Reported as a failure at `idx` so the lowest-index
+                        // rule below picks a deterministic one: whatever the
+                        // steal order, a cancelled run reports `Cancelled`.
+                        if let Err(err) = crate::cancel::check(cancel) {
+                            return Err((idx, err));
+                        }
                         match f(idx, item) {
                             Ok(result) => local.push((idx, result)),
                             // Stop claiming after this worker's own first
@@ -284,12 +303,12 @@ mod tests {
     fn results_are_in_input_order_for_every_budget() {
         let items: Vec<usize> = (0..97).collect();
         let baseline =
-            map_indexed(&items, 1, BIG, |_, &v| Ok(v * 3), |_| {}).expect("sequential map");
+            map_indexed(&items, 1, BIG, None, |_, &v| Ok(v * 3), |_| {}).expect("sequential map");
         assert_eq!(baseline, items.iter().map(|v| v * 3).collect::<Vec<_>>());
 
         for threads in [1usize, 2, 4, 8, 16] {
-            let out =
-                map_indexed(&items, threads, BIG, |_, &v| Ok(v * 3), |_| {}).expect("parallel map");
+            let out = map_indexed(&items, threads, BIG, None, |_, &v| Ok(v * 3), |_| {})
+                .expect("parallel map");
             assert_eq!(out, baseline, "order must not depend on thread count");
         }
     }
@@ -298,7 +317,7 @@ mod tests {
     #[test]
     fn closure_receives_the_input_index() {
         let items: Vec<usize> = (0..64).map(|i| i * 10).collect();
-        let out = map_indexed(&items, 8, BIG, |idx, &v| Ok((idx, v)), |_| {}).expect("map");
+        let out = map_indexed(&items, 8, BIG, None, |idx, &v| Ok((idx, v)), |_| {}).expect("map");
         for (expected, &(idx, v)) in out.iter().enumerate() {
             assert_eq!(idx, expected);
             assert_eq!(v, expected * 10);
@@ -313,7 +332,7 @@ mod tests {
         let items: Vec<usize> = (0..50).collect();
         for threads in [1usize, 4] {
             let mut seen = 0usize;
-            let out = map_indexed(&items, threads, BIG, |_, &v| Ok(v), |_| seen += 1)
+            let out = map_indexed(&items, threads, BIG, None, |_, &v| Ok(v), |_| seen += 1)
                 .expect("map with callback");
             assert_eq!(seen, out.len());
             assert_eq!(seen, items.len());
@@ -338,8 +357,8 @@ mod tests {
         };
 
         for threads in [1usize, 2, 4, 8, 16] {
-            let err =
-                map_indexed(&items, threads, BIG, failing, |_| {}).expect_err("the map must fail");
+            let err = map_indexed(&items, threads, BIG, None, failing, |_| {})
+                .expect_err("the map must fail");
             assert_eq!(
                 err.to_string(),
                 AnamnesisError::Parse {
@@ -356,11 +375,11 @@ mod tests {
     #[test]
     fn degenerate_inputs() {
         let empty: Vec<usize> = Vec::new();
-        let out = map_indexed(&empty, 8, BIG, |_, &v| Ok(v), |_| {}).expect("empty map");
+        let out = map_indexed(&empty, 8, BIG, None, |_, &v| Ok(v), |_| {}).expect("empty map");
         assert!(out.is_empty());
 
         let one = vec![42usize];
-        let out = map_indexed(&one, 8, BIG, |_, &v| Ok(v + 1), |_| {}).expect("single map");
+        let out = map_indexed(&one, 8, BIG, None, |_, &v| Ok(v + 1), |_| {}).expect("single map");
         assert_eq!(out, vec![43]);
     }
 
@@ -370,7 +389,7 @@ mod tests {
     #[test]
     fn below_the_size_threshold_still_maps_correctly() {
         let items: Vec<usize> = (0..40).collect();
-        let out = map_indexed(&items, 8, 1024, |_, &v| Ok(v * 2), |_| {}).expect("small map");
+        let out = map_indexed(&items, 8, 1024, None, |_, &v| Ok(v * 2), |_| {}).expect("small map");
         assert_eq!(out, items.iter().map(|v| v * 2).collect::<Vec<_>>());
     }
 }

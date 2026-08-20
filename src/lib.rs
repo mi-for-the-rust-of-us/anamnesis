@@ -446,6 +446,7 @@
 // parsed-model type. Crate-internal: the `Backing` enum distinguishes the
 // trusted mmap fast path from the owned-copy untrusted-input path.
 mod backing;
+pub mod cancel;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod convert;
@@ -461,7 +462,8 @@ mod parallel;
 pub mod parse;
 pub mod remember;
 
-pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
+pub use cancel::CancelToken;
+pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert, convert_with_progress};
 pub use error::{AnamnesisError, Result};
 pub use inspect::{InspectInfo, InspectOptions, InspectSummary, format_bytes};
 #[cfg(feature = "bnb")]
