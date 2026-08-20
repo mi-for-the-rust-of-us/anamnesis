@@ -478,12 +478,32 @@ fn run_remember(
             run_remember_pth(path, output)
         }
         #[cfg(feature = "npz")]
-        Format::Npz => Err(crate::AnamnesisError::Unsupported {
-            format: "NPZ".into(),
-            detail: "NPZ tensors are already full-precision; \
-                     no dequantization or conversion needed"
-                .into(),
-        }),
+        Format::Npz => {
+            // Resolved the same way as the `.pth` arm above, and for the same
+            // reason. An `NPZ` is already full precision, so `remember` copies
+            // its arrays through in their source dtype and dequantises nothing;
+            // `--to f32` is therefore vacuous rather than wrong, and refusing it
+            // on a file that is already `F32` would be hostile.
+            //
+            // Until v0.7.6 this arm returned `Unsupported`, while
+            // `npz_to_safetensors` sat exported in the library and
+            // `amn convert file.npz --to safetensors` did the very same job.
+            // One verb, one meaning, across all four formats.
+            let to_lower = to.to_ascii_lowercase();
+            let recognised = to_lower == "safetensors" || to_lower.parse::<TargetDtype>().is_ok();
+            if !recognised {
+                return Err(crate::AnamnesisError::Unsupported {
+                    format: "NPZ".into(),
+                    detail: format!(
+                        "unsupported --to value `{to}` for .npz files \
+                         (supported: `safetensors`, `bf16`, `f32`, `f16` — NPZ \
+                         arrays are already full precision, so the dtype is \
+                         accepted but nothing is narrowed or widened)"
+                    ),
+                });
+            }
+            run_remember_npz(path, output)
+        }
         #[cfg(feature = "gguf")]
         Format::Gguf => {
             // Unlike `.pth`, a quantised `GGUF` really is dequantised here, so
@@ -571,6 +591,49 @@ fn run_remember_safetensors(
         output_path.display(),
         format_bytes(info.dequantized_size),
     );
+    Ok(())
+}
+
+/// `remember` for an `NPZ` input: copy every array through into a safetensors
+/// file, dequantising nothing.
+///
+/// New in v0.7.6. The library has exported `npz_to_safetensors` since Phase 3
+/// and `amn convert file.npz --to safetensors` has always performed exactly
+/// this conversion; only `remember` refused, which left one verb meaning
+/// different things on different formats — something a Python binding would
+/// have had to reproduce.
+#[cfg(feature = "npz")]
+fn run_remember_npz(path: &std::path::Path, output: Option<&std::path::Path>) -> crate::Result<()> {
+    let tensors = crate::parse_npz(path)?;
+    let info = crate::inspect_npz(path)?;
+
+    let output_path = if let Some(p) = output {
+        p.to_owned()
+    } else {
+        // Replace extension: weights.npz → weights.safetensors
+        let mut out = path.to_owned();
+        out.set_extension("safetensors");
+        out
+    };
+
+    println!(
+        "Converting {} → {}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(input)"),
+        output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(output)")
+    );
+    println!(
+        "  {} tensors, {}",
+        info.tensors.len(),
+        format_bytes(info.total_bytes)
+    );
+
+    crate::npz_to_safetensors(&tensors, &output_path)?;
+    println!("  Done.");
     Ok(())
 }
 

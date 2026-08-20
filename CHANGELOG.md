@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`amn remember <file>.npz` works** (Phase 7.6, item 9) instead of returning
+  `Unsupported: NPZ tensors are already full-precision; no dequantization or
+  conversion needed`. The library has exported `npz_to_safetensors` since
+  Phase 3, and `amn convert file.npz --to safetensors` has always performed
+  exactly this conversion, so the refusal made one verb mean different things
+  on different formats — something a Python `remember()` binding would have had
+  to reproduce. `--to bf16|f32|f16|safetensors` is accepted and vacuous, the
+  way the `.pth` arm already resolved the same tension; a value that is not an
+  output dtype is still rejected. The two files are asserted byte-identical
+  (`cli_remember_accepts_npz_and_matches_convert`).
+
 - **`NPZ` archives holding Fortran-order arrays now parse** (Phase 7.6,
   item 8), rewritten into C-order on the way out instead of rejected with
   `Unsupported`. `NumPy` writes `fortran_order: True` for any array that is
