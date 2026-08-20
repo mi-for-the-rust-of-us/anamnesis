@@ -52,8 +52,8 @@ you need via feature flags (`gptq`, `awq`, `bnb`, `npz`, `pth`, `gguf`, `ollama`
 | Command | |
 |---------|---|
 | `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`, `.gguf`) |
-| `amn inspect <file>` | Show format, tensor counts, size estimates, dtypes, byte order |
-| `amn remember <file>` | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf` → `.safetensors` |
+| `amn inspect <file>` | Show format, tensor counts, size estimates, dtypes, byte order — `--to bf16\|f32\|f16` sizes the estimate for the width you intend |
+| `amn remember <file>` | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf`/`.npz` → `.safetensors` |
 | `amn convert <file> --to <target>` | Convert any input to `safetensors` / `gguf` / `bnb-nf4` through one dispatch |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`. Format
@@ -81,6 +81,7 @@ Format:      GGUF v3
 Arch:        llama
 Tensors:     147
 Total size:  1.22 GB
+Dequantized: 2.30 GB (BF16)
 Dtypes:      F32, Q8_0
 Alignment:   32 bytes
 

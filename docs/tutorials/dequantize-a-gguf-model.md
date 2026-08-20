@@ -73,11 +73,14 @@ Format:      GGUF v3
 Arch:        llama
 Tensors:     272
 Total size:  99 MB
+Dequantized: 257 MB (BF16)
 Dtypes:      Q8_0, F32, Q6_K, Q5_0, Q4_K
 Alignment:   32 bytes
 ```
 
-Two things to read here. The `Dtypes` line is a *mix* — `Q4_K_M` is a recipe, not a single block type, so the file holds `Q4_K`, `Q6_K`, `Q5_0`, plus some `Q8_0` and `F32` tensors that were never quantized. And `Total size: 99 MB` is the on-disk quantized size; keep it in mind for the next step, because `BF16` will be a good deal larger.
+Three things to read here. The `Dtypes` line is a *mix* — `Q4_K_M` is a recipe, not a single block type, so the file holds `Q4_K`, `Q6_K`, `Q5_0`, plus some `Q8_0` and `F32` tensors that were never quantized. `Total size: 99 MB` is the on-disk quantized size. And `Dequantized: 257 MB (BF16)` is what the next step will actually produce, which is the number you want *before* you run it.
+
+That second figure is worth pausing on, because you could not have worked it out yourself: a `GGUF`'s expansion ratio is per-kernel, so a `Q4_K` tensor and a `Q6_K` tensor of the same element count take different space on disk and the *same* space afterwards. The on-disk total predicts nothing. Ask for the width you actually intend — `--to f32` reports 513 MB for this file, twice the `bf16` figure — and the line always names the width it assumed, so a number can never be read without knowing what it was computed for. (Added in v0.7.6; before that `amn inspect` reported only the on-disk size for a `GGUF`.)
 
 ## Step 3 — Dequantize to BF16
 

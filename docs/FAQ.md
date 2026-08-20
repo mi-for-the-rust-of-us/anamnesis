@@ -48,11 +48,13 @@ A living list of the questions we and our early users have actually run into. If
   - [Which file formats can anamnesis read?](#which-file-formats-can-anamnesis-read)
   - [What's the difference between `parse` and `inspect`?](#whats-the-difference-between-parse-and-inspect)
   - [How do I inspect an Ollama model without hunting for the blob path?](#how-do-i-inspect-an-ollama-model-without-hunting-for-the-blob-path)
+  - [Can anamnesis read an `.npz` saved from a transposed array?](#can-anamnesis-read-an-npz-saved-from-a-transposed-array)
 - [Dequantizing and converting](#dequantizing-and-converting)
   - [How do I dequantize a quantized model to BF16?](#how-do-i-dequantize-a-quantized-model-to-bf16)
   - [What does "Lethe took ~N B of precision" mean?](#what-does-lethe-took-n-b-of-precision-mean)
   - [How do I convert between formats?](#how-do-i-convert-between-formats)
   - [Can I control how many threads anamnesis uses?](#can-i-control-how-many-threads-anamnesis-uses)
+  - [Can I cancel a long-running `remember` or `convert`?](#can-i-cancel-a-long-running-remember-or-convert)
   - [Why is the output `BF16` and not `float32`?](#why-is-the-output-bf16-and-not-float32)
   - [Which output dtype should I ask for?](#which-output-dtype-should-i-ask-for)
   - [Why is my `f32` output twice the size of the `bf16` one?](#why-is-my-f32-output-twice-the-size-of-the-bf16-one)
@@ -115,6 +117,12 @@ The Minimum Rust Version (MSRV) is **1.88**. The library itself (no CLI) is a no
 
 `amn inspect` is a fast, header-only summary (format, tensor counts, dtypes, size estimate, byte order), and for `.gguf`/`.npz`/`.pth` it does not read the weight bodies at all. `amn parse` does the full parse and lists every tensor with its name, dtype, and shape. Reach for `inspect` first to decide whether a file is worth the full parse; this is also the recommended safety gate for untrusted input (walkthrough: [Inspect before you parse](tutorials/inspect-before-you-parse.md)).
 
+### Can anamnesis read an `.npz` saved from a transposed array?
+
+Yes, since **v0.7.6**. `np.savez("w.npz", w=x.T)` writes `fortran_order: True`, because NumPy records the memory order it finds and a transposed view is column-major. Earlier versions rejected such an archive outright with an `Unsupported` error — defensible when the audience was Rust consumers of C-order SAE archives, and a poor welcome for anyone whose file NumPy had written from an ordinary two-line script.
+
+The array is now rewritten into row-major order on the way out, so `NpzTensor::data` keeps the row-major promise every downstream consumer relies on. That is deliberate rather than a flag on the tensor: `npz_to_safetensors`, the `convert` hub, and any framework loading the result all assume row-major, and an order flag a caller might ignore would be a silent-orientation bug — plausible numbers in the wrong places, not a crash. C-order archives, which is nearly all of them, pay nothing.
+
 ### How do I inspect an Ollama model without hunting for the blob path?
 
 Build with the `ollama` feature and pass an `ollama:<model>:<tag>` URL, and anamnesis reads the Ollama manifest and resolves it to the local GGUF blob for you:
@@ -157,7 +165,7 @@ It is the estimated number of bytes of precision that quantization (Lethe) disca
 amn convert model.gguf --to bnb-nf4     # dequantize + re-encode, one command
 ```
 
-Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full walkthrough with real output is in [Convert a model between formats](tutorials/convert-between-formats.md); the full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
+Scalar dtypes are preserved (so `.pth → safetensors` and `NPZ`-`F32` → `GGUF` stay lossless); only quantized tensors become `BF16`. From the library, `convert_bytes` does the same thing without touching the filesystem (added in v0.7.6, for callers holding a download or crossing an `FFI` boundary); it detects the input format from magic bytes and returns the output bytes, byte-identical to what the file path writes. Stamp your own GGUF metadata with `--gguf-metadata <file.json>` / `--gguf-kv key=value` (anamnesis writes it verbatim). The full walkthrough with real output is in [Convert a model between formats](tutorials/convert-between-formats.md); the full matrix, the metadata grammar, and what stays out of scope until the encode kernels land are in the [CLI reference](cli-reference.md#amn-convert-file---to-target).
 
 ### Can I control how many threads anamnesis uses?
 
@@ -166,6 +174,29 @@ Yes: pass `--threads N` to `amn remember` or `amn convert`, or use `RememberOpti
 ```
 amn convert model-Q4_K_M.gguf --to safetensors --threads 8
 ```
+
+### Can I cancel a long-running `remember` or `convert`?
+
+Yes, from the library, since **v0.7.6**. Attach a `CancelToken` through `RememberOptions::with_cancel` or `ConvertOptions::with_cancel`, keep a clone, and call `cancel()` from any thread — a signal handler, a watchdog, a request-timeout task:
+
+```rust
+use anamnesis::{CancelToken, RememberOptions, TargetDtype, parse};
+
+let token = CancelToken::new();
+let worker = token.clone();
+// ... hand `worker` to whatever decides to stop the run ...
+
+let model = parse("model-fp8.safetensors")?;
+model.remember_with_options(
+    "out.safetensors",
+    TargetDtype::BF16,
+    RememberOptions::new().with_cancel(token),
+)?;
+```
+
+The run stops at the next tensor boundary and returns `AnamnesisError::Cancelled` — a variant of its own, so a host can tell a user-initiated abort from a bad file. **No output file is written**: every path builds its result in memory before serialising, so the check lands before any byte reaches the filesystem and there is nothing to clean up. Cancellation is cooperative, so a worker already inside a tensor finishes that tensor; the bound is one tensor, not the whole model. A token you never cancel costs nothing and changes no output byte.
+
+The CLI does not expose this yet — `Ctrl-C` on `amn` is the usual process signal. The token exists for embedders, and for the v0.8.0 Python bindings, where releasing the GIL around a long call would otherwise make `KeyboardInterrupt` undeliverable until the call returned.
 
 ### Why is the output `BF16` and not `float32`?
 
@@ -201,17 +232,19 @@ Because `float32` is 4 bytes per element and `bfloat16` is 2. The doubling is th
 
 Only the tensors anamnesis **dequantizes** double. Passthrough tensors keep their source dtype and their exact bytes, so a real model grows by somewhat less than 2x overall, depending on how much of it was quantized in the first place.
 
-Expect it to be slower as well as bigger. These kernels are bandwidth-bound, so writing twice the bytes costs roughly what you would guess. If you want the size before you commit to the run, `InspectOptions` will compute the estimate at the width you actually intend:
+Expect it to be slower as well as bigger. These kernels are bandwidth-bound, so writing twice the bytes costs roughly what you would guess. If you want the size before you commit to the run, ask for it at the width you actually intend — `amn inspect --to f32` from the command line, or `InspectOptions` from the library:
 
 ```rust
 use anamnesis::{InspectOptions, TargetDtype, parse};
 
 let model = parse("model-fp8.safetensors")?;
 let info = model.inspect_with_options(
-    InspectOptions::new().with_output_dtype(TargetDtype::F32),
+    &InspectOptions::new().with_output_dtype(TargetDtype::F32),
 );
 println!("{}", info.dequantized_size);
 ```
+
+*(`InspectOptions` is taken by reference since v0.7.6, when it gained a `limits` field and stopped being `Copy`. Upgrading from v0.7.4? Add the `&`.)*
 
 ### Does asking for `f32` rewrite every tensor as `float32`?
 
@@ -233,11 +266,11 @@ Widening it found a real defect. The `BnB` `INT8` kernel computed `w * (SCB / 12
 
 ### Is it safe to parse a model file from a stranger?
 
-A tensor archive is attacker-controllable, so anamnesis treats every parser entry point as a hardened boundary: checked arithmetic on header-derived sizes, allocation caps before any `vec!`, a strict allowlist in the `.pth` pickle VM (it never invokes Python callables), and a vendored read-only ZIP reader. The recommended pattern is **inspect → check against your policy → parse**: run the cheap `amn inspect` (or the reader-based `inspect_*_from_reader` library calls) first and only commit to a full parse if the declared sizes look sane. Step-by-step walkthrough: [Inspect before you parse](tutorials/inspect-before-you-parse.md); the README's "Parsing untrusted input" section has the full policy.
+A tensor archive is attacker-controllable, so anamnesis treats every parser entry point as a hardened boundary: checked arithmetic on header-derived sizes, allocation caps before any `vec!`, a strict allowlist in the `.pth` pickle VM (it never invokes Python callables), and a vendored read-only ZIP reader. The recommended pattern is **inspect → check against your policy → parse**: run the cheap `amn inspect` (or the reader-based `inspect_*_from_reader` library calls) first and only commit to a full parse if the declared sizes look sane. Since **v0.7.6** that first call takes your budget too — the `_with_options` forms accept an `InspectOptions` carrying a `ParseLimits` — so the call you are told to make *first* is one you can tighten, which it was not before. Step-by-step walkthrough: [Inspect before you parse](tutorials/inspect-before-you-parse.md); the README's "Parsing untrusted input" section has the full policy.
 
 ### How do I bound memory when parsing untrusted files?
 
-The library API takes a caller-supplied `ParseLimits` budget (max single allocation, max aggregate declared bytes, max item count, max decompression ratio) threaded through every `parse_*_with_limits` entry point and enforced fail-fast *before* allocation. `ParseLimits::default()` is permissive (today's behaviour); tighten it to your environment (a memory-constrained edge board sets MB-scale ceilings, a multi-tenant worker sets per-slot ceilings), and a hostile declaration is rejected with a clean `AnamnesisError::LimitExceeded` (carrying the breached limit's name) instead of an OOM. Note that the **always-on permanent per-format caps** (the 100 MiB safetensors header, `MAX_PKL_SIZE`, the `GGUF` counts, …) already return `LimitExceeded` *even under the default budget*; tightening only lowers the thresholds, it is not what makes `LimitExceeded` reachable. A malformed file is `Parse`, and a `.pth` referencing a non-`torch.*` pickle global is `DisallowedGlobal`, so a host can branch on the error *kind*, not the message.
+The library API takes a caller-supplied `ParseLimits` budget (max single allocation, max aggregate declared bytes, max item count, max decompression ratio) threaded through every `parse_*_with_limits` entry point — and, since **v0.7.6**, through the `inspect_*_with_options` and `detect_format_from_bytes_with_limits` entry points as well — and enforced fail-fast *before* allocation. `ParseLimits::default()` is permissive (today's behaviour); tighten it to your environment (a memory-constrained edge board sets MB-scale ceilings, a multi-tenant worker sets per-slot ceilings), and a hostile declaration is rejected with a clean `AnamnesisError::LimitExceeded` (carrying the breached limit's name) instead of an OOM. Note that the **always-on permanent per-format caps** (the 100 MiB safetensors header, `MAX_PKL_SIZE`, the `GGUF` counts, …) already return `LimitExceeded` *even under the default budget*; tightening only lowers the thresholds, it is not what makes `LimitExceeded` reachable. A malformed file is `Parse`, and a `.pth` referencing a non-`torch.*` pickle global is `DisallowedGlobal`, so a host can branch on the error *kind*, not the message.
 
 ### Can a malformed file crash the process (panic or abort)?
 

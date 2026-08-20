@@ -75,6 +75,10 @@ alignment — without materialising tensor data.
 |---|---|
 | `<file>` | Path to the model file, or an `ollama:` URL |
 
+| Flag | Default | Description |
+|---|---|---|
+| `--to <value>` | `bf16` | Width the dequantised-size estimate assumes: `bf16`, `f32`, `f16`. Added in **v0.7.6**; before that the estimate was pinned to `bf16`, so a caller who intended `--to f32` on `remember` was reading a figure half the size of what they were about to allocate. Vacuous on `.npz` / `.pth`, whose tensors are already full precision. |
+
 ```
 $ amn inspect weights.npz
 Format:      NPZ archive
@@ -104,8 +108,12 @@ Converting model.pth → model.safetensors
   Done.
 ```
 
-`amn dequantize` is an exact alias. An `.npz` input is rejected with a clear
-`Unsupported` error (NPZ tensors are already full precision).
+`amn dequantize` is an exact alias. An `.npz` input is **accepted** since
+**v0.7.6** and copied through into safetensors, producing exactly what
+`amn convert weights.npz --to safetensors` produces; before that it was rejected
+as "already full precision", which made one verb mean different things on
+different formats. As on `.pth`, `--to` is accepted and changes nothing there:
+nothing in an `NPZ` is quantised, so there is nothing to narrow or widen.
 
 ### Output dtype on `remember`
 
@@ -278,6 +286,12 @@ clear `Unsupported` error rather than a silent no-op.
 `amn remember` and `amn convert` (added in v0.7.2 — before that the budget was a
 library-only knob).
 
+**One correction worth knowing if you benchmarked an older build.** On a `GGUF`
+input, `amn remember` accepted `--threads` and then *ignored* it from v0.7.2
+until **v0.7.6**: that arm ran its own sequential copy of the conversion rather
+than the library's threaded one. If you measured no effect there, the flag was
+the problem, not your machine. `amn convert` was threaded throughout.
+
 | Value | Effect |
 |---|---|
 | *(omitted)* | `min(cpu cores, 4)` — the measured scaling knee, leaving the rest of the machine free. |
@@ -329,6 +343,7 @@ Format:      GGUF v3
 Arch:        llama
 Tensors:     147
 Total size:  1.22 GB
+Dequantized: 2.30 GB (BF16)
 Dtypes:      F32, Q8_0
 Alignment:   32 bytes
 ```

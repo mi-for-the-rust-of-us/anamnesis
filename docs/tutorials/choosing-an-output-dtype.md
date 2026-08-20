@@ -109,12 +109,16 @@ use anamnesis::{InspectOptions, TargetDtype, parse};
 
 let model = parse("model-fp8.safetensors")?;
 let info = model.inspect_with_options(
-    InspectOptions::new().with_output_dtype(TargetDtype::F32),
+    &InspectOptions::new().with_output_dtype(TargetDtype::F32),
 );
 println!("{info}");
 ```
 
-The rendered size line names the width it assumed, so the number can never be read without knowing what it was computed for. The `amn inspect` command reports the `bf16` estimate; the dtype-aware figure is a library-level API in v0.7.4.
+The rendered size line names the width it assumed, so the number can never be read without knowing what it was computed for.
+
+`amn inspect --to f32` reports the same figure from the command line, and every format answers it — `GGUF` included, where the estimate is the one you cannot derive from the file size. Both arrived in **v0.7.6**; in v0.7.4 and v0.7.5 the dtype-aware figure was a library-only API and the command reported the `bf16` estimate whatever you intended.
+
+*(`InspectOptions` is taken by reference since v0.7.6, when it gained a `limits` field and stopped being `Copy`. If you are upgrading from v0.7.4, add the `&`.)*
 
 ## What you've learned
 

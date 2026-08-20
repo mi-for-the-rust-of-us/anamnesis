@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **User-facing docs brought back in line with the tool.** `README.md`, the
+  `CLI` reference, the FAQ and two tutorials each carried something v0.7.6 had
+  made false: three `amn inspect` transcripts of a **quantised** `GGUF` were
+  missing the `Dequantized:` line the command now prints (regenerated against
+  the real binary, not hand-edited); the `CLI` reference still said an `.npz`
+  input to `remember` is rejected, and did not document `amn inspect --to` at
+  all; two Rust examples called `inspect_with_options` by value, which stopped
+  compiling when `InspectOptions` gained a `limits` field and lost `Copy`; and
+  a tutorial said the dtype-aware size estimate was a library-only API, which
+  `amn inspect --to` had just stopped being true. The `--threads` section also
+  now records that the `GGUF` `remember` arm accepted the flag and ignored it
+  from v0.7.2 to v0.7.5, so anyone who benchmarked it then knows the flag was
+  the problem.
+
+  Two transcripts were checked and left alone: both `GGUF` samples in
+  `convert-between-formats.md` show all-scalar files, where
+  `dequantized_size == total_bytes` and the new line is deliberately not
+  printed. Verified by re-running the conversion rather than reasoned about.
+
 - **Eight broken intra-doc links, and the `CI` job that would have caught
   them.** Rustdoc was checked only by `publish.yml`, at release time, with
   `--all-features` and public items only — so two classes of breakage had no
@@ -146,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParsedPth` are already unconstructible through private fields.
 
 ### Added
+
+- **FAQ entries for the two v0.7.6 capabilities a user is most likely to want**:
+  reading an `.npz` saved from a transposed array (Fortran order), and
+  cancelling a long-running `remember` / `convert` with a `CancelToken`. The
+  untrusted-input and bound-memory answers now point at the `_with_options`
+  inspect forms that accept a budget, and the convert answer mentions
+  `convert_bytes`.
 
 - **`Format`, `detect_format`, `detect_format_from_bytes` and
   `detect_format_from_bytes_with_limits` are public**
