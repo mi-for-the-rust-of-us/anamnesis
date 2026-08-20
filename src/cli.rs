@@ -91,7 +91,7 @@ enum Commands {
     /// - `safetensors` (alias `bf16`) — dequantise any quantised input to a
     ///   BF16 safetensors file (passes through unquantised inputs losslessly).
     /// - `gguf` — write an unquantised GGUF file. Quantised GGUF emit
-    ///   (`gguf-q4km`, …) is deferred to Phase 7.5 via the same dispatch.
+    ///   (`gguf-q4km`, …) is deferred to Phase 8.5 via the same dispatch.
     /// - `bnb-nf4` — encode the BF16 source into a BitsAndBytes-NF4
     ///   safetensors file (2-D tensors only; biases / norms / embeddings
     ///   pass through unchanged in BF16).

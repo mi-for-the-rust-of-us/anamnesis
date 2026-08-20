@@ -10,7 +10,7 @@
 //!
 //! Phase 5 ships `bnb` only (`NF4` / `FP4` / `INT8`, requires the
 //! `bnb` feature). Subsequent encode-kernel families (`FP8`, `GGUF`
-//! legacy / `K-quants` / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and
+//! legacy / `K-quants` / `IQ` / `TQ` / `MXFP4`) land in Phase 8.5 and
 //! reuse the [`round_trip`] validation harness introduced here.
 
 #[cfg(feature = "bnb")]

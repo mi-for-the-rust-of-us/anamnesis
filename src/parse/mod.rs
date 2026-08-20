@@ -22,7 +22,7 @@ pub(crate) mod zip;
 pub mod gguf;
 
 /// `GGUF` file writing — the format-symmetric inverse of [`gguf`]. Scalar
-/// dtype passthrough only in Phase 6; quantised emit lands in Phase 7.5.
+/// dtype passthrough only in Phase 6; quantised emit lands in Phase 8.5.
 #[cfg(feature = "gguf")]
 pub mod gguf_write;
 

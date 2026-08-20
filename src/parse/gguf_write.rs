@@ -6,7 +6,7 @@
 //! (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`) round-trip through this writer
 //! byte-exactly. Quantised dtypes (`Q*`, `IQ*`, `TQ*`, `MXFP4`) are rejected
 //! with `AnamnesisError::Unsupported` — emitting those blocks requires the
-//! encode kernels landing in Phase 7.5.
+//! encode kernels landing in Phase 8.5.
 //!
 //! # Spec reference
 //!
@@ -77,7 +77,7 @@ pub struct GgufWriteTensor<'a> {
     /// Tensor dimensions, **most-significant-first**.
     pub shape: &'a [usize],
     /// Element / block data type. Must satisfy `!dtype.is_quantized()` —
-    /// quantised emit is deferred to Phase 7.5.
+    /// quantised emit is deferred to Phase 8.5.
     pub dtype: GgufType,
     /// Raw little-endian bytes. `data.len()` must equal
     /// `dtype.byte_size_for_n_elements(product(shape))`.
@@ -103,7 +103,7 @@ pub struct GgufWriteTensor<'a> {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] when any tensor's dtype is
-/// `is_quantized()` (quantised emit lands in Phase 7.5), or when a supplied
+/// `is_quantized()` (quantised emit lands in Phase 8.5), or when a supplied
 /// `general.alignment` value is non-`U32` or zero.
 ///
 /// Returns [`AnamnesisError::Parse`] when a tensor's `data.len()` disagrees
@@ -355,7 +355,7 @@ fn validate_tensor(tensor: &GgufWriteTensor<'_>) -> crate::Result<()> {
         return Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!(
-                "writing quantized GGUF dtype {} requires Phase 7.5 encoders \
+                "writing quantized GGUF dtype {} requires Phase 8.5 encoders \
                  (Phase 6 ships only scalar dtype passthrough emit)",
                 tensor.dtype
             ),
@@ -719,7 +719,7 @@ fn write_array_len(w: &mut impl Write, len: usize) -> crate::Result<()> {
 /// The inverse of [`GgufType::from_u32`](super::gguf). Quantised dtypes are
 /// rejected at the `validate_tensor` boundary above, so callers only ever
 /// reach this with a scalar dtype — but we provide the full mapping for
-/// future-proofing once Phase 7.5 lights up the quantised emitters.
+/// future-proofing once Phase 8.5 lights up the quantised emitters.
 const fn gguf_type_to_u32(dtype: GgufType) -> u32 {
     match dtype {
         GgufType::F32 => 0,
@@ -996,7 +996,7 @@ mod tests {
         match err {
             AnamnesisError::Unsupported { format, detail } => {
                 assert_eq!(format, "GGUF");
-                assert!(detail.contains("Phase 7.5"), "unexpected detail: {detail}");
+                assert!(detail.contains("Phase 8.5"), "unexpected detail: {detail}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

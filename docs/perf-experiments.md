@@ -643,7 +643,7 @@ future regressions.
 
 ## Experiment 7 — Sign-of-zero preservation rule (`BnB FP4` decode tweak)
 
-**Scope note:** Unlike Experiments 1–6, this is a **correctness** experiment, not a perf one. Included in this file because the template is identical: an initial framing claimed a property was impossible; empirical observation on a real fixture narrowed the framing; a targeted code change recovered the desired invariant; cross-architecture validation confirmed the change generalises. Future encode kernels (`FP8`, `GGUF`, `IQ`, `TQ`, `MXFP4` in Phase 7.5) may surface analogous "codebook-quirk-driven" findings — this entry sets the precedent.
+**Scope note:** Unlike Experiments 1–6, this is a **correctness** experiment, not a perf one. Included in this file because the template is identical: an initial framing claimed a property was impossible; empirical observation on a real fixture narrowed the framing; a targeted code change recovered the desired invariant; cross-architecture validation confirmed the change generalises. Future encode kernels (`FP8`, `GGUF`, `IQ`, `TQ`, `MXFP4` in Phase 8.5) may surface analogous "codebook-quirk-driven" findings — this entry sets the precedent.
 
 **Initial claim during Phase 5 step 1 design discussion:** "*Byte-level round-trip of `BnB FP4` is mathematically impossible — bitsandbytes' Python on-disk `quant_map` stores `+0.0` at both index 0 and index 8 (collapsing the `±0` pair), so decoding nibble 8 produces `+0.0` BF16, indistinguishable from nibble 0, and no encoder can recover which original nibble produced it.*" Conclusion drawn at the time: "the operative contract for FP4 is decode-equivalence (`decode(re_encoded) == decode(weight_data)` at the BF16 level), not byte-exact round-trip."
 
@@ -694,7 +694,7 @@ The downstream cost of dropping the constraint is bounded:
 
 **Cross-reference:** The full design discussion that led to this rule is summarised in [`ROADMAP.md`](../ROADMAP.md)'s Phase 5 "Boundary-pushing finding (sign-of-zero preservation)" paragraph and in commit `a5c452d`'s commit-message body.
 
-**Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 7.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
+**Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 8.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
 
 ---
 

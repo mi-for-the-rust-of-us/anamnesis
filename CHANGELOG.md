@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Stale `Phase 7.5` references corrected to `Phase 8.5`** (Phase 7.6,
+  item 10), in 19 places across seven source files and two documents. Phase 7.5
+  shipped as PTH reader-generic front matter; the encode-kernel completion it
+  used to name is Phase 8.5. Two of the stale references were user-facing: the
+  `amn convert --help` text, and the error string a caller sees when asking the
+  `GGUF` writer for a quantised dtype (`"requires Phase 7.5 encoders"`). The
+  rest render on docs.rs. The one genuine Phase 7.5 reference, in the `.pth`
+  front-matter test, is untouched.
+
 - **`amn remember <file>.npz` works** (Phase 7.6, item 9) instead of returning
   `Unsupported: NPZ tensors are already full-precision; no dequantization or
   conversion needed`. The library has exported `npz_to_safetensors` since

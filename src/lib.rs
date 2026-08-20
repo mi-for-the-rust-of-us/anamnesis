@@ -45,7 +45,7 @@
 //! | `BitsAndBytes` `INT8` encode | `bnb` | byte-exact vs `bitsandbytes`' on-disk bytes on every fixture |
 //!
 //! Subsequent encode-kernel families (`FP8`, `GGUF` legacy / `K-quants`
-//! / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and reuse the
+//! / `IQ` / `TQ` / `MXFP4`) land in Phase 8.5 and reuse the
 //! `lethe::round_trip` harness introduced here.
 //!
 //! # Format Conversion Pipeline (Phase 6, v0.6.0)
@@ -57,7 +57,7 @@
 //! - `write_gguf` / `write_gguf_to_writer` / `GgufWriteTensor` — the
 //!   format-symmetric inverse of `parse_gguf`. Phase 6 emits scalar
 //!   dtypes only (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`); quantised
-//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 7.5 through
+//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 8.5 through
 //!   the same writer scaffold. Behind the `gguf` feature.
 //! - `npz_to_safetensors` / `npz_to_safetensors_bytes` — lossless
 //!   `NPZ → safetensors` conversion. Every `NpzDtype` variant maps
