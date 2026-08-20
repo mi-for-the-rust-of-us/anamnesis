@@ -528,7 +528,22 @@ impl ParsedPth {
     /// No I/O — purely computed from the tensor metadata extracted during
     /// [`parse_pth`].
     pub fn inspect(&self) -> PthInspectInfo {
-        build_pth_inspect_info(&self.meta, self.big_endian)
+        self.inspect_with_options(&crate::InspectOptions::new())
+    }
+
+    /// Returns inspection info under a caller-supplied
+    /// [`InspectOptions`](crate::InspectOptions). No I/O.
+    ///
+    /// `options.output_dtype` is recorded on the result and changes no figure:
+    /// a `.pth` is already full precision, so
+    /// [`PthInspectInfo::dequantized_size`] equals `total_bytes` at every
+    /// width. `options.limits` is ignored — the archive is already parsed.
+    ///
+    /// Present for uniformity, which is the point of
+    /// [`InspectSummary`](crate::InspectSummary): a caller asks every format
+    /// the same question rather than knowing in advance which ones expand.
+    pub fn inspect_with_options(&self, options: &crate::InspectOptions) -> PthInspectInfo {
+        build_pth_inspect_info(&self.meta, self.big_endian, options.output_dtype)
     }
 
     /// Converts the parsed `.pth` tensors to a safetensors file.
@@ -659,6 +674,25 @@ pub struct PthInspectInfo {
     pub dtypes: Vec<PthDtype>,
     /// Whether the file uses big-endian storage.
     pub big_endian: bool,
+    /// Estimated tensor-data size in bytes after `remember`, at
+    /// [`output_dtype`](Self::output_dtype).
+    ///
+    /// **Always equal to [`total_bytes`](Self::total_bytes)**, and that is the
+    /// answer rather than a placeholder: a `.pth` `state_dict` is already full
+    /// precision, so `remember` copies every tensor through in its **source**
+    /// dtype and nothing is narrowed or widened. Present so a caller reading
+    /// [`InspectSummary`](crate::InspectSummary) gets the same question
+    /// answered for every format instead of having to know which formats
+    /// expand.
+    pub dequantized_size: u64,
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// Recorded, but **vacuous** for this format rather than wrong: nothing is
+    /// dequantised, so the figure is the same at every width. The same sense in
+    /// which `amn remember model.pth --to f32` is accepted and narrows nothing
+    /// — refusing a dtype on a file that is already that dtype would be
+    /// hostile.
+    pub output_dtype: crate::TargetDtype,
 }
 
 impl fmt::Display for PthInspectInfo {
@@ -2479,7 +2513,11 @@ fn interpret_pickle_to_meta(
 /// points are guaranteed substrate-equivalent — every field of the
 /// resulting `PthInspectInfo` is computed by the same code regardless of
 /// which entry point produced the underlying [`TensorMeta`] records.
-fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectInfo {
+fn build_pth_inspect_info(
+    meta: &[TensorMeta],
+    big_endian: bool,
+    output_dtype: crate::TargetDtype,
+) -> PthInspectInfo {
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<PthDtype> = Vec::new();
     for m in meta {
@@ -2503,6 +2541,30 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
         total_bytes,
         dtypes,
         big_endian,
+        // Not a copy made out of symmetry: `.pth` tensors are passed through in
+        // their source dtype, so the post-`remember` size *is* the stored size.
+        dequantized_size: total_bytes,
+        output_dtype,
+    }
+}
+
+impl crate::inspect::sealed::Sealed for PthInspectInfo {}
+
+impl crate::InspectSummary for PthInspectInfo {
+    fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    fn current_size(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn dequantized_size(&self) -> u64 {
+        self.dequantized_size
+    }
+
+    fn output_dtype(&self) -> crate::TargetDtype {
+        self.output_dtype
     }
 }
 
@@ -2676,11 +2738,40 @@ fn build_pth_inspect_info(meta: &[TensorMeta], big_endian: bool) -> PthInspectIn
 /// independent of the file's total size — a torchvision 300 MB `.pth`
 /// inspects with ~150 KiB peak heap.
 pub fn inspect_pth_from_reader<R: Read + Seek>(reader: R) -> crate::Result<PthInspectInfo> {
-    // The inspect path is intentionally limit-free: it reports the totals a host
-    // checks against its policy (the inspect-before-parse gate), then calls
-    // `parse_pth_with_limits` for enforcement. Use the unbounded default.
-    let (big_endian, meta) = read_pth_meta(reader, &ParseLimits::default())?;
-    Ok(build_pth_inspect_info(&meta, big_endian))
+    inspect_pth_from_reader_with_options(reader, &crate::InspectOptions::new())
+}
+
+/// Inspects a `.pth` archive from any `Read + Seek` source, under a
+/// caller-supplied [`InspectOptions`](crate::InspectOptions).
+///
+/// The two-knob form of [`inspect_pth_from_reader`], new in v0.7.6.
+/// `output_dtype` is recorded and vacuous here (nothing is dequantised), so the
+/// knob that does work on this format is **`limits`**: until v0.7.6 this entry
+/// point was *"intentionally limit-free"*, which left the call a host is told to
+/// make **first** on an untrusted archive as the one call it could not tighten.
+/// The budget bounds both the `ZIP` central-directory walk and the `data.pkl`
+/// size cap; the permanent floors still apply and `limits` can only narrow them.
+///
+/// # Errors
+///
+/// As [`inspect_pth_from_reader`], plus [`AnamnesisError::LimitExceeded`] when a
+/// declared count or allocation exceeds `options.limits` rather than only when
+/// it exceeds a permanent cap.
+///
+/// # Memory
+///
+/// As [`inspect_pth_from_reader`]: the `data.pkl` entry plus the pickle VM's
+/// working set, never the tensor-data files.
+pub fn inspect_pth_from_reader_with_options<R: Read + Seek>(
+    reader: R,
+    options: &crate::InspectOptions,
+) -> crate::Result<PthInspectInfo> {
+    let (big_endian, meta) = read_pth_meta(reader, &options.limits)?;
+    Ok(build_pth_inspect_info(
+        &meta,
+        big_endian,
+        options.output_dtype,
+    ))
 }
 
 /// Reads and interprets a `.pth` archive's `data.pkl`, returning the byte
@@ -2847,7 +2938,17 @@ impl PthFrontMatter {
     /// Reduces this front matter to the aggregate [`PthInspectInfo`]
     /// summary. No I/O.
     pub fn inspect(&self) -> PthInspectInfo {
-        build_front_matter_inspect_info(&self.tensors, self.big_endian)
+        self.inspect_with_options(&crate::InspectOptions::new())
+    }
+
+    /// Reduces this front matter to the aggregate [`PthInspectInfo`] summary
+    /// under a caller-supplied [`InspectOptions`](crate::InspectOptions). No
+    /// I/O.
+    ///
+    /// Both knobs are inert here — nothing is dequantised and nothing is left
+    /// to read — so this exists for uniformity with the `GGUF` counterpart.
+    pub fn inspect_with_options(&self, options: &crate::InspectOptions) -> PthInspectInfo {
+        build_front_matter_inspect_info(&self.tensors, self.big_endian, options.output_dtype)
     }
 }
 
@@ -2923,7 +3024,11 @@ pub fn parse_pth_front_matter_from_reader_with_limits<R: Read + Seek>(
 /// [`ParsedPth::tensor_info`]. Routing [`ParsedPth::inspect`] and
 /// [`inspect_pth_from_reader`] through this reduction instead would force
 /// that heavier allocation onto both, for a summary that doesn't need it.
-fn build_front_matter_inspect_info(tensors: &[PthTensorInfo], big_endian: bool) -> PthInspectInfo {
+fn build_front_matter_inspect_info(
+    tensors: &[PthTensorInfo],
+    big_endian: bool,
+    output_dtype: crate::TargetDtype,
+) -> PthInspectInfo {
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<PthDtype> = Vec::new();
     for t in tensors {
@@ -2940,6 +3045,9 @@ fn build_front_matter_inspect_info(tensors: &[PthTensorInfo], big_endian: bool) 
         total_bytes,
         dtypes,
         big_endian,
+        // As in `build_pth_inspect_info`: nothing here is quantised.
+        dequantized_size: total_bytes,
+        output_dtype,
     }
 }
 
@@ -4474,9 +4582,10 @@ mod tests {
             strides: vec![0, 0, 0],
         }];
 
-        let via_inspect = build_pth_inspect_info(&meta, false);
+        let via_inspect = build_pth_inspect_info(&meta, false, crate::TargetDtype::BF16);
         let tensors = build_pth_tensor_info(&meta);
-        let via_front_matter = build_front_matter_inspect_info(&tensors, false);
+        let via_front_matter =
+            build_front_matter_inspect_info(&tensors, false, crate::TargetDtype::BF16);
 
         assert_eq!(
             tensors[0].byte_len, 0,

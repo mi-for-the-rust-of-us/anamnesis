@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The summary `inspect` entry points accept a caller `ParseLimits`**
+  (Phase 7.6, item 7), through `InspectOptions::with_limits`. They were
+  *"intentionally limit-free"* by design, which left the call the README tells
+  a multi-tenant host to make **first** on an untrusted file as the one call it
+  could **not** tighten, an inversion of the whole premise of `ParseLimits`:
+  that a caller can always narrow a permanent floor. `NPZ` was the sharpest
+  case, having no bounded alternative at all (`GGUF` and `.pth` at least offer
+  `parse_*_front_matter_from_reader_with_limits`), a walk that is `O(entries)`
+  in both I/O and allocation, and one floor, `ZIP_MAX_ENTRIES` = `1 << 20`.
+  A hostile archive could therefore force a million-entry central directory, a
+  million `NPY` header reads, and a `Vec<NpzTensorInfo>` no caller could cap.
+  `README.md`'s untrusted-input recipe called that call "bounded"; it now is,
+  and the recipe shows how. Pinned by `inspect_npz_honours_the_caller_budget`.
+
 - **`amn remember <file>.gguf --threads N` now honours `N`** (Phase 7.6,
   item 1). The flag reached the safetensors arm only; the `GGUF` arm took no
   thread parameter, so the budget was parsed, validated, and discarded. It now
@@ -17,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remember_is_deterministic_across_thread_counts`).
 
 ### Changed
+
+- **BREAKING: `InspectOptions` is no longer `Copy`, and the
+  `inspect_with_options` family takes it by reference.** It gained a
+  `limits: ParseLimits` field, and `ParseLimits` is deliberately
+  `Clone`-not-`Copy` (a `Copy` derive would trip `trivially_copy_pass_by_ref`
+  on the 16-byte struct). Following the crate's own rule for a non-`Copy`
+  argument that is only read, `ParsedModel::inspect_with_options` and its new
+  siblings take `&InspectOptions`. Callers add one `&`.
 
 - **BREAKING: every type the crate returns is now `#[non_exhaustive]`**
   (Phase 7.6, item 4). Twenty public structs gain the attribute: the parsed
@@ -52,6 +74,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParsedPth` are already unconstructible through private fields.
 
 ### Added
+
+- **A dequantised-size estimate for every format, and one trait to read it**
+  (Phase 7.6, item 2). `GgufInspectInfo`, `PthInspectInfo` and
+  `NpzInspectInfo` each gain `dequantized_size` and `output_dtype`, joining
+  safetensors' `InspectInfo`, and all four now implement the new sealed
+  **`InspectSummary`** trait (`tensor_count` / `current_size` /
+  `dequantized_size` / `output_dtype`, plus a provided `expansion`).
+  `InspectInfo` also gains `tensor_count`, which previously could only be
+  obtained by summing the role counters, a sum that silently under-counted
+  because `TensorRole::QuantState` has no counter of its own.
+
+  **`GGUF` is why this matters.** It is the one format whose in-memory size
+  cannot be inferred from its on-disk size, because the expansion ratio is
+  *per kernel*: a `Q2_K` tensor and a `Q6_K` tensor of equal element count
+  occupy different bytes on disk and the same bytes after dequantisation. The
+  Phase 6.8 inspect-before-parse gate had nothing to check for a `GGUF`, on the
+  format where the check matters most. The estimate is asserted to equal the
+  exact tensor-data byte count `remember` then writes, at all three widths
+  (`gguf_dequantized_size_predicts_what_remember_writes`). On `.pth` and `NPZ`
+  nothing is quantised, so the figure equals `total_bytes` at every width and
+  the dtype is recorded but vacuous.
+
+- **`inspect_*_with_options` on every entry point** - `inspect_npz_with_options`,
+  `inspect_npz_from_reader_with_options`,
+  `inspect_gguf_from_reader_with_options`,
+  `inspect_pth_from_reader_with_options`, plus `inspect_with_options` on
+  `ParsedGguf`, `ParsedPth`, `GgufFrontMatter` and `PthFrontMatter`.
+
+- **`amn inspect --to bf16|f32|f16`** - the CLI could not ask for the width it
+  intended, so its size estimate was pinned to the `BF16` assumption. That is
+  the identical bug v0.7.4 fixed for `remember`'s summary line and did not
+  carry across. On a `Q6_K` `SmolLM2-135M` the same file now reports
+  `Dequantized: 257 MB (BF16)` or `513 MB (F32)`, next to the unchanged
+  `Total size: 130 MB`.
 
 - **`ParsedGguf::remember` / `remember_with_options` / `remember_to_bytes` /
   `remember_to_bytes_with_options`** (Phase 7.6, item 1) — whole-model

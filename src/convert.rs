@@ -2425,6 +2425,95 @@ mod quantized_gguf_tests {
         }
     }
 
+    /// `GgufInspectInfo::dequantized_size` predicts what `remember` actually
+    /// writes, at every width.
+    ///
+    /// The point of the estimate is that a host can gate on it *before*
+    /// committing, so "roughly right" is not the bar: this asserts it equals the
+    /// exact tensor-data byte count of the file `remember` then produces. Before
+    /// v0.7.6 the figure did not exist for `GGUF` at all, and `GGUF` is the
+    /// format where it cannot be guessed — the expansion ratio is per-kernel, so
+    /// the on-disk total predicts nothing.
+    #[test]
+    fn gguf_dequantized_size_predicts_what_remember_writes() {
+        use crate::InspectSummary as _;
+
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        for &(target, label) in &[
+            (crate::TargetDtype::BF16, "bf16"),
+            (crate::TargetDtype::F32, "f32"),
+            (crate::TargetDtype::F16, "f16"),
+        ] {
+            let info = parsed
+                .inspect_with_options(&crate::InspectOptions::new().with_output_dtype(target));
+            assert_eq!(
+                info.output_dtype(),
+                target,
+                "{label}: the figure must carry the width it assumes"
+            );
+
+            let bytes = parsed.remember_to_bytes(target).expect("remember_to_bytes");
+            let written = crate::parse_safetensors_header(&bytes)
+                .expect("parse the produced header")
+                .tensors
+                .iter()
+                .fold(0u64, |acc, t| {
+                    // CAST: usize → u64, lossless widening.
+                    #[allow(clippy::as_conversions)]
+                    let len = t.byte_len() as u64;
+                    acc + len
+                });
+
+            assert_eq!(
+                info.dequantized_size(),
+                written,
+                "{label}: estimate {} vs {written} bytes actually written",
+                info.dequantized_size()
+            );
+        }
+    }
+
+    /// The four `InspectSummary` numbers agree with the concrete fields, and the
+    /// estimate really does move with the requested width.
+    ///
+    /// `current_size` must **not** move: it is what the file costs as stored,
+    /// which no output-dtype request can change. Getting that backwards would
+    /// make the gate compare two figures that both moved.
+    #[test]
+    fn inspect_summary_reads_the_same_numbers_as_the_fields() {
+        use crate::InspectSummary as _;
+
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let bf16 = parsed.inspect();
+        assert_eq!(bf16.tensor_count(), bf16.tensor_count);
+        assert_eq!(bf16.current_size(), bf16.total_bytes);
+        assert_eq!(bf16.dequantized_size(), bf16.dequantized_size);
+        assert_eq!(bf16.output_dtype(), crate::TargetDtype::BF16);
+
+        let f32 = parsed.inspect_with_options(
+            &crate::InspectOptions::new().with_output_dtype(crate::TargetDtype::F32),
+        );
+        assert_eq!(
+            f32.current_size(),
+            bf16.current_size(),
+            "the stored size cannot depend on the width the caller intends"
+        );
+        assert!(
+            f32.dequantized_size() > bf16.dequantized_size(),
+            "an F32 request must estimate larger than BF16 ({} vs {})",
+            f32.dequantized_size(),
+            bf16.dequantized_size()
+        );
+        assert!(
+            bf16.expansion() > 0,
+            "a quantised fixture must expand on dequantisation"
+        );
+    }
+
     /// `--threads` reaches the `GGUF` `remember` path and does not change a byte.
     ///
     /// Before v0.7.6 the CLI arm took no thread budget at all, so the flag was

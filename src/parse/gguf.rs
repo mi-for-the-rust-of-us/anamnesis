@@ -970,6 +970,57 @@ pub struct GgufInspectInfo {
     /// Effective alignment read from `general.alignment`, or the default of
     /// 32 bytes if the metadata key is absent.
     pub alignment: u32,
+    /// Estimated tensor-data size in bytes after dequantisation to
+    /// [`output_dtype`](Self::output_dtype).
+    ///
+    /// New in v0.7.6, and the reason the whole trait exists: `GGUF` is the one
+    /// format whose in-memory size cannot be guessed from its on-disk size,
+    /// because the expansion ratio is **per kernel**. A `Q2_K` tensor and a
+    /// `Q6_K` tensor of the same element count occupy different numbers of
+    /// bytes on disk and the *same* number after dequantisation, so
+    /// [`total_bytes`](Self::total_bytes) predicts nothing. This figure is what
+    /// the [Phase 6.8](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
+    /// inspect-before-parse policy gate needs before committing to a parse.
+    ///
+    /// Quantised tensors contribute `n_elements × output_dtype.byte_size()`;
+    /// every other tensor contributes its stored `byte_len`, because
+    /// `remember` and `convert` pass non-quantised tensors through in their
+    /// **source** dtype. Accumulated with `saturating_*`, so an absurd declared
+    /// shape yields [`u64::MAX`] rather than wrapping — the fail-closed
+    /// direction for a policy gate.
+    ///
+    /// **Inclusion differs from `total_bytes` on purpose.** A tensor whose
+    /// dtype has no tabulated `type_size` is *excluded* from `total_bytes`
+    /// (its stored size is genuinely unknown) but *included* here, since its
+    /// element count is known from the shape regardless. Under-reporting the
+    /// figure a gate rejects on would be fail-open.
+    pub dequantized_size: u64,
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// `BF16` unless the caller asked otherwise through `InspectOptions`.
+    /// Recorded on the struct so a figure can never be read without the width
+    /// it was computed for.
+    pub output_dtype: crate::TargetDtype,
+}
+
+impl crate::inspect::sealed::Sealed for GgufInspectInfo {}
+
+impl crate::InspectSummary for GgufInspectInfo {
+    fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    fn current_size(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn dequantized_size(&self) -> u64 {
+        self.dequantized_size
+    }
+
+    fn output_dtype(&self) -> crate::TargetDtype {
+        self.output_dtype
+    }
 }
 
 impl fmt::Display for GgufInspectInfo {
@@ -991,6 +1042,20 @@ impl fmt::Display for GgufInspectInfo {
                 f,
                 " (+{} tensors with dtype of unknown size)",
                 self.unknown_size_tensors
+            )?;
+        }
+        // The figure a caller actually gates on, and the width it assumes. Only
+        // printed when it differs from the stored total: on an all-scalar
+        // `GGUF` the two are equal and a second identical line would be noise.
+        // The label is read off `output_dtype`, never hard-coded — the same
+        // rule `InspectInfo`'s `Display` learned in v0.7.4, when a literal
+        // `(BF16)` started rendering above an `F32` figure.
+        if self.dequantized_size != self.total_bytes {
+            write!(
+                f,
+                "\nDequantized: {} ({})",
+                crate::inspect::format_bytes(self.dequantized_size),
+                self.output_dtype,
             )?;
         }
         let dtype_list: String = self
@@ -1114,13 +1179,33 @@ impl ParsedGguf {
         })
     }
 
-    /// Returns inspection info derived from the parsed metadata. No I/O.
+    /// Returns inspection info derived from the parsed metadata, sizing the
+    /// dequantised estimate for the default `BF16` output. No I/O.
+    ///
+    /// The `InspectOptions::new()` special case of
+    /// [`inspect_with_options`](Self::inspect_with_options).
     pub fn inspect(&self) -> GgufInspectInfo {
+        self.inspect_with_options(&crate::InspectOptions::new())
+    }
+
+    /// Returns inspection info, sizing
+    /// [`GgufInspectInfo::dequantized_size`] for `options.output_dtype`. No I/O.
+    ///
+    /// Ask for the width you actually intend to `remember` at: at `F32` the
+    /// dequantised share is double the `BF16` figure, and a gate that checks
+    /// the `BF16` number against an `F32` request under-reserves by exactly
+    /// `2 ×`. `options.limits` is ignored here — this summarises a file already
+    /// parsed under whatever budget the parse was given.
+    ///
+    /// Mirrors
+    /// [`ParsedModel::inspect_with_options`](crate::ParsedModel::inspect_with_options).
+    pub fn inspect_with_options(&self, options: &crate::InspectOptions) -> GgufInspectInfo {
         build_inspect_info(
             self.version,
             self.alignment,
             &self.metadata,
             &self.tensor_infos,
+            options.output_dtype,
         )
     }
 
@@ -2170,11 +2255,21 @@ impl GgufFrontMatter {
     /// [`inspect_gguf_from_reader`] produce, computed by the same shared
     /// helper so all three stay substrate-equivalent. No I/O.
     pub fn inspect(&self) -> GgufInspectInfo {
+        self.inspect_with_options(&crate::InspectOptions::new())
+    }
+
+    /// Reduces this front matter to the aggregate [`GgufInspectInfo`] summary,
+    /// sizing [`GgufInspectInfo::dequantized_size`] for
+    /// `options.output_dtype`. No I/O.
+    ///
+    /// `options.limits` is ignored: the front matter has already been read.
+    pub fn inspect_with_options(&self, options: &crate::InspectOptions) -> GgufInspectInfo {
         build_inspect_info(
             self.version,
             self.alignment,
             &self.metadata,
             &self.tensor_infos,
+            options.output_dtype,
         )
     }
 }
@@ -2320,17 +2415,48 @@ pub fn inspect_gguf_from_reader<R: Read + Seek>(reader: R) -> crate::Result<Gguf
     // The path-based `parse_gguf` does **not** wrap (it passes a
     // `Cursor<&[u8]>` over the mmap, which is already zero-syscall). Adding
     // a `BufReader` there would only add a memcpy.
+    inspect_gguf_from_reader_with_options(reader, &crate::InspectOptions::new())
+}
+
+/// Inspects a `GGUF` artefact from any `Read + Seek` source, under a
+/// caller-supplied [`InspectOptions`](crate::InspectOptions).
+///
+/// The two-knob form of [`inspect_gguf_from_reader`], new in v0.7.6, and both
+/// knobs close a real gap:
+///
+/// - **`output_dtype`** sizes [`GgufInspectInfo::dequantized_size`] for the
+///   width the caller will actually request. `GGUF` is the format where this
+///   matters most: its expansion ratio is per-kernel, so the on-disk total
+///   predicts nothing about the in-memory one.
+/// - **`limits`** bounds the walk itself. Until v0.7.6 this entry point was
+///   *"intentionally limit-free"*, which left the call a host is told to make
+///   **first** on an untrusted file as the one call it could not tighten —
+///   backwards, given that [`ParseLimits`] exists precisely so a caller can
+///   tighten a permanent floor. The permanent `GGUF` caps still apply and
+///   `limits` can only narrow them.
+///
+/// # Errors
+///
+/// As [`inspect_gguf_from_reader`], plus [`AnamnesisError::LimitExceeded`] when
+/// a declared length or count exceeds `options.limits` rather than only when it
+/// exceeds a permanent cap.
+///
+/// # Memory
+///
+/// As [`inspect_gguf_from_reader`]: `O(n_tensors + n_metadata_kv)`, independent
+/// of the file's data-segment size. No tensor data is read.
+pub fn inspect_gguf_from_reader_with_options<R: Read + Seek>(
+    reader: R,
+    options: &crate::InspectOptions,
+) -> crate::Result<GgufInspectInfo> {
     let buffered = BufReader::with_capacity(READER_BUF_SIZE, reader);
-    // The inspect path is intentionally limit-free: it reports the totals a host
-    // checks against its policy (the inspect-before-parse gate), then the host
-    // calls `parse_gguf_with_limits` for the real enforcement. So pass the
-    // unbounded default — the permanent GGUF caps remain the only bound here.
-    let front = read_gguf_structure(buffered, &ParseLimits::default())?;
+    let front = read_gguf_structure(buffered, &options.limits)?;
     Ok(build_inspect_info(
         front.version,
         front.alignment,
         &front.metadata,
         &front.tensor_infos,
+        options.output_dtype,
     ))
 }
 
@@ -2420,8 +2546,13 @@ fn build_inspect_info(
     alignment: u32,
     metadata: &HashMap<String, GgufMetadataValue>,
     tensor_infos: &[GgufTensorInfo],
+    output_dtype: crate::TargetDtype,
 ) -> GgufInspectInfo {
+    // CAST: usize → u64, an output width is 2 or 4; lossless widening.
+    #[allow(clippy::as_conversions)]
+    let out_bytes = output_dtype.byte_size() as u64;
     let mut total_bytes: u64 = 0;
+    let mut dequantized_size: u64 = 0;
     let mut unknown_size_tensors: usize = 0;
     // O(1) per-tensor dtype dedup via a fixed-size bitmap keyed on the
     // dense `GgufType::inspect_index` — drops the hot loop from
@@ -2433,6 +2564,25 @@ fn build_inspect_info(
             total_bytes = total_bytes.saturating_add(byte_len);
         } else {
             unknown_size_tensors = unknown_size_tensors.saturating_add(1);
+        }
+        // A quantised tensor is written at the requested width; anything else
+        // passes through in its source dtype, exactly as `remember` / `convert`
+        // treat it. The element count is folded with `saturating_mul` so a zero
+        // dimension still zeroes the product (a short-circuiting fold would
+        // report `u64::MAX` for a mathematically-empty tensor — the bug
+        // `build_pth_tensor_info` had until v0.7.5).
+        if info.dtype.is_quantized() || info.byte_len.is_none() {
+            // CAST: usize → u64, lossless widening of a header-declared
+            // dimension on every supported target.
+            #[allow(clippy::as_conversions)]
+            let n_elements = info
+                .shape
+                .iter()
+                .fold(1u64, |acc, &d| acc.saturating_mul(d as u64));
+            dequantized_size =
+                dequantized_size.saturating_add(n_elements.saturating_mul(out_bytes));
+        } else if let Some(byte_len) = info.byte_len {
+            dequantized_size = dequantized_size.saturating_add(byte_len);
         }
         let idx = info.dtype.inspect_index();
         // INDEX: `inspect_index` is defined to return a value in
@@ -2460,6 +2610,8 @@ fn build_inspect_info(
         unknown_size_tensors,
         dtypes,
         alignment,
+        dequantized_size,
+        output_dtype,
     }
 }
 

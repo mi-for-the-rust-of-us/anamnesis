@@ -463,7 +463,7 @@ pub mod remember;
 
 pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
 pub use error::{AnamnesisError, Result};
-pub use inspect::{InspectInfo, InspectOptions, format_bytes};
+pub use inspect::{InspectInfo, InspectOptions, InspectSummary, format_bytes};
 #[cfg(feature = "bnb")]
 pub use lethe::{
     BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE, NF4_CODEBOOK, classify_inputs,
@@ -487,23 +487,25 @@ pub use parse::{
 #[cfg(feature = "gguf")]
 pub use parse::{
     GgufFrontMatter, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
-    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf, inspect_gguf_from_reader, parse_gguf,
-    parse_gguf_bytes, parse_gguf_bytes_with_limits, parse_gguf_from_reader,
-    parse_gguf_from_reader_with_limits, parse_gguf_front_matter_from_reader,
-    parse_gguf_front_matter_from_reader_with_limits, parse_gguf_with_limits, write_gguf,
-    write_gguf_to_writer,
+    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf, inspect_gguf_from_reader,
+    inspect_gguf_from_reader_with_options, parse_gguf, parse_gguf_bytes,
+    parse_gguf_bytes_with_limits, parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
+    parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
+    parse_gguf_with_limits, write_gguf, write_gguf_to_writer,
 };
 #[cfg(feature = "npz")]
 pub use parse::{
     NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo, inspect_npz, inspect_npz_from_reader,
-    parse_npz, parse_npz_with_limits,
+    inspect_npz_from_reader_with_options, inspect_npz_with_options, parse_npz,
+    parse_npz_with_limits,
 };
 #[cfg(feature = "pth")]
 pub use parse::{
     ParsedPth, PthDtype, PthFrontMatter, PthInspectInfo, PthTensor, PthTensorInfo,
-    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
-    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_front_matter_from_reader,
-    parse_pth_front_matter_from_reader_with_limits, parse_pth_with_limits,
+    inspect_pth_from_reader, inspect_pth_from_reader_with_options, parse_pth, parse_pth_bytes,
+    parse_pth_bytes_with_limits, parse_pth_from_reader, parse_pth_from_reader_with_limits,
+    parse_pth_front_matter_from_reader, parse_pth_front_matter_from_reader_with_limits,
+    parse_pth_with_limits,
 };
 pub use remember::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(feature = "awq")]

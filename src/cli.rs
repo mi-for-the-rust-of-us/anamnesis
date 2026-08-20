@@ -39,6 +39,21 @@ enum Commands {
     Inspect {
         /// Path to the model file.
         path: PathBuf,
+        /// Output dtype the size estimate assumes: `bf16` (default), `f32`,
+        /// or `f16`.
+        ///
+        /// The estimate feeds the inspect-before-parse decision, so it has to
+        /// be sized at the width you actually intend to `remember` or
+        /// `convert` at: an `F32` request against a `BF16` estimate
+        /// under-reserves by exactly `2 ×`. `remember --to` fixed this same
+        /// bug for its own summary line in v0.7.4; `inspect` had no flag at
+        /// all until v0.7.6.
+        ///
+        /// Vacuous on `.pth` and `NPZ`, whose tensors are already full
+        /// precision and pass through in their source dtype. Accepted there
+        /// for the same reason `remember --to f32` is.
+        #[arg(long, default_value = "bf16")]
+        to: String,
     },
     /// Dequantize (recover precision) or convert to a target format.
     #[command(alias = "dequantize")]
@@ -158,9 +173,10 @@ pub fn run() -> crate::Result<()> {
             let resolved = resolve_input_path(path)?;
             run_parse(&resolved)
         }
-        Commands::Inspect { path } => {
+        Commands::Inspect { path, to } => {
             let resolved = resolve_input_path(path)?;
-            run_inspect(&resolved)
+            let target: TargetDtype = to.parse()?;
+            run_inspect(&resolved, target)
         }
         Commands::Remember {
             path,
@@ -383,32 +399,40 @@ fn run_parse_npz(path: &std::path::Path) -> crate::Result<()> {
 }
 
 #[cfg(feature = "npz")]
-fn run_inspect_npz(path: &std::path::Path) -> crate::Result<()> {
+fn run_inspect_npz(path: &std::path::Path, options: &InspectOptions) -> crate::Result<()> {
     // Header-only — no tensor data loaded.
-    let info = crate::inspect_npz(path)?;
+    let info = crate::inspect_npz_with_options(path, options)?;
     println!("{info}");
     Ok(())
 }
 
-fn run_inspect(path: &std::path::Path) -> crate::Result<()> {
+/// `inspect` for any supported format, sizing every size estimate at `target`.
+///
+/// The `target` parameter is v0.7.6's. Before it, this printed whatever the
+/// `BF16` default produced, which made `amn inspect` unable to answer the one
+/// question it exists to answer — *"how much memory will this become?"* — for a
+/// caller who intended `--to f32`. That is the identical bug v0.7.4 fixed for
+/// `remember`'s summary line and did not carry across.
+fn run_inspect(path: &std::path::Path, target: TargetDtype) -> crate::Result<()> {
+    let options = InspectOptions::new().with_output_dtype(target);
     match detect_format(path)? {
         Format::Safetensors => {
             let model = parse(path)?;
-            let info = InspectInfo::from(&model.header);
+            let info = model.inspect_with_options(&options);
             println!("{info}");
         }
         #[cfg(feature = "pth")]
         Format::Pth => {
             let parsed = crate::parse_pth(path)?;
-            let info = parsed.inspect();
+            let info = parsed.inspect_with_options(&options);
             println!("{info}");
         }
         #[cfg(feature = "npz")]
-        Format::Npz => run_inspect_npz(path)?,
+        Format::Npz => run_inspect_npz(path, &options)?,
         #[cfg(feature = "gguf")]
         Format::Gguf => {
             let parsed = crate::parse_gguf(path)?;
-            let info = parsed.inspect();
+            let info = parsed.inspect_with_options(&options);
             println!("{info}");
         }
     }
@@ -501,7 +525,7 @@ fn run_remember_safetensors(
     // a stated width, and this is its most obvious consumer.
     let info = InspectInfo::with_options(
         &model.header,
-        InspectOptions::new().with_output_dtype(target),
+        &InspectOptions::new().with_output_dtype(target),
     );
 
     let total = model.header.tensors.len();

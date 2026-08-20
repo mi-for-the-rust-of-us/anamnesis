@@ -659,6 +659,44 @@ pub struct NpzInspectInfo {
     pub total_bytes: u64,
     /// Distinct dtypes found (in order of first occurrence).
     pub dtypes: Vec<NpzDtype>,
+    /// Estimated tensor-data size in bytes after conversion, at
+    /// [`output_dtype`](Self::output_dtype).
+    ///
+    /// **Always equal to [`total_bytes`](Self::total_bytes)**, and that is the
+    /// answer rather than a placeholder: `NPZ` arrays are already full
+    /// precision, so a conversion copies every array through in its **source**
+    /// dtype. Present so a caller reading
+    /// [`InspectSummary`](crate::InspectSummary) gets the same question
+    /// answered for every format instead of having to know which formats
+    /// expand.
+    pub dequantized_size: u64,
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// Recorded, but **vacuous** for this format rather than wrong: nothing is
+    /// dequantised, so the figure is the same at every width — the same sense
+    /// in which `amn convert weights.npz --out-dtype f32` is accepted and
+    /// widens nothing.
+    pub output_dtype: crate::TargetDtype,
+}
+
+impl crate::inspect::sealed::Sealed for NpzInspectInfo {}
+
+impl crate::InspectSummary for NpzInspectInfo {
+    fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    fn current_size(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn dequantized_size(&self) -> u64 {
+        self.dequantized_size
+    }
+
+    fn output_dtype(&self) -> crate::TargetDtype {
+        self.output_dtype
+    }
 }
 
 impl fmt::Display for NpzInspectInfo {
@@ -722,8 +760,31 @@ impl fmt::Display for NpzInspectInfo {
 /// The distinction is intentional: `inspect_npz` is best-effort metadata
 /// extraction, while `parse_npz` must validate before allocating buffers.
 pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
+    inspect_npz_with_options(path, &crate::InspectOptions::new())
+}
+
+/// Inspects an `NPZ` archive on disk under a caller-supplied
+/// [`InspectOptions`](crate::InspectOptions).
+///
+/// The path-based twin of [`inspect_npz_from_reader_with_options`], and the
+/// `NPZ` counterpart of `parse_npz_with_limits`: the parse could be bounded
+/// before v0.7.6, the inspect that is supposed to *precede* it could not.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or read, and
+/// otherwise as [`inspect_npz_from_reader_with_options`].
+///
+/// # Memory
+///
+/// As [`inspect_npz_from_reader_with_options`]: `O(n_arrays)` metadata, no
+/// array data.
+pub fn inspect_npz_with_options(
+    path: impl AsRef<Path>,
+    options: &crate::InspectOptions,
+) -> crate::Result<NpzInspectInfo> {
     let file = std::fs::File::open(path.as_ref())?;
-    inspect_npz_from_reader(file)
+    inspect_npz_from_reader_with_options(file, options)
 }
 
 /// Inspects an `NPZ` archive from any `Read + Seek` source, returning
@@ -799,11 +860,45 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// `u64::MAX`. Behaviour matches [`inspect_npz`] and differs from
 /// `parse_npz`, which returns `Err` on the same overflow.
 pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
+    inspect_npz_from_reader_with_options(reader, &crate::InspectOptions::new())
+}
+
+/// Inspects an `NPZ` archive from any `Read + Seek` source, under a
+/// caller-supplied [`InspectOptions`](crate::InspectOptions).
+///
+/// The two-knob form of [`inspect_npz_from_reader`], new in v0.7.6.
+/// `output_dtype` is recorded and vacuous here (`NPZ` arrays are already full
+/// precision), so the knob that does work is **`limits`**, and it closes the
+/// sharpest instance of the gap in the family: `NPZ` had no bounded inspect at
+/// all, not even the front-matter alternative `GGUF` and `.pth` offer. The walk
+/// is `O(entries)` in both I/O and allocation, and the permanent
+/// `ZIP_MAX_ENTRIES` floor is `1 << 20`, so a hostile archive could force a
+/// million-entry central directory, a million `NPY` header reads, and a
+/// `Vec<NpzTensorInfo>` no caller could cap — on the very call
+/// [`README.md`](https://github.com/mi-for-the-rust-of-us/anamnesis#parsing-untrusted-input)
+/// tells a multi-tenant host to make **first**. `limits` now bounds the
+/// central-directory read, the item count, and every `NPY` header, cumulatively
+/// as well as individually.
+///
+/// # Errors
+///
+/// As [`inspect_npz_from_reader`], plus [`AnamnesisError::LimitExceeded`] when
+/// a declared count or allocation exceeds `options.limits` rather than only
+/// when it exceeds a permanent cap.
+///
+/// # Memory
+///
+/// `O(n_arrays)` metadata — names, shapes and dtypes — plus one `NPY` header at
+/// a time. No array data is read.
+pub fn inspect_npz_from_reader_with_options<R: Read + Seek>(
+    reader: R,
+    options: &crate::InspectOptions,
+) -> crate::Result<NpzInspectInfo> {
     let mut src = crate::parse::zip::ReaderSource::new(reader)?;
-    // Inspect path is intentionally limit-free (it reports totals for the host's
-    // inspect-before-parse gate); the permanent ZIP_MAX_ENTRIES floor still
-    // applies inside the reader.
-    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
+    let entries = crate::parse::zip::read_central_directory(&mut src, &options.limits)?;
+    // One accountant for the whole walk, so the running total bounds the header
+    // set rather than each header in isolation.
+    let mut budget = Budget::new(&options.limits);
 
     // Clamp the pre-allocation hint: the central-directory entry count is
     // attacker-influenced (a many-empty-entries zip), so trusting it for
@@ -822,12 +917,14 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
             None => continue,
         };
 
-        // Inspect path is intentionally limit-free: it reports the totals a host
-        // checks against its policy (the inspect-before-parse gate), then calls
-        // `parse_npz_with_limits` for enforcement. Unbounded budget keeps the
-        // permanent NPY_MAX_HEADER_BYTES cap as the only bound here.
+        // The header read is charged to the caller's budget. Before v0.7.6 this
+        // was `Budget::unbounded()` by design, which left the permanent
+        // `NPY_MAX_HEADER_BYTES` cap as the only bound on the call a host is
+        // told to make *first* on an untrusted archive — the one call it could
+        // not tighten. One accountant for the whole walk, so the cumulative
+        // total bounds the headers as a set and not merely one at a time.
         let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
-        let header = parse_npy_header(&mut entry_reader, &mut Budget::unbounded())?;
+        let header = parse_npy_header(&mut entry_reader, &mut budget)?;
 
         if header.fortran_order {
             return Err(AnamnesisError::Unsupported {
@@ -868,6 +965,10 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
         tensors,
         total_bytes,
         dtypes,
+        // Not a copy made out of symmetry: `NPZ` arrays are passed through in
+        // their source dtype, so the post-conversion size *is* the stored size.
+        dequantized_size: total_bytes,
+        output_dtype: options.output_dtype,
     })
 }
 
@@ -1655,6 +1756,79 @@ mod tests {
             tensors.len(),
             N,
             "every entry must round-trip past the clamp"
+        );
+    }
+
+    /// Phase 7.6 item 7: the inspect the host is told to run **first** is now
+    /// bounded by the host's own budget.
+    ///
+    /// Until v0.7.6 the summary inspects were "intentionally limit-free", so the
+    /// only bound on this call was the permanent `ZIP_MAX_ENTRIES` floor of
+    /// `1 << 20` — a hostile archive could force a million-entry walk and a
+    /// `Vec<NpzTensorInfo>` no caller could cap, on the call `README.md`
+    /// recommends making before anything else. That inverts `ParseLimits`, whose
+    /// whole premise is that a caller can always tighten.
+    #[test]
+    fn inspect_npz_honours_the_caller_budget() {
+        let data = vec![0u8; 4000];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy", "c.npy"] {
+                zip.start_file(name, options).unwrap();
+                let npy = make_npy_v1(
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1000,), }",
+                    &data,
+                );
+                zip.write_all(&npy).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        // Unbounded: three arrays, as stored.
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert_eq!(info.tensors.len(), 3);
+
+        // An item-count budget below the declared entry count rejects before the
+        // entry vector is materialised.
+        let tight =
+            crate::InspectOptions::new().with_limits(ParseLimits::default().with_max_item_count(2));
+        let err = inspect_npz_with_options(tmp.path(), &tight).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "an item-count budget must bound the inspect walk, got {err:?}"
+        );
+
+        // A per-allocation budget below one `NPY` header rejects the header read.
+        let tiny = crate::InspectOptions::new()
+            .with_limits(ParseLimits::default().with_max_single_alloc(8));
+        let err = inspect_npz_with_options(tmp.path(), &tiny).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "a per-allocation budget must bound the header reads, got {err:?}"
+        );
+
+        // The same budget through the reader-generic entry point.
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let err =
+            inspect_npz_from_reader_with_options(std::io::Cursor::new(&bytes), &tight).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "the reader form must enforce the same budget, got {err:?}"
+        );
+
+        // And a generous budget still succeeds, so the gate is not simply stuck.
+        let roomy = crate::InspectOptions::new()
+            .with_limits(ParseLimits::default().with_max_item_count(100));
+        assert_eq!(
+            inspect_npz_with_options(tmp.path(), &roomy)
+                .unwrap()
+                .tensors
+                .len(),
+            3
         );
     }
 

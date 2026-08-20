@@ -486,7 +486,7 @@ impl ParsedModel {
     /// [`remember_with_options`](Self::remember_with_options). No I/O — purely
     /// derived from the parsed header.
     pub fn inspect(&self) -> InspectInfo {
-        self.inspect_with_options(InspectOptions::new())
+        self.inspect_with_options(&InspectOptions::new())
     }
 
     /// Returns inspection info with a caller-supplied [`InspectOptions`].
@@ -502,7 +502,7 @@ impl ParsedModel {
     ///
     /// let model = parse("model-fp8.safetensors")?;
     /// let info = model.inspect_with_options(
-    ///     InspectOptions::new().with_output_dtype(TargetDtype::F32),
+    ///     &InspectOptions::new().with_output_dtype(TargetDtype::F32),
     /// );
     /// // `info.dequantized_size` now sizes an F32 request, and
     /// // `info.output_dtype` records which width it assumed.
@@ -510,7 +510,7 @@ impl ParsedModel {
     /// ```
     ///
     /// No I/O — purely derived from the parsed header.
-    pub fn inspect_with_options(&self, options: InspectOptions) -> InspectInfo {
+    pub fn inspect_with_options(&self, options: &InspectOptions) -> InspectInfo {
         InspectInfo::with_options(&self.header, options)
     }
 

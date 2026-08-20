@@ -1977,9 +1977,9 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 /// ignored `--threads`, and — the part that mattered for
 /// [Phase 8](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
 /// — could not be called from the library at all, so a binding would have been
-/// the third transcription. Both paths now run
-/// [`hub_from_gguf`](crate::convert::hub_from_gguf), and the outputs are pinned
-/// byte-for-byte against `convert --to safetensors` in `tests/cli_convert.rs`.
+/// the third transcription. Both paths now run one crate-internal
+/// `hub_from_gguf`, and the outputs are pinned byte-for-byte against
+/// `convert --to safetensors` by `remember_matches_convert_byte_for_byte_at_every_width`.
 ///
 /// Quantised tensors are dequantised to `target`; every other tensor passes
 /// through in its **source** dtype, so the output is legitimately mixed-dtype
