@@ -29,16 +29,23 @@
 //!
 //! Every length, count, and offset is attacker-controllable. The reader
 //! follows the `CONVENTIONS.md` *"When Parsing Untrusted Input"* invariants:
-//! every multi-byte field is read through a bounds-checked [`ByteCursor`]
+//! every multi-byte field is read through a bounds-checked `ByteCursor`
 //! (never direct indexing); every offset/size combination uses `checked_*`
-//! arithmetic; the declared entry count is capped at [`ZIP_MAX_ENTRIES`] and
-//! each entry name at [`ZIP_MAX_NAME_LEN`] **before** allocating; each entry's
+//! arithmetic; the declared entry count is capped at `ZIP_MAX_ENTRIES` and
+//! each entry name at `ZIP_MAX_NAME_LEN` **before** allocating; each entry's
 //! `data_start + compressed_size` is cross-checked against the source length;
 //! and compression methods are **allowlisted** (`Stored` / `Deflate`), never
-//! denylisted. On top of those permanent floors, [`read_central_directory`]
-//! also honours the caller's [`ParseLimits`] (`max_item_count` and
+//! denylisted. On top of those permanent floors, `read_central_directory`
+//! also honours the caller's `ParseLimits` (`max_item_count` and
 //! `max_single_alloc_bytes`) fail-fast, so a memory-constrained caller bounds
 //! the container metadata to *its* budget (CWE-770).
+//!
+//! *Identifiers in this module header are plain code spans rather than
+//! intra-doc links: `rustdoc` cannot resolve links in the `//!` docs of a
+//! `pub(crate)` module, even fully qualified, so under
+//! `--document-private-items` they are hard errors. Item-level docs below use
+//! real links, which do resolve. Same rule `CONVENTIONS.md` already gives for
+//! links that cannot be guaranteed to resolve.*
 
 use std::borrow::Cow;
 use std::io::{Read, Seek};

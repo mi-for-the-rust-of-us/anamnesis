@@ -440,7 +440,7 @@
 #![allow(unknown_lints)]
 
 /// Command-line interface implementation shared by the `anamnesis` and
-/// `amn` binaries. Feature-gated behind `cli`; pulls in [`clap`] only
+/// `amn` binaries. Feature-gated behind `cli`; pulls in `clap` only
 /// when enabled.
 // Raw-byte backing store (memory map or owned copy) shared by every
 // parsed-model type. Crate-internal: the `Backing` enum distinguishes the

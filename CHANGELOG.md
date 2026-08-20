@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Eight broken intra-doc links, and the `CI` job that would have caught
+  them.** Rustdoc was checked only by `publish.yml`, at release time, with
+  `--all-features` and public items only — so two classes of breakage had no
+  gate at all: a link that resolves under `--all-features` but not under an
+  intermediate feature combination, and a broken link on a `pub(crate)` item,
+  which a public-items run never reaches. `.github/workflows/ci.yml` gains a
+  `docs` job running **twelve** feature combinations with
+  `--document-private-items` and `-D warnings`; `publish.yml`'s doc step now
+  documents private items too. Fixed on the way in: a field link missing its
+  `Self::` path, an `AnamnesisError` link from a module that does not import
+  it, an ambiguous `crate::convert` (both a module and a function), a link to
+  the optional `clap` dependency, a link to the `ollama`-gated
+  `resolve_ollama_model` from a `cli`-only build, a link to the `gguf`-gated
+  `MAX_OUTPUT_BYTES` from an always-on item, an `AnamnesisError` link in
+  `parallel.rs` whose import is `parallel`-gated, and five links in the
+  vendored `ZIP` module header, which `rustdoc` cannot resolve at all in a
+  `pub(crate)` module's own `//!` docs.
+
 - **A cancelled run with nothing to do is now cancelled.** The token was polled
   once per work item, so an **empty** item list reached no poll at all and the
   run proceeded to write its output — contradicting the unconditional guarantee

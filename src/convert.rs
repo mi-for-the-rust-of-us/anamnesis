@@ -2386,7 +2386,7 @@ mod stats_tests {
 )]
 mod quantized_gguf_tests {
     use super::{
-        AnamnesisError, ConvertOptions, ConvertTarget, Format, ParseLimits, convert, convert_bytes,
+        AnamnesisError, ConvertOptions, ConvertTarget, Format, convert, convert_bytes,
         convert_with_progress, derive_output_path, derive_output_path_for_dtype,
     };
     use crate::GgufType;
@@ -2904,7 +2904,7 @@ mod quantized_gguf_tests {
                 let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2,), }";
                 let mut npy = b"\x93NUMPY\x01\x00".to_vec();
                 let mut padded = header.as_bytes().to_vec();
-                while (10 + padded.len() + 1) % 64 != 0 {
+                while !(10 + padded.len() + 1).is_multiple_of(64) {
                     padded.push(b' ');
                 }
                 padded.push(b'\n');
@@ -2926,7 +2926,7 @@ mod quantized_gguf_tests {
         );
 
         // A budget below the declared entry count rejects during detection.
-        let tight = ParseLimits::default().with_max_item_count(1);
+        let tight = crate::ParseLimits::default().with_max_item_count(1);
         let err = crate::detect_format_from_bytes_with_limits(&archive, &tight)
             .expect_err("an item-count budget must bound the detection walk");
         assert!(

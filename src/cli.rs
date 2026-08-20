@@ -231,7 +231,7 @@ pub fn run() -> crate::Result<()> {
 /// `ollama` Cargo feature.
 ///
 /// Returns the [`crate::AnamnesisError`] variants documented on
-/// [`resolve_ollama_model`](crate::resolve_ollama_model) otherwise.
+/// `resolve_ollama_model` otherwise (requires the `ollama` feature).
 #[allow(clippy::unnecessary_wraps)]
 fn resolve_input_path(raw: PathBuf) -> crate::Result<PathBuf> {
     let s = raw.to_string_lossy();
@@ -835,8 +835,8 @@ fn build_convert_options(
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32` or
-/// `f16`.
+/// Returns [`crate::AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32`
+/// or `f16`.
 fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
     match s.to_ascii_lowercase().as_str() {
         "bf16" => Ok(crate::Dtype::BF16),

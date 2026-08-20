@@ -95,7 +95,8 @@ pub(crate) const MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Propagates whatever `f` returns, and returns [`AnamnesisError::Parse`] if a
+/// Propagates whatever `f` returns, and returns [`crate::AnamnesisError::Parse`]
+/// if a
 /// worker thread panics (which the crate's `panic`-denying lint floor makes
 /// unreachable in practice — it is a fail-closed backstop, not an expected path).
 ///

@@ -928,7 +928,7 @@ impl ParsedModel {
         }
     }
 
-    /// Normalises this model into [`crate::convert`]'s hub form: quantised
+    /// Normalises this model into [`mod@crate::convert`]'s hub form: quantised
     /// entries dequantised to `E`, passthrough entries copied in their
     /// **original** dtype. Returns the tensors plus how many were dequantised.
     ///

@@ -40,3 +40,55 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features
+
+  # Rustdoc was checked only by `publish.yml`, at release time, with
+  # `--all-features` and public items only. That misses two whole classes of
+  # breakage, both of which this repository has actually shipped:
+  #
+  #   * An intra-doc link that resolves under `--all-features` but not under an
+  #     intermediate combination, because the item it names is feature-gated.
+  #     `--all-features` cannot see these by construction.
+  #   * A broken link on a `pub(crate)` item, which no public-items run reaches.
+  #     Phase 7.6 found three of these left behind by its own refactor, plus
+  #     five pre-existing ones.
+  #
+  # Catching either at `cargo publish` time is too late: the tag is already cut.
+  docs:
+    name: "Docs (feature combos, private items)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Rustdoc across feature combinations
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          # Default features first, then each axis. `$combo` is intentionally
+          # unquoted: the multi-word entries must word-split into flags.
+          echo "::group::cargo doc (default features)"
+          cargo doc --no-deps --document-private-items
+          echo "::endgroup::"
+          for combo in \
+            "--all-features" \
+            "--no-default-features" \
+            "--no-default-features --features npz" \
+            "--no-default-features --features pth" \
+            "--no-default-features --features gguf" \
+            "--no-default-features --features bnb" \
+            "--no-default-features --features gptq" \
+            "--no-default-features --features awq" \
+            "--no-default-features --features cli" \
+            "--no-default-features --features ollama" \
+            "--features cli,gguf,npz,pth"
+          do
+            echo "::group::cargo doc $combo"
+            cargo doc --no-deps --document-private-items $combo
+            echo "::endgroup::"
+          done

@@ -70,8 +70,8 @@ pub struct ParseLimits {
     max_single_alloc_bytes: u64,
 
     /// Upper bound, in bytes, on the *cumulative* parse-time heap a file may
-    /// drive — the running sum of every eager allocation [`max_single_alloc_bytes`]
-    /// gates. Closes the many-small-items blow-up: a file declaring thousands
+    /// drive — the running sum of every eager allocation
+    /// [`Self::max_single_alloc_bytes`] gates. Closes the many-small-items blow-up: a file declaring thousands
     /// of buffers each just under the single-allocation cap is rejected once
     /// their total crosses this budget, before the host `OOM`s. Since Phase
     /// 6.11 the running sum also includes the `.pth` pickle VM's working set —
