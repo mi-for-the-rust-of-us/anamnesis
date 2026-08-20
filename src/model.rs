@@ -471,7 +471,7 @@ impl RememberOptions {
     /// [`resolve_thread_budget`]). Consumes the options (the builder is spent
     /// once its budget has been read).
     #[must_use]
-    fn resolved_threads(self) -> usize {
+    pub(crate) fn resolved_threads(self) -> usize {
         resolve_thread_budget(self.threads)
     }
 }

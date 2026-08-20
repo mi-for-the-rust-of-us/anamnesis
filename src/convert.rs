@@ -837,7 +837,38 @@ fn read_gguf_as<E: crate::OutputElement>(
     threads: usize,
 ) -> crate::Result<Hub> {
     let parsed = crate::parse_gguf_with_limits(path, limits)?;
+    hub_from_gguf::<E>(&parsed, threads)
+}
 
+/// Normalises an already-parsed `GGUF` into the hub: quantised tensors
+/// dequantised to `E`, everything else passed through in its source dtype,
+/// shapes reversed into row-major order.
+///
+/// Split out of [`read_gguf_as`] at v0.7.6 so `ParsedGguf::remember` and the
+/// `convert` reader run the **same** code rather than two transcriptions of it.
+/// Until then the `remember` path for a `GGUF` input lived only in the CLI, was
+/// sequential, ignored `--threads`, and could not be called from the library at
+/// all; `tests/cli_convert.rs` pins the two paths byte-for-byte so they cannot
+/// drift again.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if a tensor's element count overflows
+/// `usize` or a dequant worker thread panics, and
+/// [`AnamnesisError::Unsupported`] for a `GGUF` dtype with no safetensors
+/// equivalent.
+///
+/// # Memory
+///
+/// Allocates one owned `Vec<u8>` per tensor and holds them all: peak is the
+/// whole model at `E`'s width for the dequantised share plus the source width
+/// for the passthrough share. Identical to what `ParsedModel::remember` holds
+/// for a safetensors input; per-tensor streaming is ROADMAP Phase 10.
+#[cfg(feature = "gguf")]
+pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
+    parsed: &crate::ParsedGguf,
+    threads: usize,
+) -> crate::Result<Hub> {
     // Materialise the tensor views up front so the dispatch has an indexable
     // slice. The views borrow the mapped bytes (name, shape and data are all
     // references), so this costs one small struct per tensor and copies no
@@ -915,8 +946,19 @@ fn read_gguf_as<E: crate::OutputElement>(
 // Writers — hub → format
 // ---------------------------------------------------------------------------
 
-/// Writes the hub as a safetensors file, each tensor in its hub dtype.
-fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
+/// Builds the safetensors views for every hub tensor, in hub order.
+///
+/// The single view-construction site shared by [`write_safetensors`] (file) and
+/// [`write_safetensors_bytes`] (memory), so the two destinations cannot drift on
+/// dtype mapping, shape, or tensor order. The views borrow `hub`, so the
+/// returned `Vec` is tied to it.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] for a hub dtype with no safetensors
+/// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects the
+/// shape/length pairing.
+fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'_>)>> {
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {
@@ -927,26 +969,74 @@ fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
             })?;
         views.push((t.name.clone(), view));
     }
+    Ok(views)
+}
 
-    safetensors::tensor::serialize_to_file(views, hub.st_metadata.clone(), output).map_err(
-        // EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
-            other => AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
+/// Maps an upstream `safetensors` serialisation failure onto this crate's error
+/// type, keeping `IoError` distinguishable from a malformed-input `Parse`.
+///
+/// Shared by the file and in-memory writers so a caller sees the same variant
+/// whichever destination it picked.
+// EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
+    match e {
+        safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
+        other => AnamnesisError::Parse {
+            reason: format!("failed to write safetensors file: {other}"),
         },
-    )?;
+    }
+}
 
-    Ok(ConvertStats {
+/// Counts the written set for a safetensors destination.
+///
+/// A dequantised tensor did *not* go out in its incoming dtype, so the two
+/// counts partition the written set rather than overlapping.
+fn safetensors_stats(hub: &Hub) -> ConvertStats {
+    ConvertStats {
         tensors: hub.tensors.len(),
         dequantized: hub.dequantized,
         quantized: 0,
-        // A dequantised tensor did *not* go out in its incoming dtype, so the
-        // two counts partition the written set rather than overlapping.
         passthrough: hub.tensors.len().saturating_sub(hub.dequantized),
-    })
+    }
+}
+
+/// Serialises the hub as safetensors **bytes**, each tensor in its hub dtype.
+///
+/// The in-memory twin of [`write_safetensors`], sharing [`build_hub_views`] so
+/// the two are byte-identical by construction.
+///
+/// # Errors
+///
+/// Propagates [`build_hub_views`], and returns [`AnamnesisError::Parse`] if the
+/// upstream serializer fails.
+///
+/// # Memory
+///
+/// Peak is the hub plus one contiguous output buffer of the same size (the hub
+/// tensors are still live while `serialize` copies them), so roughly `2 ×` the
+/// written model. [`write_safetensors`] streams instead and peaks at the hub
+/// alone.
+// Feature-gated only because `ParsedGguf::remember_to_bytes` is its sole caller
+// today and `#![deny(warnings)]` counts an unused private fn as an error under
+// `--no-default-features`. The gate comes off when `convert_bytes` lands and
+// needs this on every build.
+#[cfg(feature = "gguf")]
+pub(crate) fn write_safetensors_bytes(hub: &Hub) -> crate::Result<(Vec<u8>, ConvertStats)> {
+    let views = build_hub_views(hub)?;
+    let bytes = safetensors::tensor::serialize(views, hub.st_metadata.clone())
+        .map_err(map_serialize_err)?;
+    Ok((bytes, safetensors_stats(hub)))
+}
+
+/// Writes the hub as a safetensors file, each tensor in its hub dtype.
+pub(crate) fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
+    let views = build_hub_views(hub)?;
+
+    safetensors::tensor::serialize_to_file(views, hub.st_metadata.clone(), output)
+        .map_err(map_serialize_err)?;
+
+    Ok(safetensors_stats(hub))
 }
 
 /// Writes the hub as an unquantised `GGUF` file, reversing shapes back to
@@ -1893,6 +1983,7 @@ mod quantized_gguf_tests {
     };
     use crate::GgufType;
     use crate::parallel::MIN_PARALLEL_BYTES;
+    use crate::parse::safetensors::Dtype;
     use std::path::PathBuf;
 
     /// `GGUF` default tensor-data alignment.
@@ -2267,6 +2358,108 @@ mod quantized_gguf_tests {
         .expect("default convert");
         assert_bytes_eq(
             &std::fs::read(&default_out).expect("read output"),
+            &baseline,
+            "the default thread budget vs the sequential baseline",
+        );
+    }
+
+    /// `ParsedGguf::remember` and `convert --to safetensors` are the **same
+    /// operation** on a `GGUF` input, so they must produce the same file.
+    ///
+    /// This is the regression guard for the v0.7.6 refactor. Until then the
+    /// `remember` path for a `GGUF` lived in the CLI as a 121-line transcription
+    /// of `convert`'s reader; the two happened to agree byte-for-byte, which is
+    /// exactly the property a transcription loses first and silently. Both now
+    /// call `hub_from_gguf`, and this pins that they cannot drift again — at
+    /// every output width, and through the in-memory twin as well as the file.
+    #[test]
+    fn remember_matches_convert_byte_for_byte_at_every_width() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let widths: &[(crate::TargetDtype, Dtype, &str)] = &[
+            (crate::TargetDtype::BF16, Dtype::BF16, "bf16"),
+            (crate::TargetDtype::F32, Dtype::F32, "f32"),
+            (crate::TargetDtype::F16, Dtype::F16, "f16"),
+        ];
+
+        for &(target, out_dtype, label) in widths {
+            let via_convert = dir_out.path().join(format!("convert-{label}.safetensors"));
+            convert(
+                &path,
+                ConvertTarget::Safetensors,
+                &via_convert,
+                &ConvertOptions::new()
+                    .with_output_dtype(out_dtype)
+                    .with_threads(4),
+            )
+            .expect("convert to safetensors");
+            let expected = std::fs::read(&via_convert).expect("read convert output");
+
+            let via_remember = dir_out.path().join(format!("remember-{label}.safetensors"));
+            parsed
+                .remember_with_options(
+                    &via_remember,
+                    target,
+                    crate::RememberOptions::new().with_threads(4),
+                )
+                .expect("remember");
+            assert_bytes_eq(
+                &std::fs::read(&via_remember).expect("read remember output"),
+                &expected,
+                &format!("remember vs convert at {label}"),
+            );
+
+            let in_memory = parsed
+                .remember_to_bytes_with_options(
+                    target,
+                    crate::RememberOptions::new().with_threads(4),
+                )
+                .expect("remember_to_bytes");
+            assert_bytes_eq(
+                &in_memory,
+                &expected,
+                &format!("remember_to_bytes vs convert at {label}"),
+            );
+        }
+    }
+
+    /// `--threads` reaches the `GGUF` `remember` path and does not change a byte.
+    ///
+    /// Before v0.7.6 the CLI arm took no thread budget at all, so the flag was
+    /// accepted and discarded; the sibling `convert` test could not see that
+    /// because it exercised a different function. The fixture clears
+    /// [`MIN_PARALLEL_BYTES`] (asserted by `fixture_clears_the_parallel_threshold`),
+    /// so the parallel dispatch really runs.
+    #[test]
+    fn remember_is_deterministic_across_thread_counts() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let baseline = parsed
+            .remember_to_bytes_with_options(
+                crate::TargetDtype::BF16,
+                crate::RememberOptions::new().with_threads(1),
+            )
+            .expect("sequential remember");
+
+        for n in [1usize, 2, 4, 8, 16] {
+            let out = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new().with_threads(n),
+                )
+                .expect("threaded remember");
+            assert_bytes_eq(&out, &baseline, &format!("GGUF remember at {n} threads"));
+        }
+
+        // The default (hardware-resolved) budget must agree too.
+        let default_out = parsed
+            .remember_to_bytes(crate::TargetDtype::BF16)
+            .expect("default remember");
+        assert_bytes_eq(
+            &default_out,
             &baseline,
             "the default thread budget vs the sequential baseline",
         );

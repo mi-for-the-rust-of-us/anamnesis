@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`amn remember <file>.gguf --threads N` now honours `N`** (Phase 7.6,
+  item 1). The flag reached the safetensors arm only; the `GGUF` arm took no
+  thread parameter, so the budget was parsed, validated, and discarded. It now
+  routes through `RememberOptions` like every other path, and the output stays
+  byte-identical at any thread count (pinned by
+  `remember_is_deterministic_across_thread_counts`).
+
 ### Changed
 
 - **BREAKING: every type the crate returns is now `#[non_exhaustive]`**
@@ -43,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParsedPth` are already unconstructible through private fields.
 
 ### Added
+
+- **`ParsedGguf::remember` / `remember_with_options` / `remember_to_bytes` /
+  `remember_to_bytes_with_options`** (Phase 7.6, item 1) — whole-model
+  dequantise-and-write for a `GGUF` input, mirroring `ParsedModel`'s spelling
+  method for method. Until now the only whole-model `GGUF` `remember` in the
+  crate lived **inside the CLI**: 121 lines in `run_remember_gguf` that
+  transcribed what `convert`'s reader already did. The transcription was
+  sequential, took no thread budget (so `amn remember model.gguf --threads 8`
+  was accepted and silently ignored), and could not be called from the library
+  at all, which would have made a Python binding the third copy of the same
+  loop. Both paths now run one `hub_from_gguf`.
+
+  **Measured** (medians of 5, `--release`, `target-cpu=native`, output
+  `SHA-256`-identical before and after): `SmolLM2-135M-Q6_K` 241 → 194 ms
+  (**1.24×**), `Qwen2.5-1.5B-IQ2_M` 5854 → 2631 ms (**2.23×**). The gap widens
+  with model size as the fixed parse/write cost amortises. Recorded as
+  Experiment 16 in `docs/perf-experiments.md`.
 
 - **`NpzTensor::new` and `PthTensor::new`** — both types are *returned* by
   `parse_npz` / `ParsedPth::tensors` **and** consumed by

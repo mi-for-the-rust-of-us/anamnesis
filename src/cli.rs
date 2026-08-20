@@ -480,7 +480,7 @@ fn run_remember(
                         ),
                     })?
             };
-            run_remember_gguf(path, output, target)
+            run_remember_gguf(path, output, target, threads)
         }
     }
 }
@@ -630,11 +630,21 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
 /// Gained the `target` parameter in v0.7.4. Before that it hard-coded `BF16`,
 /// which made `amn remember model.gguf --to f32` a rejection even though the
 /// 24 `GGUF` kernels had been generic over `OutputElement` since v0.7.3.
+///
+/// **v0.7.6 moved the work into the library.** This function used to carry 121
+/// lines that transcribed `convert`'s `GGUF` reader — shape reversal, dtype
+/// mapping, dequant dispatch, `TensorView` assembly, `serialize_to_file` — and
+/// the transcription was sequential where the library path is threaded, took no
+/// `threads` argument so `--threads` was silently ignored here, and left a
+/// binding with nothing to call. It is now a call to
+/// `ParsedGguf::remember_with_options`, which is the same code
+/// `convert --to safetensors` runs.
 #[cfg(feature = "gguf")]
 fn run_remember_gguf(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
     target: TargetDtype,
+    threads: Option<usize>,
 ) -> crate::Result<()> {
     let parsed = crate::parse_gguf(path)?;
     let info = parsed.inspect();
@@ -659,121 +669,18 @@ fn run_remember_gguf(
     );
     println!("  {} tensors", info.tensor_count);
 
-    // Dequantize quantized tensors to `target`; pass through non-quantized
-    // tensors (F32, F16, BF16, integer types) with their original dtype.
-    // Collect owned data because TensorView borrows data and all views
-    // must be alive simultaneously for serialize_to_file.
-    let mut tensor_data: Vec<(String, Vec<u8>, Vec<usize>, safetensors::Dtype)> =
-        Vec::with_capacity(info.tensor_count);
-    let mut dequantized_count: usize = 0;
-    // The single runtime boundary for this path: past here the width is a
-    // static type parameter, exactly as in `ParsedModel::remember`.
-    let target_st_dtype = match target {
-        TargetDtype::BF16 => safetensors::Dtype::BF16,
-        TargetDtype::F32 => safetensors::Dtype::F32,
-        TargetDtype::F16 => safetensors::Dtype::F16,
+    // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
+    // caller's `--threads`, clamped to at least 1 by the builder. Before v0.7.6
+    // this arm had no thread budget at all, so `--threads` was accepted and
+    // discarded.
+    let opts = match threads {
+        Some(n) => crate::RememberOptions::new().with_threads(n),
+        None => crate::RememberOptions::new(),
     };
-
-    for tensor in parsed.tensors() {
-        // GGUF shape is most-significant-first; safetensors expects
-        // row-major (NumPy-style). Reverse the dimensions.
-        let mut shape: Vec<usize> = tensor.shape.to_vec();
-        shape.reverse();
-
-        if tensor.dtype.is_quantized() {
-            let n_elements: usize = tensor
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| crate::AnamnesisError::Parse {
-                    reason: format!(
-                        "GGUF tensor `{}` shape {:?} element count overflows usize",
-                        tensor.name, tensor.shape
-                    ),
-                })?;
-            let data = match target {
-                TargetDtype::BF16 => crate::dequantize_gguf::<crate::Bf16Out>(
-                    &tensor.data,
-                    tensor.dtype,
-                    n_elements,
-                )?,
-                TargetDtype::F32 => {
-                    crate::dequantize_gguf::<crate::F32Out>(&tensor.data, tensor.dtype, n_elements)?
-                }
-                TargetDtype::F16 => {
-                    crate::dequantize_gguf::<crate::F16Out>(&tensor.data, tensor.dtype, n_elements)?
-                }
-            };
-            tensor_data.push((tensor.name.to_owned(), data, shape, target_st_dtype));
-            dequantized_count += 1;
-        } else {
-            let st_dtype = gguf_type_to_safetensors_dtype(tensor.dtype)?;
-            // BORROW: `.into_owned()` copies borrowed mmap bytes into an
-            // owned Vec so the data outlives the parsed borrow.
-            tensor_data.push((
-                tensor.name.to_owned(),
-                tensor.data.into_owned(),
-                shape,
-                st_dtype,
-            ));
-        }
-    }
-
-    println!(
-        "  {} dequantized to {target}, {} passed through",
-        dequantized_count,
-        tensor_data.len() - dequantized_count
-    );
-
-    // Build TensorView list and serialize to file.
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        tensor_data
-            .iter()
-            .map(|(name, data, shape, dtype)| {
-                let view = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                    .map_err(|e| crate::AnamnesisError::Parse {
-                        reason: format!("failed to create TensorView for `{name}`: {e}"),
-                    })?;
-                Ok((name.clone(), view))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-    safetensors::tensor::serialize_to_file(views, None, output_path.as_ref()).map_err(
-        // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => crate::AnamnesisError::Io(io_err),
-            other => crate::AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
-        },
-    )?;
+    parsed.remember_with_options(&output_path, target, opts)?;
 
     println!("  Output: {}", output_path.display());
     Ok(())
-}
-
-/// Maps a non-quantized [`GgufType`](crate::GgufType) to the corresponding
-/// `safetensors::Dtype`.
-#[cfg(feature = "gguf")]
-fn gguf_type_to_safetensors_dtype(dtype: crate::GgufType) -> crate::Result<safetensors::Dtype> {
-    // EXHAUSTIVE: GgufType is a foreign #[non_exhaustive] enum — new
-    // variants may be added. The wildcard covers future types.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    match dtype {
-        crate::GgufType::F32 => Ok(safetensors::Dtype::F32),
-        crate::GgufType::F16 => Ok(safetensors::Dtype::F16),
-        crate::GgufType::BF16 => Ok(safetensors::Dtype::BF16),
-        crate::GgufType::F64 => Ok(safetensors::Dtype::F64),
-        crate::GgufType::I8 => Ok(safetensors::Dtype::I8),
-        crate::GgufType::I16 => Ok(safetensors::Dtype::I16),
-        crate::GgufType::I32 => Ok(safetensors::Dtype::I32),
-        crate::GgufType::I64 => Ok(safetensors::Dtype::I64),
-        other => Err(crate::AnamnesisError::Unsupported {
-            format: "GGUF".into(),
-            detail: format!("no safetensors equivalent for {other}"),
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------

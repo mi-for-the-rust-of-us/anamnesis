@@ -1963,6 +1963,162 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ParsedGguf::remember — the whole-model dequantise-and-write path
+// ---------------------------------------------------------------------------
+
+/// Whole-model `remember` for a parsed `GGUF`, mirroring
+/// [`ParsedModel`](crate::ParsedModel)'s spelling method for method.
+///
+/// **New in v0.7.6, and it closes a real gap rather than adding a convenience.**
+/// Until this release the only whole-model `GGUF` dequantise-and-write in the
+/// crate lived inside the CLI's `run_remember_gguf`, 121 lines that transcribed
+/// what `convert`'s reader already did. That copy was sequential, silently
+/// ignored `--threads`, and — the part that mattered for
+/// [Phase 8](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
+/// — could not be called from the library at all, so a binding would have been
+/// the third transcription. Both paths now run
+/// [`hub_from_gguf`](crate::convert::hub_from_gguf), and the outputs are pinned
+/// byte-for-byte against `convert --to safetensors` in `tests/cli_convert.rs`.
+///
+/// Quantised tensors are dequantised to `target`; every other tensor passes
+/// through in its **source** dtype, so the output is legitimately mixed-dtype
+/// exactly as it is on the safetensors path. `GGUF` shapes are
+/// most-significant-first and are reversed into row-major (`NumPy`) order on the
+/// way out.
+impl crate::ParsedGguf {
+    /// Dequantizes every quantised tensor to `target` and writes a standard
+    /// `.safetensors` file.
+    ///
+    /// The `RememberOptions::default()` special case of
+    /// [`remember_with_options`](Self::remember_with_options).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed, a
+    /// tensor's element count overflows `usize`, or a dequant worker thread
+    /// panics.
+    /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
+    /// safetensors equivalent.
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    ///
+    /// # Memory
+    ///
+    /// Peak is the whole dequantised model: one owned `Vec<u8>` per tensor,
+    /// `target.byte_size() × n_elements` for the dequantised share and the
+    /// source width for the passthrough share, all live at once because
+    /// `safetensors::serialize_to_file` needs every view alive. Identical in
+    /// class to [`ParsedModel::remember`](crate::ParsedModel::remember);
+    /// per-tensor streaming is ROADMAP Phase 10.
+    pub fn remember(
+        &self,
+        output_path: impl AsRef<std::path::Path>,
+        target: crate::TargetDtype,
+    ) -> crate::Result<()> {
+        self.remember_with_options(output_path, target, crate::RememberOptions::default())
+    }
+
+    /// Dequantizes every quantised tensor to `target` and writes a standard
+    /// `.safetensors` file, with a caller-supplied
+    /// [`RememberOptions`](crate::RememberOptions).
+    ///
+    /// Output bytes are identical for any thread count — the dispatch
+    /// reassembles results in input order — so the budget is a performance knob
+    /// and never a correctness variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if tensor data is malformed, a
+    /// tensor's element count overflows `usize`, or a dequant worker thread
+    /// panics.
+    /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
+    /// safetensors equivalent.
+    /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    ///
+    /// # Memory
+    ///
+    /// As [`remember`](Self::remember).
+    pub fn remember_with_options(
+        &self,
+        output_path: impl AsRef<std::path::Path>,
+        target: crate::TargetDtype,
+        opts: crate::RememberOptions,
+    ) -> crate::Result<()> {
+        let hub = self.hub_for(target, opts)?;
+        crate::convert::write_safetensors(&hub, output_path.as_ref()).map(|_| ())
+    }
+
+    /// Dequantizes every quantised tensor to `target` and returns the standard
+    /// `.safetensors` bytes in memory.
+    ///
+    /// The `RememberOptions::default()` special case of
+    /// [`remember_to_bytes_with_options`](Self::remember_to_bytes_with_options).
+    ///
+    /// # Errors
+    ///
+    /// As [`remember`](Self::remember), except that serialization failures are
+    /// reported as [`AnamnesisError::Parse`] rather than
+    /// [`AnamnesisError::Io`] — nothing is written to a file.
+    ///
+    /// # Memory
+    ///
+    /// Peak is **higher** than [`remember`](Self::remember)'s: the per-tensor
+    /// buffers and the one contiguous output buffer are live simultaneously
+    /// (~`2 ×` the dequantised set) before the per-tensor buffers drop. The
+    /// same relationship
+    /// [`ParsedModel::remember_to_bytes`](crate::ParsedModel::remember_to_bytes)
+    /// documents against its own file path.
+    pub fn remember_to_bytes(&self, target: crate::TargetDtype) -> crate::Result<Vec<u8>> {
+        self.remember_to_bytes_with_options(target, crate::RememberOptions::default())
+    }
+
+    /// Dequantizes every quantised tensor to `target` and returns the standard
+    /// `.safetensors` bytes in memory, with a caller-supplied
+    /// [`RememberOptions`](crate::RememberOptions).
+    ///
+    /// # Errors
+    ///
+    /// As [`remember_to_bytes`](Self::remember_to_bytes).
+    ///
+    /// # Memory
+    ///
+    /// As [`remember_to_bytes`](Self::remember_to_bytes).
+    pub fn remember_to_bytes_with_options(
+        &self,
+        target: crate::TargetDtype,
+        opts: crate::RememberOptions,
+    ) -> crate::Result<Vec<u8>> {
+        let hub = self.hub_for(target, opts)?;
+        crate::convert::write_safetensors_bytes(&hub).map(|(bytes, _)| bytes)
+    }
+
+    /// Resolves the thread budget and the output width, then normalises this
+    /// file into the shared hub.
+    ///
+    /// The single runtime boundary for the output width on this path: past this
+    /// `match` the width is a static type parameter and no per-tensor branch
+    /// exists, exactly as in
+    /// [`ParsedModel::remember_with_progress_and_options`](crate::ParsedModel::remember_with_options).
+    fn hub_for(
+        &self,
+        target: crate::TargetDtype,
+        opts: crate::RememberOptions,
+    ) -> crate::Result<crate::convert::Hub> {
+        let threads = opts.resolved_threads();
+        match target {
+            crate::TargetDtype::BF16 => {
+                crate::convert::hub_from_gguf::<crate::Bf16Out>(self, threads)
+            }
+            crate::TargetDtype::F32 => {
+                crate::convert::hub_from_gguf::<crate::F32Out>(self, threads)
+            }
+            crate::TargetDtype::F16 => {
+                crate::convert::hub_from_gguf::<crate::F16Out>(self, threads)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
