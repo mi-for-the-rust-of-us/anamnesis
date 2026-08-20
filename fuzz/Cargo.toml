@@ -138,3 +138,20 @@ path = "fuzz_targets/fuzz_pth_bytes.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_npz_bytes"
+path = "fuzz_targets/fuzz_npz_bytes.rs"
+test = false
+doc = false
+bench = false
+
+# Magic-byte format detection. Distinct from the per-format targets because it
+# runs *before* one is chosen, and because separating `.npz` from `.pth` means
+# walking a ZIP central directory built from arbitrary bytes.
+[[bin]]
+name = "fuzz_detect_format"
+path = "fuzz_targets/fuzz_detect_format.rs"
+test = false
+doc = false
+bench = false

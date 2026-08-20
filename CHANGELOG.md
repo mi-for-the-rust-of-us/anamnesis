@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The panic-freedom battery now covers the entry points this release added.**
+  `tests/no_panic.rs` says in its own header that it drives *"every re-exported
+  parse/inspect entry point of all four formats"*, and the README, the FAQ and
+  `lib.rs` all rest a headline claim on it — *no public parse/inspect entry
+  point panics or aborts on any input*. v0.7.6 added ten public entry points
+  and put none of them in it, so the claim had outrun its evidence. The `NPZ`
+  owned-bytes and reader family, the four `inspect_*_with_options` forms, and
+  the format-agnostic `detect_format_from_bytes*` / `convert_bytes` are now
+  driven over the same adversarial corpus, under both the default and a
+  hostile-tight `ParseLimits`.
+
+  Two `cargo fuzz` targets follow the same reasoning: **`fuzz_npz_bytes`**
+  completes a pattern the other three formats already had (`fuzz_pth_bytes`,
+  `fuzz_gguf_bytes`, `fuzz_safetensors_bytes` — `NPZ` was simply the last format
+  to get a byte parser), and **`fuzz_detect_format`** covers a genuinely new
+  surface: telling an `.npz` from a `.pth` means walking a `ZIP` central
+  directory built from arbitrary bytes, *before* any parser has been chosen.
+  Fifteen targets become seventeen.
+
+  `CancelToken` is also asserted `Send + Sync` in its own right rather than
+  transitively through the options structs that hold one, so a future change
+  that broke it would name the type.
+
 - **User-facing docs brought back in line with the tool.** `README.md`, the
   `CLI` reference, the FAQ and two tutorials each carried something v0.7.6 had
   made false: three `amn inspect` transcripts of a **quantised** `GGUF` were
