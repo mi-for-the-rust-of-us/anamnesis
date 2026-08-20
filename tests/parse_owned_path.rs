@@ -8,6 +8,11 @@
 //! the `Backing` plumbing reads the same bytes regardless of origin. Plus:
 //! malformed bytes yield a clean `Err` (never a panic), and a tightened
 //! `ParseLimits` rejects an oversized read.
+//!
+//! `NPZ` joined at v0.7.6 (Phase 7.6 item 3). Until then it had no owned entry
+//! points at all, so the contract this file exists to pin had one format
+//! missing — the format whose Python-side callers most often hold bytes rather
+//! than a path.
 
 #![allow(
     clippy::panic,
@@ -255,5 +260,79 @@ mod gguf {
     fn gguf_malformed_bytes_is_clean_err() {
         assert!(parse_gguf_bytes(b"XXXX not a gguf file".to_vec()).is_err());
         assert!(parse_gguf_bytes(Vec::new()).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NPZ (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "npz")]
+mod npz {
+    use super::{ParseLimits, fs};
+    use anamnesis::{
+        NpzTensor, parse_npz, parse_npz_bytes, parse_npz_from_reader,
+        parse_npz_from_reader_with_limits,
+    };
+    use std::collections::HashMap;
+
+    const NPZ_FIXTURE: &str = "tests/fixtures/npz_reference/gemma_scope_small.npz";
+
+    /// Sorted `(name, shape, dtype, data)` so two maps compare independently of
+    /// `HashMap` iteration order.
+    fn fingerprint(map: &HashMap<String, NpzTensor>) -> Vec<(String, Vec<usize>, String, Vec<u8>)> {
+        let mut out: Vec<_> = map
+            .values()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.shape.clone(),
+                    t.dtype.to_string(),
+                    t.data.clone(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The three `NPZ` entry points must return identical arrays.
+    ///
+    /// `NPZ` had no owned paths at all before v0.7.6, which is why this suite
+    /// covered three formats and not four: the copy-based untrusted-input
+    /// contract Phase 6.13 documents simply had no `NPZ` instance.
+    #[test]
+    fn npz_owned_paths_match_path() {
+        let bytes = fs::read(NPZ_FIXTURE).expect("read npz fixture");
+
+        let m_path = parse_npz(NPZ_FIXTURE).expect("path parse");
+        let m_bytes = parse_npz_bytes(bytes).expect("bytes parse");
+        let m_reader = parse_npz_from_reader(fs::File::open(NPZ_FIXTURE).expect("open"))
+            .expect("reader parse");
+
+        let fp = fingerprint(&m_path);
+        assert!(!fp.is_empty(), "the fixture should hold arrays");
+        assert_eq!(fp, fingerprint(&m_bytes), "bytes path differs from path");
+        assert_eq!(fp, fingerprint(&m_reader), "reader path differs from path");
+    }
+
+    #[test]
+    fn npz_malformed_bytes_is_clean_err() {
+        assert!(parse_npz_bytes(b"XXXX not a zip archive".to_vec()).is_err());
+        assert!(parse_npz_bytes(Vec::new()).is_err());
+    }
+
+    /// A tightened budget rejects the streamed read before the archive is
+    /// buffered, the same way the safetensors and `.pth` reader paths do.
+    #[test]
+    fn npz_reader_honours_a_tight_budget() {
+        let limits = ParseLimits::default().with_max_single_alloc(16);
+        let err =
+            parse_npz_from_reader_with_limits(fs::File::open(NPZ_FIXTURE).expect("open"), &limits)
+                .expect_err("a 16-byte budget cannot admit the archive");
+        assert!(
+            matches!(err, anamnesis::AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
     }
 }

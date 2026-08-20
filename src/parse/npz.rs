@@ -1036,7 +1036,118 @@ pub fn parse_npz_with_limits(
     limits: &ParseLimits,
 ) -> crate::Result<HashMap<String, NpzTensor>> {
     let file = std::fs::File::open(path.as_ref())?;
-    let mut src = crate::parse::zip::ReaderSource::new(file)?;
+    parse_npz_from_zip_reader(file, limits)
+}
+
+/// Parses `NPZ` bytes already held in memory, returning the arrays as a
+/// name-to-tensor map.
+///
+/// The `NPZ` member of the copy-based, mmap-free family every other format has
+/// had since [Phase 6.13](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
+/// — `parse_bytes` for safetensors, `parse_gguf_bytes`, `parse_pth_bytes`. Its
+/// absence was not a design decision but an omission, and it meant the
+/// untrusted-input contract those siblings document had no `NPZ` instance: a
+/// caller holding bytes had to write a temporary file first.
+///
+/// [`parse_npz_bytes`] is the [`ParseLimits::default`] (unbounded) special case
+/// of [`parse_npz_bytes_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed, an
+/// `NPY` header is invalid, or array data is truncated.
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared count, allocation,
+/// or decompression ratio exceeds a permanent `NPZ` cap.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype.
+/// Returns [`AnamnesisError::Io`] only from the in-memory cursor, which does
+/// not fail in practice.
+///
+/// # Memory
+///
+/// Holds `bytes` for the duration of the parse **and** allocates one `Vec<u8>`
+/// per array, so peak is the archive plus the decompressed arrays. Contrast
+/// [`parse_npz`], which streams from a file and peaks at the arrays alone.
+pub fn parse_npz_bytes(bytes: Vec<u8>) -> crate::Result<HashMap<String, NpzTensor>> {
+    parse_npz_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Parses owned `NPZ` bytes under a caller-supplied [`ParseLimits`] budget.
+///
+/// Rejects an input larger than [`ParseLimits::max_single_alloc_bytes`] before
+/// parsing, then enforces every applicable ceiling exactly as
+/// [`parse_npz_with_limits`] does.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if `bytes` exceeds `limits`, or if
+/// a declared count, allocation or decompression ratio does. Otherwise as
+/// [`parse_npz_bytes`].
+///
+/// # Memory
+///
+/// As [`parse_npz_bytes`].
+pub fn parse_npz_bytes_with_limits(
+    bytes: Vec<u8>,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    // CAST: usize → u64, lossless widening on all supported targets.
+    #[allow(clippy::as_conversions)]
+    let len = bytes.len() as u64;
+    limits.check_alloc(len, "NPZ bytes")?;
+    parse_npz_from_zip_reader(std::io::Cursor::new(bytes), limits)
+}
+
+/// Parses an `NPZ` archive from any reader, returning the arrays as a
+/// name-to-tensor map — the copy-based, mmap-free path for untrusted streams.
+///
+/// The whole stream is read into an owned buffer (bounded by [`ParseLimits`])
+/// and parsed from memory, so a truncated or hostile stream is a clean `Err`.
+/// Takes `Read` alone, not `Read + Seek`, matching `parse_pth_from_reader` and
+/// `parse_gguf_from_reader`: the seeks the `ZIP` container needs happen over the
+/// owned buffer, so an HTTP body or a pipe works without a seekable adapter.
+/// (`inspect_npz_from_reader` does require `Seek`, because it deliberately
+/// avoids buffering the archive at all.)
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::LimitExceeded`] if the bytes read exceed `limits`.
+/// Otherwise as [`parse_npz_bytes`].
+///
+/// # Memory
+///
+/// Reads the stream into an owned `Vec<u8>` of at most
+/// `max_single_alloc_bytes + 1` bytes, then as [`parse_npz_bytes`].
+pub fn parse_npz_from_reader<R: Read>(reader: R) -> crate::Result<HashMap<String, NpzTensor>> {
+    parse_npz_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses an `NPZ` archive from any reader under a caller-supplied
+/// [`ParseLimits`] budget — the bounded, mmap-free path for untrusted input.
+///
+/// # Errors
+///
+/// As [`parse_npz_from_reader`].
+///
+/// # Memory
+///
+/// As [`parse_npz_from_reader`].
+pub fn parse_npz_from_reader_with_limits<R: Read>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    let bytes = limits.read_to_vec_bounded(reader, "NPZ archive")?;
+    parse_npz_bytes_with_limits(bytes, limits)
+}
+
+/// The single parse body shared by the path, bytes and reader entry points, so
+/// the three cannot drift on limit enforcement or `NPY` interpretation.
+fn parse_npz_from_zip_reader<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    let mut src = crate::parse::zip::ReaderSource::new(reader)?;
     // The reader enforces `limits` (item-count + the central-directory single
     // allocation) fail-fast, before materialising the entry vector — so a
     // tight-budget caller bounds the container metadata, not only the

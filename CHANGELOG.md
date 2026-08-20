@@ -75,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`parse_npz_bytes`, `parse_npz_bytes_with_limits`, `parse_npz_from_reader`,
+  `parse_npz_from_reader_with_limits`** (Phase 7.6, item 3). `NPZ` was the one
+  format with no in-memory or streamed parse: safetensors, `.pth` and `GGUF`
+  have each had a `parse_*_bytes` and a `parse_*_from_reader` (plus
+  `_with_limits` forms of both) since Phase 6.13, and `NPZ` had only the two
+  path-based entry points. So Phase 6.13's copy-based untrusted-input contract
+  had **no `NPZ` instance**, and a caller holding bytes — an `io.BytesIO`, an
+  HTTP response, a blob from a dataset loader — had to write a temporary file
+  first. All four entry points share one parse body with the path form, so
+  limit enforcement and `NPY` interpretation cannot drift between them.
+
+  `parse_npz_from_reader` takes `Read` alone rather than `Read + Seek`,
+  matching `parse_pth_from_reader` and `parse_gguf_from_reader`: the stream is
+  read into one bounded owned buffer and the container seeks happen over that,
+  so a pipe or an HTTP body works with no seekable adapter.
+  (`inspect_npz_from_reader` still requires `Seek`, because it deliberately
+  never buffers the archive.) `tests/parse_owned_path.rs` — the suite that
+  exists to pin exactly this contract, and that covered three formats because
+  the fourth had nothing to pin — now covers all four.
+
 - **A dequantised-size estimate for every format, and one trait to read it**
   (Phase 7.6, item 2). `GgufInspectInfo`, `PthInspectInfo` and
   `NpzInspectInfo` each gain `dequantized_size` and `output_dtype`, joining

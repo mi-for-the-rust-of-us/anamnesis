@@ -52,7 +52,8 @@ pub use gguf_write::{GgufWriteTensor, write_gguf, write_gguf_to_writer};
 #[cfg(feature = "npz")]
 pub use npz::{
     NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo, inspect_npz, inspect_npz_from_reader,
-    inspect_npz_from_reader_with_options, inspect_npz_with_options, parse_npz,
+    inspect_npz_from_reader_with_options, inspect_npz_with_options, parse_npz, parse_npz_bytes,
+    parse_npz_bytes_with_limits, parse_npz_from_reader, parse_npz_from_reader_with_limits,
     parse_npz_with_limits,
 };
 #[cfg(feature = "ollama")]
