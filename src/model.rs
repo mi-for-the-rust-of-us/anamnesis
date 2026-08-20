@@ -113,6 +113,30 @@ impl TargetDtype {
             Self::F32 => 4,
         }
     }
+
+    /// The element [`Dtype`] this output width names.
+    ///
+    /// `TargetDtype` and [`Dtype`] describe the same three widths from two
+    /// directions: one is what a caller *asks* for, the other is what a tensor
+    /// *is*. The `remember` paths speak the first and the `convert` paths the
+    /// second, so without this the two would each need their own three-arm
+    /// dispatch to the same three monomorphisations — which is exactly the
+    /// duplication Phase 7.6 exists to remove.
+    ///
+    /// Total and infallible: every `TargetDtype` is an output width by
+    /// construction, which is the point of the type.
+    ///
+    /// Gated on `gguf` because that is where the two dispatch styles meet; a
+    /// build without it has only one and needs no bridge.
+    #[cfg(feature = "gguf")]
+    #[must_use]
+    pub(crate) const fn as_dtype(self) -> Dtype {
+        match self {
+            Self::BF16 => Dtype::BF16,
+            Self::F32 => Dtype::F32,
+            Self::F16 => Dtype::F16,
+        }
+    }
 }
 
 impl fmt::Display for TargetDtype {

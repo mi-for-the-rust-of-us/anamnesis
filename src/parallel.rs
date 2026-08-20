@@ -74,10 +74,12 @@ pub(crate) const MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
 /// Maps `f` over `items`, in parallel when it is worth it, returning the results
 /// **in `items` order regardless of thread count**.
 ///
-/// `cancel`, when present, is polled once per item immediately after the
-/// cursor hands it out (and at the top of each sequential iteration), so a
-/// cancelled run stops within one item's work rather than at the end. See
-/// [`crate::cancel`] for why the progress hook could not carry this.
+/// `cancel`, when present, is polled once before the dispatch and then once per
+/// item, immediately after the cursor hands it out (or at the top of each
+/// sequential iteration), so a cancelled run stops within one item's work rather
+/// than at the end — and an *empty* work list is cancelled too, rather than
+/// slipping past a check that only ever fires per item. See [`crate::cancel`]
+/// for why the progress hook could not carry this.
 ///
 /// `f` receives `(index, &item)` and must be a pure function of its arguments
 /// plus shared-**immutable** captured state: it allocates and writes only the
@@ -132,6 +134,14 @@ where
     F: Fn(usize, &T) -> crate::Result<R> + Sync,
     P: FnMut(&R),
 {
+    // Polled once before the dispatch, not only per item. Without this a work
+    // list that is *empty* — an unquantised safetensors model has no quantised
+    // entries at all, which is an ordinary input, not an exotic one — would
+    // never reach a per-item poll, and a cancelled run would proceed to write
+    // its output. The guarantee `crate::cancel` documents is unconditional, so
+    // the check has to be too.
+    crate::cancel::check(cancel)?;
+
     // The three gates, stated once so both builds read the same rule: a budget
     // above one, more than one item, and enough work to amortise the pool.
     let worth_spawning = threads > 1 && items.len() > 1 && work_bytes >= MIN_PARALLEL_BYTES;
@@ -296,6 +306,41 @@ mod tests {
     /// A work-byte figure comfortably above [`MIN_PARALLEL_BYTES`], so the
     /// parallel path is actually taken when the feature is on.
     const BIG: u64 = MIN_PARALLEL_BYTES * 2;
+
+    /// Cancellation is observed even when there is **no work to do**.
+    ///
+    /// The regression: the token was polled once per item, so an empty item list
+    /// reached no poll at all and a cancelled run proceeded to write its output.
+    /// An empty list is not exotic — an unquantised safetensors model has no
+    /// quantised entries, so `remember` on one dispatches over nothing. The
+    /// guarantee `crate::cancel` documents is unconditional, and this pins that.
+    #[test]
+    fn an_empty_work_list_still_observes_cancellation() {
+        let empty: Vec<usize> = Vec::new();
+        let token = crate::CancelToken::new();
+        token.cancel();
+
+        for threads in [1usize, 4] {
+            let err = map_indexed(&empty, threads, BIG, Some(&token), |_, &v| Ok(v), |_| {})
+                .expect_err("a cancelled run must not succeed, even with nothing to do");
+            assert!(
+                matches!(err, AnamnesisError::Cancelled),
+                "at {threads} threads: expected Cancelled, got {err:?}"
+            );
+        }
+
+        // And an uncancelled empty list is still simply empty.
+        let out = map_indexed(
+            &empty,
+            4,
+            BIG,
+            Some(&crate::CancelToken::new()),
+            |_, &v| Ok(v),
+            |_| {},
+        )
+        .expect("an uncancelled empty run succeeds");
+        assert!(out.is_empty());
+    }
 
     /// Order is an input-order property, not a completion-order one: the same
     /// sequence must come back for every thread budget.

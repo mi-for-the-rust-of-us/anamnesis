@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cancelled run with nothing to do is now cancelled.** The token was polled
+  once per work item, so an **empty** item list reached no poll at all and the
+  run proceeded to write its output — contradicting the unconditional guarantee
+  `CancelToken` documents. An empty list is not exotic: an unquantised
+  safetensors model has no quantised entries, so `remember` on one dispatches
+  over nothing. `map_indexed` now polls once before the dispatch as well as once
+  per item. Found by the v0.7.6 consistency pass, pinned by
+  `an_empty_work_list_still_observes_cancellation`.
+
 - **Stale `Phase 7.5` references corrected to `Phase 8.5`** (Phase 7.6,
   item 10), in 19 places across seven source files and two documents. Phase 7.5
   shipped as PTH reader-generic front matter; the encode-kernel completion it
@@ -120,7 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`Format`, `detect_format` and `detect_format_from_bytes` are public**
+- **`Format`, `detect_format`, `detect_format_from_bytes` and
+  `detect_format_from_bytes_with_limits` are public**
   (Phase 7.6, item 6). Format detection was crate-private, so an embedder — or
   the v0.8.0 binding — wanting the polymorphic `parse(path)` / `inspect(path)`
   the CLI offers had to re-sniff extensions and magic bytes itself, duplicating
@@ -128,7 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension-first with a magic fallback for `.bin`, as before;
   `detect_format_from_bytes` is magic-first for callers holding an artefact in
   memory, and separates `.npz` from `.pth` (which share the `ZIP` magic) by
-  reading the central directory and looking at member names.
+  reading the central directory and looking at member names — a walk that is
+  charged to the caller's `ParseLimits` through the `_with_limits` form, which
+  is what `convert_bytes` uses, so detection is not the one untightenable step
+  in an otherwise bounded pipeline.
 
   **The naming trap is documented rather than fixed**, because fixing it would
   break every consumer: `anamnesis::parse()` is **safetensors-only** while

@@ -994,6 +994,14 @@ pub struct GgufInspectInfo {
     /// (its stored size is genuinely unknown) but *included* here, since its
     /// element count is known from the shape regardless. Under-reporting the
     /// figure a gate rejects on would be fail-open.
+    ///
+    /// One consequence, stated so nobody has to rediscover it: `remember` and
+    /// `convert` **skip** those tensors (`ParsedGguf::tensors` filters them),
+    /// so on a file that contains one this figure is an *upper bound* on what
+    /// is actually written rather than an exact prediction. On a file where
+    /// every dtype has a tabulated size — every real model, and what
+    /// `gguf_dequantized_size_predicts_what_remember_writes` asserts — the two
+    /// agree to the byte.
     pub dequantized_size: u64,
     /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
     ///

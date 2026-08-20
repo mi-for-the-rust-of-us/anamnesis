@@ -388,6 +388,42 @@ fn has_magic(path: &Path, magic: [u8; 4]) -> bool {
 /// Returns [`AnamnesisError::Unsupported`] if the bytes are a recognised format
 /// whose Cargo feature is disabled in this build.
 pub fn detect_format_from_bytes(bytes: &[u8]) -> crate::Result<Format> {
+    detect_format_from_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Detects the input format from an in-memory artefact under a caller-supplied
+/// [`ParseLimits`] budget.
+///
+/// Identical to [`detect_format_from_bytes`] except that the `ZIP`
+/// central-directory walk — the one step of detection that allocates in
+/// proportion to attacker-controlled input — is charged to `limits` rather than
+/// only to the permanent `ZIP` caps. `GGUF` and safetensors detection read a
+/// fixed number of bytes and allocate nothing, so the budget is inert for them.
+///
+/// This is the entry point [`convert_bytes`] uses, so a caller who tightens
+/// `ConvertOptions::limits` tightens detection too. Without it, detection would
+/// be the one unbounded step in an otherwise bounded pipeline — the same
+/// inversion Phase 7.6 item 7 removed from the summary `inspect` calls, and it
+/// would be odd to reintroduce it in the same release.
+///
+/// # Errors
+///
+/// As [`detect_format_from_bytes`], plus [`AnamnesisError::LimitExceeded`] when
+/// the `ZIP` central directory exceeds `limits`.
+///
+/// # Memory
+///
+/// `O(1)` for `GGUF` and safetensors. For a `ZIP` container, one entry record
+/// per member (name plus offsets), bounded by `limits` and by the permanent
+/// `ZIP_MAX_ENTRIES` floor. No member data is read.
+// `limits` reaches only the `ZIP` branch, which is compiled out when neither
+// `npz` nor `pth` is enabled; the parameter stays in the signature so the public
+// API does not change shape with the feature set.
+#[cfg_attr(not(any(feature = "npz", feature = "pth")), allow(unused_variables))]
+pub fn detect_format_from_bytes_with_limits(
+    bytes: &[u8],
+    limits: &ParseLimits,
+) -> crate::Result<Format> {
     // `GGUF`: a four-byte magic, and nothing else in this set starts with it.
     if bytes.get(..4) == Some(b"GGUF".as_slice()) {
         #[cfg(feature = "gguf")]
@@ -404,7 +440,7 @@ pub fn detect_format_from_bytes(bytes: &[u8]) -> crate::Result<Format> {
     if bytes.get(..4) == Some(b"PK\x03\x04".as_slice()) {
         #[cfg(any(feature = "npz", feature = "pth"))]
         {
-            return detect_zip_flavour(bytes);
+            return detect_zip_flavour(bytes, limits);
         }
         #[cfg(not(any(feature = "npz", feature = "pth")))]
         {
@@ -445,11 +481,9 @@ pub fn detect_format_from_bytes(bytes: &[u8]) -> crate::Result<Format> {
 /// through the same vendored central-directory reader the parsers use, so the
 /// classification cannot disagree with what the parser will then accept.
 #[cfg(any(feature = "npz", feature = "pth"))]
-fn detect_zip_flavour(bytes: &[u8]) -> crate::Result<Format> {
+fn detect_zip_flavour(bytes: &[u8], limits: &ParseLimits) -> crate::Result<Format> {
     let mut src = crate::parse::zip::SliceSource::new(bytes);
-    // The permanent `ZIP` caps apply; a caller-tightened budget is not
-    // available here because detection precedes any options.
-    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
+    let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
 
     let mut saw_npy = false;
     let mut saw_pickle = false;
@@ -820,7 +854,7 @@ fn read_hub_from_bytes(
     let threads = crate::model::resolve_thread_budget(options.threads);
     let cancel = options.cancel.as_ref();
     let out_dtype = resolve_output_dtype(options)?;
-    match detect_format_from_bytes(bytes)? {
+    match detect_format_from_bytes_with_limits(bytes, &options.limits)? {
         Format::Safetensors => {
             let model = crate::parse_bytes_with_limits(bytes.to_vec(), &options.limits)?;
             hub_from_model(&model, threads, cancel, on_tensor, out_dtype)
@@ -846,7 +880,7 @@ fn read_hub_from_bytes(
 /// The output-width dispatch for a parsed `GGUF`, shared by the path and bytes
 /// readers so the `match` on the width exists once.
 #[cfg(feature = "gguf")]
-fn hub_from_gguf_dyn(
+pub(crate) fn hub_from_gguf_dyn(
     parsed: &crate::ParsedGguf,
     threads: usize,
     cancel: Option<&crate::CancelToken>,
@@ -928,10 +962,17 @@ fn hub_from_model(
 ///
 /// # Memory
 ///
-/// Higher than [`convert`]'s, and knowably so: the input bytes, the hub, **and**
-/// the output buffer are all live at once, where the file path streams the
-/// output and drops the input mapping. Budget roughly `input + 2 × output`
-/// against `convert`'s `input + output`.
+/// Higher than [`convert`]'s, and knowably so. Three things are live at once:
+/// `input` as the caller's slice, an **owned copy** of it (each byte-form parser
+/// takes ownership of its buffer), and the hub; the output buffer then joins
+/// them before the hub drops. Budget roughly `2 × input + hub + output`, against
+/// the file path's `input + hub` where the input is a mapping rather than a copy
+/// and the output streams to disk.
+///
+/// The owned copy is inherent to taking `&[u8]`: the byte parsers own their
+/// buffers, so a borrowed slice must be copied once. A caller who already holds
+/// a `Vec<u8>` and wants that copy back can call the format's own
+/// `parse_*_bytes` entry point directly.
 pub fn convert_bytes(
     input: &[u8],
     target: ConvertTarget,
@@ -1200,7 +1241,7 @@ fn read_gguf(
 /// dequantised to `E`, everything else passed through in its source dtype,
 /// shapes reversed into row-major order.
 ///
-/// Split out of [`read_gguf_as`] at v0.7.6 so `ParsedGguf::remember` and the
+/// Split out of the `GGUF` reader at v0.7.6 so `ParsedGguf::remember` and the
 /// `convert` reader run the **same** code rather than two transcriptions of it.
 /// Until then the `remember` path for a `GGUF` input lived only in the CLI, was
 /// sequential, ignored `--threads`, and could not be called from the library at
@@ -1320,10 +1361,10 @@ pub(crate) enum Sink<'a> {
 
 /// Builds the safetensors views for every hub tensor, in hub order.
 ///
-/// The single view-construction site shared by [`write_safetensors`] (file) and
-/// [`write_safetensors_bytes`] (memory), so the two destinations cannot drift on
-/// dtype mapping, shape, or tensor order. The views borrow `hub`, so the
-/// returned `Vec` is tied to it.
+/// The single view-construction site behind [`write_safetensors_to`], so the
+/// file and in-memory destinations cannot drift on dtype mapping, shape, or
+/// tensor order — they differ only in the call that consumes these views. The
+/// views borrow `hub`, so the returned `Vec` is tied to it.
 ///
 /// # Errors
 ///
@@ -2345,7 +2386,7 @@ mod stats_tests {
 )]
 mod quantized_gguf_tests {
     use super::{
-        AnamnesisError, ConvertOptions, ConvertTarget, Format, convert, convert_bytes,
+        AnamnesisError, ConvertOptions, ConvertTarget, Format, ParseLimits, convert, convert_bytes,
         convert_with_progress, derive_output_path, derive_output_path_for_dtype,
     };
     use crate::GgufType;
@@ -2838,6 +2879,72 @@ mod quantized_gguf_tests {
             );
             assert_eq!(byte_stats.dequantized, file_stats.dequantized);
         }
+    }
+
+    /// Detection is bounded by the caller's budget, not only by the permanent
+    /// `ZIP` floor.
+    ///
+    /// The `ZIP` central-directory walk is the one step of detection that
+    /// allocates in proportion to attacker-controlled input, and
+    /// `convert_bytes` runs it *before* anything else. Leaving it unbounded
+    /// would have made detection the single untightenable step in an otherwise
+    /// bounded pipeline — the inversion Phase 7.6 item 7 had just removed from
+    /// the summary `inspect` calls.
+    #[cfg(feature = "npz")]
+    #[test]
+    fn detection_and_convert_bytes_honour_the_caller_budget() {
+        // A small NPZ, built through the same writer the NPZ tests use.
+        let mut archive = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut archive));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy"] {
+                zip.start_file(name, opts).expect("start entry");
+                let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2,), }";
+                let mut npy = b"\x93NUMPY\x01\x00".to_vec();
+                let mut padded = header.as_bytes().to_vec();
+                while (10 + padded.len() + 1) % 64 != 0 {
+                    padded.push(b' ');
+                }
+                padded.push(b'\n');
+                // CAST: usize → u16, the padded header is 64 bytes by
+                // construction and the format's own field is `u16`.
+                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                npy.extend_from_slice(&(padded.len() as u16).to_le_bytes());
+                npy.extend_from_slice(&padded);
+                npy.extend_from_slice(&[0u8; 8]);
+                std::io::Write::write_all(&mut zip, &npy).expect("write entry");
+            }
+            zip.finish().expect("finish archive");
+        }
+
+        // Unbounded detection sees an NPZ.
+        assert_eq!(
+            crate::detect_format_from_bytes(&archive).expect("detect"),
+            Format::Npz
+        );
+
+        // A budget below the declared entry count rejects during detection.
+        let tight = ParseLimits::default().with_max_item_count(1);
+        let err = crate::detect_format_from_bytes_with_limits(&archive, &tight)
+            .expect_err("an item-count budget must bound the detection walk");
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
+
+        // And `convert_bytes` inherits it from `ConvertOptions::limits`.
+        let err = convert_bytes(
+            &archive,
+            ConvertTarget::Safetensors,
+            &ConvertOptions::new().with_limits(tight),
+        )
+        .expect_err("convert_bytes must not detect outside its own budget");
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
     }
 
     /// The magic-byte detector recognises what the parsers accept, and refuses

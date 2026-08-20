@@ -1241,6 +1241,21 @@ commits on `phase-7.6`. Seven results worth carrying forward:
    readers byte-capable — the earlier "record it as file-to-file" option became
    unnecessary.
 
+8. **A consistency pass over the phase's own diff found two real defects**, not
+   just tidiness, which is the argument for running one at all. Cancellation was
+   not observed when the work list was **empty** — an unquantised safetensors
+   model has no quantised entries, so `remember` on one dispatched over nothing
+   and a cancelled run wrote its file anyway, contradicting the unconditional
+   guarantee `CancelToken` documents. And `detect_format_from_bytes` walked a
+   `ZIP` central directory unbounded, *including from inside `convert_bytes`
+   where the caller's limits were in scope* — the same inversion item 7 had just
+   removed from the summary `inspect` calls, reintroduced on a new entry point in
+   the same release. Both are fixed and pinned. The other five findings were a
+   duplicated width dispatch this phase introduced, an under-counted `# Memory`
+   note, three intra-doc links to functions the phase deleted (invisible to the
+   rustdoc sweep because they sit on `pub(crate)` items), an over-stated
+   exactness claim, and one ASCII arrow.
+
 **Deviations from the plan, stated plainly:** items 2 and 7 share a commit
 (point 2 above); the inspect entry points are spelled `_with_options` rather
 than `_with_limits`, because one options object carries both knobs; and

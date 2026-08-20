@@ -590,7 +590,7 @@ fn to_c_order(
         });
     }
 
-    // CAST: usize -> u64, lossless widening on all supported targets.
+    // CAST: usize → u64, lossless widening on all supported targets.
     #[allow(clippy::as_conversions)]
     let expected_u64 = expected as u64;
     budget.charge_alloc(expected_u64, "NPZ fortran-order transposition")?;

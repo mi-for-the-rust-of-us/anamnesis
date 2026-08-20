@@ -2098,10 +2098,12 @@ impl crate::ParsedGguf {
     /// Resolves the thread budget and the output width, then normalises this
     /// file into the shared hub.
     ///
-    /// The single runtime boundary for the output width on this path: past this
-    /// `match` the width is a static type parameter and no per-tensor branch
-    /// exists, exactly as in
-    /// [`ParsedModel::remember_with_progress_and_options`](crate::ParsedModel::remember_with_options).
+    /// Delegates the width dispatch to `convert`'s, rather than repeating it:
+    /// the two would otherwise be three-arm matches fanning out to the same
+    /// three monomorphisations, differing only in whether the width arrives as a
+    /// `TargetDtype` or a `Dtype`. `TargetDtype::as_dtype` bridges them. Past
+    /// that dispatch the width is a static type parameter and no per-tensor
+    /// branch exists, exactly as on the safetensors path.
     fn hub_for(
         &self,
         target: crate::TargetDtype,
@@ -2112,17 +2114,7 @@ impl crate::ParsedGguf {
         let cancel = opts.cancel.clone();
         let cancel = cancel.as_ref();
         let threads = opts.resolved_threads();
-        match target {
-            crate::TargetDtype::BF16 => {
-                crate::convert::hub_from_gguf::<crate::Bf16Out>(self, threads, cancel, &mut || {})
-            }
-            crate::TargetDtype::F32 => {
-                crate::convert::hub_from_gguf::<crate::F32Out>(self, threads, cancel, &mut || {})
-            }
-            crate::TargetDtype::F16 => {
-                crate::convert::hub_from_gguf::<crate::F16Out>(self, threads, cancel, &mut || {})
-            }
-        }
+        crate::convert::hub_from_gguf_dyn(self, threads, cancel, &mut || {}, target.as_dtype())
     }
 }
 
