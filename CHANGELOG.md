@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`NPZ` archives holding Fortran-order arrays now parse** (Phase 7.6,
+  item 8), rewritten into C-order on the way out instead of rejected with
+  `Unsupported`. `NumPy` writes `fortran_order: True` for any array that is
+  `F`-contiguous and not `C`-contiguous, which a transposed view is: a plain
+  `np.savez("w.npz", w=x.T)` produces one. The rejection was defensible while
+  the audience was Rust consumers of `C`-order `SAE` archives; it is a
+  first-contact failure for a `pip install anamnesis-quant` user on a file
+  `NumPy` wrote unprompted.
+
+  Materialised rather than flagged, deliberately: everything downstream
+  (`npz_to_safetensors`, the `convert` hub, any framework loading the result)
+  assumes row-major, so an order flag a caller might ignore would be the same
+  silent-orientation trap Phase 6.10 already had to fix once for `AWQ`/`GPTQ` —
+  and a wrong orientation is not a crash, it is plausible numbers in the wrong
+  places. C-order input pays nothing: no branch inside a loop, no second
+  buffer. The transposition uses reversed strides, so rank 2 and rank *n* are
+  one code path, rank 0/1 and empty arrays are the identity, and the
+  destination buffer is charged to the caller's `ParseLimits` before it is
+  allocated.
+
+  `inspect_npz*` no longer rejects these archives either: memory order changes
+  no shape, dtype or byte count, so an inspect never had anything to reject,
+  and refusing meant a host could not run its inspect-before-parse gate on an
+  archive it would now parse happily.
+
 - **The summary `inspect` entry points accept a caller `ParseLimits`**
   (Phase 7.6, item 7), through `InspectOptions::with_limits`. They were
   *"intentionally limit-free"* by design, which left the call the README tells
