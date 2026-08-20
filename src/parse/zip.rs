@@ -149,13 +149,13 @@ pub(crate) trait ZipSource {
 /// `ReaderSource` — so it is gated on `pth` to keep an `npz`-only build free of
 /// dead code. `test` keeps it available to this module's own unit tests in every
 /// feature combination.
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 pub(crate) struct SliceSource<'a> {
     /// The whole archive bytes (the mmap).
     data: &'a [u8],
 }
 
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 impl<'a> SliceSource<'a> {
     /// Wraps `data` as a [`ZipSource`].
     #[must_use]
@@ -164,7 +164,7 @@ impl<'a> SliceSource<'a> {
     }
 }
 
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 impl ZipSource for SliceSource<'_> {
     fn total_len(&self) -> u64 {
         // CAST: usize → u64, lossless widening on all supported targets
@@ -956,7 +956,7 @@ pub(crate) fn data_start<S: ZipSource>(src: &mut S, entry: &ZipEntry) -> crate::
 /// Only the `.pth` reader strips the prefix today (`.npz` keys on the full entry
 /// name), so it is gated on `pth` to keep an `npz`-only build free of dead code;
 /// `test` keeps it available to this module's unit tests.
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 #[must_use]
 pub(crate) fn strip_archive_prefix(name: &str) -> Cow<'_, str> {
     match name.find('/') {

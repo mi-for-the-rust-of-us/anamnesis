@@ -111,6 +111,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Format`, `detect_format` and `detect_format_from_bytes` are public**
+  (Phase 7.6, item 6). Format detection was crate-private, so an embedder — or
+  the v0.8.0 binding — wanting the polymorphic `parse(path)` / `inspect(path)`
+  the CLI offers had to re-sniff extensions and magic bytes itself, duplicating
+  logic this crate already has and keeps correct. `detect_format` is
+  extension-first with a magic fallback for `.bin`, as before;
+  `detect_format_from_bytes` is magic-first for callers holding an artefact in
+  memory, and separates `.npz` from `.pth` (which share the `ZIP` magic) by
+  reading the central directory and looking at member names.
+
+  **The naming trap is documented rather than fixed**, because fixing it would
+  break every consumer: `anamnesis::parse()` is **safetensors-only** while
+  `amn parse` dispatches over all four formats. The CLI's polymorphism lives in
+  its own dispatch, not in the library entry point of the same name. Detect
+  first, then call that format's parser; the `Format` docs say so.
+
+- **`convert_bytes` and `convert_bytes_with_progress`** (Phase 7.6, item 3).
+  `convert` was `Path` → `Path` only while `parse` and `remember` each had
+  bytes forms, so a caller working from a download, or handing bytes across an
+  `FFI` boundary, had to round-trip through two temporary files for an
+  operation that never needed the filesystem. Feasible only now that all four
+  readers have byte entry points.
+
+  Not a second implementation: the writers gained an internal `Sink` (file or
+  buffer), so each one builds its tensor list once and differs only in the last
+  call, and the readers share their hub mapping with the path versions. The
+  test asserts byte-identical output against `convert` for every target
+  reachable from a quantised `GGUF` source. Peak memory is honestly higher and
+  documented as such — input, hub and output are all live at once, roughly
+  `input + 2 × output` against `convert`'s `input + output`.
+
 - **`CancelToken`, and `AnamnesisError::Cancelled`** (Phase 7.6, item 5).
   Attach a token through `RememberOptions::with_cancel` or
   `ConvertOptions::with_cancel`, keep a clone, and call `cancel()` from any

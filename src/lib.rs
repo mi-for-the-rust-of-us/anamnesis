@@ -463,7 +463,10 @@ pub mod parse;
 pub mod remember;
 
 pub use cancel::CancelToken;
-pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert, convert_with_progress};
+pub use convert::{
+    ConvertOptions, ConvertStats, ConvertTarget, Format, convert, convert_bytes,
+    convert_bytes_with_progress, convert_with_progress, detect_format, detect_format_from_bytes,
+};
 pub use error::{AnamnesisError, Result};
 pub use inspect::{InspectInfo, InspectOptions, InspectSummary, format_bytes};
 #[cfg(feature = "bnb")]

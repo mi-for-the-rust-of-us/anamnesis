@@ -2045,7 +2045,8 @@ impl crate::ParsedGguf {
         opts: crate::RememberOptions,
     ) -> crate::Result<()> {
         let hub = self.hub_for(target, opts)?;
-        crate::convert::write_safetensors(&hub, output_path.as_ref()).map(|_| ())
+        crate::convert::write_safetensors_to(&hub, crate::convert::Sink::File(output_path.as_ref()))
+            .map(|_| ())
     }
 
     /// Dequantizes every quantised tensor to `target` and returns the standard
@@ -2089,7 +2090,9 @@ impl crate::ParsedGguf {
         opts: crate::RememberOptions,
     ) -> crate::Result<Vec<u8>> {
         let hub = self.hub_for(target, opts)?;
-        crate::convert::write_safetensors_bytes(&hub).map(|(bytes, _)| bytes)
+        let mut bytes = Vec::new();
+        crate::convert::write_safetensors_to(&hub, crate::convert::Sink::Memory(&mut bytes))?;
+        Ok(bytes)
     }
 
     /// Resolves the thread budget and the output width, then normalises this
