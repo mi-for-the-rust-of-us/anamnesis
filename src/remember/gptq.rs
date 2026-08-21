@@ -19,22 +19,15 @@
 //! Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
 //! Generative Pre-trained Transformers", ICLR 2023 (arXiv:2210.17323).
 
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Migrating this tile loop to `as_chunks` cost **+51 %** on
-// `dequant_gptq_int4` (criterion, 4096 x 11008, target-cpu=native, p = 0.00,
-// reproduced twice). Reverting restored it to -1.1 % (p = 0.73).
+// This module carries **no** `chunks_exact_to_as_chunks` suppression, unlike its
+// `AWQ`, `FP8` and `BnB` siblings. It is the spike for the redesign those three
+// point at: `OutputElement` grew a fixed-size `Tile` associated type, so all
+// four streams of the tile loop below migrate together instead of three of them
+// migrating and the output staying a `ChunksExactMut`. The half-migrated shape
+// is what cost +51 % here and +74 % in `AWQ`; whether the whole-migration shape
+// pays for itself is what the `dequant_gptq_int4` CodSpeed benchmark decides.
 //
-// The likely mechanism, recorded because it points at the fix: the loop zips
-// four streams, and only three of them can migrate. `as_chunks_mut::<{VECTOR_TILE
-// * E::BYTES}>()` is rejected by stable Rust ("generic parameters may not be used
-// in const operations"), so the output stayed a `ChunksExactMut` while the inputs
-// became slices-of-arrays. A homogeneous four-way zip became a mixed one. Taking
-// this lint here means migrating all four, which needs `OutputElement` to accept
-// a fixed-size array instead of a byte slice of computed width -- a redesign, not
-// a lint fix.
-// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
-// criterion baseline alone cannot settle this.
-#![allow(clippy::chunks_exact_to_as_chunks)]
+// Do not copy this module's shape to its siblings before that number lands.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
@@ -532,10 +525,11 @@ pub fn dequantize_gptq<E: OutputElement>(
                     reason: "unpacked buffer too short".into(),
                 })?;
         #[allow(clippy::indexing_slicing)]
-        for (j, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
-            // INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk;
+        for (j, &qw_chunk) in qw_row.as_chunks::<4>().0.iter().enumerate() {
+            // INDEX: `as_chunks::<4>` hands back `[u8; 4]`, so `from_le_bytes`
+            // takes the array whole and no element indexing survives here;
             // j < out_features guaranteed by qw_row length validation above
-            let packed = u32::from_le_bytes([qw_chunk[0], qw_chunk[1], qw_chunk[2], qw_chunk[3]]);
+            let packed = u32::from_le_bytes(qw_chunk);
             // BITWISE: extract unsigned quantized value at bit position `shift`
             // CAST: u32 → f32, qw is at most 15 (4-bit) or 255 (8-bit), exact in f32
             #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
@@ -555,16 +549,16 @@ pub fn dequantize_gptq<E: OutputElement>(
         // intermediate round-tripped through L2 and the pair cost 1.15× against
         // the pre-v0.7.4 fused loop. The same tiling is what took `FP8` from
         // 1.06× to 0.45×.
-        let unp_tiles = unpacked_row.chunks_exact(VECTOR_TILE);
-        let zer_tiles = zeros_row.chunks_exact(VECTOR_TILE);
-        let sca_tiles = scales_row.chunks_exact(VECTOR_TILE);
-        // Read the remainders before the iterators are consumed.
-        let (unp_tail, zer_tail, sca_tail) = (
-            unp_tiles.remainder(),
-            zer_tiles.remainder(),
-            sca_tiles.remainder(),
-        );
-        let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+        // All four streams are slices of fixed-size arrays: each `as_chunks`
+        // hands its edge run back beside its tiles, and `split_tiles` does the
+        // same for the output at a width the implementation knows literally.
+        // That is the whole point of the redesign -- the zip below is
+        // homogeneous, and every one of its four trip counts is a compile-time
+        // constant.
+        let (unp_tiles, unp_tail) = unpacked_row.as_chunks::<VECTOR_TILE>();
+        let (zer_tiles, zer_tail) = zeros_row.as_chunks::<VECTOR_TILE>();
+        let (sca_tiles, sca_tail) = scales_row.as_chunks::<VECTOR_TILE>();
+        let (out_tiles, out_tail) = E::split_tiles(out_row);
 
         // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
         // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
@@ -583,14 +577,15 @@ pub fn dequantize_gptq<E: OutputElement>(
         // baseline" clause has no referent here, because the previous baseline
         // was not scalar.
         for (((unp, zer), sca), out_tile) in unp_tiles
+            .iter()
             .zip(zer_tiles)
             .zip(sca_tiles)
-            .zip(out_tiles.by_ref())
+            .zip(out_tiles)
         {
             for (((value, &qw), &zero), &scale) in tile.iter_mut().zip(unp).zip(zer).zip(sca) {
                 *value = (qw - zero) * scale;
             }
-            E::write_scratch(&tile, out_tile);
+            E::write_tile(&tile, out_tile);
         }
 
         // Edge tile (< VECTOR_TILE elements). `tail.len() < VECTOR_TILE ==
@@ -608,7 +603,7 @@ pub fn dequantize_gptq<E: OutputElement>(
             {
                 *value = (qw - zero) * scale;
             }
-            E::write_scratch(tail_tile, out_tiles.into_remainder());
+            E::write_scratch(tail_tile, out_tail);
         }
     }
 
@@ -738,7 +733,7 @@ mod tests {
         assert_eq!(output.len(), in_features * out_features * 2);
 
         // Expected: (5 - 4) × 2.0 = 2.0 → BF16 0x4000 → LE [0x00, 0x40]
-        for chunk in output.chunks_exact(2) {
+        for chunk in output.as_chunks::<2>().0 {
             assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
         }
     }
@@ -862,8 +857,8 @@ mod tests {
 
         // Expected: (100 - 50) × 0.5 = 25.0 → BF16 0x41C8 → LE [0xC8, 0x41]
         let bf16_25 = f32_bits_to_bf16_bits(25.0_f32.to_bits());
-        for chunk in output.chunks_exact(2) {
-            let actual = u16::from_le_bytes([chunk[0], chunk[1]]);
+        for &chunk in output.as_chunks::<2>().0 {
+            let actual = u16::from_le_bytes(chunk);
             assert_eq!(actual, bf16_25, "expected BF16 25.0");
         }
     }
