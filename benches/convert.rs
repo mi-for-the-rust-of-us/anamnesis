@@ -93,7 +93,12 @@ use std::path::PathBuf;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use anamnesis::{ConvertOptions, ConvertTarget, RememberOptions, TargetDtype, convert};
+use anamnesis::{ConvertOptions, ConvertTarget, RememberOptions, TargetDtype};
+// Only `bench_convert_gguf_to_safetensors` calls the path-to-path `convert()`;
+// its in-memory sibling uses `anamnesis::convert_bytes` fully qualified. Gated
+// with the group so the CI build (feature off) has no unused import.
+#[cfg(feature = "bench-fileio")]
+use anamnesis::convert;
 
 /// The two budgets every group is measured at: the sequential baseline and the
 /// library's default `min(cores, 4)`.
@@ -332,6 +337,20 @@ fn build_fp8_fixture() -> (tempfile::TempDir, PathBuf) {
 
 /// Quantised `GGUF` → safetensors through the public `convert()`. The Phase 7.2
 /// path; includes the output write (see the module docs).
+///
+/// # Not run in CI
+///
+/// Gated behind the `bench-fileio` feature, which
+/// `.github/workflows/codspeed.yml` deliberately does not enable. This group
+/// writes its output to a file, and on macro runners that measures CI storage
+/// rather than this crate. See `Cargo.toml`'s `bench-fileio` entry for the two
+/// measurements that settled it. Run it locally with
+/// `cargo bench --all-features --bench convert`.
+///
+/// Its in-memory sibling `convert_bytes_gguf_to_safetensors` covers the same
+/// conversion and **is** the CI guard for it: 90.70 ms to 19.63 ms across the
+/// budgets, a real 4.62×, on the same runner where this group reports 1.00×.
+#[cfg(feature = "bench-fileio")]
 fn bench_convert_gguf_to_safetensors(c: &mut Criterion) {
     let (_dir, input) = build_gguf_fixture();
     let out_dir = tempfile::tempdir().expect("create temp dir");
@@ -498,6 +517,14 @@ fn bench_remember_f32_whole_model(c: &mut Criterion) {
 /// | `remember_to_bytes` | 14.71 ms | 14.50 ms | **1.01×** |
 /// | `remember` (file) | 14.33 ms | 12.18 ms | **1.18×** |
 ///
+/// **CI then refuted the choice that table justified, which is why this group
+/// no longer runs there.** The 1.18× was measured on a developer desktop. On
+/// CodSpeed macro runners the file form reports 167.45 ms at 1 thread against
+/// 168.47 ms at 4 — 0.99×, so the scaling the file form was *chosen for* does
+/// not survive the instrument that watches it. The open question this doc
+/// carried for the first CodSpeed run has its answer, recorded rather than
+/// left as a standing assumption.
+///
 /// A guard that reports 1.01× cannot do its job: if this path regressed to
 /// sequential, `threads_4` would move by ~1.4 %, inside the noise. Through the
 /// file form the same regression is a ~18 % jump, which CodSpeed will see. The
@@ -513,6 +540,7 @@ fn bench_remember_f32_whole_model(c: &mut Criterion) {
 /// group flattens the same way, the absolute `threads_4` time stops moving on a
 /// sequential regression and the guard weakens — in which case say so here
 /// rather than trusting it.
+#[cfg(feature = "bench-fileio")]
 fn bench_remember_gguf_whole_model(c: &mut Criterion) {
     let (_dir, input) = build_gguf_fixture();
     let parsed = anamnesis::parse_gguf(&input).expect("parse gguf fixture");
@@ -595,6 +623,16 @@ fn bench_convert_bytes_gguf(c: &mut Criterion) {
     }
     group.finish();
 }
+
+/// Stub for the feature-off build: `criterion_group!` names this function
+/// unconditionally, so it has to exist in both configurations. Registering no
+/// benchmarks is exactly the intent — see the real definition above.
+#[cfg(not(feature = "bench-fileio"))]
+fn bench_convert_gguf_to_safetensors(_c: &mut Criterion) {}
+
+/// Stub for the feature-off build; see `bench_convert_gguf_to_safetensors`.
+#[cfg(not(feature = "bench-fileio"))]
+fn bench_remember_gguf_whole_model(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,

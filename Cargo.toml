@@ -86,6 +86,26 @@ cli = ["dep:clap"]
 # with this feature off the dequant path is always sequential. See
 # `docs/perf-experiments.md` Experiment 11 for the measured ~3–4× scaling.
 parallel = []
+# Compiles the two **file-writing** benchmark groups in `benches/convert.rs`.
+#
+# Deliberately NOT enabled by the CodSpeed workflow, and the only feature in
+# this list whose purpose is to be left off in CI. Both groups write their output
+# to a file, and on CodSpeed macro runners that makes CI storage the numerator:
+#
+#   * they do not scale. `remember_gguf_whole_model` reads 167.45 ms at 1 thread
+#     against 168.47 ms at 4; `convert_gguf_to_safetensors` reads 315.39 ms at
+#     both budgets at `F32`, to the last decimal.
+#   * their two measurement bases disagree. Criterion's own median is stable
+#     across five consecutive `main` runs at 168.32-168.47 ms, while CodSpeed's
+#     reported BASE for the same id reads 89.9 ms. Every other group agrees
+#     between the two to within 1 %.
+#
+# Together those made CodSpeed report "degrade performance by 34.31 %" on a pull
+# request that changed no `src/` file at all. A guard that fires on changes it
+# cannot see is worse than no guard, because it trains the reader to click past
+# a red check. `cargo bench --all-features` still runs them locally, where the
+# storage is yours and the number means something.
+bench-fileio = []
 gptq = []
 awq = []
 bnb = []
