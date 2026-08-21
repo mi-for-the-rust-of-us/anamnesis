@@ -35,17 +35,6 @@
 //! at ~200 `KiB` (the slice is 65 536 elements). Comfortable on any
 //! machine with > 256 `MiB` free RAM.
 
-// `unknown_lints` first: MSRV clippy does not know the lint named below, and
-// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
-// the same guard, but a test or bench is its own crate and inherits none of the
-// lib's inner attributes.
-#![allow(unknown_lints)]
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. This code mirrors the
-// kernel loops it exercises, and those kept `chunks_exact` on measured evidence
-// (+18 % to +74 % when migrated; see the modules under `src/remember/`). Code
-// that no longer looks like the code under test is worth less than a satisfied
-// lint. See CONVENTIONS.md § MEASURED-REVERT Annotation.
-#![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -237,7 +226,7 @@ fn bench_gptq_int4(c: &mut Criterion) {
     let num_groups = in_features / group_size;
     let mut scales = vec![0u8; num_groups * out_features * 2];
     // `0x3F00` = BF16 representation of 0.5. Non-zero so dequant output is non-trivial.
-    for pair in scales.chunks_exact_mut(2) {
+    for pair in scales.as_chunks_mut::<2>().0 {
         pair[0] = 0x00;
         pair[1] = 0x3F;
     }
@@ -316,7 +305,7 @@ fn bench_awq_int4(c: &mut Criterion) {
     let qweight = synth_bytes(in_features * (out_features / pack_factor) * 4);
     let num_groups = in_features / group_size;
     let mut scales = vec![0u8; num_groups * out_features * 2];
-    for pair in scales.chunks_exact_mut(2) {
+    for pair in scales.as_chunks_mut::<2>().0 {
         pair[0] = 0x00;
         pair[1] = 0x3F; // BF16 0.5
     }

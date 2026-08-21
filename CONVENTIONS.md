@@ -28,7 +28,7 @@ the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/
 | Parse a header, archive, or stream from caller input | [Untrusted input invariants](#when-parsing-untrusted-input) |
 | Add `#[allow(clippy::...)]` for a newer lint | [MSRV lint guard](#msrv-lint-guard) |
 | Suppress a lint because its advice measured *slower* | [`// MEASURED-REVERT:`](#measured-revert-annotation) |
-| Compare two versions of a kernel with `cargo bench` | [Benchmark evidence](#benchmark-evidence-what-a-criterion-baseline-can-and-cannot-show) |
+| Decide whether a kernel change is faster | [Benchmark evidence](#benchmark-evidence-which-instrument-may-decide-what) |
 
 ---
 
@@ -288,14 +288,32 @@ were. The annotation records an *experiment*: the suggestion was applied,
 benchmarked against a saved baseline, and reverted on the numbers. A reader who
 doubts it can re-run the same bench and get the same answer.
 
-Required content, all four parts:
+Required content, all six parts:
 
 1. the lint name, so a future toolchain bump can find every site;
 2. the measured delta **and its direction**;
 3. the benchmark identifier and the fixture shape it ran on;
-4. the significance, and how many independent runs reproduced it.
+4. the significance, and how many independent runs reproduced it;
+5. **the instrument and the architecture**, because a delta without them is not
+   reportable (rules 6 and 8 above);
+6. **what shape was actually measured.** "The lint's advice is slower" and "a
+   *partial* application of the lint's advice is slower" are different claims,
+   and v0.7.6 shipped six comments asserting the first while having measured the
+   second. Migrating three of a tile loop's four zipped streams is not the same
+   experiment as migrating all four, and it gave the opposite answer in two of
+   the six cases.
 
-> Example (real, from the v0.7.6 evaluation):
+**"Unmeasurable" is a legitimate verdict, and must not be written as
+"measured slow".** If no benchmark can resolve the effect — a private function
+with no callable seam, or a loop that is too small a fraction of every public
+path — say exactly that, say why, and say what would make it measurable. A
+benchmark that cannot resolve the effect is not evidence, and building one
+anyway dresses a guess as a measurement. `convert.rs::to_bf16_bytes` carries the
+worked example.
+
+> Example (real, from the v0.7.6 evaluation — and **note that its number was
+> later shown to be mostly instrument error**, which is exactly why parts 5 and
+> 6 above are now required):
 > ```rust
 > // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. Migrating this tile
 > // loop to `as_chunks` cost +74 % on `dequant_awq_int4` (criterion,
@@ -804,7 +822,10 @@ The `// VECTORIZED:` annotation has three states:
 Re-verify after any change to the loop body or its dependencies — the
 annotation goes back to `pending` and the verification cycle repeats.
 
-### Benchmark evidence: what a criterion baseline can and cannot show
+### Benchmark evidence: which instrument may decide what
+
+Every perf question in this crate is settled by **wall clock, on a paired
+instrument, on a stated architecture**. Everything else screens or explains.
 
 `cargo bench -- --save-baseline X` then `--baseline X` is the cheapest way to
 compare two versions of a kernel. It is a **screening** instrument, not an
@@ -833,15 +854,48 @@ Rules that follow, not suggestions:
    [`CLAUDE.md`](CLAUDE.md) § *Performance Changes***: alternating binaries,
    median or min of N, on an idle machine. That protocol controls for layout by
    construction; criterion's baseline does not.
-4. **Prefer a low-noise instrument when one exists.** CodSpeed macro runners are
-   bare-metal and isolated; a result that survives there outranks a local
-   criterion delta. Note the converse trap recorded in Experiment 12: a
-   file-writing benchmark can flatten to 1.00× there because CI storage
-   dominates, so choose a benchmark whose numerator is the code under test.
+4. **Prefer a paired instrument.** [`benches/ab.rs`](benches/ab.rs) loads both
+   versions together and interleaves them sample by sample, so drift applies to
+   both sides and cancels. It answers in ~30 s on x86-64. Note the converse trap
+   recorded in Experiment 12: a file-writing benchmark can flatten to 1.00× on a
+   CI runner because storage dominates, so choose a benchmark whose numerator is
+   the code under test.
 5. **Attribute a screened regression before acting on it.** Reverting a whole
    change because a bench moved is how a genuine improvement gets discarded
    beside a layout artefact — and, symmetrically, how a real regression gets
    waved through as "probably noise".
+6. **State the instrument's floor, and measure it against identical source.**
+   An instrument whose error is unknown is not an instrument. Each floor below
+   was taken by comparing a build against an export of byte-identical code, and
+   each starred a difference that did not exist:
+
+   | Instrument | Floor on identical code | Architecture | Turnaround |
+   |---|---|---|---|
+   | Paired (`benches/ab.rs`, tango) | **~2 %** | x86-64 | ~30 s |
+   | CodSpeed walltime | ~4 % | `aarch64` **only** | ~18 min |
+   | Local criterion, pointwise | **10-23 %** | x86-64 | minutes |
+
+   A significance marker means "significant given the sampling", **not** "real".
+   Below the floor there is no signal whatever the marker says.
+7. **A static instruction count never decides a perf question**, on any
+   architecture, including the one being timed. Phase 7.7 migrated `AWQ` and its
+   `aarch64` instruction count fell at *every* output width (806→710, 736→667,
+   737→642) while its wall clock on that same architecture rose **~30 %**.
+   Counts describe codegen and can *explain* a timing result; they never
+   substitute for one. A CPU-simulation instrument that derives cycles from
+   instruction counts inherits the same limit — see Experiment 10, where
+   simulation would have scored a null SIMD change as a win.
+8. **The architecture a number came from is part of the number.** Quote it or
+   the number is not reportable. This is not pedantry: `AWQ`'s `F16` arithmetic
+   scalarises on x86-64 and does not on `aarch64`, and CodSpeed's walltime
+   instrument can only measure the latter while this crate is released from the
+   former. Two architectures can disagree and both be right.
+9. **Measure the site you changed, not a sibling.** Phase 7.7's central finding
+   is that this transfer does not hold: `GPTQ` and `AWQ` differ only in one
+   scatter, were given the identical change, and answered -9.87 % and +30 %.
+   Run untouched kernels alongside as **controls** — one Phase 7.7 run moved an
+   untouched `AWQ` arm by +3.03 %, which is how that run was known to be noisy —
+   and reproduce before acting.
 
 ### When auto-vectorization is not enough
 
@@ -983,7 +1037,7 @@ Like vectorization, **verify** — do not assume:
 2. The scaling win is measured (best-of-N, real fixture) and recorded in
    `docs/perf-experiments.md` with the sequential baseline. A criterion
    `--baseline` delta is screening only; see
-   [Benchmark evidence](#benchmark-evidence-what-a-criterion-baseline-can-and-cannot-show).
+   [Benchmark evidence](#benchmark-evidence-which-instrument-may-decide-what).
 3. Where the platform supports it, the parallelized path is exercised under a
    race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
    the disjoint-slice design is race-free by construction, so this is a backstop).

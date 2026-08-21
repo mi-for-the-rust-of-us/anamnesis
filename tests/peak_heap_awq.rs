@@ -31,17 +31,6 @@
 //! contract. The layer-size variant peaks at ~90 `MiB` resident; the
 //! small variant peaks at ~2 `MiB`.
 
-// `unknown_lints` first: MSRV clippy does not know the lint named below, and
-// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
-// the same guard, but a test or bench is its own crate and inherits none of the
-// lib's inner attributes.
-#![allow(unknown_lints)]
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. This code mirrors the
-// kernel loops it exercises, and those kept `chunks_exact` on measured evidence
-// (+18 % to +74 % when migrated; see the modules under `src/remember/`). Code
-// that no longer looks like the code under test is worth less than a satisfied
-// lint. See CONVENTIONS.md § MEASURED-REVERT Annotation.
-#![allow(clippy::chunks_exact_to_as_chunks)]
 #![cfg(feature = "awq")]
 #![allow(
     clippy::panic,
@@ -128,7 +117,7 @@ fn synth_awq_fixture(
     // produces well-defined non-zero output instead of NaN-soup that
     // an arbitrary bit pattern in `scales` could yield).
     let mut scales = vec![0u8; num_groups * out_features * 2];
-    for pair in scales.chunks_exact_mut(2) {
+    for pair in scales.as_chunks_mut::<2>().0 {
         pair[0] = 0x00;
         pair[1] = 0x3F;
     }

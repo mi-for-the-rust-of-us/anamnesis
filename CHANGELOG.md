@@ -43,12 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the `GPTQ`-specific gain is nearer 5.7 %. Attributing that is Phase 7.7
   item 6.
 
-- **v0.7.6's `chunks_exact` suppression comments are known to be misleading**,
-  and are corrected per kernel as Phase 7.7 measures each one. They state costs
-  of +18 % to +74 % for migrating a loop to `as_chunks`; each is true as a
-  measurement, but what was measured was a *half* migration, in which only three
-  of a tile loop's four zipped streams could move. Migrating all four is worth
-  about 10 %, not -51 %.
+- **v0.7.6's `chunks_exact` suppression comments have been corrected, each
+  against its own measurement.** They stated costs of +18 % to +74 % for
+  migrating a loop to `as_chunks`. Every one of those was a pointwise reading
+  taken at a 10-23 % noise floor, and re-measuring with a paired harness at a
+  ~2 % floor changed both the numbers and the conclusions: `FP8`'s real cost is
+  about +3 to +5 %, not +18 % to +21 %, and `BnB`'s migration is a *win* rather
+  than a loss. The suppressions that remain now each state what was measured, on
+  which architecture, with which instrument.
+
+- **The fourteen test and bench crates no longer suppress the lint at all.**
+  Their blanket `#![allow]` rested on the claim that they "mirror the kernel
+  loops [they] exercise". They do not: every site is a cold assertion loop
+  decoding output bytes or a fixture builder, at a concrete width, mirroring
+  nothing. The `#![allow(unknown_lints)]` MSRV guards carried alongside them are
+  gone too, having had no other referent.
 
 ## [0.7.6] - 2026-08-21
 

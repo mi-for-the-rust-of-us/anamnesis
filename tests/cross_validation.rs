@@ -7,17 +7,6 @@
 //! dequantization output against `PyTorch`'s `float8_e4m3fn` → `bfloat16`
 //! conversion. Each fixture is a 256×256 slice from a real model.
 
-// `unknown_lints` first: MSRV clippy does not know the lint named below, and
-// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
-// the same guard; an integration test is its own crate and inherits none of the
-// lib's inner attributes.
-#![allow(unknown_lints)]
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. These tests mirror the
-// kernel loops they validate, and those loops kept `chunks_exact` on measured
-// evidence (+18 % to +74 % when migrated). A test that no longer looks like the
-// code under test is worth less than a satisfied lint. See CONVENTIONS.md
-// § MEASURED-REVERT Annotation.
-#![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -150,8 +139,10 @@ fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u1
     let mut max_diff: u16 = 0;
 
     for (i, (a_pair, e_pair)) in actual
-        .chunks_exact(2)
-        .zip(expected.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<2>().0)
         .enumerate()
     {
         let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);
@@ -230,7 +221,9 @@ fn f32_comparison_detects_what_bf16_hides() {
 
     let golden: Vec<f32> = fixture
         .expected_f32
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
 
@@ -377,8 +370,10 @@ fn compare_f32_exact(name: &str, fixture: &Fixture) {
     let mut mismatches = 0usize;
     let mut first: Option<(usize, f32, f32)> = None;
     for (i, (a_word, e_word)) in actual
-        .chunks_exact(4)
-        .zip(fixture.expected_f32.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(fixture.expected_f32.as_chunks::<4>().0)
         .enumerate()
     {
         let a = f32::from_le_bytes([a_word[0], a_word[1], a_word[2], a_word[3]]);

@@ -36,17 +36,6 @@
 //! produced by re-running `generate_bnb.py`; tests pass bit-exactness
 //! regardless of whether the sidecar is present.
 
-// `unknown_lints` first: MSRV clippy does not know the lint named below, and
-// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
-// the same guard, but a test or bench is its own crate and inherits none of the
-// lib's inner attributes.
-#![allow(unknown_lints)]
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. This code mirrors the
-// kernel loops it exercises, and those kept `chunks_exact` on measured evidence
-// (+18 % to +74 % when migrated; see the modules under `src/remember/`). Code
-// that no longer looks like the code under test is worth less than a satisfied
-// lint. See CONVENTIONS.md § MEASURED-REVERT Annotation.
-#![allow(clippy::chunks_exact_to_as_chunks)]
 #![cfg(feature = "bnb")]
 #![allow(
     clippy::panic,
@@ -274,8 +263,10 @@ fn assert_bf16_equal(actual: &[u8], expected: &[u8], name: &str) {
     );
     let mut mismatches = 0usize;
     for (i, (a_pair, e_pair)) in actual
-        .chunks_exact(2)
-        .zip(expected.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<2>().0)
         .enumerate()
     {
         let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);

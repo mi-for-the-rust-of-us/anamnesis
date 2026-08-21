@@ -19,35 +19,36 @@
 //! Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
 //! Generative Pre-trained Transformers", ICLR 2023 (arXiv:2210.17323).
 
-// This module carries **no** `chunks_exact_to_as_chunks` suppression, unlike its
-// `AWQ`, `FP8` and `BnB` siblings. It is the spike for the redesign those three
-// point at: `OutputElement` grew a fixed-size `Tile` associated type, so all
-// four streams of the tile loop below migrate together instead of three of them
-// migrating and the output staying a `ChunksExactMut`. The half-migrated shape
-// is what cost +51 % here and +74 % in `AWQ`; whether the whole-migration shape
-// pays for itself is what the `dequant_gptq_int4` CodSpeed benchmark decides.
+// This module carries **no** `chunks_exact_to_as_chunks` suppression. Nor does
+// `bnb.rs`; `awq.rs`, `fp8.rs`, `output.rs` and `convert.rs` still do, each on
+// its own measurement. `OutputElement` grew a fixed-size `Tile` associated type
+// so all four streams of the tile loop below migrate together, instead of three
+// migrating and the output staying a `ChunksExactMut`.
 //
-// **The number landed: -9.97 %.** CodSpeed macro runner (walltime, bare metal),
-// `dequant_gptq_int4/synthetic_4096x11008_g128`, 182.82 ms at `245f112` on main
-// against 164.59 ms here. On the same run the five kernels this branch does not
-// touch moved -0.86 % to +1.12 %, and the disassembly agrees independently:
-// 1088 -> 939 instructions for `Bf16Out` (-13.7 %), 979 -> 919 for `F32Out`
-// (-6.1 %), 1108 -> 906 for `F16Out` (-18.2 %), with every documented vector
-// instruction family still present.
+// **The number: -9.97 %** on `dequant_gptq_int4/synthetic_4096x11008_g128`,
+// CodSpeed walltime on `aarch64`, 182.82 ms against 164.59 ms, with five
+// untouched kernels moving -0.86 % to +1.12 % on the same run.
 //
-// Read it with the caveat it deserves: `dequant_gguf_q4_k` moved -4.85 % on the
-// same run without being touched, so adding code to `output.rs` shifts layout
-// even on this instrument. Effective noise here is nearer +/-5 % than the
-// +/-0.9 % measured between two runs of identical code. -9.97 % clears that by
-// about 2x, and the instruction-count drop is layout-independent evidence
-// pointing the same way.
+// **What that number does NOT license is the inference this comment used to
+// draw from it.** It once said `AWQ` was structurally identical and "should
+// follow". Phase 7.7 item 1 migrated `AWQ` exactly the same way and measured
+// **+30.6 % on aarch64 and ~+45 % on x86-64** -- a large regression from an
+// identical source change to a near-identical kernel. `write_scratch` (item 2)
+// then cost `BnB` `INT8` +32 % at `BF16` while gaining `GPTQ` 10 % at `F16` in
+// the same commit.
 //
-// So the +51 % this module once recorded was the cost of a *half* migration,
-// not of `as_chunks`. Migrating all four streams is worth about 10 %.
+// So the +51 % this module once recorded was indeed the cost of a *half*
+// migration **here**, and that explanation does not generalise to any other
+// site. Of six suppressed sites, two migrations proved wins (this one and
+// `BnB` `INT8`), three measured losses, one is unmeasurable. Read a sibling's
+// number as a sibling's number.
 //
-// Do not copy this module's shape to its siblings before their own numbers
-// land: `AWQ` is structurally identical and should follow, but `FP8` and `BnB`
-// funnel through `write_scratch`, which this branch deliberately left alone.
+// One further correction, because this comment carried it as evidence: it used
+// to cite falling instruction counts as "layout-independent evidence pointing
+// the same way". Instruction counts are **not** evidence about wall clock.
+// `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 %.
+// The counts are retained in the git history as a description of codegen; they
+// never corroborated the timing. See CONVENTIONS.md.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
