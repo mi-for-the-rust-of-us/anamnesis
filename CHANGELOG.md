@@ -189,6 +189,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CodSpeed guard for the item-1 fix** — a `remember_gguf_whole_model` bench
+  group (`benches/convert.rs`) at the same 1-and-4-thread budgets as its `FP8`
+  siblings. The v0.7.6 GGUF `remember` defect shipped partly *because* nothing
+  benched that path: the CLI is not benched, and there was no library
+  `ParsedGguf::remember` to bench. The 1.24×–2.23× the fix bought was therefore
+  unguarded until now.
+
+  It goes through the **file** form rather than `remember_to_bytes`, against the
+  siblings' convention, and the reason is measured: `safetensors::serialize`
+  builds one contiguous buffer in a single thread, which swamps the threaded
+  dequant and leaves `to_bytes` reporting 1.01× between 1 and 4 threads against
+  the file form's 1.18×. A guard reporting 1.01× would not notice this path
+  regressing to sequential; through the file form the same regression is a ~18 %
+  jump. Both figures, and the same ordering on a real 132 MiB `Q6_K` model, are
+  recorded at the group.
+
 - **FAQ entries for the two v0.7.6 capabilities a user is most likely to want**:
   reading an `.npz` saved from a transposed array (Fortran order), and
   cancelling a long-running `remember` / `convert` with a `CancelToken`. The

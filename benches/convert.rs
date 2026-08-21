@@ -465,10 +465,73 @@ fn bench_remember_f32_whole_model(c: &mut Criterion) {
     group.finish();
 }
 
+/// Whole-model `GGUF` → `BF16` through `ParsedGguf::remember_to_bytes_with_options`.
+///
+/// The guard for the v0.7.6 item-1 fix, and it exists because that defect had no
+/// bench to trip. Until v0.7.6 the only whole-model `GGUF` `remember` lived
+/// inside the CLI, where nothing benches; it was sequential, ignored
+/// `--threads`, and was 1.24×–2.23× slower than `convert --to safetensors` on
+/// the same file for byte-identical output. `convert_gguf_to_safetensors` was
+/// fast throughout, so the benched path stayed green while the shipped verb was
+/// slow. This group watches the library entry point both now run.
+///
+/// **Writes a file, unlike its `FP8` siblings, and that choice was measured
+/// rather than assumed.** The obvious design was to match them and go through
+/// `remember_to_bytes_with_options`, keeping file I/O out of the numerator. On
+/// this path it fails: `safetensors::serialize` builds one contiguous output
+/// buffer in a single thread, and that copy is large enough here to swamp the
+/// threaded dequant. Measured on the bench fixture (best of 3, this host):
+///
+/// | form | 1 thread | 4 threads | ratio |
+/// |---|---|---|---|
+/// | `remember_to_bytes` | 14.71 ms | 14.50 ms | **1.01×** |
+/// | `remember` (file) | 14.33 ms | 12.18 ms | **1.18×** |
+///
+/// A guard that reports 1.01× cannot do its job: if this path regressed to
+/// sequential, `threads_4` would move by ~1.4 %, inside the noise. Through the
+/// file form the same regression is a ~18 % jump, which CodSpeed will see. The
+/// file form is also what `amn remember` actually runs.
+///
+/// The same probe on a real 132 MiB `Q6_K` model shows the same ordering
+/// (`to_bytes` 1.10×, `to_file` 1.33×), so this is a property of the path, not
+/// of the fixture.
+///
+/// **Open question for the first CodSpeed run**, in the shape Experiment 12
+/// left for its sibling: `convert_gguf_to_safetensors` also writes a file, and
+/// macro runners flattened it from 1.26–1.36× locally to 0.99× there. If this
+/// group flattens the same way, the absolute `threads_4` time stops moving on a
+/// sequential regression and the guard weakens — in which case say so here
+/// rather than trusting it.
+fn bench_remember_gguf_whole_model(c: &mut Criterion) {
+    let (_dir, input) = build_gguf_fixture();
+    let parsed = anamnesis::parse_gguf(&input).expect("parse gguf fixture");
+    let input_bytes = std::fs::metadata(&input).expect("stat fixture").len();
+
+    let out_dir = tempfile::tempdir().expect("create temp dir");
+    let mut group = c.benchmark_group("remember_gguf_whole_model");
+    group.throughput(Throughput::Bytes(input_bytes));
+    for threads in BUDGETS {
+        let output = out_dir.path().join(format!("out-t{threads}.safetensors"));
+        group.bench_function(format!("threads_{threads}"), |b| {
+            b.iter(|| {
+                parsed
+                    .remember_with_options(
+                        &output,
+                        TargetDtype::BF16,
+                        RememberOptions::new().with_threads(black_box(threads)),
+                    )
+                    .expect("remember gguf to file");
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_convert_gguf_to_safetensors,
     bench_remember_bf16_whole_model,
     bench_remember_f32_whole_model,
+    bench_remember_gguf_whole_model,
 );
 criterion_main!(benches);
