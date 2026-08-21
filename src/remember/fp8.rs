@@ -21,6 +21,22 @@
 //! crate is produced. That keeps the kernel arithmetic identical across output
 //! types and gives each width one loop to verify rather than three per family.
 
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// Migrating these loops to `as_chunks` cost **+18 % to +21 %** on
+// `dequant_fp8_fine_grained` (criterion, 4096 x 11008, target-cpu=native,
+// p = 0.00, reproduced across four runs and unchanged by reverting the inner
+// tile loop, which is how it was isolated to this module rather than to one
+// function). `CLAUDE.md` does not allow a hot path to change without a measured
+// win, and this is a measured loss.
+//
+// Part of the module cannot take the advice at all: `as_chunks_mut::<{VECTOR_TILE
+// * E::BYTES}>()` needs its width as a const generic argument, and stable Rust
+// rejects an associated const of a type parameter there -- "generic parameters
+// may not be used in const operations".
+// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
+// criterion baseline alone cannot settle this.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};

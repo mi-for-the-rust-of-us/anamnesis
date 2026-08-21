@@ -7,6 +7,17 @@
 //! dequantization output against `PyTorch`'s `float8_e4m3fn` → `bfloat16`
 //! conversion. Each fixture is a 256×256 slice from a real model.
 
+// `unknown_lints` first: MSRV clippy does not know the lint named below, and
+// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
+// the same guard; an integration test is its own crate and inherits none of the
+// lib's inner attributes.
+#![allow(unknown_lints)]
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. These tests mirror the
+// kernel loops they validate, and those loops kept `chunks_exact` on measured
+// evidence (+18 % to +74 % when migrated). A test that no longer looks like the
+// code under test is worth less than a satisfied lint. See CONVENTIONS.md
+// § MEASURED-REVERT Annotation.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,

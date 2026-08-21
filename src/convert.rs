@@ -2045,6 +2045,14 @@ fn hub_dtype_to_gguf(dtype: Dtype) -> crate::Result<crate::GgufType> {
 /// [`AnamnesisError::Parse`] if the byte count is not a whole number of
 /// elements.
 #[cfg(feature = "bnb")]
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// This is the per-element narrowing every `bnb-nf4` conversion runs over the
+// whole model, so it is a hot loop by any reading. It was migrated with the
+// dequant kernels during the v0.7.6 evaluation and reverted with them: the
+// families that could be attributed cost +18 % to +74 %, and this one has no
+// bench of its own to clear it. Unmeasured plus hot means unchanged, per
+// `CLAUDE.md`. See CONVENTIONS.md § MEASURED-REVERT Annotation.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<Cow<'a, [u8]>> {
     match dtype {
         Dtype::BF16 => Ok(Cow::Borrowed(data)),
@@ -2069,12 +2077,7 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
             // the round-to-nearest-even bias-add and shift, eight lanes at a
             // time. Byte-identical arithmetic to `Bf16Out::write_scratch`,
             // which is the point: one narrowing convention, one codegen shape.
-            for (chunk, out_pair) in data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<2>().0.iter_mut())
-            {
+            for (chunk, out_pair) in data.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(4)` guarantees exactly 4 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
@@ -2100,12 +2103,7 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
             // %ymm in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 — the
             // `F16C` widening load followed by the same round-to-nearest-even
             // sequence the `F32` arm uses.
-            for (chunk, out_pair) in data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<2>().0.iter_mut())
-            {
+            for (chunk, out_pair) in data.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
                 // INDEX: `chunks_exact(2)` guarantees exactly 2 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 2] = [chunk[0], chunk[1]];

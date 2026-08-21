@@ -22,6 +22,20 @@
 //! - Dettmers et al., "`QLoRA`: Efficient Finetuning of Quantized Large
 //!   Language Models", `NeurIPS` 2023 (`arXiv:2305.14314`)
 
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// Not taken here **despite a favourable reading**, which is the honest reason
+// rather than a convenient one. Migrating this loop measured -7.6 % on
+// `dequant_bnb_int8` (i.e. faster), but that sits inside this host's own noise
+// floor: the same bench run reported +10.6 % at p = 0.00 on `dequant_bnb_nf4`
+// with byte-identical source. A reading smaller than the instrument's error is
+// not evidence. Meanwhile the structurally identical `GPTQ` and `AWQ` loops --
+// same four-way zip, same `VECTOR_TILE * E::BYTES` output that cannot migrate --
+// cost +51 % and +74 % respectively. Reverted with its twins pending a
+// measurement on hardware that can resolve the difference.
+// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
+// criterion baseline alone cannot settle this.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use crate::error::AnamnesisError;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
 

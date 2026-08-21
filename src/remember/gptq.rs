@@ -19,6 +19,23 @@
 //! Reference: Frantar et al., "GPTQ: Accurate Post-Training Quantization for
 //! Generative Pre-trained Transformers", ICLR 2023 (arXiv:2210.17323).
 
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// Migrating this tile loop to `as_chunks` cost **+51 %** on
+// `dequant_gptq_int4` (criterion, 4096 x 11008, target-cpu=native, p = 0.00,
+// reproduced twice). Reverting restored it to -1.1 % (p = 0.73).
+//
+// The likely mechanism, recorded because it points at the fix: the loop zips
+// four streams, and only three of them can migrate. `as_chunks_mut::<{VECTOR_TILE
+// * E::BYTES}>()` is rejected by stable Rust ("generic parameters may not be used
+// in const operations"), so the output stayed a `ChunksExactMut` while the inputs
+// became slices-of-arrays. A homogeneous four-way zip became a mixed one. Taking
+// this lint here means migrating all four, which needs `OutputElement` to accept
+// a fixed-size array instead of a byte slice of computed width -- a redesign, not
+// a lint fix.
+// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
+// criterion baseline alone cannot settle this.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};

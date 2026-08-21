@@ -43,6 +43,17 @@
 // AVX2 kernel to prove/disprove the ROADMAP's "SIMD the pass-2 writer" thesis
 // before any product `unsafe` is committed. `unsafe` is allowed here (the crate
 // lint denies it library-wide) with `// SAFETY:` on the one intrinsic block.
+// `unknown_lints` first: MSRV clippy does not know the lint named below, and
+// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
+// the same guard; an integration test is its own crate and inherits none of the
+// lib's inner attributes.
+#![allow(unknown_lints)]
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. These tests mirror the
+// kernel loops they validate, and those loops kept `chunks_exact` on measured
+// evidence (+18 % to +74 % when migrated). A test that no longer looks like the
+// code under test is worth less than a satisfied lint. See CONVENTIONS.md
+// § MEASURED-REVERT Annotation.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(unsafe_code)]
 #![allow(
     clippy::panic,

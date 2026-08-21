@@ -79,6 +79,18 @@
 //! 0.98×–4.25×, and the design note stands. See `docs/perf-experiments.md` for
 //! the full numbers.
 
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// Reverted with the kernel family rather than on an attribution of its own, and
+// that distinction matters: this is the narrowing writer **every** dequant kernel
+// funnels through, and the `dequant_fp8_fine_grained` regression (+18 % to +21 %,
+// p = 0.00) survived reverting both fp8 loops individually, so it could not be
+// isolated away from here. Each `write_scratch` also carries a
+// `// VECTORIZED: confirmed` annotation earned by reading its disassembly; those
+// claims would need re-establishing before the iterator shape changes.
+// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
+// criterion baseline alone cannot settle this.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use crate::parse::safetensors::Dtype;
 use crate::remember::fp8::f32_bits_to_bf16_bits;
 

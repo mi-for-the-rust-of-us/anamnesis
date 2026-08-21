@@ -36,6 +36,17 @@
 //! Compression and Acceleration", `MLSys` 2024 (arXiv:2306.00978);
 //! `AutoAWQ` `awq/utils/packing_utils.py` (`unpack_awq`, `reverse_awq_order`).
 
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
+// Migrating this tile loop to `as_chunks` cost **+74 %** on `dequant_awq_int4`
+// (criterion, 4096 x 11008, target-cpu=native, p = 0.00, reproduced twice).
+// Reverting restored it to +4.2 % (p = 0.09, inside this host's noise floor).
+// Same mechanism as its `GPTQ` twin, recorded there in full: only three of the
+// four zipped streams can migrate, because the output width derives from
+// `E::BYTES` and stable Rust will not take that as a const generic argument.
+// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
+// criterion baseline alone cannot settle this.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};

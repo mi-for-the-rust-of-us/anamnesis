@@ -61,6 +61,17 @@
 //! hub tensors; the safetensors fixture is ~16 `MiB` of `FP8` dequantising to
 //! ~32 `MiB` of `BF16`. Peak resident stays under ~120 `MiB`.
 
+// `unknown_lints` first: MSRV clippy does not know the lint named below, and
+// `deny(warnings)` would turn that ignorance into an error. `src/lib.rs` carries
+// the same guard, but a test or bench is its own crate and inherits none of the
+// lib's inner attributes.
+#![allow(unknown_lints)]
+// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. This code mirrors the
+// kernel loops it exercises, and those kept `chunks_exact` on measured evidence
+// (+18 % to +74 % when migrated; see the modules under `src/remember/`). Code
+// that no longer looks like the code under test is worth less than a satisfied
+// lint. See CONVENTIONS.md § MEASURED-REVERT Annotation.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
