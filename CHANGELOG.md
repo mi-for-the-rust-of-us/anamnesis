@@ -205,6 +205,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jump. Both figures, and the same ordering on a real 132 MiB `Q6_K` model, are
   recorded at the group.
 
+- **CodSpeed guard for the in-memory pipeline** — a
+  `convert_bytes_gguf_to_safetensors` group covering the byte-form readers, the
+  magic-byte detector they dispatch on, and the writer's `Sink::Memory` arm,
+  none of which `convert`'s path-based group reaches.
+
+  It also **refutes** a hypothesis rather than confirming one. Experiment 12
+  left open whether `convert`'s modest end-to-end threading hides a reader that
+  scales ~1.9×, with the output write as the Amdahl denominator; removing the
+  write looked like the way to see the reader alone. Measured, `convert_bytes`
+  scales **worse** (1.10×) than the file path (1.34×), because the in-memory
+  verb trades one serial cost for two: an owned copy of the caller's input, and
+  a single-threaded contiguous output buffer, where the file path memory-maps
+  its input and streams its output. Experiment 12's question stays open, and the
+  reason it cannot be answered this way is recorded at the group.
+
 - **FAQ entries for the two v0.7.6 capabilities a user is most likely to want**:
   reading an `.npz` saved from a transposed array (Fortran order), and
   cancelling a long-running `remember` / `convert` with a `CancelToken`. The

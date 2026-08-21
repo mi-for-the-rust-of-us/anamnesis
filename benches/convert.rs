@@ -527,11 +527,70 @@ fn bench_remember_gguf_whole_model(c: &mut Criterion) {
     group.finish();
 }
 
+/// `convert_bytes` on a `GGUF` source: memory in, memory out, no filesystem in
+/// the measured region.
+///
+/// Guards the in-memory pipeline no other group touches: the byte-form readers
+/// behind `read_hub_from_bytes`, the magic-byte detector they dispatch on, and
+/// the `Sink::Memory` arm of the safetensors writer. `convert` reaches none of
+/// those, because it takes paths.
+///
+/// **It also settles a question, in the opposite direction to the one expected.**
+/// Experiment 12 left open whether `convert`'s modest end-to-end threading
+/// (1.26–1.36× locally, 0.99× on CodSpeed macro runners) hides a reader that
+/// scales ~1.9×, with the output write as the Amdahl denominator. `convert_bytes`
+/// removes the file write entirely, so it looked like the clean way to see the
+/// reader alone. It is not. Measured on the bench fixture (best of 3, this host):
+///
+/// | path | 1 thread | 4 threads | ratio |
+/// |---|---|---|---|
+/// | `convert` (file) | 19.88 ms | 14.88 ms | **1.34×** |
+/// | `convert_bytes` | 16.67 ms | 15.14 ms | **1.10×** |
+///
+/// Removing the write made scaling *worse*, because the in-memory verb trades
+/// one serial cost for two: it copies the caller's `&[u8]` into an owned buffer
+/// (each byte-form parser takes ownership) and then serialises into one
+/// contiguous output buffer in a single thread, where the file path memory-maps
+/// its input and streams its output per tensor. So `convert_bytes` cannot be
+/// used to isolate the reader's scaling; it carries more serial work than the
+/// path it was meant to strip down. Experiment 12's question stays open.
+///
+/// Read this group as a guard on the in-memory pipeline's **absolute** cost
+/// rather than on its scaling. The threading of the stage it shares with
+/// `convert` and `remember` is already guarded twice over by their groups; at
+/// 1.10× a sequential regression here would show as a ~10 % jump on `threads_4`,
+/// detectable but not the reason this exists.
+fn bench_convert_bytes_gguf(c: &mut Criterion) {
+    let (_dir, input) = build_gguf_fixture();
+    let source = std::fs::read(&input).expect("read gguf fixture");
+    // CAST: usize → u64, lossless widening; a bench fixture is far inside u64.
+    #[allow(clippy::as_conversions)]
+    let input_bytes = source.len() as u64;
+
+    let mut group = c.benchmark_group("convert_bytes_gguf_to_safetensors");
+    group.throughput(Throughput::Bytes(input_bytes));
+    for threads in BUDGETS {
+        group.bench_function(format!("threads_{threads}"), |b| {
+            b.iter(|| {
+                let (bytes, stats) = anamnesis::convert_bytes(
+                    black_box(&source),
+                    ConvertTarget::Safetensors,
+                    &ConvertOptions::new().with_threads(black_box(threads)),
+                )
+                .expect("convert_bytes gguf -> safetensors");
+                black_box((bytes, stats));
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_convert_gguf_to_safetensors,
     bench_remember_bf16_whole_model,
     bench_remember_f32_whole_model,
     bench_remember_gguf_whole_model,
+    bench_convert_bytes_gguf,
 );
 criterion_main!(benches);
