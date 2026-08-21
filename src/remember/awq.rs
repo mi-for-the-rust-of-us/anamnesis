@@ -36,16 +36,15 @@
 //! Compression and Acceleration", `MLSys` 2024 (arXiv:2306.00978);
 //! `AutoAWQ` `awq/utils/packing_utils.py` (`unpack_awq`, `reverse_awq_order`).
 
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Migrating this tile loop to `as_chunks` cost **+74 %** on `dequant_awq_int4`
-// (criterion, 4096 x 11008, target-cpu=native, p = 0.00, reproduced twice).
-// Reverting restored it to +4.2 % (p = 0.09, inside this host's noise floor).
-// Same mechanism as its `GPTQ` twin, recorded there in full: only three of the
-// four zipped streams can migrate, because the output width derives from
-// `E::BYTES` and stable Rust will not take that as a const generic argument.
-// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
-// criterion baseline alone cannot settle this.
-#![allow(clippy::chunks_exact_to_as_chunks)]
+// This module carries **no** `chunks_exact_to_as_chunks` suppression, following
+// its `GPTQ` twin. It once did, recording +74 % on `dequant_awq_int4`, which was
+// the largest of the five measurements v0.7.6 shipped. That number was the cost
+// of a *half* migration: only three of the tile loop's four zipped streams could
+// move, because `as_chunks_mut::<{VECTOR_TILE * E::BYTES}>()` is rejected by
+// stable Rust ("generic parameters may not be used in const operations"), so the
+// output stayed a `ChunksExactMut` and a homogeneous four-way zip became a mixed
+// one. `OutputElement::Tile` removed that constraint; all four now migrate
+// together. See ROADMAP.md Phase 7.7 item 1 for this kernel's own number.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
@@ -448,9 +447,12 @@ pub fn dequantize_awq<E: OutputElement>(
         // "fix" this by copying that annotation across. Pass 2 below is where
         // both kernels converge and vectorise alike.
         #[allow(clippy::indexing_slicing)]
-        for (packed_col, qw_chunk) in qw_row.chunks_exact(4).enumerate() {
-            // INDEX: chunks_exact(4) guarantees exactly 4 bytes per chunk
-            let packed = u32::from_le_bytes([qw_chunk[0], qw_chunk[1], qw_chunk[2], qw_chunk[3]]);
+        for (packed_col, &qw_chunk) in qw_row.as_chunks::<4>().0.iter().enumerate() {
+            // INDEX: the allow above covers `unpacked_row` and `AWQ_ORDER`
+            // inside the body, justified at their own use. It no longer covers
+            // this line: `as_chunks::<4>` yields `[u8; 4]`, which
+            // `from_le_bytes` takes whole.
+            let packed = u32::from_le_bytes(qw_chunk);
 
             // Unpack pack_factor values from this I32
             for pos in 0..pack_factor {
@@ -473,15 +475,15 @@ pub fn dequantize_awq<E: OutputElement>(
         // --- Pass 2 + 3: arithmetic then narrowing, TILED through registers ---
         // The twin of `GPTQ`'s loop; see that one for the measurement that
         // settled tile-sized over row-sized.
-        let unp_tiles = unpacked_row.chunks_exact(VECTOR_TILE);
-        let zer_tiles = zeros_row.chunks_exact(VECTOR_TILE);
-        let sca_tiles = scales_row.chunks_exact(VECTOR_TILE);
-        let (unp_tail, zer_tail, sca_tail) = (
-            unp_tiles.remainder(),
-            zer_tiles.remainder(),
-            sca_tiles.remainder(),
-        );
-        let mut out_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+        // All four streams are slices of fixed-size arrays, as in `GPTQ`: each
+        // `as_chunks` returns its edge run beside its tiles, and `split_tiles`
+        // does the same for the output at a width the implementation knows
+        // literally. Every one of the zip's four trip counts is therefore a
+        // compile-time constant.
+        let (unp_tiles, unp_tail) = unpacked_row.as_chunks::<VECTOR_TILE>();
+        let (zer_tiles, zer_tail) = zeros_row.as_chunks::<VECTOR_TILE>();
+        let (sca_tiles, sca_tail) = scales_row.as_chunks::<VECTOR_TILE>();
+        let (out_tiles, out_tail) = E::split_tiles(out_row);
 
         // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
         // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
@@ -497,14 +499,15 @@ pub fn dequantize_awq<E: OutputElement>(
         // against the untiled shape in isolation). As in `GPTQ`'s twin,
         // `confirmed` states that the loop vectorises, not that it got faster.
         for (((unp, zer), sca), out_tile) in unp_tiles
+            .iter()
             .zip(zer_tiles)
             .zip(sca_tiles)
-            .zip(out_tiles.by_ref())
+            .zip(out_tiles)
         {
             for (((value, &qw), &zero), &scale) in tile.iter_mut().zip(unp).zip(zer).zip(sca) {
                 *value = (qw - zero) * scale;
             }
-            E::write_scratch(&tile, out_tile);
+            E::write_tile(&tile, out_tile);
         }
 
         // Edge tile (< VECTOR_TILE elements); see `GPTQ`'s twin.
@@ -520,7 +523,7 @@ pub fn dequantize_awq<E: OutputElement>(
             {
                 *value = (qw - zero) * scale;
             }
-            E::write_scratch(tail_tile, out_tiles.into_remainder());
+            E::write_scratch(tail_tile, out_tail);
         }
     }
 
@@ -599,8 +602,8 @@ mod tests {
 
         // Expected: (10 - 3) × 2.0 = 14.0 → BF16 0x4160 → LE [0x60, 0x41]
         let bf16_14 = f32_bits_to_bf16_bits(14.0_f32.to_bits());
-        for chunk in output.chunks_exact(2) {
-            let actual = u16::from_le_bytes([chunk[0], chunk[1]]);
+        for &chunk in output.as_chunks::<2>().0 {
+            let actual = u16::from_le_bytes(chunk);
             assert_eq!(actual, bf16_14, "expected BF16 14.0");
         }
     }
@@ -645,8 +648,8 @@ mod tests {
 
         // AWQ: (5 - 3) × 1.0 = 2.0 (NOT (5 - 4) × 1.0 = 1.0 like GPTQ would give)
         let bf16_2 = f32_bits_to_bf16_bits(2.0_f32.to_bits());
-        for chunk in output.chunks_exact(2) {
-            let actual = u16::from_le_bytes([chunk[0], chunk[1]]);
+        for &chunk in output.as_chunks::<2>().0 {
+            let actual = u16::from_le_bytes(chunk);
             assert_eq!(actual, bf16_2, "expected BF16 2.0 (AWQ: no +1 offset)");
         }
     }
