@@ -38,10 +38,18 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      # `--all-features` satisfies the benches' required-features
-      # (dequant: gptq/awq/bnb/gguf; parsing: npz/pth/gguf).
+      # Every feature the three bench targets require, listed explicitly rather
+      # than via `--all-features`, because ONE feature must stay off here:
+      # `bench-fileio`. It compiles the two file-writing groups in
+      # `benches/convert.rs`, which on macro runners measure CI storage rather
+      # than this crate — they report 1.00× across thread budgets, and their
+      # CodSpeed BASE disagrees with criterion's own median by ~2×. See the
+      # `bench-fileio` entry in `Cargo.toml` for the numbers.
+      #
+      # Required-features by target: dequant needs gptq/awq/bnb/gguf, parsing
+      # needs npz/pth/gguf, convert needs gguf. `parallel` is on by default.
       - name: Build the benchmark targets
-        run: cargo codspeed build --all-features
+        run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
