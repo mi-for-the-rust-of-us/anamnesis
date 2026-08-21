@@ -44,6 +44,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 15 | Phase 7.4 `BnB` `INT8` association fix — bit-exactness at `F32` versus one packed multiply | **A correctness fix with a measured price, kept anyway. `w × (SCB/127)` and `bitsandbytes`' `(w × SCB) × (1/127)` are the same real number and the same `BF16`, but differ by 1 `ULP` on **26.9 %** of elements at `F32` — which is why 0/65536 `BF16` cross-validation never caught it. Matching the canonical association costs **16.82 → 17.48 ms** at 4096 × 11008 (1.04×, min of 10 interleaved rounds) for one extra `vmulps` per 8 lanes. Not recoverable by hoisting: `w × (SCB × c)` is a *third* association, measured **worse** (17299/65536 mismatches)** | Shipped (v0.7.4, Phase 7.4) |
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36× locally, and **0.99× on CodSpeed macro runners** (see the Experiment 14 postscript) — the output write is ~60 % of the wall clock (Amdahl) and is slower still on CI storage, so treat the end-to-end threading figure as host-dependent rather than a property of the code. Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 | 16 | Phase 7.6 `GGUF` `remember` moved out of the CLI — what the duplicated sequential path cost | **A duplication, not an optimisation: `amn remember model.gguf` ran a 121-line CLI transcription of `convert`'s reader that was sequential and silently ignored `--threads`, while `convert --to safetensors` on the same file ran the threaded library path and produced `SHA-256`-identical bytes. Routing the CLI at the library gives **1.24×** on `SmolLM2-135M-Q6_K` (241 → 194 ms) and **2.23×** on `Qwen2.5-1.5B-IQ2_M` (5854 → 2631 ms), medians of 5, `target-cpu=native`, output byte-identical before and after. The gap widens with model size because the fixed parse/write cost amortises, which is also why the small fixture understates it** | Shipped (v0.7.6, Phase 7.6) |
+| 17 | Phase 7.7 `clippy::chunks_exact_to_as_chunks` across the six suppressed sites in `src/` | **Unpredictable per site, and v0.7.6's figures were mostly instrument error.** 2 migrations are wins (`GPTQ` -9.87 %, `BnB` `INT8` -3 to -6 % at `F16`), 3 are measured losses (`AWQ` **+30 % aarch64 / ~+45 % x86-64**, `write_scratch` **+32 %** on `BnB` `INT8` `BF16`, `FP8` +3-5 %), 1 is unmeasurable. Identical source changes to near-identical kernels gave opposite answers, so **no site may be migrated on a sibling's number**. Secondary finding, larger than the primary one: **a static instruction count is not a proxy for wall clock** — `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 % | Shipped (v0.7.7, Phase 7.7) |
 
 ---
 
@@ -1564,3 +1565,89 @@ on more threads, not a different one.
    the *size* of the claim, not its sign: the audit's earlier best-of-3 default
    build put the same two fixtures at 1.39× and 2.35×, close enough to confirm
    the effect and different enough to show why the protocol pins the build flags.
+
+## Experiment 17 — Phase 7.7 `as_chunks` migration: six sites, six separate answers
+
+**Hypothesis.** `clippy::chunks_exact_to_as_chunks` (new in Rust 1.98) advises
+replacing `chunks_exact(N)` with `as_chunks::<N>()`, which hands back
+fixed-size arrays and so gives the optimiser a compile-time length. v0.7.6
+suppressed the lint at six sites in `src/` after measuring costs of +18 % to
++74 %, and diagnosed those costs as the fault of a *half* migration: the tile
+loops zip four streams, and only three could move, because
+`as_chunks_mut::<{VECTOR_TILE * E::BYTES}>()` is rejected by stable Rust. The
+prediction was that migrating all four streams would pay for itself.
+
+**Verdict: the prediction held for exactly one kernel, and the diagnosis does
+not generalise at all.**
+
+| Site | Migration | Result |
+|---|---|---|
+| `remember/gptq.rs` | four-stream | **-9.87 %** (`aarch64`) — **taken** |
+| `remember/bnb.rs` | two-stream + `NF4` core | **-5.22 / -2.87 / -5.96 %** at `F16`, three runs — **taken** |
+| `remember/awq.rs` | four-stream | **+30.6 % (`aarch64`), +48.8 / +49.7 / +43.1 % (x86-64)** — reverted |
+| `remember/output.rs` | `write_scratch` | **+37.7 / +31.7 %** on `BnB` `INT8` `BF16` against `GPTQ` `F16` -10 % — reverted |
+| `remember/fp8.rs` | two-stream | **+3.21 / +4.56 %** — reverted |
+| `convert.rs::to_bf16_bytes` | — | **unmeasurable** (private; no path benchmark can resolve it) |
+
+`GPTQ` and `AWQ` are structural twins differing only in `AWQ`'s `AWQ_ORDER`
+scatter in pass 1. They were given the *same* source change and answered nine
+percent apart in opposite directions. `write_scratch` gained one kernel 10 %
+while costing another 32 % in the same commit.
+
+### Why v0.7.6's numbers were wrong
+
+Not carelessness: the figures were reproducible, and were taken with the
+protocol available at the time. They were taken with the wrong *instrument*.
+
+| Instrument | Floor on **byte-identical code** | Architecture | Turnaround |
+|---|---|---|---|
+| Paired harness (`benches/ab.rs`, tango) | **~2 %** | x86-64 | ~30 s |
+| CodSpeed walltime (macro runners) | ~4 % | `aarch64` **only** | ~18 min |
+| Local criterion, pointwise | **10-23 %** | x86-64 | minutes |
+
+At a 10-23 % floor, `FP8`'s true +3-5 % reads as +18-21 %, and `BnB`'s genuine
+win reads as noise and is discarded. Both happened. The floors above are
+measured, not estimated: each was taken by comparing a build against an export
+of identical source.
+
+### The finding that outlives the phase
+
+**A static instruction count is not a proxy for wall clock, not even on the
+architecture being timed.** Migrating `AWQ` *reduced* its `aarch64` instruction
+count at every output width — 806 to 710 (`Bf16Out`), 736 to 667 (`F32Out`),
+737 to 642 (`F16Out`) — while its wall clock rose about 30 % on that same
+architecture. On x86-64 the counts fell at two widths of three while wall clock
+rose ~45 %.
+
+An instruction count describes codegen. It can *explain* a timing result after
+the fact. It cannot stand in for one, and a CPU-simulation instrument that
+reports cycles derived from instruction counts inherits the same limit — which
+is consistent with Experiment 10, where simulation would have scored a null
+SIMD change as a win.
+
+### Three instrument defects found on the way, each by the item it blocked
+
+1. **The benchmark suite could only see `BF16`.** Every dequant group called a
+   `_to_bf16` entry point, leaving two thirds of the `OutputElement` surface
+   unmeasured. `AWQ`'s migration improves `BF16` codegen while scalarising
+   `F16` on x86-64; a `BF16`-only suite reports that as a clean win.
+2. **Two benchmarks reported a false 34 % regression** on pull requests that
+   changed no `src/` file, because they write output files and CI storage became
+   the numerator. Their two measurement bases also disagreed by ~2x. They now
+   sit behind a `bench-fileio` feature that CI does not enable.
+3. **The arbiter measured the wrong architecture.** CodSpeed's walltime
+   instrument is `aarch64`-only with no self-hosted option, while the crate is
+   developed and released on x86-64. It is now a `main`-only drift watch, and
+   deciding whether a change is faster happens locally.
+
+### What to do next time
+
+1. **Measure the site you changed, not a sibling.** This experiment's whole
+   content is that the transfer does not hold.
+2. **State the instrument's floor before quoting a delta**, and measure that
+   floor against identical source rather than assuming it.
+3. **Run untouched kernels alongside as controls.** In one run here an untouched
+   `AWQ` arm moved +3.03 %; without controls that run's numbers would have read
+   as signal.
+4. **Reproduce before acting.** Every verdict above is from two or three runs;
+   several single-run readings did not survive the second.
