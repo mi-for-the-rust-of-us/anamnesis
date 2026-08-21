@@ -2046,12 +2046,29 @@ fn hub_dtype_to_gguf(dtype: Dtype) -> crate::Result<crate::GgufType> {
 /// elements.
 #[cfg(feature = "bnb")]
 // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// This is the per-element narrowing every `bnb-nf4` conversion runs over the
-// whole model, so it is a hot loop by any reading. It was migrated with the
-// dequant kernels during the v0.7.6 evaluation and reverted with them: the
-// families that could be attributed cost +18 % to +74 %, and this one has no
-// bench of its own to clear it. Unmeasured plus hot means unchanged, per
-// `CLAUDE.md`. See CONVENTIONS.md § MEASURED-REVERT Annotation.
+//
+// **UNMEASURABLE, which is a different claim from "measured slow" and is stated
+// as such.** This is the per-element narrowing every `bnb-nf4` conversion runs
+// over a whole model, so it is hot by any reading, and it remains the one
+// suppressed site in `src/` with no number of its own.
+//
+// Phase 7.7 item 5 tried and could not get one. The function is private, so the
+// bench crate cannot call it; the only public path that reaches it
+// (`convert_bytes` into `ConvertTarget::BnbNf4`) also parses, builds the hub and
+// runs the `NF4` encode, in which this loop is a small enough fraction that a
+// 5 % change in it lands below the harness's own ~2 % floor. A benchmark that
+// cannot resolve the effect is not evidence, and building one anyway would have
+// dressed a guess as a measurement.
+//
+// **And no inference is available from the sites that were measured**, because
+// Phase 7.7's central finding is that this migration is unpredictable per site:
+// it gained `GPTQ` 9.87 %, cost `AWQ` ~45 %, cost `BnB` `INT8` +32 % through
+// `write_scratch` while gaining `GPTQ` `F16` 10 % in the same commit. Nothing
+// here can be argued from a sibling's number.
+//
+// Unmeasured plus hot means unchanged, per `CLAUDE.md`. To settle it, give the
+// narrowing a callable seam rather than a bigger benchmark.
+// See CONVENTIONS.md § MEASURED-REVERT Annotation.
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<Cow<'a, [u8]>> {
     match dtype {

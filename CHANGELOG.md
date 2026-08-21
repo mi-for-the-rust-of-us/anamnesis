@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`BnB` `INT8` dequantisation is about 3-6 % faster at `F16` output.** Measured
+  with the paired harness in `benches/ab.rs` on x86-64: -5.22 %, -2.87 % and
+  -5.96 % across three runs, all significant against that harness's measured
+  ~2 % floor, with no reproduced regression at `BF16` or `F32` or in any other
+  kernel family. Output bytes are unchanged and remain bit-exact against the
+  `bitsandbytes` goldens.
+
 - **`GPTQ` dequantisation is about 10 % faster**, at every output width.
   Measured on CodSpeed macro runners (walltime, bare metal, isolated):
   `dequant_gptq_int4/synthetic_4096x11008_g128` went 181.75 / 182.82 ms before

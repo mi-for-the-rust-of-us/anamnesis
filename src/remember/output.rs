@@ -80,15 +80,32 @@
 //! the full numbers.
 
 // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Reverted with the kernel family rather than on an attribution of its own, and
-// that distinction matters: this is the narrowing writer **every** dequant kernel
-// funnels through, and the `dequant_fp8_fine_grained` regression (+18 % to +21 %,
-// p = 0.00) survived reverting both fp8 loops individually, so it could not be
-// isolated away from here. Each `write_scratch` also carries a
-// `// VECTORIZED: confirmed` annotation earned by reading its disassembly; those
-// claims would need re-establishing before the iterator shape changes.
-// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
-// criterion baseline alone cannot settle this.
+//
+// **SETTLED by its own measurement, not inherited from a family revert.** This
+// is the narrowing writer every dequant kernel funnels through, so v0.7.6 could
+// only revert it *with* the `FP8` family and say so. Phase 7.7 item 2 measured
+// it directly, migrating all three `write_scratch` loops to `as_chunks_mut`,
+// paired harness on x86-64, two runs:
+//
+//   bnb_int8 BF16   +37.7 %  /  +31.7 %     <- the default width, badly hurt
+//   bnb_int8 F32    +17.8 %  /  +13.4 %
+//   gptq_int4 F16   -10.6 %  /  -10.0 %     <- a real gain, and far smaller
+//
+// Everything else moved inconsistently between the two runs, i.e. noise --
+// including every `gguf_q4_k` arm, which is worth recording because all 24
+// `GGUF` kernel functions reach their output through this writer and yet showed
+// nothing.
+//
+// A +32 % regression on `BnB` `INT8`'s default width is not paid for by a 10 %
+// gain on `GPTQ`'s least-used one, so the migration is not taken. Note what the
+// shape of that result says: this change *helps one kernel and badly hurts
+// another*, which is the same per-kernel unpredictability Phase 7.7 item 1
+// found between the `GPTQ` and `AWQ` twins. There is no shared mechanism to
+// reason from here, only measurements.
+//
+// Each `write_scratch` also carries a `// VECTORIZED: confirmed` annotation
+// earned by reading its disassembly; those claims would need re-establishing
+// before the iterator shape changes.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use crate::parse::safetensors::Dtype;
