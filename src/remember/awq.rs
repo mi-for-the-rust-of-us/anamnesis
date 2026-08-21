@@ -37,14 +37,37 @@
 //! `AutoAWQ` `awq/utils/packing_utils.py` (`unpack_awq`, `reverse_awq_order`).
 
 // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Migrating this tile loop to `as_chunks` cost **+74 %** on `dequant_awq_int4`
-// (criterion, 4096 x 11008, target-cpu=native, p = 0.00, reproduced twice).
-// Reverting restored it to +4.2 % (p = 0.09, inside this host's noise floor).
-// Same mechanism as its `GPTQ` twin, recorded there in full: only three of the
-// four zipped streams can migrate, because the output width derives from
-// `E::BYTES` and stable Rust will not take that as a const generic argument.
-// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
-// criterion baseline alone cannot settle this.
+//
+// **SETTLED. Do not re-attempt this migration without reading Phase 7.7 item 1
+// first.** The v0.7.6 note this replaces recorded +74 % for migrating the tile
+// loop and blamed the *half* migration: only three of the four zipped streams
+// could move, because `as_chunks_mut::<{VECTOR_TILE * E::BYTES}>()` is rejected
+// by stable Rust. That diagnosis predicted a full four-stream migration would
+// pay for itself, and for the `GPTQ` twin it did, by 9.87 %.
+//
+// It does not here. Phase 7.7 built the machinery (`OutputElement::Tile`,
+// `split_tiles`, `write_tile`), migrated all four streams, and measured:
+//
+//   x86-64, paired harness (`benches/ab.rs`, tango), 3 runs:
+//     BF16  +48.8 % / +49.7 % / +43.1 %   (all significant)
+//     F32    -1.7 % /  -0.8 % /  -0.7 %   (not significant)
+//     F16    -8.8 % /  -7.4 % /  -7.7 %   (significant)
+//
+//   aarch64, CodSpeed walltime, `dequant_awq_int4` vs main:
+//     BF16 +30.6 %, F16 +7.7 %, F32 +0.1 %
+//     (18 untouched dequant arms moved <= 2.67 % on the same run)
+//
+// Both architectures agree the default width regresses badly. That is why the
+// output stays a `ChunksExactMut` here while `GPTQ` migrated: the kernels are
+// structurally identical apart from this module's `AWQ_ORDER` scatter in pass 1,
+// which is the only candidate explanation and is not yet confirmed.
+//
+// **The disassembly said the opposite, at both targets, and was wrong.**
+// Instruction counts FELL on aarch64 at every width (806 -> 710, 736 -> 667,
+// 737 -> 642) and on x86-64 at two of three. Fewer instructions, ~45 % more
+// time. A static instruction count is not a proxy for wall clock, not even on
+// the architecture being timed. See CONVENTIONS.md § MEASURED-REVERT Annotation
+// and § Benchmark evidence.
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 use crate::error::AnamnesisError;

@@ -1,24 +1,49 @@
-# Continuous performance tracking via CodSpeed (https://codspeed.io).
+# Continuous ARM drift detection via CodSpeed (https://codspeed.io).
 #
-# Instrument: WALLTIME (real elapsed time) on CodSpeed *macro runners*
-# (`runs-on: codspeed-macro`) — bare-metal, low-noise, isolated. This is the
-# accurate signal that CAN gate perf decisions: it reflects real time, so it
-# captures the memory-bandwidth and multi-thread effects the CPU-simulation
-# instrument misses (simulation would have shown the null Phase-7 SIMD change as
-# a "win" — see docs/perf-experiments.md Experiment 10).
+# ============================================================================
+# THIS JOB WATCHES FOR DRIFT. IT DOES NOT DECIDE WHETHER A CHANGE IS FASTER.
+# ============================================================================
 #
-# Macro runners require a GitHub *organization* (not a personal account) and draw
-# from the org's monthly macro-runner minutes. To fall back to the free,
-# always-on CPU-simulation instrument, set `runs-on: ubuntu-latest` and
-# `mode: simulation` (a deterministic *complexity* tripwire, not a wall-clock
-# verdict). Even with walltime, the local best-of-N protocol in CLAUDE.md remains
-# the release-gating authority; CI walltime is the continuous regression signal.
-name: CodSpeed
+# ARCHITECTURE — the single most important fact about this file. CodSpeed's
+# walltime instrument runs *only* on `codspeed-macro` runners, and those are
+# **Linux aarch64, server-class bare metal** (Ampere/Graviton class). There is
+# no x86-64 option: walltime requires CodSpeed's own hosted macro runners, and
+# self-hosted runners are not supported. So this job cannot measure the
+# architecture this crate is developed and released on.
+#
+# It is worth keeping anyway, because `aarch64` is a first-class target for a
+# GGUF crate: Apple Silicon is one of the most common local-LLM platforms there
+# is, and Graviton/Ampere carry a real share of cloud inference. But note what
+# this is NOT:
+#
+#   * NOT Apple Silicon. M-series has a different microarchitecture (wider
+#     decode, far larger caches, different memory bandwidth) and ARMv8.2+
+#     hardware FP16 arithmetic, under macOS rather than Linux. This is the
+#     closest continuous proxy available, and it is only a proxy. Phase 7.7's
+#     finding that `F16Out::write_scratch` fails to inline here has NOT been
+#     confirmed on an M-series chip.
+#   * NOT the whole story. Two numbers can disagree between architectures and
+#     both be right; Phase 7.7 item 1 found exactly that for `AWQ` at `F16`.
+#
+# WHY `pull_request` IS GONE. It used to run on PRs, and that was actively
+# harmful: it rendered a verdict on changes it measured on the wrong
+# architecture, at ~4 % effective resolution, 18 minutes after the fact. Phase
+# 7.7 item 1 was nearly decided on such a verdict. Deciding whether a change is
+# faster is now done *locally on x86-64* with the paired harness in
+# `benches/ab.rs`, which answers in seconds. Removing the trigger makes that
+# structural rather than a matter of remembering.
+#
+# WHAT IT STILL BUYS. Nobody runs a local benchmark on every merge. This job
+# does, and it holds the ARM time series that would otherwise not exist.
+#
+# Macro runners require a GitHub *organization* (not a personal account) and
+# draw from the org's monthly macro-runner minutes. The local best-of-N protocol
+# in CLAUDE.md remains the release-gating authority.
+name: CodSpeed (aarch64 drift watch)
 
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
