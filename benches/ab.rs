@@ -70,15 +70,32 @@
 //!
 //! # Coverage, and how to extend it
 //!
-//! `AWQ` and `GPTQ`, at all three [`OutputElement`](anamnesis::OutputElement)
-//! widths. That pairing is deliberate rather than arbitrary: the two kernels are
+//! All seven dequant families `dequant.rs` covers, at all three
+//! [`OutputElement`](anamnesis::OutputElement) widths: **21 arms**.
+//!
+//! The `AWQ` / `GPTQ` pairing is the load-bearing one. Those two kernels are
 //! structurally identical apart from `AWQ`'s `AWQ_ORDER` scatter, they received
 //! the *same* source change in Phase 7.7, and they disagreed about it — `GPTQ`
-//! gained 9.87 % while `AWQ` lost ~45 %. Keeping both means every future run
-//! carries its own control.
+//! gained 9.87 % while `AWQ` lost ~45 %. The rest are here so that **every run
+//! carries its own controls**: a kernel nobody touched that moves as much as the
+//! one under test is the signal that the reading is layout, not algorithm.
 //!
 //! Adding a kernel is mechanical: build its fixture as `dequant.rs` does, then
-//! add one `benchmark_fn` per width. Each arm costs roughly ten seconds.
+//! add one `benchmark_fn` per width.
+//!
+//! # Running a subset
+//!
+//! A full pass is ~21 arms. When iterating on one kernel, filter — but **keep at
+//! least one untouched family in the filter as a control**:
+//!
+//! ```text
+//! cargo bench --bench=ab --features gptq,awq,bnb,gguf -- \
+//!     compare target/benchmarks/ab --filter '{awq,gptq}_*' --noise-threshold 2.5
+//! ```
+//!
+//! `--noise-threshold` defaults to **1 %**, which is below this harness's
+//! measured floor and will star differences that are not real. Pass **2.5**,
+//! for the reason tabulated above.
 
 // A bench is its own crate and inherits none of `src/lib.rs`'s inner attributes,
 // so the lint policy is restated here. Same set `dequant.rs` carries, and for the
@@ -91,14 +108,21 @@
     clippy::indexing_slicing,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    // Each fixture is cloned once per output width, giving deliberately parallel
+    // binding names (`nf4a`/`nf4b`/`nf4c`). The similarity is the point: they are
+    // the same fixture, and naming them apart would imply a difference that does
+    // not exist. `tango`'s closures are `move`, so one shared binding will not do.
+    clippy::similar_names
 )]
 
 use std::hint::black_box;
 
 use anamnesis::{
-    Dtype, F16Out, F32Out, dequantize_awq, dequantize_awq_to_bf16, dequantize_gptq,
-    dequantize_gptq_to_bf16,
+    Dtype, F16Out, F32Out, GgufType, dequantize_awq, dequantize_awq_to_bf16, dequantize_bnb_int8,
+    dequantize_bnb_int8_to_bf16, dequantize_bnb4, dequantize_bnb4_to_bf16, dequantize_fp8,
+    dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16, dequantize_gptq,
+    dequantize_gptq_to_bf16, dequantize_per_tensor_fp8, dequantize_per_tensor_fp8_to_bf16,
 };
 use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
 
@@ -111,6 +135,28 @@ const LAYER_COLS: usize = 11008;
 const BITS: u8 = 4;
 /// Group size for both kernels below.
 const GROUP_SIZE: usize = 128;
+/// `BnB` `NF4` block size.
+const BNB_BLOCK: usize = 64;
+/// Canonical `NF4` codebook, the same constant as `anamnesis::NF4_CODEBOOK`,
+/// duplicated so the bench has no dependency on a non-public item.
+const NF4_CODEBOOK: [f32; 16] = [
+    -1.0,
+    -0.696_192_8,
+    -0.525_073_05,
+    -0.394_917_5,
+    -0.284_441_38,
+    -0.184_773_43,
+    -0.091_050_036,
+    0.0,
+    0.079_580_3,
+    0.160_930_2,
+    0.246_112_3,
+    0.337_915_24,
+    0.440_709_83,
+    0.562_617,
+    0.722_956_84,
+    1.0,
+];
 
 /// Knuth multiplicative hash on the index, the same filler `dequant.rs` uses, so
 /// bit patterns are stable across runs and the pair is not perturbed by fixture
@@ -163,6 +209,41 @@ fn gptq_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     )
 }
 
+/// `(weight, scale_data)` for fine-grained `FP8`: `128x128` block scales, `BF16`
+/// `1.0` (`0x3F80`) so the arithmetic is real without perturbing magnitudes.
+fn fp8_fine_fixture() -> (Vec<u8>, Vec<u8>) {
+    let blocks = (LAYER_ROWS / 128) * (LAYER_COLS / 128);
+    (
+        synth_bytes(LAYER_ROWS * LAYER_COLS),
+        [0x80u8, 0x3F].repeat(blocks),
+    )
+}
+
+/// `(weight, absmax, quant_map)` for `BnB` `NF4` at `block_size = 64`. `absmax`
+/// is all `1.0`, so the dequantised output is the codebook itself.
+fn bnb4_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let total = LAYER_ROWS * LAYER_COLS;
+    let absmax = (0..total / BNB_BLOCK)
+        .flat_map(|_| 1.0_f32.to_le_bytes())
+        .collect();
+    let quant_map = NF4_CODEBOOK.iter().flat_map(|v| v.to_le_bytes()).collect();
+    (synth_bytes(total / 2), absmax, quant_map)
+}
+
+/// `(weight, scb)` for `BnB` `INT8`: per-row `f32` absmax, all `1.0`. Note the
+/// shape is `[out_features, in_features]`, the opposite of `GPTQ`/`AWQ` above.
+fn bnb_int8_fixture() -> (Vec<u8>, Vec<u8>) {
+    let scb = (0..LAYER_COLS)
+        .flat_map(|_| 1.0_f32.to_le_bytes())
+        .collect();
+    (synth_bytes(LAYER_COLS * LAYER_ROWS), scb)
+}
+
+/// `Q4_K` raw blocks: 256 elements per 144-byte super-block.
+fn gguf_q4k_fixture() -> Vec<u8> {
+    synth_bytes((LAYER_ROWS * LAYER_COLS / 256) * 144)
+}
+
 /// One arm per output width. Phase 7.7 item 1a established that the three
 /// [`OutputElement`](anamnesis::OutputElement) monomorphisations are three
 /// separate codegen outcomes, and that a suite measuring one of them measures
@@ -172,6 +253,16 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
     let (awq1, awq2, awq3) = (awq.clone(), awq.clone(), awq);
     let gptq = gptq_fixture();
     let (gptq1, gptq2, gptq3) = (gptq.clone(), gptq.clone(), gptq);
+    let fp8f = fp8_fine_fixture();
+    let (fp8a, fp8b, fp8c) = (fp8f.clone(), fp8f.clone(), fp8f);
+    let fp8t = synth_bytes(LAYER_ROWS * LAYER_COLS);
+    let (fp8t1, fp8t2, fp8t3) = (fp8t.clone(), fp8t.clone(), fp8t);
+    let nf4 = bnb4_fixture();
+    let (nf4a, nf4b, nf4c) = (nf4.clone(), nf4.clone(), nf4);
+    let i8 = bnb_int8_fixture();
+    let (i8a, i8b, i8c) = (i8.clone(), i8.clone(), i8);
+    let gg = gguf_q4k_fixture();
+    let (gg1, gg2, gg3) = (gg.clone(), gg.clone(), gg);
 
     [
         benchmark_fn("awq_int4_bf16", move |b| {
@@ -282,6 +373,200 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
                         Dtype::BF16,
                     )
                     .expect("gptq f16"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_fine_bf16", move |b| {
+            let (w, s) = fp8a.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_fp8_to_bf16(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_ROWS,
+                        LAYER_COLS,
+                        Dtype::BF16,
+                    )
+                    .expect("fp8 fine bf16"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_fine_f32", move |b| {
+            let (w, s) = fp8b.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_fp8::<F32Out>(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_ROWS,
+                        LAYER_COLS,
+                        Dtype::BF16,
+                    )
+                    .expect("fp8 fine f32"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_fine_f16", move |b| {
+            let (w, s) = fp8c.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_fp8::<F16Out>(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_ROWS,
+                        LAYER_COLS,
+                        Dtype::BF16,
+                    )
+                    .expect("fp8 fine f16"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_tensor_bf16", move |b| {
+            let w = fp8t1.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_per_tensor_fp8_to_bf16(black_box(&w), black_box(0.125_f32))
+                        .expect("fp8 tensor bf16"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_tensor_f32", move |b| {
+            let w = fp8t2.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_per_tensor_fp8::<F32Out>(black_box(&w), black_box(0.125_f32))
+                        .expect("fp8 tensor f32"),
+                )
+            })
+        }),
+        benchmark_fn("fp8_tensor_f16", move |b| {
+            let w = fp8t3.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_per_tensor_fp8::<F16Out>(black_box(&w), black_box(0.125_f32))
+                        .expect("fp8 tensor f16"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_nf4_bf16", move |b| {
+            let (w, a, q) = nf4a.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb4_to_bf16(
+                        black_box(&w),
+                        black_box(&a),
+                        black_box(&q),
+                        LAYER_ROWS * LAYER_COLS,
+                        BNB_BLOCK,
+                    )
+                    .expect("bnb nf4 bf16"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_nf4_f32", move |b| {
+            let (w, a, q) = nf4b.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb4::<F32Out>(
+                        black_box(&w),
+                        black_box(&a),
+                        black_box(&q),
+                        LAYER_ROWS * LAYER_COLS,
+                        BNB_BLOCK,
+                    )
+                    .expect("bnb nf4 f32"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_nf4_f16", move |b| {
+            let (w, a, q) = nf4c.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb4::<F16Out>(
+                        black_box(&w),
+                        black_box(&a),
+                        black_box(&q),
+                        LAYER_ROWS * LAYER_COLS,
+                        BNB_BLOCK,
+                    )
+                    .expect("bnb nf4 f16"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_int8_bf16", move |b| {
+            let (w, s) = i8a.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb_int8_to_bf16(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_COLS,
+                        LAYER_ROWS,
+                    )
+                    .expect("bnb int8 bf16"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_int8_f32", move |b| {
+            let (w, s) = i8b.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb_int8::<F32Out>(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_COLS,
+                        LAYER_ROWS,
+                    )
+                    .expect("bnb int8 f32"),
+                )
+            })
+        }),
+        benchmark_fn("bnb_int8_f16", move |b| {
+            let (w, s) = i8c.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_bnb_int8::<F16Out>(
+                        black_box(&w),
+                        black_box(&s),
+                        LAYER_COLS,
+                        LAYER_ROWS,
+                    )
+                    .expect("bnb int8 f16"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_q4k_bf16", move |b| {
+            let r = gg1.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf_to_bf16(black_box(&r), GgufType::Q4_K, LAYER_ROWS * LAYER_COLS)
+                        .expect("gguf q4k bf16"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_q4k_f32", move |b| {
+            let r = gg2.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F32Out>(
+                        black_box(&r),
+                        GgufType::Q4_K,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf q4k f32"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_q4k_f16", move |b| {
+            let r = gg3.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F16Out>(
+                        black_box(&r),
+                        GgufType::Q4_K,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf q4k f16"),
                 )
             })
         }),
