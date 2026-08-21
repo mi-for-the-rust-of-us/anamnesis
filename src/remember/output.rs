@@ -205,6 +205,47 @@ pub trait OutputElement: sealed::Sealed + Copy + Send + Sync + 'static {
     /// tail untouched. Every caller in this crate sizes both buffers from the
     /// same block constant, so neither happens in practice.
     fn write_scratch(src: &[f32], out: &mut [u8]);
+
+    /// One whole tile's worth of output bytes: `[u8; VECTOR_TILE * BYTES]`.
+    ///
+    /// Spelled as an associated type rather than computed, because
+    /// `[u8; VECTOR_TILE * Self::BYTES]` needs `generic_const_exprs`: stable
+    /// Rust rejects an associated const of a *type parameter* inside a const
+    /// operation, with "generic parameters may not be used in const
+    /// operations". Each implementation writes its own width as a literal, and
+    /// the `const` block below proves every one of them equals
+    /// `VECTOR_TILE * BYTES`, so the three literals cannot drift.
+    ///
+    /// `VECTOR_TILE` is a plain code span rather than an intra-doc link
+    /// throughout these three items: it is `pub(crate)` while this trait is
+    /// `pub`, and linking down that visibility step trips
+    /// `private_intra_doc_links` under `-D warnings`. See `CONVENTIONS.md`
+    /// section *Intra-Doc Link Safety*.
+    type Tile;
+
+    /// Splits an output row into whole [`Tile`](Self::Tile)s plus the ragged
+    /// edge run, in that order.
+    ///
+    /// Exists so that no caller has to name `VECTOR_TILE * BYTES`, which is
+    /// exactly the const expression stable Rust will not accept from generic
+    /// code. Each implementation is a single `as_chunks_mut` call at a literal
+    /// width.
+    ///
+    /// # Preconditions
+    ///
+    /// None. A row shorter than one tile yields an empty tile slice and the
+    /// whole row as the edge run, which is what the ragged-tail path expects.
+    fn split_tiles(out: &mut [u8]) -> (&mut [Self::Tile], &mut [u8]);
+
+    /// Converts exactly one tile of `f32` values into `out`.
+    ///
+    /// The fixed-size counterpart to [`write_scratch`](Self::write_scratch).
+    /// Both operands carry their length in the type, so the narrowing loop has
+    /// a compile-time-constant trip count and needs no length reconciliation
+    /// between source and destination. Use this for whole tiles and
+    /// [`write_scratch`](Self::write_scratch) for the ragged edge, whose length
+    /// is only known at run time.
+    fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile);
 }
 
 /// `BF16` output: 2 bytes per value, round-to-nearest-even. **The default**,
@@ -274,6 +315,34 @@ impl OutputElement for Bf16Out {
             out_chunk.copy_from_slice(&bits.to_le_bytes());
         }
     }
+
+    type Tile = [u8; VECTOR_TILE * 2];
+
+    #[inline]
+    fn split_tiles(out: &mut [u8]) -> (&mut [Self::Tile], &mut [u8]) {
+        out.as_chunks_mut::<{ VECTOR_TILE * 2 }>()
+    }
+
+    #[inline]
+    fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
+        // VECTORIZED: confirmed AVX2 vpaddd + vpsrld + vpand on %ymm in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, read at the
+        // inlined call site inside `dequantize_gptq::<Bf16Out>` (this function
+        // is `#[inline]` and has no standalone symbol). That is the same
+        // round-to-nearest-even bias-add and shift `write_scratch` emits, so
+        // the fixed-size form keeps the narrowing that the byte-slice form had.
+        //
+        // The arithmetic is deliberately identical to `write_scratch` above.
+        // Only the operand types differ: both are fixed-size arrays, so the zip
+        // has a constant trip count of `VECTOR_TILE` rather than one reconciled
+        // from two run-time lengths, and assigning the `[u8; 2]` whole replaces
+        // a length-checked `copy_from_slice`. Measured effect at the call site:
+        // 1088 -> 939 instructions for the whole `Bf16Out` monomorphisation
+        // (-13.7 %), and -9.97 % wall clock. See `gptq.rs` for the numbers.
+        for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<2>().0) {
+            *out_chunk = f32_bits_to_bf16_bits(val.to_bits()).to_le_bytes();
+        }
+    }
 }
 
 impl OutputElement for F32Out {
@@ -292,6 +361,26 @@ impl OutputElement for F32Out {
         // doubled write, not a failure to vectorise.
         for (&val, out_chunk) in src.iter().zip(out.chunks_exact_mut(4)) {
             out_chunk.copy_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    type Tile = [u8; VECTOR_TILE * 4];
+
+    #[inline]
+    fn split_tiles(out: &mut [u8]) -> (&mut [Self::Tile], &mut [u8]) {
+        out.as_chunks_mut::<{ VECTOR_TILE * 4 }>()
+    }
+
+    #[inline]
+    fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
+        // VECTORIZED: confirmed AVX2 vmovups on %ymm (256-bit stores) in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, read at the
+        // inlined call site as for `Bf16Out`. The fixed-size form emits **more**
+        // wide stores than the byte-slice one, not fewer: across the whole
+        // `F32Out` monomorphisation `vmovups` goes 64 -> 95 and `%ymm` mentions
+        // 96 -> 160, on 979 -> 919 instructions (-6.1 %).
+        for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<4>().0) {
+            *out_chunk = val.to_le_bytes();
         }
     }
 }
@@ -314,7 +403,44 @@ impl OutputElement for F16Out {
             out_chunk.copy_from_slice(&half::f16::from_f32(val).to_le_bytes());
         }
     }
+
+    type Tile = [u8; VECTOR_TILE * 2];
+
+    #[inline]
+    fn split_tiles(out: &mut [u8]) -> (&mut [Self::Tile], &mut [u8]) {
+        out.as_chunks_mut::<{ VECTOR_TILE * 2 }>()
+    }
+
+    #[inline]
+    fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
+        // VECTORIZED: confirmed F16C `vcvtps2ph` in `--emit=asm`, x86-64
+        // target-cpu=native, opt-level=3, read at the inlined call site as for
+        // `Bf16Out`. The `$0` immediate is round-to-nearest-even, so the
+        // documented rounding stays enforced by the instruction itself. The
+        // count drops 41 -> 9 across the whole `F16Out` monomorphisation while
+        // total instructions drop 1108 -> 906 (-18.2 %): the same conversions
+        // expressed in fewer, wider ones rather than conversions lost.
+        for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<2>().0) {
+            *out_chunk = half::f16::from_f32(val).to_le_bytes();
+        }
+    }
 }
+
+/// Proves each implementation's `Tile` really is `VECTOR_TILE * BYTES` wide.
+///
+/// The three widths are literals because stable Rust will not let generic code
+/// compute them (see [`OutputElement::Tile`]), so nothing in the type system
+/// ties them to `BYTES`. This block does, at compile time: change `BYTES`
+/// without changing the literal, or add a fourth output type whose `Tile` is
+/// wrong, and the build fails here rather than truncating tensor data.
+///
+/// Not feature-gated, unlike the `MAX_OUTPUT_BYTES` block above: `VECTOR_TILE`
+/// is always-on, so these tiles exist in every build.
+const _: () = {
+    assert!(size_of::<<Bf16Out as OutputElement>::Tile>() == VECTOR_TILE * Bf16Out::BYTES);
+    assert!(size_of::<<F32Out as OutputElement>::Tile>() == VECTOR_TILE * F32Out::BYTES);
+    assert!(size_of::<<F16Out as OutputElement>::Tile>() == VECTOR_TILE * F16Out::BYTES);
+};
 
 #[cfg(test)]
 // `float_cmp` is allowed deliberately, not as a blanket concession: every
