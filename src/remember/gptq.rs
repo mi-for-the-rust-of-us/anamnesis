@@ -27,7 +27,27 @@
 // is what cost +51 % here and +74 % in `AWQ`; whether the whole-migration shape
 // pays for itself is what the `dequant_gptq_int4` CodSpeed benchmark decides.
 //
-// Do not copy this module's shape to its siblings before that number lands.
+// **The number landed: -9.97 %.** CodSpeed macro runner (walltime, bare metal),
+// `dequant_gptq_int4/synthetic_4096x11008_g128`, 182.82 ms at `245f112` on main
+// against 164.59 ms here. On the same run the five kernels this branch does not
+// touch moved -0.86 % to +1.12 %, and the disassembly agrees independently:
+// 1088 -> 939 instructions for `Bf16Out` (-13.7 %), 979 -> 919 for `F32Out`
+// (-6.1 %), 1108 -> 906 for `F16Out` (-18.2 %), with every documented vector
+// instruction family still present.
+//
+// Read it with the caveat it deserves: `dequant_gguf_q4_k` moved -4.85 % on the
+// same run without being touched, so adding code to `output.rs` shifts layout
+// even on this instrument. Effective noise here is nearer +/-5 % than the
+// +/-0.9 % measured between two runs of identical code. -9.97 % clears that by
+// about 2x, and the instruction-count drop is layout-independent evidence
+// pointing the same way.
+//
+// So the +51 % this module once recorded was the cost of a *half* migration,
+// not of `as_chunks`. Migrating all four streams is worth about 10 %.
+//
+// Do not copy this module's shape to its siblings before their own numbers
+// land: `AWQ` is structurally identical and should follow, but `FP8` and `BnB`
+// funnel through `write_scratch`, which this branch deliberately left alone.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;

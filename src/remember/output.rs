@@ -325,13 +325,20 @@ impl OutputElement for Bf16Out {
 
     #[inline]
     fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
-        // VECTORIZED: pending -- resolved before this spike is promoted. The
-        // shape is deliberately the same arithmetic as `write_scratch` above,
-        // differing only in that both operands are fixed-size arrays, so the
-        // zip below has a constant trip count of `VECTOR_TILE` instead of one
-        // reconciled from two run-time lengths. Assigning the `[u8; 2]`
-        // directly also replaces `copy_from_slice`, which had to be a
-        // length-checked memcpy.
+        // VECTORIZED: confirmed AVX2 vpaddd + vpsrld + vpand on %ymm in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, read at the
+        // inlined call site inside `dequantize_gptq::<Bf16Out>` (this function
+        // is `#[inline]` and has no standalone symbol). That is the same
+        // round-to-nearest-even bias-add and shift `write_scratch` emits, so
+        // the fixed-size form keeps the narrowing that the byte-slice form had.
+        //
+        // The arithmetic is deliberately identical to `write_scratch` above.
+        // Only the operand types differ: both are fixed-size arrays, so the zip
+        // has a constant trip count of `VECTOR_TILE` rather than one reconciled
+        // from two run-time lengths, and assigning the `[u8; 2]` whole replaces
+        // a length-checked `copy_from_slice`. Measured effect at the call site:
+        // 1088 -> 939 instructions for the whole `Bf16Out` monomorphisation
+        // (-13.7 %), and -9.97 % wall clock. See `gptq.rs` for the numbers.
         for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<2>().0) {
             *out_chunk = f32_bits_to_bf16_bits(val.to_bits()).to_le_bytes();
         }
@@ -366,7 +373,12 @@ impl OutputElement for F32Out {
 
     #[inline]
     fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
-        // VECTORIZED: pending -- see the `Bf16Out` note above.
+        // VECTORIZED: confirmed AVX2 vmovups on %ymm (256-bit stores) in
+        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, read at the
+        // inlined call site as for `Bf16Out`. The fixed-size form emits **more**
+        // wide stores than the byte-slice one, not fewer: across the whole
+        // `F32Out` monomorphisation `vmovups` goes 64 -> 95 and `%ymm` mentions
+        // 96 -> 160, on 979 -> 919 instructions (-6.1 %).
         for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<4>().0) {
             *out_chunk = val.to_le_bytes();
         }
@@ -401,7 +413,13 @@ impl OutputElement for F16Out {
 
     #[inline]
     fn write_tile(src: &[f32; VECTOR_TILE], out: &mut Self::Tile) {
-        // VECTORIZED: pending -- see the `Bf16Out` note above.
+        // VECTORIZED: confirmed F16C `vcvtps2ph` in `--emit=asm`, x86-64
+        // target-cpu=native, opt-level=3, read at the inlined call site as for
+        // `Bf16Out`. The `$0` immediate is round-to-nearest-even, so the
+        // documented rounding stays enforced by the instruction itself. The
+        // count drops 41 -> 9 across the whole `F16Out` monomorphisation while
+        // total instructions drop 1108 -> 906 (-18.2 %): the same conversions
+        // expressed in fewer, wider ones rather than conversions lost.
         for (&val, out_chunk) in src.iter().zip(out.as_chunks_mut::<2>().0) {
             *out_chunk = half::f16::from_f32(val).to_le_bytes();
         }
