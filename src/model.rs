@@ -1897,7 +1897,7 @@ mod tests {
             &out_bytes[data_start + w_entry.data_offsets.0..data_start + w_entry.data_offsets.1];
         // 4 elements × 2 bytes = 8 bytes
         assert_eq!(w_data.len(), 8);
-        for chunk in w_data.chunks_exact(2) {
+        for chunk in w_data.as_chunks::<2>().0 {
             assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
         }
 
@@ -1944,7 +1944,7 @@ mod tests {
         let w_data =
             &bytes[data_start + w_entry.data_offsets.0..data_start + w_entry.data_offsets.1];
         assert_eq!(w_data.len(), 8); // 4 elements × 2 bytes
-        for chunk in w_data.chunks_exact(2) {
+        for chunk in w_data.as_chunks::<2>().0 {
             assert_eq!(chunk, &[0x00, 0x40], "expected BF16 2.0");
         }
 

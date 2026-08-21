@@ -2299,7 +2299,7 @@ mod tests {
         block[0..2].copy_from_slice(&f16_bytes(0.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q8_0, 32).unwrap();
         assert_eq!(out.len(), 64);
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2480,7 +2480,7 @@ mod tests {
     fn q2_k_zero_scales_and_mins() {
         let block = vec![0u8; 84];
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q2_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2499,7 +2499,7 @@ mod tests {
         block[80..82].copy_from_slice(&f16_bytes(1.0));
         block[82..84].copy_from_slice(&f16_bytes(0.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q2_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 2.0);
         }
     }
@@ -2532,7 +2532,7 @@ mod tests {
     fn q3_k_all_zero_block() {
         let block = vec![0u8; 110];
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q3_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2564,7 +2564,7 @@ mod tests {
     fn q4_k_all_zero_block() {
         let block = vec![0u8; 144];
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q4_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2577,7 +2577,7 @@ mod tests {
     fn q5_k_all_zero_block() {
         let block = vec![0u8; 176];
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q5_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2590,7 +2590,7 @@ mod tests {
     fn q6_k_all_zero_block() {
         let block = vec![0u8; 210];
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q6_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2604,7 +2604,7 @@ mod tests {
         }
         block[208..210].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::Q6_K, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), -32.0);
         }
     }
@@ -2623,7 +2623,7 @@ mod tests {
         }
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_NL, 32).unwrap();
         assert_eq!(out.len(), 64);
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2678,7 +2678,7 @@ mod tests {
         // All-zero block: d = 0.0 kills every output regardless of ls/nibble.
         let block = vec![0u8; 136];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_XS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2694,7 +2694,7 @@ mod tests {
         let mut block = vec![0u8; 136];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ4_XS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 4064.0);
         }
     }
@@ -2746,7 +2746,7 @@ mod tests {
     fn iq2_xxs_all_zero_block() {
         let block = vec![0u8; 66];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ2_XXS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2761,7 +2761,7 @@ mod tests {
         let mut block = vec![0u8; 66];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ2_XXS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 1.0);
         }
     }
@@ -2801,7 +2801,7 @@ mod tests {
     fn iq2_xs_all_zero_block() {
         let block = vec![0u8; 74];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ2_XS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2853,7 +2853,7 @@ mod tests {
     fn iq2_s_all_zero_block() {
         let block = vec![0u8; 82];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ2_S, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2916,7 +2916,7 @@ mod tests {
     fn iq3_xxs_all_zero_block() {
         let block = vec![0u8; 98];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_XXS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -2931,7 +2931,7 @@ mod tests {
         let mut block = vec![0u8; 98];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_XXS, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 1.0);
         }
     }
@@ -2972,7 +2972,7 @@ mod tests {
     fn iq3_s_all_zero_block() {
         let block = vec![0u8; 110];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ3_S, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -3068,7 +3068,7 @@ mod tests {
     fn iq1_s_all_zero_block() {
         let block = vec![0u8; 50];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_S, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -3084,7 +3084,7 @@ mod tests {
         let mut block = vec![0u8; 50];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_S, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), -0.875);
         }
     }
@@ -3128,7 +3128,7 @@ mod tests {
         // All bytes 0 → scale_u16 = 0 → d = f16(0.0) = 0.0 → all outputs 0.
         let block = vec![0u8; 56];
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_M, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -3151,7 +3151,7 @@ mod tests {
         block[48 + 6] = 0x00;
         block[48 + 7] = 0x30;
         let out = dequantize_gguf_to_bf16(&block, GgufType::IQ1_M, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), -0.875);
         }
     }
@@ -3210,7 +3210,7 @@ mod tests {
         // d = 0.0 → all outputs 0.0 regardless of qs/qh contents.
         let block = vec![0u8; 54];
         let out = dequantize_gguf_to_bf16(&block, GgufType::TQ1_0, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -3223,7 +3223,7 @@ mod tests {
         let mut block = vec![0u8; 54];
         block[52..54].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::TQ1_0, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), -1.0);
         }
     }
@@ -3236,7 +3236,7 @@ mod tests {
     fn tq2_0_all_zero_block() {
         let block = vec![0u8; 66];
         let out = dequantize_gguf_to_bf16(&block, GgufType::TQ2_0, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }
@@ -3247,7 +3247,7 @@ mod tests {
         let mut block = vec![0u8; 66];
         block[64..66].copy_from_slice(&f16_bytes(1.0));
         let out = dequantize_gguf_to_bf16(&block, GgufType::TQ2_0, 256).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), -1.0);
         }
     }
@@ -3291,7 +3291,7 @@ mod tests {
         // so every output is 0.0 regardless of the e8m0 sub-2 branch.
         let block = vec![0u8; 17];
         let out = dequantize_gguf_to_bf16(&block, GgufType::MXFP4, 32).unwrap();
-        for chunk in out.chunks_exact(2) {
+        for chunk in out.as_chunks::<2>().0 {
             assert_eq!(bf16_pair_to_f32(chunk), 0.0);
         }
     }

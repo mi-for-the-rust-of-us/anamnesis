@@ -27,6 +27,8 @@ the [Grit — Strict Rust for AI-Assisted Development](https://github.com/PCfVW/
 | Batch operations by key | [HashMap grouping idiom](#hashmap-grouping-idiom) |
 | Parse a header, archive, or stream from caller input | [Untrusted input invariants](#when-parsing-untrusted-input) |
 | Add `#[allow(clippy::...)]` for a newer lint | [MSRV lint guard](#msrv-lint-guard) |
+| Suppress a lint because its advice measured *slower* | [`// MEASURED-REVERT:`](#measured-revert-annotation) |
+| Compare two versions of a kernel with `cargo bench` | [Benchmark evidence](#benchmark-evidence-what-a-criterion-baseline-can-and-cannot-show) |
 
 ---
 
@@ -46,6 +48,7 @@ is what makes the code build under `#![deny(warnings)]`.
 | `// INDEX:` | `#[allow(clippy::indexing_slicing)]` |
 | `// EXHAUSTIVE:` | `#[allow(clippy::wildcard_enum_match_arm)]` or `#[allow(clippy::exhaustive_enums)]` |
 | `// SAFETY:` | `#[allow(unsafe_code)]` (at item or block scope) |
+| `// MEASURED-REVERT:` | `#[allow(clippy::<the lint whose advice was measured slower>)]` |
 | `// BITWISE:`, `// VECTORIZED:`, `// PARALLEL:`, `// BORROW:`, `// TRAIT_OBJECT:`, `// EXPLICIT:` | none — these are documentation-only |
 
 ### Per-site vs block-scope
@@ -272,6 +275,53 @@ evidence each state requires.
 > Example: `// VECTORIZED: confirmed AVX2 vsubps + vmulps in cargo-show-asm, x86-64 target-cpu=native, opt-level=3`
 > Example: `// VECTORIZED: scalar fallback — loop body contains branch that defeats auto-vectorization`
 > Example: `// VECTORIZED: pending cargo-show-asm verification`
+
+### MEASURED-REVERT Annotation
+
+`// MEASURED-REVERT: <lint>, <measured cost>, <bench id>, <significance>` —
+required whenever a lint is suppressed **because taking its advice was measured
+to be slower**. Pairs with `#[allow(clippy::<lint>)]` at the smallest scope that
+covers the loop.
+
+This is not "I disagree with the lint", and it must not be written as though it
+were. The annotation records an *experiment*: the suggestion was applied,
+benchmarked against a saved baseline, and reverted on the numbers. A reader who
+doubts it can re-run the same bench and get the same answer.
+
+Required content, all four parts:
+
+1. the lint name, so a future toolchain bump can find every site;
+2. the measured delta **and its direction**;
+3. the benchmark identifier and the fixture shape it ran on;
+4. the significance, and how many independent runs reproduced it.
+
+> Example (real, from the v0.7.6 evaluation):
+> ```rust
+> // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. Migrating this tile
+> // loop to `as_chunks` cost +74 % on `dequant_awq_int4` (criterion,
+> // 4096 × 11008, target-cpu=native, p = 0.00, reproduced across two runs).
+> // Reverted under CLAUDE.md's rule that a hot path does not change without a
+> // measured win.
+> #[allow(clippy::chunks_exact_to_as_chunks)]
+> ```
+
+**When the lint is *inapplicable* rather than costly, say that instead.** That is
+a different claim: it needs no measurement, and no future measurement can
+invalidate it. Use a plain reason comment naming the compile constraint.
+
+> Example: the `as_chunks` family takes its width as a *const generic argument*,
+> so it cannot express one derived from an associated const of a type parameter:
+> ```rust
+> // GENERIC-CONST: `as_chunks_mut::<{VECTOR_TILE * E::BYTES}>()` is rejected by
+> // stable Rust — "generic parameters may not be used in const operations".
+> #[allow(clippy::chunks_exact_to_as_chunks)]
+> ```
+
+**A crate-wide `#![allow]` is never a `MEASURED-REVERT`.** Suppressing at the
+crate root also hides the lint in code written *later*, which no measurement of
+today's code can justify. That is a policy decision: it belongs in
+`src/lib.rs` with its reasoning stated, it should say plainly that it hides
+future occurrences, and it should be revisited rather than inherited.
 
 ### BORROW Annotation
 
@@ -754,6 +804,45 @@ The `// VECTORIZED:` annotation has three states:
 Re-verify after any change to the loop body or its dependencies — the
 annotation goes back to `pending` and the verification cycle repeats.
 
+### Benchmark evidence: what a criterion baseline can and cannot show
+
+`cargo bench -- --save-baseline X` then `--baseline X` is the cheapest way to
+compare two versions of a kernel. It is a **screening** instrument, not an
+adjudicating one, and the difference is not academic.
+
+Criterion's p-value describes sampling noise *within* one run of one binary. It
+does not model the effect that dominates on this project's development host:
+whole-program code layout. The two are easy to confuse because criterion reports
+the second with the confidence of the first.
+
+**Measured, 2026-08-21**, while evaluating a `clippy::chunks_exact_to_as_chunks`
+migration: `dequant_bnb_nf4` reported **+10.6 % at p = 0.00** against a saved
+baseline while its kernel's source was **byte-identical** (`git diff` on the file
+was empty). The only thing that had changed was unrelated code elsewhere in the
+crate. `docs/perf-experiments.md` Experiment 14 independently puts this host's
+layout sensitivity at up to **23 %**.
+
+Rules that follow, not suggestions:
+
+1. **A criterion baseline comparison cannot establish a regression or a win by
+   itself.** Use it to decide what is worth measuring properly.
+2. **Below roughly 15 % on this host, treat the result as no signal** — whatever
+   the p-value says.
+3. **Any claim that reaches a commit message, `CHANGELOG.md`, or
+   `docs/perf-experiments.md` needs the interleaved best-of-N protocol in
+   [`CLAUDE.md`](CLAUDE.md) § *Performance Changes***: alternating binaries,
+   median or min of N, on an idle machine. That protocol controls for layout by
+   construction; criterion's baseline does not.
+4. **Prefer a low-noise instrument when one exists.** CodSpeed macro runners are
+   bare-metal and isolated; a result that survives there outranks a local
+   criterion delta. Note the converse trap recorded in Experiment 12: a
+   file-writing benchmark can flatten to 1.00× there because CI storage
+   dominates, so choose a benchmark whose numerator is the code under test.
+5. **Attribute a screened regression before acting on it.** Reverting a whole
+   change because a bench moved is how a genuine improvement gets discarded
+   beside a layout artefact — and, symmetrically, how a real regression gets
+   waved through as "probably noise".
+
 ### When auto-vectorization is not enough
 
 If a verified scalar loop is too slow and the compiler refuses to vectorize
@@ -892,7 +981,9 @@ Like vectorization, **verify** — do not assume:
 
 1. The determinism test (byte-identical across thread counts incl. 1) is green.
 2. The scaling win is measured (best-of-N, real fixture) and recorded in
-   `docs/perf-experiments.md` with the sequential baseline.
+   `docs/perf-experiments.md` with the sequential baseline. A criterion
+   `--baseline` delta is screening only; see
+   [Benchmark evidence](#benchmark-evidence-what-a-criterion-baseline-can-and-cannot-show).
 3. Where the platform supports it, the parallelized path is exercised under a
    race detector (ThreadSanitizer on a Linux CI runner — MSVC/Windows has no TSan;
    the disjoint-slice design is race-free by construction, so this is a backstop).

@@ -2069,7 +2069,12 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
             // the round-to-nearest-even bias-add and shift, eight lanes at a
             // time. Byte-identical arithmetic to `Bf16Out::write_scratch`,
             // which is the point: one narrowing convention, one codegen shape.
-            for (chunk, out_pair) in data.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
+            for (chunk, out_pair) in data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<2>().0.iter_mut())
+            {
                 // INDEX: `chunks_exact(4)` guarantees exactly 4 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
@@ -2095,7 +2100,12 @@ fn to_bf16_bytes<'a>(data: &'a [u8], dtype: Dtype, name: &str) -> crate::Result<
             // %ymm in `--emit=asm`, x86-64 target-cpu=native, opt-level=3 — the
             // `F16C` widening load followed by the same round-to-nearest-even
             // sequence the `F32` arm uses.
-            for (chunk, out_pair) in data.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
+            for (chunk, out_pair) in data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<2>().0.iter_mut())
+            {
                 // INDEX: `chunks_exact(2)` guarantees exactly 2 bytes per chunk.
                 #[allow(clippy::indexing_slicing)]
                 let arr: [u8; 2] = [chunk[0], chunk[1]];
@@ -2456,13 +2466,13 @@ mod quantized_gguf_tests {
                 .collect();
             match self.dtype {
                 GgufType::Q8_0 => {
-                    for block in buf.chunks_exact_mut(34) {
+                    for block in buf.as_chunks_mut::<34>().0 {
                         block[0] = 0x00;
                         block[1] = 0x3C; // f16 1.0, little-endian
                     }
                 }
                 GgufType::Q4_K => {
-                    for block in buf.chunks_exact_mut(144) {
+                    for block in buf.as_chunks_mut::<144>().0 {
                         block[0] = 0x00;
                         block[1] = 0x3C; // d    = f16 1.0
                         block[2] = 0x00;

@@ -322,7 +322,12 @@ fn encode_bnb4_core(
         // unpacking crosses byte/integer/float domains and is
         // intentionally scalar (mirrors the decode-side Pass-1 rule in
         // src/remember/bnb.rs).
-        for (bf16_pair, slot) in bf16_block.chunks_exact(2).zip(scratch_block.iter_mut()) {
+        for (bf16_pair, slot) in bf16_block
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(scratch_block.iter_mut())
+        {
             // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([bf16_pair[0], bf16_pair[1]]);
@@ -352,7 +357,12 @@ fn encode_bnb4_core(
         // loop is compute-bound. It is on the encode path, which no benchmark
         // currently reports as hot, so the honest state is `scalar fallback`
         // rather than a speculative rewrite.
-        for (pair, out_byte) in scratch_view.chunks_exact(2).zip(out_block.iter_mut()) {
+        for (pair, out_byte) in scratch_view
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(out_block.iter_mut())
+        {
             // INDEX: chunks_exact(2) guarantees exactly 2 f32 per pair
             #[allow(clippy::indexing_slicing)]
             let (val_first, val_second) = (pair[0], pair[1]);
@@ -571,7 +581,7 @@ pub fn encode_bnb4_compute_absmax(
                 reason: format!("BnB4 encode bf16 block {block_idx} out of bounds"),
             })?;
         let mut max_abs = 0.0_f32;
-        for pair in bf16_block.chunks_exact(2) {
+        for pair in bf16_block.as_chunks::<2>().0 {
             // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
@@ -947,7 +957,7 @@ pub fn encode_bnb_int8(
         // `CONVENTIONS.md` makes a release blocker at the next `vX.Y.0`. It is
         // resolved here rather than at v0.8.0 so the Python bindings do not
         // inherit an open one.
-        for (bf16_pair, out_byte) in bf16_row.chunks_exact(2).zip(out_row.iter_mut()) {
+        for (bf16_pair, out_byte) in bf16_row.as_chunks::<2>().0.iter().zip(out_row.iter_mut()) {
             // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([bf16_pair[0], bf16_pair[1]]);
@@ -1043,7 +1053,7 @@ pub fn encode_bnb_int8_compute_scb(
                 reason: format!("BnB INT8 encode bf16 row {row} out of bounds"),
             })?;
         let mut max_abs = 0.0_f32;
-        for pair in bf16_row.chunks_exact(2) {
+        for pair in bf16_row.as_chunks::<2>().0 {
             // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
