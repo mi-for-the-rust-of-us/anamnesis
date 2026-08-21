@@ -23,13 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`F16Out`'s documentation now states what it costs: 2x to 3x `Bf16Out`.**
   Both are 2 bytes per element, so nothing about the output size hints at this,
   and the doc previously discussed only range and precision. Measured across all
-  seven dequant families on x86-64 (1.99x to 3.00x) and on `aarch64` (2.10x to
+  seven dequant families on x86-64 (2.02x to 3.11x) and on `aarch64` (2.10x to
   2.93x). Two distinct mechanisms produce it: on x86-64 the `F16C` `vcvtps2ph`
   instruction narrows **4 lanes** where `BF16`'s bias-and-shift does **8**; on
   `aarch64` the narrowing is not inlined at all. Since x86-64 already has the
   inline and still pays the cost, this is the conversion rather than a fixable
   call-overhead defect. Not measured on Apple Silicon, which is stated as open.
-  `F32Out` is quantified in the same pass: **1.10x to 1.92x**, *less* than its
+  `F32Out` is quantified in the same pass: **1.09x to 1.63x**, *less* than its
   doubled output bytes suggest.
 
 - **`BnB` `INT8` dequantisation is about 3-6 % faster at `F16` output.** Measured

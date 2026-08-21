@@ -22,6 +22,22 @@
 //! crate is developed and released on, and the one `CodSpeed` cannot measure at
 //! all, its walltime instrument being `aarch64`-only with no self-hosted option.
 //!
+//! # What its numbers are NOT
+//!
+//! **Do not quote the absolute millisecond figures this harness prints.** It
+//! samples adaptively to resolve the *difference between two binaries*, which
+//! is what makes it sensitive; the absolute magnitude of either side is not a
+//! stable statistic and is not what it optimises for. Measured here: three
+//! consecutive invocations on unchanged code reported `bnb_int8` at `F16` as
+//! **75.9, 149.2 and 75.8 ms**, while every paired delta in those same runs
+//! stayed within +/-2 %.
+//!
+//! So: **this harness answers "is A faster than B", not "how long does A
+//! take".** For an absolute magnitude — including a ratio between two output
+//! widths, which is a *within-binary* comparison with no layout term between
+//! the arms — use `benches/dequant.rs` under criterion, whose 100-sample median
+//! is the right statistic for the question.
+//!
 //! # What it does not fix
 //!
 //! Pairing removes *noise*, not *bias*. Two different binaries have two
@@ -158,17 +174,25 @@ const NF4_CODEBOOK: [f32; 16] = [
     1.0,
 ];
 
-/// Knuth multiplicative hash on the index, the same filler `dequant.rs` uses, so
-/// bit patterns are stable across runs and the pair is not perturbed by fixture
-/// churn.
+/// Knuth multiplicative hash on the index, identical to
+/// `dequant.rs::fill_deterministic`, so bit patterns are stable across runs, the
+/// pair is not perturbed by fixture churn, and absolute times from the two
+/// harnesses may be compared.
 fn synth_bytes(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
     for (i, b) in v.iter_mut().enumerate() {
-        // CAST: usize -> u64 widening for the hash, then -> u8 by deliberate
-        // truncation to a byte pattern. Neither is a value-carrying conversion.
+        // CAST: usize -> u8 by deliberate truncation to a byte pattern, not a
+        // value-carrying conversion.
+        //
+        // **Byte-for-byte the expression `dequant.rs::fill_deterministic` uses**,
+        // and that matters: the two harnesses are quoted side by side (see the
+        // `F16Out` cost table), so a different filler would give different
+        // quantised values, different codebook indices and different denormal
+        // counts, making their absolute times incomparable while looking as
+        // though they compared.
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         {
-            *b = ((i as u64).wrapping_mul(2_654_435_761) >> 16) as u8;
+            *b = (i.wrapping_mul(2_654_435_761) & 0xFF) as u8;
         }
     }
     v

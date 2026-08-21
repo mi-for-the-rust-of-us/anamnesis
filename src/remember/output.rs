@@ -284,12 +284,12 @@ pub struct Bf16Out;
 /// precision, not a defect.
 ///
 /// **Measured, and it is cheaper than the byte ratio implies.** Across the
-/// seven dequant families on x86-64 (paired harness, 4096 x 11008), `F32`
-/// costs **1.10x to 1.92x** [`Bf16Out`] rather than the 2x its output bytes
+/// seven dequant families on x86-64 (criterion medians, 4096 x 11008), `F32`
+/// costs **1.09x to 1.63x** [`Bf16Out`] rather than the 2x its output bytes
 /// would suggest, because the narrowing step [`Bf16Out`] performs is itself
-/// work that `F32` simply does not do. Two outliers are worth knowing:
-/// `fp8_per_tensor` at **2.50x**, and `gguf_q4_k` at 1.92x. Compare
-/// [`F16Out`], which is the *same width as `BF16`* and yet costs 2x to 3x.
+/// work that `F32` simply does not do. Widest is `gguf_q4_k` at 1.63x,
+/// narrowest `fp8_per_tensor` at 1.09x. Compare [`F16Out`], which is the *same
+/// width as `BF16`* and yet costs 2.02x to 3.11x.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F32Out;
 
@@ -325,16 +325,25 @@ pub struct F32Out;
 ///
 /// | Kernel | `BF16` | `F16` | ratio |
 /// |---|---:|---:|---:|
-/// | `gptq_int4` | 27.5 ms | 81.8 ms | **2.97x** |
-/// | `bnb_int8` | 24.1 ms | 72.2 ms | **3.00x** |
-/// | `awq_int4` | 36.2 ms | 97.4 ms | **2.69x** |
-/// | `bnb_nf4` | 50.9 ms | 116.9 ms | **2.30x** |
-/// | `fp8_per_tensor` | 42.0 ms | 92.1 ms | **2.19x** |
-/// | `fp8_fine_grained` | 46.4 ms | 97.1 ms | **2.09x** |
-/// | `gguf_q4_k` | 32.8 ms | 65.3 ms | **1.99x** |
+/// | `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** |
+/// | `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** |
+/// | `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** |
+/// | `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** |
+/// | `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** |
+/// | `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** |
+/// | `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** |
 ///
-/// x86-64, paired harness, 4096 x 11008. `aarch64` walltime agrees on the same
-/// seven kernels at **2.10x to 2.93x**, so this is not one platform's quirk.
+/// x86-64, criterion medians from `benches/dequant.rs`, 4096 x 11008.
+/// `aarch64` walltime agrees on the same seven kernels at **2.10x to 2.93x**,
+/// so this is not one platform's quirk.
+///
+/// *Criterion rather than the paired harness, deliberately.* A ratio between
+/// two output widths is a **within-binary** comparison: both arms are compiled
+/// into the same binary, so there is no code-layout term between them, and a
+/// 100-sample median is the right statistic for an absolute magnitude.
+/// `benches/ab.rs` is built to resolve *differences between two binaries* and
+/// samples adaptively for that; its printed absolute times swing 50-100 % run
+/// to run and must not be quoted.
 ///
 /// **Two different mechanisms produce the same magnitude**, which is why the
 /// obvious fix is not one:

@@ -45,7 +45,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36× locally, and **0.99× on CodSpeed macro runners** (see the Experiment 14 postscript) — the output write is ~60 % of the wall clock (Amdahl) and is slower still on CI storage, so treat the end-to-end threading figure as host-dependent rather than a property of the code. Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 | 16 | Phase 7.6 `GGUF` `remember` moved out of the CLI — what the duplicated sequential path cost | **A duplication, not an optimisation: `amn remember model.gguf` ran a 121-line CLI transcription of `convert`'s reader that was sequential and silently ignored `--threads`, while `convert --to safetensors` on the same file ran the threaded library path and produced `SHA-256`-identical bytes. Routing the CLI at the library gives **1.24×** on `SmolLM2-135M-Q6_K` (241 → 194 ms) and **2.23×** on `Qwen2.5-1.5B-IQ2_M` (5854 → 2631 ms), medians of 5, `target-cpu=native`, output byte-identical before and after. The gap widens with model size because the fixed parse/write cost amortises, which is also why the small fixture understates it** | Shipped (v0.7.6, Phase 7.6) |
 | 17 | Phase 7.7 `clippy::chunks_exact_to_as_chunks` across the six suppressed sites in `src/` | **Unpredictable per site, and v0.7.6's figures were mostly instrument error.** 2 migrations are wins (`GPTQ` -9.87 %, `BnB` `INT8` -3 to -6 % at `F16`), 3 are measured losses (`AWQ` **+30 % aarch64 / ~+45 % x86-64**, `write_scratch` **+32 %** on `BnB` `INT8` `BF16`, `FP8` +3-5 %), 1 is unmeasurable. Identical source changes to near-identical kernels gave opposite answers, so **no site may be migrated on a sibling's number**. Secondary finding, larger than the primary one: **a static instruction count is not a proxy for wall clock** — `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 % | Shipped (v0.7.7, Phase 7.7) |
-| 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width, on both architectures — and the inline is not the lever.** x86-64 1.99x-3.00x across seven kernels, `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.10x-1.92x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
+| 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width, on both architectures — and the inline is not the lever.** x86-64 2.02x-3.11x across seven kernels, `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.09x-1.63x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
 
 ---
 
@@ -1667,17 +1667,29 @@ and no fix was attempted because none is cheap.**
 
 | Kernel | `BF16` | `F16` | ratio (x86-64) | ratio (`aarch64`) |
 |---|---:|---:|---:|---:|
-| `bnb_int8` | 24.1 ms | 72.2 ms | **3.00x** | 2.28x |
-| `gptq_int4` | 27.5 ms | 81.8 ms | **2.97x** | 2.93x |
-| `awq_int4` | 36.2 ms | 97.4 ms | **2.69x** | 2.10x |
-| `bnb_nf4` | 50.9 ms | 116.9 ms | **2.30x** | 2.33x |
-| `fp8_per_tensor` | 42.0 ms | 92.1 ms | **2.19x** | 2.21x |
-| `fp8_fine_grained` | 46.4 ms | 97.1 ms | **2.09x** | 2.13x |
-| `gguf_q4_k` | 32.8 ms | 65.3 ms | **1.99x** | 2.36x |
+| `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** | 2.36x |
+| `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** | 2.28x |
+| `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** | 2.93x |
+| `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** | 2.10x |
+| `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** | 2.13x |
+| `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** | 2.33x |
+| `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** | 2.21x |
 
-x86-64 figures are whole-kernel wall clock from the paired harness at
-4096 x 11008; `aarch64` from CodSpeed walltime. These are whole-kernel numbers,
-so the narrowing step's own share is larger than the ratios suggest.
+x86-64 figures are criterion medians from `benches/dequant.rs` at 4096 x 11008;
+`aarch64` from CodSpeed walltime. These are whole-kernel numbers, so the
+narrowing step's own share is larger than the ratios suggest.
+
+**A methodological correction was needed to produce this table, and it is worth
+more than the table.** The first version of these figures was read off
+`benches/ab.rs`'s printed absolute times. That is a misuse of a paired harness:
+tango samples adaptively to resolve the *difference between two binaries*, and
+its absolute magnitudes are not a stable statistic — re-running it gave
+`bnb_int8` `F16` as 75.9, 149.2 and 75.8 ms across three consecutive
+invocations, while every paired delta in the same runs stayed within +/-2 %.
+**A paired harness answers "is A faster than B", not "how long does A take".**
+The ratio between two output widths is a *within-binary* comparison with no
+layout term between the arms, so a criterion median is both sufficient and
+correct for it.
 
 ### Why the inlining hypothesis fails
 
@@ -1698,10 +1710,10 @@ is still 2x-3x.
 ### Incidental finding: `F32` is cheaper than its byte ratio
 
 `F32Out` doubles output bytes against `BF16`, and its documentation warned to
-expect a cost. Measured, that cost is **1.10x to 1.92x**, *below* 2x, because
+expect a cost. Measured, that cost is **1.09x to 1.63x**, *below* 2x, because
 `F32` skips the narrowing step `BF16` performs — writing more bytes but doing
-less arithmetic. Two outliers: `fp8_per_tensor` at 2.50x and `gguf_q4_k` at
-1.92x.
+less arithmetic. Widest is `gguf_q4_k` at 1.63x, narrowest `fp8_per_tensor` at
+1.09x.
 
 That inverts the intuition worth recording: **the width that costs most is the
 one that changes no bytes at all.**

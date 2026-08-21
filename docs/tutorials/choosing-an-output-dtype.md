@@ -92,7 +92,23 @@ What it costs: double the output bytes, and slower in roughly the way that impli
 
 ## Why `f16` is a trap
 
-`f16` and `bf16` are both 2 bytes per element, which makes `f16` look like a free upgrade: same size, 3 more bits of significand (11 versus 8). It is not free, and the thing it costs you is the thing quantized model weights are most likely to need.
+`f16` and `bf16` are both 2 bytes per element, which makes `f16` look like a free upgrade: same size, 3 more bits of significand (11 versus 8). It is not free, and it costs you twice: once in exponent range, and once in time.
+
+**It is 2x to 3x slower than `bf16`, at identical output size.** Measured across all seven dequantisation families (criterion medians, 4096 × 11008, x86-64):
+
+| Kernel | `bf16` | `f16` | ratio |
+|---|---:|---:|---:|
+| `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** |
+| `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** |
+| `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** |
+| `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** |
+| `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** |
+| `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** |
+| `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** |
+
+`aarch64` agrees at 2.10x to 2.93x on the same seven, so this is not one machine's quirk. Note what it means for the comparison above: **`f16` is slower than `f32`**, which writes twice the bytes. The cost is the conversion, not the traffic — on x86-64 the `F16C` instruction narrows 4 lanes per instruction where `bf16`'s shift-and-round does 8; on `aarch64` the narrowing is not inlined at all. The full write-up is [`docs/perf-experiments.md`](../perf-experiments.md), Experiment 18.
+
+The range cost is the one more likely to bite your *results*, so it comes next.
 
 `bf16` has the same exponent range as `f32`. `f16` does not. It overflows to infinity above 65504 and flushes to zero below about 2⁻²⁴. That is a much narrower window, and dequantized values can leave it: the `BnB` `INT8` path multiplies a per-row scale by an integer of up to 127, which is exactly the shape of arithmetic that can exceed 65504 on a large scale value.
 
@@ -102,7 +118,9 @@ Reach for `f16` when a downstream consumer specifically requires IEEE half and y
 
 ## Checking the cost before you commit
 
-The size estimate `inspect` reports assumes a width, so ask it for the one you actually intend. From the library:
+Two costs, and `inspect` only answers one of them. **It reports size, not time** — and as the table above shows, the two do not track each other: `f16` and `bf16` produce byte-identical output sizes while differing 2x to 3x in run time. For the time cost, use the table above rather than reasoning from the size figure.
+
+For size: the estimate `inspect` reports assumes a width, so ask it for the one you actually intend. From the library:
 
 ```rust
 use anamnesis::{InspectOptions, TargetDtype, parse};
