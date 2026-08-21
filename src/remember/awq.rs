@@ -44,7 +44,27 @@
 // stable Rust ("generic parameters may not be used in const operations"), so the
 // output stayed a `ChunksExactMut` and a homogeneous four-way zip became a mixed
 // one. `OutputElement::Tile` removed that constraint; all four now migrate
-// together. See ROADMAP.md Phase 7.7 item 1 for this kernel's own number.
+// together.
+//
+// **AND THE MIGRATION IS SLOWER HERE, WHICH IS NOT WHAT ITS TWIN DID.** First
+// CodSpeed reading, `dequant_awq_int4` against `main` at 3807c88:
+//
+//   BF16  181.87 -> 237.59 ms   +30.64 %
+//   F16   373.32 -> 402.14 ms    +7.72 %
+//   F32   262.56 -> 262.82 ms    +0.10 %
+//
+// Eighteen untouched dequant arms moved by at most 2.67 % on the same run, and
+// `GPTQ`'s three arms by at most 0.72 %, so the baseline is aligned and this is
+// roughly 11x the control spread. `GPTQ` gained 9.87 % from the structurally
+// identical change.
+//
+// Both disassemblies say the opposite, which is the point worth keeping:
+// instruction counts fell on aarch64 (806 -> 710, 736 -> 667, 737 -> 642) and on
+// x86-64 for two widths of three. Fewer instructions, more time. A static count
+// is not a proxy for wall clock even on the architecture being timed.
+//
+// This commit records the reading; it does not yet act on it. See ROADMAP.md
+// Phase 7.7 item 1.
 
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
