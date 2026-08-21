@@ -22,19 +22,28 @@
 //! - Dettmers et al., "`QLoRA`: Efficient Finetuning of Quantized Large
 //!   Language Models", `NeurIPS` 2023 (`arXiv:2305.14314`)
 
-// MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Not taken here **despite a favourable reading**, which is the honest reason
-// rather than a convenient one. Migrating this loop measured -7.6 % on
-// `dequant_bnb_int8` (i.e. faster), but that sits inside this host's own noise
-// floor: the same bench run reported +10.6 % at p = 0.00 on `dequant_bnb_nf4`
-// with byte-identical source. A reading smaller than the instrument's error is
-// not evidence. Meanwhile the structurally identical `GPTQ` and `AWQ` loops --
-// same four-way zip, same `VECTOR_TILE * E::BYTES` output that cannot migrate --
-// cost +51 % and +74 % respectively. Reverted with its twins pending a
-// measurement on hardware that can resolve the difference.
-// See CONVENTIONS.md § MEASURED-REVERT Annotation, and § Benchmark evidence for why a
-// criterion baseline alone cannot settle this.
-#![allow(clippy::chunks_exact_to_as_chunks)]
+// This module carries **no** `chunks_exact_to_as_chunks` suppression: Phase 7.7
+// item 4 measured the migration and took it.
+//
+// v0.7.6 reverted it here *despite a favourable reading* -- -7.6 % on
+// `dequant_bnb_int8`, i.e. faster -- because that sat inside the instrument's
+// own error, which the same run demonstrated by reporting +10.6 % at p = 0.00
+// on byte-identical source. Declining to bank a number smaller than the
+// instrument's floor was the right call on the evidence then available.
+//
+// A paired harness with a measured ~2 % floor ([`benches/ab.rs`]) can resolve
+// it. Three runs on x86-64, `bnb_int8` at `F16`:
+//
+//   -5.22 %, -2.87 %, -5.96 %   (all significant at a 2.5 % threshold)
+//
+// No reproduced regression at any other width or in any other family; the
+// `BF16` and `F32` arms sat inside the floor. Note the discipline that made
+// this readable: untouched kernels ran beside it as controls, and `AWQ` moving
+// +3.03 % in one run while nothing had touched it is exactly why single-run
+// readings are not trusted here.
+//
+// Bit-exactness is unchanged: the `cross_validation_bnb` and
+// `cross_validation_bnb_encode` suites pass, as does the full 700-test battery.
 
 use crate::error::AnamnesisError;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
@@ -190,7 +199,10 @@ fn dequantize_bnb4_core<E: OutputElement>(
         // INDEX: scratch.len() == block_size, guaranteed by vec![0.0f32; block_size]
         #[allow(clippy::indexing_slicing)]
         let scratch_block = &mut scratch[..block_size];
-        for (&byte, pair) in weight_block.iter().zip(scratch_block.chunks_exact_mut(2)) {
+        for (&byte, pair) in weight_block
+            .iter()
+            .zip(scratch_block.as_chunks_mut::<2>().0)
+        {
             // BITWISE: extract high nibble (bits [7:4]) and low nibble (bits [3:0])
             // CAST: u8 → usize, nibble values 0-15 used as lookup indices
             #[allow(clippy::as_conversions)]
@@ -760,20 +772,30 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         // Two passes per tile: `I8` → `f32` × scale, then narrow. Tiling at
         // `VECTOR_TILE` keeps the intermediate `f32`s in registers, so the
         // split costs no memory traffic over the pre-v0.7.4 fused loop.
-        let w_tiles = row_weights.chunks_exact(VECTOR_TILE);
-        // Read before the iterator is consumed: `remainder` borrows.
-        let tail_w = w_tiles.remainder();
-        let mut o_tiles = out_row.chunks_exact_mut(VECTOR_TILE * E::BYTES);
+        // Both streams are slices of fixed-size arrays: `as_chunks` returns its
+        // edge run beside its tiles, and `split_tiles` does the same for the
+        // output at a width the implementation knows literally.
+        let (w_tiles, tail_w) = row_weights.as_chunks::<VECTOR_TILE>();
+        let (o_tiles, o_tail) = E::split_tiles(out_row);
 
         // VECTORIZED: confirmed AVX2 vpmovsxbd + vcvtdq2ps + vmulps on %ymm
-        // (8-wide) via cargo-show-asm, x86-64 target-cpu=native, opt-level=3,
-        // for all three `E` — each dumps 6 vpmovsxbd, 6 vcvtdq2ps and 12
-        // vmulps, i.e. exactly the two packed multiplies (× SCB, × INV_127)
-        // per sign-extending load, with no vdivps/vdivss anywhere: the v0.7.3
-        // per-row division is gone rather than merely hoisted. The 2 vmulss in
-        // each dump belong to the ragged-tail loop below, which is annotated
-        // scalar fallback. The narrowing that follows is `write_scratch`'s own
-        // confirmed loop.
+        // (8-wide) in `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for
+        // all three `E`: exactly the two packed multiplies (× SCB, × INV_127)
+        // per sign-extending load, with **no vdivps/vdivss anywhere**, so the
+        // v0.7.3 per-row division is gone rather than merely hoisted.
+        //
+        // Re-read after Phase 7.7 item 4 migrated both streams of this loop to
+        // fixed-size arrays, because an annotation describing the previous shape
+        // would be false. The counts are no longer uniform across `E`, which is
+        // why they are now listed per width rather than as one figure:
+        //
+        //   Bf16Out   6 vpmovsxbd,  6 vcvtdq2ps, 12 vmulps
+        //   F32Out   16 vpmovsxbd, 16 vcvtdq2ps, 32 vmulps
+        //   F16Out    8 vpmovsxbd,  8 vcvtdq2ps, 16 vmulps
+        //
+        // The `vmulss` in each dump belong to the ragged-tail loop below, which
+        // is annotated scalar fallback. The narrowing that follows is
+        // `write_scratch`'s own confirmed loop.
         //
         // Cost of the association fix, measured because adding a multiply to a
         // bandwidth-bound loop is a hypothesis until it is not: 16.82 -> 17.48
@@ -788,14 +810,14 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
         // BF16 store inline; the split is what buys F32/F16, and the register
         // tiling is what keeps the cost to ~11% rather than the 44 KB row
         // scratch's measured 1.115x plus L2 traffic.
-        for (w_tile, o_tile) in w_tiles.zip(o_tiles.by_ref()) {
+        for (w_tile, o_tile) in w_tiles.iter().zip(o_tiles) {
             for (&w_byte, value) in w_tile.iter().zip(tile.iter_mut()) {
                 // CAST: u8 (from I8 two's complement) → i8 → f32
                 #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
                 let w_i8 = w_byte as i8;
                 *value = f32::from(w_i8) * scb_val * INV_127;
             }
-            E::write_scratch(&tile, o_tile);
+            E::write_tile(&tile, o_tile);
         }
 
         // Edge tile (< VECTOR_TILE elements). `tail_w.len() < VECTOR_TILE ==
@@ -811,7 +833,7 @@ pub fn dequantize_bnb_int8<E: OutputElement>(
                 let w_i8 = w_byte as i8;
                 *value = f32::from(w_i8) * scb_val * INV_127;
             }
-            E::write_scratch(tail_tile, o_tiles.into_remainder());
+            E::write_scratch(tail_tile, o_tail);
         }
     }
 

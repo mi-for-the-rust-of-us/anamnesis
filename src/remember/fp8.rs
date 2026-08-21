@@ -22,12 +22,27 @@
 //! types and gives each width one loop to verify rather than three per family.
 
 // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks (new in Rust 1.98).
-// Migrating these loops to `as_chunks` cost **+18 % to +21 %** on
-// `dequant_fp8_fine_grained` (criterion, 4096 x 11008, target-cpu=native,
-// p = 0.00, reproduced across four runs and unchanged by reverting the inner
-// tile loop, which is how it was isolated to this module rather than to one
-// function). `CLAUDE.md` does not allow a hot path to change without a measured
-// win, and this is a measured loss.
+//
+// **SETTLED, and the v0.7.6 figure it replaces was overstated.** That note
+// recorded +18 % to +21 % on `dequant_fp8_fine_grained` and claimed the
+// regression had been "isolated to this module rather than to one function".
+// `output.rs` simultaneously claimed the same regression "could not be isolated
+// away from here". Both shipped; they name different culprits; Phase 7.7 item 3
+// resolved it by measuring each separately.
+//
+// Migrating this module's own loop, paired harness on x86-64, two runs:
+//
+//   fp8_fine BF16   +3.21 %  /  +4.56 %    (significant at a 2.5 % threshold)
+//
+// No reproduced effect at any other width, in any other family, or on the
+// `per_tensor` arms that share this function. So the real cost of migrating
+// *this* module is about +3 to +5 %, not +18 % to +21 %: the larger v0.7.6
+// figure was a pointwise reading at a 10-23 % floor, and most of it was noise.
+//
+// It is still a measured loss with no compensating gain, so `CLAUDE.md`'s rule
+// that a hot path does not change without a measured win keeps the loop as it
+// is. The number is now small enough to be worth re-testing if the surrounding
+// code changes shape.
 //
 // Part of the module cannot take the advice at all: `as_chunks_mut::<{VECTOR_TILE
 // * E::BYTES}>()` needs its width as a const generic argument, and stable Rust
