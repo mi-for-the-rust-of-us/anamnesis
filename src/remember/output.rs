@@ -282,6 +282,14 @@ pub struct Bf16Out;
 /// step" means precisely. It doubles output bytes on a bandwidth-bound path,
 /// so expect it to be slower than [`Bf16Out`]; that is the honest cost of the
 /// precision, not a defect.
+///
+/// **Measured, and it is cheaper than the byte ratio implies.** Across the
+/// seven dequant families on x86-64 (paired harness, 4096 x 11008), `F32`
+/// costs **1.10x to 1.92x** [`Bf16Out`] rather than the 2x its output bytes
+/// would suggest, because the narrowing step [`Bf16Out`] performs is itself
+/// work that `F32` simply does not do. Two outliers are worth knowing:
+/// `fp8_per_tensor` at **2.50x**, and `gguf_q4_k` at 1.92x. Compare
+/// [`F16Out`], which is the *same width as `BF16`* and yet costs 2x to 3x.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F32Out;
 
@@ -305,6 +313,53 @@ pub struct F32Out;
 /// value no reference implementation produces, and would put the `F16`
 /// cross-validation permanently at odds with `NumPy` and `PyTorch`, which both
 /// produce infinity here.
+///
+/// # Cost: expect **2x to 3x** [`Bf16Out`], at the same output width
+///
+/// This is the surprising one, and until Phase 7.7 nothing here said it. `F16`
+/// and `BF16` are both 2 bytes per element, so there is no bandwidth story to
+/// explain it, unlike [`F32Out`]. The cost is the *conversion*.
+///
+/// Measured across every dequant family, both architectures, whole-kernel wall
+/// clock (so the narrowing is only part of each figure):
+///
+/// | Kernel | `BF16` | `F16` | ratio |
+/// |---|---:|---:|---:|
+/// | `gptq_int4` | 27.5 ms | 81.8 ms | **2.97x** |
+/// | `bnb_int8` | 24.1 ms | 72.2 ms | **3.00x** |
+/// | `awq_int4` | 36.2 ms | 97.4 ms | **2.69x** |
+/// | `bnb_nf4` | 50.9 ms | 116.9 ms | **2.30x** |
+/// | `fp8_per_tensor` | 42.0 ms | 92.1 ms | **2.19x** |
+/// | `fp8_fine_grained` | 46.4 ms | 97.1 ms | **2.09x** |
+/// | `gguf_q4_k` | 32.8 ms | 65.3 ms | **1.99x** |
+///
+/// x86-64, paired harness, 4096 x 11008. `aarch64` walltime agrees on the same
+/// seven kernels at **2.10x to 2.93x**, so this is not one platform's quirk.
+///
+/// **Two different mechanisms produce the same magnitude**, which is why the
+/// obvious fix is not one:
+///
+/// - **x86-64**: `write_scratch` here *is* inlined, and does use the `F16C`
+///   hardware instruction, but `vcvtps2ph` takes a 128-bit source — **4 lanes**
+///   where [`Bf16Out`]'s bias-add-and-shift runs **8** on `%ymm`. Half the
+///   throughput per instruction on the narrowing step, from the hardware.
+/// - **`aarch64`**: `write_scratch` here is **not inlined at all**, unlike
+///   [`Bf16Out`]'s and [`F32Out`]'s — an out-of-line call per 32-element tile.
+///
+/// So **recovering the `aarch64` inline would not close this gap**: x86-64
+/// already has the inline and still pays 2x to 3x. The conversion is the cost,
+/// not the call.
+///
+/// **Not measured on Apple Silicon.** The `aarch64` figures come from Linux
+/// server-class bare metal. M-series parts have `ARMv8.2` hardware `FP16`
+/// arithmetic and a materially different microarchitecture, so the ratio there
+/// is an open question — though both platforms measured so far agree, which
+/// makes the direction unlikely to reverse.
+///
+/// None of this is an argument against `F16`. It is the right choice when you
+/// need its 3 extra significand bits and your data fits its exponent range.
+/// It is an argument against choosing it *believing it is free* because it is
+/// the same width as the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F16Out;
 

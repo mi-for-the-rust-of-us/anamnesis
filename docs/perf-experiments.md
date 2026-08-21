@@ -45,6 +45,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36× locally, and **0.99× on CodSpeed macro runners** (see the Experiment 14 postscript) — the output write is ~60 % of the wall clock (Amdahl) and is slower still on CI storage, so treat the end-to-end threading figure as host-dependent rather than a property of the code. Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
 | 16 | Phase 7.6 `GGUF` `remember` moved out of the CLI — what the duplicated sequential path cost | **A duplication, not an optimisation: `amn remember model.gguf` ran a 121-line CLI transcription of `convert`'s reader that was sequential and silently ignored `--threads`, while `convert --to safetensors` on the same file ran the threaded library path and produced `SHA-256`-identical bytes. Routing the CLI at the library gives **1.24×** on `SmolLM2-135M-Q6_K` (241 → 194 ms) and **2.23×** on `Qwen2.5-1.5B-IQ2_M` (5854 → 2631 ms), medians of 5, `target-cpu=native`, output byte-identical before and after. The gap widens with model size because the fixed parse/write cost amortises, which is also why the small fixture understates it** | Shipped (v0.7.6, Phase 7.6) |
 | 17 | Phase 7.7 `clippy::chunks_exact_to_as_chunks` across the six suppressed sites in `src/` | **Unpredictable per site, and v0.7.6's figures were mostly instrument error.** 2 migrations are wins (`GPTQ` -9.87 %, `BnB` `INT8` -3 to -6 % at `F16`), 3 are measured losses (`AWQ` **+30 % aarch64 / ~+45 % x86-64**, `write_scratch` **+32 %** on `BnB` `INT8` `BF16`, `FP8` +3-5 %), 1 is unmeasurable. Identical source changes to near-identical kernels gave opposite answers, so **no site may be migrated on a sibling's number**. Secondary finding, larger than the primary one: **a static instruction count is not a proxy for wall clock** — `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 % | Shipped (v0.7.7, Phase 7.7) |
+| 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width, on both architectures — and the inline is not the lever.** x86-64 1.99x-3.00x across seven kernels, `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.10x-1.92x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
 
 ---
 
@@ -1651,3 +1652,68 @@ SIMD change as a win.
    as signal.
 4. **Reproduce before acting.** Every verdict above is from two or three runs;
    several single-run readings did not survive the second.
+
+## Experiment 18 — Phase 7.7: what `F16` output costs, and why the obvious fix is not one
+
+**Hypothesis.** Phase 7.7 item 1a's new `_f16` benchmark arms showed `F16`
+output running far slower than `BF16` despite both being 2 bytes per element.
+Reading the `aarch64` disassembly found `F16Out::write_scratch` was **not
+inlined** there, while `Bf16Out`'s and `F32Out`'s were — an out-of-line call per
+32-element tile. The obvious hypothesis was that recovering that inline would
+close the gap.
+
+**Verdict: the gap is real and larger than expected, the hypothesis is wrong,
+and no fix was attempted because none is cheap.**
+
+| Kernel | `BF16` | `F16` | ratio (x86-64) | ratio (`aarch64`) |
+|---|---:|---:|---:|---:|
+| `bnb_int8` | 24.1 ms | 72.2 ms | **3.00x** | 2.28x |
+| `gptq_int4` | 27.5 ms | 81.8 ms | **2.97x** | 2.93x |
+| `awq_int4` | 36.2 ms | 97.4 ms | **2.69x** | 2.10x |
+| `bnb_nf4` | 50.9 ms | 116.9 ms | **2.30x** | 2.33x |
+| `fp8_per_tensor` | 42.0 ms | 92.1 ms | **2.19x** | 2.21x |
+| `fp8_fine_grained` | 46.4 ms | 97.1 ms | **2.09x** | 2.13x |
+| `gguf_q4_k` | 32.8 ms | 65.3 ms | **1.99x** | 2.36x |
+
+x86-64 figures are whole-kernel wall clock from the paired harness at
+4096 x 11008; `aarch64` from CodSpeed walltime. These are whole-kernel numbers,
+so the narrowing step's own share is larger than the ratios suggest.
+
+### Why the inlining hypothesis fails
+
+**x86-64 already has the inline, and still pays 2x to 3x.** There,
+`F16Out::write_scratch` is inlined into its callers and does use the `F16C`
+hardware instruction. The cost is that `vcvtps2ph` takes a **128-bit source**:
+it narrows **4 lanes** per instruction, where `Bf16Out`'s round-to-nearest-even
+bias-add and shift runs **8 lanes** on `%ymm`. That is a property of the
+instruction, not a missed optimisation, and the crate's own `VECTORIZED:`
+annotation on that impl already said so — what nobody had done was measure what
+it costs.
+
+So the two architectures reach the same 2x-3x by different routes: x86-64
+through a half-width hardware conversion, `aarch64` through a missed inline.
+Fixing the `aarch64` inline would at best bring it to x86-64's position, which
+is still 2x-3x.
+
+### Incidental finding: `F32` is cheaper than its byte ratio
+
+`F32Out` doubles output bytes against `BF16`, and its documentation warned to
+expect a cost. Measured, that cost is **1.10x to 1.92x**, *below* 2x, because
+`F32` skips the narrowing step `BF16` performs — writing more bytes but doing
+less arithmetic. Two outliers: `fp8_per_tensor` at 2.50x and `gguf_q4_k` at
+1.92x.
+
+That inverts the intuition worth recording: **the width that costs most is the
+one that changes no bytes at all.**
+
+### Outcome
+
+No code change. Both `F16Out` and `F32Out` gained measured cost sections, and
+`F16Out`'s says plainly that choosing `F16` for its 3 extra significand bits is
+legitimate while choosing it *believing it free because it is the same width as
+the default* is not.
+
+**Not measured on Apple Silicon**, and that is left explicitly open: M-series
+parts have `ARMv8.2` hardware `FP16` arithmetic and a materially different
+microarchitecture. Both platforms measured so far agree, so the direction is
+unlikely to reverse, but the magnitude there is unknown.
