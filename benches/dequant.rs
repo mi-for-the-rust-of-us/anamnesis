@@ -59,9 +59,10 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{
-    Dtype, F32Out, GgufType, dequantize_awq_to_bf16, dequantize_bnb_int8_to_bf16,
-    dequantize_bnb4_to_bf16, dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16,
-    dequantize_gptq_to_bf16, dequantize_per_tensor_fp8_to_bf16,
+    Dtype, F16Out, F32Out, GgufType, dequantize_awq, dequantize_awq_to_bf16, dequantize_bnb_int8,
+    dequantize_bnb_int8_to_bf16, dequantize_bnb4, dequantize_bnb4_to_bf16, dequantize_fp8,
+    dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16, dequantize_gptq,
+    dequantize_gptq_to_bf16, dequantize_per_tensor_fp8, dequantize_per_tensor_fp8_to_bf16,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,34 @@ const LAYER_ROWS: usize = 4096;
 const LAYER_COLS: usize = 11008;
 /// Total elements per synthetic layer fixture (`4096 × 11008`).
 const LAYER_ELEMENTS: usize = LAYER_ROWS * LAYER_COLS;
+
+// ---------------------------------------------------------------------------
+// Output-width arms (`_f32` / `_f16`)
+// ---------------------------------------------------------------------------
+//
+// Why every dequant group below carries `_f32` and `_f16` arms beside its
+// `BF16` one, added in Phase 7.7.
+//
+// Until Phase 7.7 these groups were `BF16`-only, on the reasoning `GGUF`'s
+// `Q4_K` group used to record in full: `F32` doubles the output bytes on a
+// bandwidth-bound path, and `F16` is *the same width* as `BF16`, so neither
+// tells a **bandwidth** story worth a benchmark. That reasoning was sound, and
+// it is not what these arms are for.
+//
+// Phase 7.7 found a second story the `BF16` arm cannot tell, and it is about
+// **codegen**. Migrating `AWQ`'s tile loop to `as_chunks` improved `Bf16Out` by
+// 16.1 % and `F32Out` by 8.6 % on instruction count while *scalarising*
+// `F16Out`'s arithmetic — `vsubps` 11 to 6, scalar `vsubss` 2 to 41 — in the
+// same commit. A `BF16`-only suite reports that as a clean win.
+//
+// The three widths are three separate monomorphisations of the same generic
+// kernel, so they are three separate codegen outcomes. A suite that measures
+// one of them measures one of them.
+//
+// These arms **record**; they do not gate. The `BF16` id in each group remains
+// the primary regression guard, because it is the width the crate emits by
+// default and the one every historical number is quoted at. The two new ids
+// exist so a per-width divergence cannot hide behind it again.
 
 // ---------------------------------------------------------------------------
 // Deterministic synthesis helpers
@@ -114,6 +143,21 @@ fn bench_fp8_per_tensor(c: &mut Criterion) {
             black_box(out);
         });
     });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_per_tensor_fp8::<F32Out>(black_box(&weight), black_box(scale))
+                .expect("fp8 per-tensor dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_per_tensor_fp8::<F16Out>(black_box(&weight), black_box(scale))
+                .expect("fp8 per-tensor dequant f16");
+            black_box(out);
+        });
+    });
     group.finish();
 }
 
@@ -142,6 +186,33 @@ fn bench_fp8_fine_grained(c: &mut Criterion) {
                 Dtype::BF16,
             )
             .expect("fp8 fine-grained dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_fp8::<F32Out>(
+                black_box(&weight),
+                black_box(&scale_data),
+                LAYER_ROWS,
+                LAYER_COLS,
+                Dtype::BF16,
+            )
+            .expect("fp8 fine-grained dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_fp8::<F16Out>(
+                black_box(&weight),
+                black_box(&scale_data),
+                LAYER_ROWS,
+                LAYER_COLS,
+                Dtype::BF16,
+            )
+            .expect("fp8 fine-grained dequant f16");
             black_box(out);
         });
     });
@@ -192,6 +263,41 @@ fn bench_gptq_int4(c: &mut Criterion) {
             black_box(out);
         });
     });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_g128_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gptq::<F32Out>(
+                black_box(&qweight),
+                black_box(&scales),
+                black_box(&qzeros),
+                None,
+                in_features,
+                out_features,
+                group_size,
+                bits,
+                Dtype::BF16,
+            )
+            .expect("gptq dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_g128_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gptq::<F16Out>(
+                black_box(&qweight),
+                black_box(&scales),
+                black_box(&qzeros),
+                None,
+                in_features,
+                out_features,
+                group_size,
+                bits,
+                Dtype::BF16,
+            )
+            .expect("gptq dequant f16");
+            black_box(out);
+        });
+    });
     group.finish();
 }
 
@@ -231,6 +337,39 @@ fn bench_awq_int4(c: &mut Criterion) {
                 Dtype::BF16,
             )
             .expect("awq dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_g128_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_awq::<F32Out>(
+                black_box(&qweight),
+                black_box(&scales),
+                black_box(&qzeros),
+                in_features,
+                out_features,
+                group_size,
+                bits,
+                Dtype::BF16,
+            )
+            .expect("awq dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_g128_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_awq::<F16Out>(
+                black_box(&qweight),
+                black_box(&scales),
+                black_box(&qzeros),
+                in_features,
+                out_features,
+                group_size,
+                bits,
+                Dtype::BF16,
+            )
+            .expect("awq dequant f16");
             black_box(out);
         });
     });
@@ -291,6 +430,33 @@ fn bench_bnb_nf4(c: &mut Criterion) {
             black_box(out);
         });
     });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_b64_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_bnb4::<F32Out>(
+                black_box(&weight),
+                black_box(&absmax),
+                black_box(&quant_map),
+                total_elements,
+                block_size,
+            )
+            .expect("bnb nf4 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_b64_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_bnb4::<F16Out>(
+                black_box(&weight),
+                black_box(&absmax),
+                black_box(&quant_map),
+                total_elements,
+                block_size,
+            )
+            .expect("bnb nf4 dequant f16");
+            black_box(out);
+        });
+    });
     group.finish();
 }
 
@@ -326,6 +492,31 @@ fn bench_bnb_int8(c: &mut Criterion) {
             black_box(out);
         });
     });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_11008x4096_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_bnb_int8::<F32Out>(
+                black_box(&weight),
+                black_box(&scb),
+                out_features,
+                in_features,
+            )
+            .expect("bnb int8 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_11008x4096_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_bnb_int8::<F16Out>(
+                black_box(&weight),
+                black_box(&scb),
+                out_features,
+                in_features,
+            )
+            .expect("bnb int8 dequant f16");
+            black_box(out);
+        });
+    });
     group.finish();
 }
 
@@ -354,13 +545,24 @@ fn bench_gguf_q4_k(c: &mut Criterion) {
     // to be slower, and the phase claims exactness rather than speed. The
     // `BF16` id above is the regression guard, and it is unchanged.
     //
-    // No `F16` arm: same width as `BF16`, so there is no bandwidth story to
-    // tell, and its interesting properties (accuracy, exponent range) are
-    // tests rather than benchmarks.
+    // This group once said "no `F16` arm: same width as `BF16`, so there is no
+    // bandwidth story to tell". That remains true about *bandwidth*, and Phase
+    // 7.7 added the arm anyway for the reason recorded under "Output-width
+    // arms" at the top of this file: `F16` is a separate monomorphisation and
+    // therefore a separate codegen outcome. It matters here specifically
+    // because this kernel reaches its output through
+    // `OutputElement::write_scratch`, which Phase 7.7 item 2 rewrites.
     group.bench_function("synthetic_4096x11008_f32", |b| {
         b.iter(|| {
             let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::Q4_K, n_elements)
                 .expect("gguf q4_k dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F16Out>(black_box(&raw), GgufType::Q4_K, n_elements)
+                .expect("gguf q4_k dequant f16");
             black_box(out);
         });
     });
