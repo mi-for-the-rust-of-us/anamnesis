@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`OutputElement` gained a fixed-size output tile: `Tile`, `split_tiles` and
+  `write_tile`.** The trait is sealed, so this is additive for every caller.
+  `Tile` is `[u8; VECTOR_TILE * BYTES]`, written as a literal per implementation
+  because stable Rust rejects `as_chunks_mut::<{VECTOR_TILE * E::BYTES}>()` with
+  *"generic parameters may not be used in const operations"*; a `const` block
+  proves each literal equals `VECTOR_TILE * BYTES` so the three cannot drift.
+  `write_scratch` is unchanged and still handles the ragged edge run, whose
+  length is only known at run time.
+
+### Changed
+
+- **`GPTQ` dequantisation is about 10 % faster**, at every output width.
+  Measured on CodSpeed macro runners (walltime, bare metal, isolated):
+  `dequant_gptq_int4/synthetic_4096x11008_g128` went 181.75 / 182.82 ms before
+  to 164.59 / 164.00 ms after, two runs per side, **-9.87 %**, against five
+  untouched control kernels that moved -0.90 % to +1.14 % on the same runs.
+  Instruction counts for `dequantize_gptq` at `--emit=asm`,
+  `target-cpu=native`, `opt-level=3` fell 1088 to 939 for `Bf16Out` (-13.7 %),
+  979 to 919 for `F32Out` (-6.1 %) and 1108 to 906 for `F16Out` (-18.2 %),
+  which is layout-independent evidence pointing the same way. Output bytes are
+  unchanged and remain bit-exact against the `gptqmodel` goldens.
+
+  *Caveat recorded rather than buried:* `dequant_gguf_q4_k` improved 4.16 %
+  consistently across both runs without being touched, so the conservative floor
+  on the `GPTQ`-specific gain is nearer 5.7 %. Attributing that is Phase 7.7
+  item 6.
+
+- **v0.7.6's `chunks_exact` suppression comments are known to be misleading**,
+  and are corrected per kernel as Phase 7.7 measures each one. They state costs
+  of +18 % to +74 % for migrating a loop to `as_chunks`; each is true as a
+  measurement, but what was measured was a *half* migration, in which only three
+  of a tile loop's four zipped streams could move. Migrating all four is worth
+  about 10 %, not -51 %.
+
 ## [0.7.6] - 2026-08-21
 
 ### Fixed
