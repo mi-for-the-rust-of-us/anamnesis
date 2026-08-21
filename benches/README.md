@@ -23,9 +23,10 @@ checked into `tests/fixtures/`.
 
 | File | Scope | Run command |
 |---|---|---|
-| `dequant.rs` | Dequantisation kernels (decode side) — `FP8` per-tensor / fine-grained, `GPTQ` `INT4`, `AWQ` `INT4`, `BnB` `NF4`, `BnB` `INT8`, `GGUF` `Q4_K`, plus the real-world `GGUF` `Q8_0` slice from the `Ollama`-distributed `llama3.2:1b` fixture | `cargo bench --features gptq,awq,bnb,gguf --bench dequant` |
+| `dequant.rs` | Dequantisation kernels (decode side) — `FP8` per-tensor / fine-grained, `GPTQ` `INT4`, `AWQ` `INT4`, `BnB` `NF4`, `BnB` `INT8`, `GGUF` `Q4_K`, plus the real-world `GGUF` `Q8_0` slice from the `Ollama`-distributed `llama3.2:1b` fixture. Each family carries `_f32` and `_f16` arms beside its `BF16` one since **v0.7.7** — 22 ids in total | `cargo bench --features gptq,awq,bnb,gguf --bench dequant` |
 | `parsing.rs` | Header / metadata-only parses for the four supported tensor formats vs an `fs::read` baseline at the same fixture | `cargo bench --features npz,pth,gguf --bench parsing` |
-| `convert.rs` | **Whole-model, multi-threaded** paths — quantised `GGUF` → safetensors `convert()`, and `FP8` safetensors → `BF16` `remember_to_bytes` — each measured at **1 and 4 threads** | `cargo bench --features gguf --bench convert` |
+| `convert.rs` | **Whole-model, multi-threaded** paths — in-memory `convert_bytes()` and `FP8` safetensors → `BF16` `remember_to_bytes`, each at **1 and 4 threads**. The two *file-writing* groups sit behind the `bench-fileio` feature and are **not run in CI**; see below | `cargo bench --features gguf --bench convert` |
+| `ab.rs` | **Paired A/B harness** (`tango-bench`) — the instrument that decides whether a kernel change is faster. Loads both versions and interleaves them, so drift cancels. Not a `criterion` bench and not part of the statistical run | see [A/B comparisons](#ab-comparisons) |
 
 ### Why `convert.rs` benchmarks each path twice
 
@@ -66,6 +67,61 @@ sit alongside `dequant.rs` rather than letting one file balloon past
 ~600 LOC. See the [ROADMAP](../ROADMAP.md) Phase 7.5 entry.
 
 ---
+
+## Width arms, and why `BF16` alone was not enough
+
+Every `dequant_*` group carries `_f32` and `_f16` arms as well as its `BF16`
+one. The three [`OutputElement`](../src/remember/output.rs) widths are three
+separate monomorphisations, therefore three separate codegen outcomes, and a
+suite that measures one of them measures one of them.
+
+That is not theoretical. Phase 7.7 found a change that improved `AWQ`'s `BF16`
+codegen while *scalarising* its `F16` arithmetic on x86-64; a `BF16`-only suite
+reports that as a clean win. The arms then found something larger: **`F16` costs
+2.02x to 3.11x `BF16` at identical output size** — slower even than `F32`, which
+writes twice the bytes. See [`docs/perf-experiments.md`](../docs/perf-experiments.md)
+Experiment 18.
+
+The arms **record; they do not gate.** `BF16` stays each group's regression
+guard, being the default width and the one every historical number is quoted at.
+
+## The `bench-fileio` feature
+
+Two groups in `convert.rs` — `convert_gguf_to_safetensors` and
+`remember_gguf_whole_model` — write their output to a **file**, which on a CI
+runner makes storage the numerator rather than this crate. They are gated behind
+`bench-fileio`, which the CodSpeed workflow deliberately does not enable, and
+they still run under `cargo bench --all-features` where the storage is yours.
+
+The evidence: both report ~1.00x across thread budgets (`167.45` vs `168.47 ms`;
+`315.39 ms` at *both* budgets at `F32`), and their two measurement bases
+disagreed by ~2x. Together they reported a 34 % regression on a pull request that
+changed no `src/` file. `convert_bytes_gguf_to_safetensors` is the real CI guard
+for that path, at a genuine **4.62x**.
+
+## A/B comparisons
+
+`criterion` is *pointwise*: it measures one binary, and a verdict needs two runs
+whose difference carries whatever drifted in between. `ab.rs` measures the
+**pair**, interleaved sample by sample, so drift cancels:
+
+```sh
+cargo install cargo-export                     # once
+
+# on the baseline commit
+cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf
+
+# on the candidate code
+cargo bench --bench=ab --features gptq,awq,bnb,gguf --     compare target/benchmarks/ab --noise-threshold 2.5
+```
+
+Pass `--noise-threshold 2.5`: the default is 1 %, below this harness's measured
+~2 % floor, so it will star differences that are not real.
+
+**Do not quote its absolute millisecond figures.** It samples adaptively to
+resolve a *difference*, and its magnitudes swing 50-100 % between invocations
+while the paired deltas stay within ±2 %. It answers "is A faster than B", not
+"how long does A take" — for the latter use `dequant.rs` under `criterion`.
 
 ## Running
 

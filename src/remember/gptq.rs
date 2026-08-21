@@ -581,12 +581,21 @@ pub fn dequantize_gptq<E: OutputElement>(
         let (sca_tiles, sca_tail) = scales_row.as_chunks::<VECTOR_TILE>();
         let (out_tiles, out_tail) = E::split_tiles(out_row);
 
-        // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm (8-wide) in
-        // `--emit=asm`, x86-64 target-cpu=native, opt-level=3, for all three
-        // `E`; the narrowing that follows is `write_scratch`'s own confirmed
-        // loop (`vpaddd`/`vpsrld` at `Bf16Out`, `vmovups` at `F32Out`,
-        // `vcvtps2ph` at `F16Out`). This resolves an annotation that had read
-        // `pending` since the kernel was written.
+        // VECTORIZED: confirmed AVX2 vsubps + vmulps on %ymm in `--emit=asm`,
+        // x86-64 target-cpu=native, opt-level=3, for all three `E`. The
+        // narrowing that follows is `write_tile`'s own loop, and it survives
+        // here too: `vpaddd`/`vpsrld`/`vpand` at `Bf16Out`, `vmovups` at
+        // `F32Out`, `vcvtps2ph` at `F16Out`.
+        //
+        // **Re-read after Phase 7.7 migrated all four streams of this loop**,
+        // rather than left describing the shape it had before. Two things in
+        // the previous text were wrong afterwards: it named `write_scratch`,
+        // which this loop no longer calls, and the counts are not uniform
+        // across `E`. Measured now, per width:
+        //
+        //   Bf16Out   10 vsubps, 10 vmulps, 12 vpaddd,  6 vpsrld
+        //   F32Out    18 vsubps, 18 vmulps, 95 vmovups
+        //   F16Out    10 vsubps, 10 vmulps,  9 vcvtps2ph
         //
         // Measured 19.90 -> 23.44 ms at 4096 x 11008 against the v0.7.3 binary
         // (best-of-5 min of 4 interleaved rounds, release, target-cpu=native),

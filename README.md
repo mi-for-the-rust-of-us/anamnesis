@@ -220,10 +220,14 @@ Representative measured results (release build, `target-cpu=native`, best-of-5):
 - **vs the Python `GGUF` stack:** whole-model `GGUF` dequantisation is **17–28×** faster than [`gguf-py`](https://pypi.org/project/gguf/) single-threaded and **34–53×** at the default thread budget. **Not a like-for-like output:** `gguf-py` returns `float32`, anamnesis returns `BF16`, which is half the bytes and the narrower type. What is verified is that anamnesis's `BF16` is **bit-identical to `gguf-py`'s `float32` correctly rounded to `BF16`** (0 ULP, all 22 kernels), so the two agree on the numbers and differ only in the delivered width. Since that width difference is itself worth ~2× of memory traffic on a bandwidth-bound workload, halving `gguf-py`'s time as a generous correction still leaves ~9–14× and ~17–26×.
 
 These are guarded against regression by [CodSpeed](https://codspeed.io/) continuous
-benchmarking in CI, plus dev-only tracks: [Criterion runtime
-benchmarks](benches/README.md), [`dhat-rs` peak-heap assertions](tests/peak_heap_README.md)
-that hold each kernel to its documented `# Memory` ceiling, and an Ollama
-cross-validation, none of which ship in the published crate.
+benchmarking on every merge to `main` — note that its bare-metal runners are
+`aarch64`, while the numbers above are x86-64, so it watches a *different*
+architecture rather than the same one twice. Deciding whether a change is faster
+is done locally on x86-64 with a paired harness that resolves ~2 %. Alongside
+those: dev-only tracks in [Criterion runtime benchmarks](benches/README.md),
+[`dhat-rs` peak-heap assertions](tests/peak_heap_README.md) that hold each kernel
+to its documented `# Memory` ceiling, and an Ollama cross-validation, none of
+which ship in the published crate.
 
 Numbers, fixtures, and method: [Validation & tested models](docs/validation.md)
 and [`docs/perf-experiments.md`](docs/perf-experiments.md).

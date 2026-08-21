@@ -135,9 +135,12 @@ The semantics are identical to `convert`'s, and so are the trade-offs:
 - **`f32`** removes anamnesis's own narrowing step, so you get the reference
   implementation's own `f32`. Doubles the output bytes and runs slower on a
   bandwidth-bound path.
-- **`f16`** buys 3 significand bits over `bf16` and pays a far narrower exponent
-  range (overflow to infinity above 65504, flush to zero below about `2⁻²⁴`).
-  Plain IEEE semantics, never saturation.
+- **`f16`** buys 3 significand bits over `bf16` and pays twice for them. First a
+  far narrower exponent range (overflow to infinity above 65504, flush to zero
+  below about `2⁻²⁴`); plain IEEE semantics, never saturation. Second **2x to 3x
+  the run time of `bf16` at identical output size** — slower even than `f32`,
+  which writes twice the bytes, because the cost is the conversion rather than
+  the traffic.
 - **It governs dequantised tensors only.** Passthrough tensors keep their source
   dtype, so the output is legitimately mixed-dtype.
 - On a `.pth` input nothing is dequantised, so the value is accepted and inert.
@@ -184,6 +187,10 @@ Converting model.gguf -> model-f32.safetensors
   range: it overflows to infinity above 65504 and flushes to zero below about
   `2⁻²⁴`, where `bf16` shares `f32`'s range. anamnesis follows plain IEEE
   semantics rather than saturating, so its output matches NumPy and PyTorch.
+  It is also **2x to 3x slower than `bf16` at the same output size**, and so
+  slower than `f32` despite writing half the bytes: the cost is the conversion,
+  not the write. Measured per kernel in
+  [Choosing an output dtype](tutorials/choosing-an-output-dtype.md).
 - The derived output filename tracks the dtype (`model-f32.safetensors`), so a
   file never claims a width it does not hold.
 

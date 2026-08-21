@@ -58,6 +58,7 @@ A living list of the questions we and our early users have actually run into. If
   - [Why is the output `BF16` and not `float32`?](#why-is-the-output-bf16-and-not-float32)
   - [Which output dtype should I ask for?](#which-output-dtype-should-i-ask-for)
   - [Why is my `f32` output twice the size of the `bf16` one?](#why-is-my-f32-output-twice-the-size-of-the-bf16-one)
+  - [Why is `f16` slower than `bf16` when they are the same size?](#why-is-f16-slower-than-bf16-when-they-are-the-same-size)
   - [Does asking for `f32` rewrite every tensor as `float32`?](#does-asking-for-f32-rewrite-every-tensor-as-float32)
   - [Is anamnesis still bit-exact against PyTorch at `f32`?](#is-anamnesis-still-bit-exact-against-pytorch-at-f32)
 - [Parsing untrusted input](#parsing-untrusted-input)
@@ -245,6 +246,16 @@ println!("{}", info.dequantized_size);
 ```
 
 *(`InspectOptions` is taken by reference since v0.7.6, when it gained a `limits` field and stopped being `Copy`. Upgrading from v0.7.4? Add the `&`.)*
+
+### Why is `f16` slower than `bf16` when they are the same size?
+
+Because the cost is the **conversion**, not the bytes written. Both are 2 bytes per element and both produce identically sized files, but `f16` runs **2x to 3x slower** across every dequantisation kernel — measured 2.02x to 3.11x on x86-64 and 2.10x to 2.93x on `aarch64`.
+
+It is slower than `f32`, which writes *twice* as many bytes. That is the surprising part, and it is the giveaway: if this were a bandwidth story, `f32` would be the expensive one. It is not.
+
+`bf16` is the top 16 bits of an `f32` plus a rounding decision, so narrowing to it is a shift and an add, and the compiler runs 8 elements at a time. `f16` has a different exponent width, so it needs a real conversion: on x86-64 that is the `F16C` instruction, which takes a 128-bit source and so converts 4 elements per instruction rather than 8; on `aarch64` the narrowing is not inlined into the kernel at all. Two different mechanisms, the same 2x-3x.
+
+This is not an argument against `f16`. It is the right choice when a downstream consumer requires IEEE half and your values fit its range. It is an argument against picking it *because it looks free* next to `bf16`. The per-kernel numbers are in [Choosing an output dtype](tutorials/choosing-an-output-dtype.md), and the investigation is [`perf-experiments.md`](perf-experiments.md) Experiment 18.
 
 ### Does asking for `f32` rewrite every tensor as `float32`?
 
