@@ -1,6 +1,6 @@
 # Lethe — Encode-Side Walkthrough
 
-**Status:** v0.5.0 (Phase 5 step 1a/1b/1c shipped). Covers `BnB` encode only — `FP8` / `GGUF` / `IQ` / `TQ` / `MXFP4` encode land in Phase 7.5.
+**Status:** v0.5.0 (Phase 5 step 1a/1b/1c shipped). Covers `BnB` encode only — `FP8` / `GGUF` / `IQ` / `TQ` / `MXFP4` encode land in Phase 8.5.
 
 This document walks through the `lethe` namespace — the encode-side inverse of [`remember`](../src/remember/). Three audiences:
 
@@ -179,7 +179,7 @@ For a deeper read see [`src/lethe/bnb.rs`](../src/lethe/bnb.rs) (the module-leve
 
 - **No CLI `quantize` / `forget` / `convert` subcommand yet.** Phase 6 will ship `amn convert model.safetensors --to bnb-nf4 -o quantised.safetensors`. Today the kernels are library-only.
 - **No `encode_bnb4_double_quant_compute_*` convenience** (deferred to the Phase 6 conversion-CLI work).
-- **No FP8 / GPTQ / AWQ / GGUF / IQ / TQ / MXFP4 encode** — all targeted at Phase 7.5 ("Lethe Encode Completion"), shipping after the BnB encode pipeline has been validated end-to-end through Python bindings in Phase 7.
+- **No FP8 / GPTQ / AWQ / GGUF / IQ / TQ / MXFP4 encode** — all targeted at Phase 8.5 ("Lethe Encode Completion"), shipping after the BnB encode pipeline has been validated end-to-end through Python bindings in Phase 7.
 - **No Python bindings yet.** Phase 7 (PyO3) exposes the encode + decode + convert primitives to the Python ecosystem.
 - **No SIMD on encode hot paths.** Encode kernels are currently 4–6× slower than PyTorch's broadcast-vectorised quantize on `BnB4`, 32× slower on `INT8`. Phase 9 (CPU SIMD pass) is the natural target — the same loop-fission + `target-cpu=native` infrastructure that gave the decode path its 18–54× wins is the candidate retrofit on the encode side.
 
@@ -191,6 +191,6 @@ See [`ROADMAP.md`](../ROADMAP.md) for the full sequencing.
 
 - [`README.md`](../README.md) — "BitsAndBytes Quantization (Lethe — Phase 5)" section with the cross-architecture fixture table
 - [`CHANGELOG.md`](../CHANGELOG.md) — `[0.5.0]` entry block
-- [`ROADMAP.md`](../ROADMAP.md) — Phase 5 step 1a/1b/1c (shipped) + Phase 7.5 (deferred encode kernels)
+- [`ROADMAP.md`](../ROADMAP.md) — Phase 5 step 1a/1b/1c (shipped) + Phase 8.5 (deferred encode kernels)
 - [`docs/rust-ecosystem-comparison.md`](rust-ecosystem-comparison.md) — where anamnesis's encode-side coverage stands in the wider Rust + cross-language landscape
 - [`docs/perf-experiments.md`](perf-experiments.md) — case-study entry for the sign-of-zero preservation rule (Experiment 7)

@@ -103,7 +103,8 @@ use crate::remember::fp8::f32_bits_to_bf16_bits;
 /// overhead per element than the register pressure it saved.
 ///
 /// Not feature-gated: the always-on `FP8` family uses it, so it is live in
-/// every build. Contrast [`MAX_OUTPUT_BYTES`], which is a `GGUF`-only concept.
+/// every build. Contrast `MAX_OUTPUT_BYTES`, which is a `GGUF`-only concept
+/// (and so `gguf`-gated, which is why this is a plain code span).
 pub(crate) const VECTOR_TILE: usize = 32;
 
 /// Widest output element in bytes, over every [`OutputElement`] implementation.

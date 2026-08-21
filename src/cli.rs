@@ -39,6 +39,21 @@ enum Commands {
     Inspect {
         /// Path to the model file.
         path: PathBuf,
+        /// Output dtype the size estimate assumes: `bf16` (default), `f32`,
+        /// or `f16`.
+        ///
+        /// The estimate feeds the inspect-before-parse decision, so it has to
+        /// be sized at the width you actually intend to `remember` or
+        /// `convert` at: an `F32` request against a `BF16` estimate
+        /// under-reserves by exactly `2 ×`. `remember --to` fixed this same
+        /// bug for its own summary line in v0.7.4; `inspect` had no flag at
+        /// all until v0.7.6.
+        ///
+        /// Vacuous on `.pth` and `NPZ`, whose tensors are already full
+        /// precision and pass through in their source dtype. Accepted there
+        /// for the same reason `remember --to f32` is.
+        #[arg(long, default_value = "bf16")]
+        to: String,
     },
     /// Dequantize (recover precision) or convert to a target format.
     #[command(alias = "dequantize")]
@@ -76,7 +91,7 @@ enum Commands {
     /// - `safetensors` (alias `bf16`) — dequantise any quantised input to a
     ///   BF16 safetensors file (passes through unquantised inputs losslessly).
     /// - `gguf` — write an unquantised GGUF file. Quantised GGUF emit
-    ///   (`gguf-q4km`, …) is deferred to Phase 7.5 via the same dispatch.
+    ///   (`gguf-q4km`, …) is deferred to Phase 8.5 via the same dispatch.
     /// - `bnb-nf4` — encode the BF16 source into a BitsAndBytes-NF4
     ///   safetensors file (2-D tensors only; biases / norms / embeddings
     ///   pass through unchanged in BF16).
@@ -158,9 +173,10 @@ pub fn run() -> crate::Result<()> {
             let resolved = resolve_input_path(path)?;
             run_parse(&resolved)
         }
-        Commands::Inspect { path } => {
+        Commands::Inspect { path, to } => {
             let resolved = resolve_input_path(path)?;
-            run_inspect(&resolved)
+            let target: TargetDtype = to.parse()?;
+            run_inspect(&resolved, target)
         }
         Commands::Remember {
             path,
@@ -215,7 +231,7 @@ pub fn run() -> crate::Result<()> {
 /// `ollama` Cargo feature.
 ///
 /// Returns the [`crate::AnamnesisError`] variants documented on
-/// [`resolve_ollama_model`](crate::resolve_ollama_model) otherwise.
+/// `resolve_ollama_model` otherwise (requires the `ollama` feature).
 #[allow(clippy::unnecessary_wraps)]
 fn resolve_input_path(raw: PathBuf) -> crate::Result<PathBuf> {
     let s = raw.to_string_lossy();
@@ -383,32 +399,40 @@ fn run_parse_npz(path: &std::path::Path) -> crate::Result<()> {
 }
 
 #[cfg(feature = "npz")]
-fn run_inspect_npz(path: &std::path::Path) -> crate::Result<()> {
+fn run_inspect_npz(path: &std::path::Path, options: &InspectOptions) -> crate::Result<()> {
     // Header-only — no tensor data loaded.
-    let info = crate::inspect_npz(path)?;
+    let info = crate::inspect_npz_with_options(path, options)?;
     println!("{info}");
     Ok(())
 }
 
-fn run_inspect(path: &std::path::Path) -> crate::Result<()> {
+/// `inspect` for any supported format, sizing every size estimate at `target`.
+///
+/// The `target` parameter is v0.7.6's. Before it, this printed whatever the
+/// `BF16` default produced, which made `amn inspect` unable to answer the one
+/// question it exists to answer — *"how much memory will this become?"* — for a
+/// caller who intended `--to f32`. That is the identical bug v0.7.4 fixed for
+/// `remember`'s summary line and did not carry across.
+fn run_inspect(path: &std::path::Path, target: TargetDtype) -> crate::Result<()> {
+    let options = InspectOptions::new().with_output_dtype(target);
     match detect_format(path)? {
         Format::Safetensors => {
             let model = parse(path)?;
-            let info = InspectInfo::from(&model.header);
+            let info = model.inspect_with_options(&options);
             println!("{info}");
         }
         #[cfg(feature = "pth")]
         Format::Pth => {
             let parsed = crate::parse_pth(path)?;
-            let info = parsed.inspect();
+            let info = parsed.inspect_with_options(&options);
             println!("{info}");
         }
         #[cfg(feature = "npz")]
-        Format::Npz => run_inspect_npz(path)?,
+        Format::Npz => run_inspect_npz(path, &options)?,
         #[cfg(feature = "gguf")]
         Format::Gguf => {
             let parsed = crate::parse_gguf(path)?;
-            let info = parsed.inspect();
+            let info = parsed.inspect_with_options(&options);
             println!("{info}");
         }
     }
@@ -454,12 +478,32 @@ fn run_remember(
             run_remember_pth(path, output)
         }
         #[cfg(feature = "npz")]
-        Format::Npz => Err(crate::AnamnesisError::Unsupported {
-            format: "NPZ".into(),
-            detail: "NPZ tensors are already full-precision; \
-                     no dequantization or conversion needed"
-                .into(),
-        }),
+        Format::Npz => {
+            // Resolved the same way as the `.pth` arm above, and for the same
+            // reason. An `NPZ` is already full precision, so `remember` copies
+            // its arrays through in their source dtype and dequantises nothing;
+            // `--to f32` is therefore vacuous rather than wrong, and refusing it
+            // on a file that is already `F32` would be hostile.
+            //
+            // Until v0.7.6 this arm returned `Unsupported`, while
+            // `npz_to_safetensors` sat exported in the library and
+            // `amn convert file.npz --to safetensors` did the very same job.
+            // One verb, one meaning, across all four formats.
+            let to_lower = to.to_ascii_lowercase();
+            let recognised = to_lower == "safetensors" || to_lower.parse::<TargetDtype>().is_ok();
+            if !recognised {
+                return Err(crate::AnamnesisError::Unsupported {
+                    format: "NPZ".into(),
+                    detail: format!(
+                        "unsupported --to value `{to}` for .npz files \
+                         (supported: `safetensors`, `bf16`, `f32`, `f16` — NPZ \
+                         arrays are already full precision, so the dtype is \
+                         accepted but nothing is narrowed or widened)"
+                    ),
+                });
+            }
+            run_remember_npz(path, output)
+        }
         #[cfg(feature = "gguf")]
         Format::Gguf => {
             // Unlike `.pth`, a quantised `GGUF` really is dequantised here, so
@@ -480,7 +524,7 @@ fn run_remember(
                         ),
                     })?
             };
-            run_remember_gguf(path, output, target)
+            run_remember_gguf(path, output, target, threads)
         }
     }
 }
@@ -501,7 +545,7 @@ fn run_remember_safetensors(
     // a stated width, and this is its most obvious consumer.
     let info = InspectInfo::with_options(
         &model.header,
-        InspectOptions::new().with_output_dtype(target),
+        &InspectOptions::new().with_output_dtype(target),
     );
 
     let total = model.header.tensors.len();
@@ -547,6 +591,49 @@ fn run_remember_safetensors(
         output_path.display(),
         format_bytes(info.dequantized_size),
     );
+    Ok(())
+}
+
+/// `remember` for an `NPZ` input: copy every array through into a safetensors
+/// file, dequantising nothing.
+///
+/// New in v0.7.6. The library has exported `npz_to_safetensors` since Phase 3
+/// and `amn convert file.npz --to safetensors` has always performed exactly
+/// this conversion; only `remember` refused, which left one verb meaning
+/// different things on different formats — something a Python binding would
+/// have had to reproduce.
+#[cfg(feature = "npz")]
+fn run_remember_npz(path: &std::path::Path, output: Option<&std::path::Path>) -> crate::Result<()> {
+    let tensors = crate::parse_npz(path)?;
+    let info = crate::inspect_npz(path)?;
+
+    let output_path = if let Some(p) = output {
+        p.to_owned()
+    } else {
+        // Replace extension: weights.npz → weights.safetensors
+        let mut out = path.to_owned();
+        out.set_extension("safetensors");
+        out
+    };
+
+    println!(
+        "Converting {} → {}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(input)"),
+        output_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("(output)")
+    );
+    println!(
+        "  {} tensors, {}",
+        info.tensors.len(),
+        format_bytes(info.total_bytes)
+    );
+
+    crate::npz_to_safetensors(&tensors, &output_path)?;
+    println!("  Done.");
     Ok(())
 }
 
@@ -630,11 +717,21 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
 /// Gained the `target` parameter in v0.7.4. Before that it hard-coded `BF16`,
 /// which made `amn remember model.gguf --to f32` a rejection even though the
 /// 24 `GGUF` kernels had been generic over `OutputElement` since v0.7.3.
+///
+/// **v0.7.6 moved the work into the library.** This function used to carry 121
+/// lines that transcribed `convert`'s `GGUF` reader — shape reversal, dtype
+/// mapping, dequant dispatch, `TensorView` assembly, `serialize_to_file` — and
+/// the transcription was sequential where the library path is threaded, took no
+/// `threads` argument so `--threads` was silently ignored here, and left a
+/// binding with nothing to call. It is now a call to
+/// `ParsedGguf::remember_with_options`, which is the same code
+/// `convert --to safetensors` runs.
 #[cfg(feature = "gguf")]
 fn run_remember_gguf(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
     target: TargetDtype,
+    threads: Option<usize>,
 ) -> crate::Result<()> {
     let parsed = crate::parse_gguf(path)?;
     let info = parsed.inspect();
@@ -659,121 +756,18 @@ fn run_remember_gguf(
     );
     println!("  {} tensors", info.tensor_count);
 
-    // Dequantize quantized tensors to `target`; pass through non-quantized
-    // tensors (F32, F16, BF16, integer types) with their original dtype.
-    // Collect owned data because TensorView borrows data and all views
-    // must be alive simultaneously for serialize_to_file.
-    let mut tensor_data: Vec<(String, Vec<u8>, Vec<usize>, safetensors::Dtype)> =
-        Vec::with_capacity(info.tensor_count);
-    let mut dequantized_count: usize = 0;
-    // The single runtime boundary for this path: past here the width is a
-    // static type parameter, exactly as in `ParsedModel::remember`.
-    let target_st_dtype = match target {
-        TargetDtype::BF16 => safetensors::Dtype::BF16,
-        TargetDtype::F32 => safetensors::Dtype::F32,
-        TargetDtype::F16 => safetensors::Dtype::F16,
+    // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
+    // caller's `--threads`, clamped to at least 1 by the builder. Before v0.7.6
+    // this arm had no thread budget at all, so `--threads` was accepted and
+    // discarded.
+    let opts = match threads {
+        Some(n) => crate::RememberOptions::new().with_threads(n),
+        None => crate::RememberOptions::new(),
     };
-
-    for tensor in parsed.tensors() {
-        // GGUF shape is most-significant-first; safetensors expects
-        // row-major (NumPy-style). Reverse the dimensions.
-        let mut shape: Vec<usize> = tensor.shape.to_vec();
-        shape.reverse();
-
-        if tensor.dtype.is_quantized() {
-            let n_elements: usize = tensor
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| crate::AnamnesisError::Parse {
-                    reason: format!(
-                        "GGUF tensor `{}` shape {:?} element count overflows usize",
-                        tensor.name, tensor.shape
-                    ),
-                })?;
-            let data = match target {
-                TargetDtype::BF16 => crate::dequantize_gguf::<crate::Bf16Out>(
-                    &tensor.data,
-                    tensor.dtype,
-                    n_elements,
-                )?,
-                TargetDtype::F32 => {
-                    crate::dequantize_gguf::<crate::F32Out>(&tensor.data, tensor.dtype, n_elements)?
-                }
-                TargetDtype::F16 => {
-                    crate::dequantize_gguf::<crate::F16Out>(&tensor.data, tensor.dtype, n_elements)?
-                }
-            };
-            tensor_data.push((tensor.name.to_owned(), data, shape, target_st_dtype));
-            dequantized_count += 1;
-        } else {
-            let st_dtype = gguf_type_to_safetensors_dtype(tensor.dtype)?;
-            // BORROW: `.into_owned()` copies borrowed mmap bytes into an
-            // owned Vec so the data outlives the parsed borrow.
-            tensor_data.push((
-                tensor.name.to_owned(),
-                tensor.data.into_owned(),
-                shape,
-                st_dtype,
-            ));
-        }
-    }
-
-    println!(
-        "  {} dequantized to {target}, {} passed through",
-        dequantized_count,
-        tensor_data.len() - dequantized_count
-    );
-
-    // Build TensorView list and serialize to file.
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        tensor_data
-            .iter()
-            .map(|(name, data, shape, dtype)| {
-                let view = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                    .map_err(|e| crate::AnamnesisError::Parse {
-                        reason: format!("failed to create TensorView for `{name}`: {e}"),
-                    })?;
-                Ok((name.clone(), view))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-    safetensors::tensor::serialize_to_file(views, None, output_path.as_ref()).map_err(
-        // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => crate::AnamnesisError::Io(io_err),
-            other => crate::AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
-        },
-    )?;
+    parsed.remember_with_options(&output_path, target, opts)?;
 
     println!("  Output: {}", output_path.display());
     Ok(())
-}
-
-/// Maps a non-quantized [`GgufType`](crate::GgufType) to the corresponding
-/// `safetensors::Dtype`.
-#[cfg(feature = "gguf")]
-fn gguf_type_to_safetensors_dtype(dtype: crate::GgufType) -> crate::Result<safetensors::Dtype> {
-    // EXHAUSTIVE: GgufType is a foreign #[non_exhaustive] enum — new
-    // variants may be added. The wildcard covers future types.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    match dtype {
-        crate::GgufType::F32 => Ok(safetensors::Dtype::F32),
-        crate::GgufType::F16 => Ok(safetensors::Dtype::F16),
-        crate::GgufType::BF16 => Ok(safetensors::Dtype::BF16),
-        crate::GgufType::F64 => Ok(safetensors::Dtype::F64),
-        crate::GgufType::I8 => Ok(safetensors::Dtype::I8),
-        crate::GgufType::I16 => Ok(safetensors::Dtype::I16),
-        crate::GgufType::I32 => Ok(safetensors::Dtype::I32),
-        crate::GgufType::I64 => Ok(safetensors::Dtype::I64),
-        other => Err(crate::AnamnesisError::Unsupported {
-            format: "GGUF".into(),
-            detail: format!("no safetensors equivalent for {other}"),
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,8 +835,8 @@ fn build_convert_options(
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32` or
-/// `f16`.
+/// Returns [`crate::AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32`
+/// or `f16`.
 fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
     match s.to_ascii_lowercase().as_str() {
         "bf16" => Ok(crate::Dtype::BF16),

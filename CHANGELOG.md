@@ -5,6 +5,380 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The panic-freedom battery now covers the entry points this release added.**
+  `tests/no_panic.rs` says in its own header that it drives *"every re-exported
+  parse/inspect entry point of all four formats"*, and the README, the FAQ and
+  `lib.rs` all rest a headline claim on it — *no public parse/inspect entry
+  point panics or aborts on any input*. v0.7.6 added ten public entry points
+  and put none of them in it, so the claim had outrun its evidence. The `NPZ`
+  owned-bytes and reader family, the four `inspect_*_with_options` forms, and
+  the format-agnostic `detect_format_from_bytes*` / `convert_bytes` are now
+  driven over the same adversarial corpus, under both the default and a
+  hostile-tight `ParseLimits`.
+
+  Two `cargo fuzz` targets follow the same reasoning: **`fuzz_npz_bytes`**
+  completes a pattern the other three formats already had (`fuzz_pth_bytes`,
+  `fuzz_gguf_bytes`, `fuzz_safetensors_bytes` — `NPZ` was simply the last format
+  to get a byte parser), and **`fuzz_detect_format`** covers a genuinely new
+  surface: telling an `.npz` from a `.pth` means walking a `ZIP` central
+  directory built from arbitrary bytes, *before* any parser has been chosen.
+  Fifteen targets become seventeen.
+
+  `CancelToken` is also asserted `Send + Sync` in its own right rather than
+  transitively through the options structs that hold one, so a future change
+  that broke it would name the type.
+
+- **User-facing docs brought back in line with the tool.** `README.md`, the
+  `CLI` reference, the FAQ and two tutorials each carried something v0.7.6 had
+  made false: three `amn inspect` transcripts of a **quantised** `GGUF` were
+  missing the `Dequantized:` line the command now prints (regenerated against
+  the real binary, not hand-edited); the `CLI` reference still said an `.npz`
+  input to `remember` is rejected, and did not document `amn inspect --to` at
+  all; two Rust examples called `inspect_with_options` by value, which stopped
+  compiling when `InspectOptions` gained a `limits` field and lost `Copy`; and
+  a tutorial said the dtype-aware size estimate was a library-only API, which
+  `amn inspect --to` had just stopped being true. The `--threads` section also
+  now records that the `GGUF` `remember` arm accepted the flag and ignored it
+  from v0.7.2 to v0.7.5, so anyone who benchmarked it then knows the flag was
+  the problem.
+
+  Two transcripts were checked and left alone: both `GGUF` samples in
+  `convert-between-formats.md` show all-scalar files, where
+  `dequantized_size == total_bytes` and the new line is deliberately not
+  printed. Verified by re-running the conversion rather than reasoned about.
+
+- **Eight broken intra-doc links, and the `CI` job that would have caught
+  them.** Rustdoc was checked only by `publish.yml`, at release time, with
+  `--all-features` and public items only — so two classes of breakage had no
+  gate at all: a link that resolves under `--all-features` but not under an
+  intermediate feature combination, and a broken link on a `pub(crate)` item,
+  which a public-items run never reaches. `.github/workflows/ci.yml` gains a
+  `docs` job running **twelve** feature combinations with
+  `--document-private-items` and `-D warnings`; `publish.yml`'s doc step now
+  documents private items too. Fixed on the way in: a field link missing its
+  `Self::` path, an `AnamnesisError` link from a module that does not import
+  it, an ambiguous `crate::convert` (both a module and a function), a link to
+  the optional `clap` dependency, a link to the `ollama`-gated
+  `resolve_ollama_model` from a `cli`-only build, a link to the `gguf`-gated
+  `MAX_OUTPUT_BYTES` from an always-on item, an `AnamnesisError` link in
+  `parallel.rs` whose import is `parallel`-gated, and five links in the
+  vendored `ZIP` module header, which `rustdoc` cannot resolve at all in a
+  `pub(crate)` module's own `//!` docs.
+
+- **A cancelled run with nothing to do is now cancelled.** The token was polled
+  once per work item, so an **empty** item list reached no poll at all and the
+  run proceeded to write its output — contradicting the unconditional guarantee
+  `CancelToken` documents. An empty list is not exotic: an unquantised
+  safetensors model has no quantised entries, so `remember` on one dispatches
+  over nothing. `map_indexed` now polls once before the dispatch as well as once
+  per item. Found by the v0.7.6 consistency pass, pinned by
+  `an_empty_work_list_still_observes_cancellation`.
+
+- **Stale `Phase 7.5` references corrected to `Phase 8.5`** (Phase 7.6,
+  item 10), in 19 places across seven source files and two documents. Phase 7.5
+  shipped as PTH reader-generic front matter; the encode-kernel completion it
+  used to name is Phase 8.5. Two of the stale references were user-facing: the
+  `amn convert --help` text, and the error string a caller sees when asking the
+  `GGUF` writer for a quantised dtype (`"requires Phase 7.5 encoders"`). The
+  rest render on docs.rs. The one genuine Phase 7.5 reference, in the `.pth`
+  front-matter test, is untouched.
+
+- **`amn remember <file>.npz` works** (Phase 7.6, item 9) instead of returning
+  `Unsupported: NPZ tensors are already full-precision; no dequantization or
+  conversion needed`. The library has exported `npz_to_safetensors` since
+  Phase 3, and `amn convert file.npz --to safetensors` has always performed
+  exactly this conversion, so the refusal made one verb mean different things
+  on different formats — something a Python `remember()` binding would have had
+  to reproduce. `--to bf16|f32|f16|safetensors` is accepted and vacuous, the
+  way the `.pth` arm already resolved the same tension; a value that is not an
+  output dtype is still rejected. The two files are asserted byte-identical
+  (`cli_remember_accepts_npz_and_matches_convert`).
+
+- **`NPZ` archives holding Fortran-order arrays now parse** (Phase 7.6,
+  item 8), rewritten into C-order on the way out instead of rejected with
+  `Unsupported`. `NumPy` writes `fortran_order: True` for any array that is
+  `F`-contiguous and not `C`-contiguous, which a transposed view is: a plain
+  `np.savez("w.npz", w=x.T)` produces one. The rejection was defensible while
+  the audience was Rust consumers of `C`-order `SAE` archives; it is a
+  first-contact failure for a `pip install anamnesis-quant` user on a file
+  `NumPy` wrote unprompted.
+
+  Materialised rather than flagged, deliberately: everything downstream
+  (`npz_to_safetensors`, the `convert` hub, any framework loading the result)
+  assumes row-major, so an order flag a caller might ignore would be the same
+  silent-orientation trap Phase 6.10 already had to fix once for `AWQ`/`GPTQ` —
+  and a wrong orientation is not a crash, it is plausible numbers in the wrong
+  places. C-order input pays nothing: no branch inside a loop, no second
+  buffer. The transposition uses reversed strides, so rank 2 and rank *n* are
+  one code path, rank 0/1 and empty arrays are the identity, and the
+  destination buffer is charged to the caller's `ParseLimits` before it is
+  allocated.
+
+  `inspect_npz*` no longer rejects these archives either: memory order changes
+  no shape, dtype or byte count, so an inspect never had anything to reject,
+  and refusing meant a host could not run its inspect-before-parse gate on an
+  archive it would now parse happily.
+
+- **The summary `inspect` entry points accept a caller `ParseLimits`**
+  (Phase 7.6, item 7), through `InspectOptions::with_limits`. They were
+  *"intentionally limit-free"* by design, which left the call the README tells
+  a multi-tenant host to make **first** on an untrusted file as the one call it
+  could **not** tighten, an inversion of the whole premise of `ParseLimits`:
+  that a caller can always narrow a permanent floor. `NPZ` was the sharpest
+  case, having no bounded alternative at all (`GGUF` and `.pth` at least offer
+  `parse_*_front_matter_from_reader_with_limits`), a walk that is `O(entries)`
+  in both I/O and allocation, and one floor, `ZIP_MAX_ENTRIES` = `1 << 20`.
+  A hostile archive could therefore force a million-entry central directory, a
+  million `NPY` header reads, and a `Vec<NpzTensorInfo>` no caller could cap.
+  `README.md`'s untrusted-input recipe called that call "bounded"; it now is,
+  and the recipe shows how. Pinned by `inspect_npz_honours_the_caller_budget`.
+
+- **`amn remember <file>.gguf --threads N` now honours `N`** (Phase 7.6,
+  item 1). The flag reached the safetensors arm only; the `GGUF` arm took no
+  thread parameter, so the budget was parsed, validated, and discarded. It now
+  routes through `RememberOptions` like every other path, and the output stays
+  byte-identical at any thread count (pinned by
+  `remember_is_deterministic_across_thread_counts`).
+
+### Changed
+
+- **BREAKING: `InspectOptions` is no longer `Copy`, and the
+  `inspect_with_options` family takes it by reference.** It gained a
+  `limits: ParseLimits` field, and `ParseLimits` is deliberately
+  `Clone`-not-`Copy` (a `Copy` derive would trip `trivially_copy_pass_by_ref`
+  on the 16-byte struct). Following the crate's own rule for a non-`Copy`
+  argument that is only read, `ParsedModel::inspect_with_options` and its new
+  siblings take `&InspectOptions`. Callers add one `&`.
+
+- **BREAKING: every type the crate returns is now `#[non_exhaustive]`**
+  (Phase 7.6, item 4). Twenty public structs gain the attribute: the parsed
+  headers (`SafetensorsHeader`, `TensorEntry`), the quantisation configs
+  (`GptqConfig`, `AwqConfig`, `BnbConfig`) and companion sets
+  (`GptqCompanions`, `AwqCompanions`, `Bnb4Companions`), the `GGUF` types
+  (`GgufTensorInfo`, `GgufTensor`, `GgufInspectInfo`, `GgufFrontMatter`), the
+  `NPZ` types (`NpzTensor`, `NpzTensorInfo`, `NpzInspectInfo`), the `.pth`
+  types (`PthTensor`, `PthTensorInfo`, `PthInspectInfo`, `PthFrontMatter`),
+  and `BnbNf4WriteStats`. Every public **enum** has carried the attribute
+  since it was introduced, and `InspectInfo` was marked at v0.7.4 with the
+  rationale *"the Python bindings freeze this shape in Phase 8, and a struct
+  whose fields are all `pub` cannot otherwise gain one without a breaking
+  change"* — that reasoning applies to all of its siblings, and this release
+  applies it. It has to happen now: v0.8.0 mirrors this surface into a `PyPI`
+  package where a signature change is far more expensive than on `crates.io`,
+  and adding the attribute afterwards would itself be the breaking change.
+  Phase 7.6's next commit depends on it directly, since it grows
+  `GgufInspectInfo` by two fields.
+
+  **What breaks:** an external crate can no longer write a struct literal for
+  these types, nor destructure one exhaustively. Reading fields, cloning, and
+  pattern-matching with `..` are all unaffected, which covers every documented
+  usage. A side effect worth naming: the external-construction path the
+  v0.7.4 readiness audit's F-1 finding leaned on — building a
+  `SafetensorsHeader` by hand and passing it to `InspectInfo::from` to bypass
+  the upstream `safetensors` validation — is now closed at the type level as
+  well as by the saturating arithmetic that fixed it.
+
+  **Deliberately exempt:** `BnbWriteInput` and `GgufWriteTensor` stay
+  literal-constructible because callers must build them to call
+  `write_bnb_nf4_safetensors` / `write_gguf`. `ParsedModel`, `ParsedGguf` and
+  `ParsedPth` are already unconstructible through private fields.
+
+### Added
+
+- **CodSpeed guard for the item-1 fix** — a `remember_gguf_whole_model` bench
+  group (`benches/convert.rs`) at the same 1-and-4-thread budgets as its `FP8`
+  siblings. The v0.7.6 GGUF `remember` defect shipped partly *because* nothing
+  benched that path: the CLI is not benched, and there was no library
+  `ParsedGguf::remember` to bench. The 1.24×–2.23× the fix bought was therefore
+  unguarded until now.
+
+  It goes through the **file** form rather than `remember_to_bytes`, against the
+  siblings' convention, and the reason is measured: `safetensors::serialize`
+  builds one contiguous buffer in a single thread, which swamps the threaded
+  dequant and leaves `to_bytes` reporting 1.01× between 1 and 4 threads against
+  the file form's 1.18×. A guard reporting 1.01× would not notice this path
+  regressing to sequential; through the file form the same regression is a ~18 %
+  jump. Both figures, and the same ordering on a real 132 MiB `Q6_K` model, are
+  recorded at the group.
+
+- **CodSpeed guard for the in-memory pipeline** — a
+  `convert_bytes_gguf_to_safetensors` group covering the byte-form readers, the
+  magic-byte detector they dispatch on, and the writer's `Sink::Memory` arm,
+  none of which `convert`'s path-based group reaches.
+
+  It also **refutes** a hypothesis rather than confirming one. Experiment 12
+  left open whether `convert`'s modest end-to-end threading hides a reader that
+  scales ~1.9×, with the output write as the Amdahl denominator; removing the
+  write looked like the way to see the reader alone. Measured, `convert_bytes`
+  scales **worse** (1.10×) than the file path (1.34×), because the in-memory
+  verb trades one serial cost for two: an owned copy of the caller's input, and
+  a single-threaded contiguous output buffer, where the file path memory-maps
+  its input and streams its output. Experiment 12's question stays open, and the
+  reason it cannot be answered this way is recorded at the group.
+
+- **FAQ entries for the two v0.7.6 capabilities a user is most likely to want**:
+  reading an `.npz` saved from a transposed array (Fortran order), and
+  cancelling a long-running `remember` / `convert` with a `CancelToken`. The
+  untrusted-input and bound-memory answers now point at the `_with_options`
+  inspect forms that accept a budget, and the convert answer mentions
+  `convert_bytes`.
+
+- **`Format`, `detect_format`, `detect_format_from_bytes` and
+  `detect_format_from_bytes_with_limits` are public**
+  (Phase 7.6, item 6). Format detection was crate-private, so an embedder — or
+  the v0.8.0 binding — wanting the polymorphic `parse(path)` / `inspect(path)`
+  the CLI offers had to re-sniff extensions and magic bytes itself, duplicating
+  logic this crate already has and keeps correct. `detect_format` is
+  extension-first with a magic fallback for `.bin`, as before;
+  `detect_format_from_bytes` is magic-first for callers holding an artefact in
+  memory, and separates `.npz` from `.pth` (which share the `ZIP` magic) by
+  reading the central directory and looking at member names — a walk that is
+  charged to the caller's `ParseLimits` through the `_with_limits` form, which
+  is what `convert_bytes` uses, so detection is not the one untightenable step
+  in an otherwise bounded pipeline.
+
+  **The naming trap is documented rather than fixed**, because fixing it would
+  break every consumer: `anamnesis::parse()` is **safetensors-only** while
+  `amn parse` dispatches over all four formats. The CLI's polymorphism lives in
+  its own dispatch, not in the library entry point of the same name. Detect
+  first, then call that format's parser; the `Format` docs say so.
+
+- **`convert_bytes` and `convert_bytes_with_progress`** (Phase 7.6, item 3).
+  `convert` was `Path` → `Path` only while `parse` and `remember` each had
+  bytes forms, so a caller working from a download, or handing bytes across an
+  `FFI` boundary, had to round-trip through two temporary files for an
+  operation that never needed the filesystem. Feasible only now that all four
+  readers have byte entry points.
+
+  Not a second implementation: the writers gained an internal `Sink` (file or
+  buffer), so each one builds its tensor list once and differs only in the last
+  call, and the readers share their hub mapping with the path versions. The
+  test asserts byte-identical output against `convert` for every target
+  reachable from a quantised `GGUF` source. Peak memory is honestly higher and
+  documented as such — input, hub and output are all live at once, roughly
+  `input + 2 × output` against `convert`'s `input + output`.
+
+- **`CancelToken`, and `AnamnesisError::Cancelled`** (Phase 7.6, item 5).
+  Attach a token through `RememberOptions::with_cancel` or
+  `ConvertOptions::with_cancel`, keep a clone, and call `cancel()` from any
+  thread; the run stops at the next tensor boundary. Nothing in the API could
+  be interrupted before this, which mattered specifically for v0.8.0: the
+  bindings release the `GIL` around a large call, and a released `GIL` means
+  `KeyboardInterrupt` is not delivered until Rust returns — so a notebook user
+  could not `Ctrl-C` a multi-minute conversion and a web worker could not
+  honour a request timeout.
+
+  **Why a token and not a callback return value.** The obvious design is to let
+  the existing progress hook say *stop*, and it cannot work here: on the
+  parallel path that hook fires on the calling thread as each worker **joins**,
+  which is deliberate (an `FnMut` closing over a progress bar never crosses a
+  thread boundary) and which means it is not called at all while work is in
+  flight. The token is read by the workers themselves, once per tensor at the
+  point the scheduling cursor hands one out — the same once-per-item,
+  never-inside-a-kernel discipline `CONVENTIONS.md` already sanctions for the
+  cursor. Cancellation is therefore prompt (bounded by one tensor) even though
+  progress is coarse.
+
+  A cancelled run **writes no output file**: every path builds its result in
+  memory before serialising, so the check lands strictly before any byte
+  reaches the filesystem, and there is nothing to clean up. An *uncancelled*
+  token changes no output byte at any thread count. Both are tested. Costs
+  nothing when unused: `None` allocates no token and the poll is a `None`
+  check.
+
+- **`convert_with_progress`** — `remember` has had a per-tensor progress hook
+  since v0.7.2 and `convert` had none, so a caller converting a 70 B model had
+  no way to show that anything was happening. Same output bytes, same errors.
+  Documented honestly: on the parallel path it fires as each worker joins, so
+  progress arrives in bursts, which is exactly why cancellation is a token
+  rather than a return value from this callback.
+
+- **`parse_npz_bytes`, `parse_npz_bytes_with_limits`, `parse_npz_from_reader`,
+  `parse_npz_from_reader_with_limits`** (Phase 7.6, item 3). `NPZ` was the one
+  format with no in-memory or streamed parse: safetensors, `.pth` and `GGUF`
+  have each had a `parse_*_bytes` and a `parse_*_from_reader` (plus
+  `_with_limits` forms of both) since Phase 6.13, and `NPZ` had only the two
+  path-based entry points. So Phase 6.13's copy-based untrusted-input contract
+  had **no `NPZ` instance**, and a caller holding bytes — an `io.BytesIO`, an
+  HTTP response, a blob from a dataset loader — had to write a temporary file
+  first. All four entry points share one parse body with the path form, so
+  limit enforcement and `NPY` interpretation cannot drift between them.
+
+  `parse_npz_from_reader` takes `Read` alone rather than `Read + Seek`,
+  matching `parse_pth_from_reader` and `parse_gguf_from_reader`: the stream is
+  read into one bounded owned buffer and the container seeks happen over that,
+  so a pipe or an HTTP body works with no seekable adapter.
+  (`inspect_npz_from_reader` still requires `Seek`, because it deliberately
+  never buffers the archive.) `tests/parse_owned_path.rs` — the suite that
+  exists to pin exactly this contract, and that covered three formats because
+  the fourth had nothing to pin — now covers all four.
+
+- **A dequantised-size estimate for every format, and one trait to read it**
+  (Phase 7.6, item 2). `GgufInspectInfo`, `PthInspectInfo` and
+  `NpzInspectInfo` each gain `dequantized_size` and `output_dtype`, joining
+  safetensors' `InspectInfo`, and all four now implement the new sealed
+  **`InspectSummary`** trait (`tensor_count` / `current_size` /
+  `dequantized_size` / `output_dtype`, plus a provided `expansion`).
+  `InspectInfo` also gains `tensor_count`, which previously could only be
+  obtained by summing the role counters, a sum that silently under-counted
+  because `TensorRole::QuantState` has no counter of its own.
+
+  **`GGUF` is why this matters.** It is the one format whose in-memory size
+  cannot be inferred from its on-disk size, because the expansion ratio is
+  *per kernel*: a `Q2_K` tensor and a `Q6_K` tensor of equal element count
+  occupy different bytes on disk and the same bytes after dequantisation. The
+  Phase 6.8 inspect-before-parse gate had nothing to check for a `GGUF`, on the
+  format where the check matters most. The estimate is asserted to equal the
+  exact tensor-data byte count `remember` then writes, at all three widths
+  (`gguf_dequantized_size_predicts_what_remember_writes`). On `.pth` and `NPZ`
+  nothing is quantised, so the figure equals `total_bytes` at every width and
+  the dtype is recorded but vacuous.
+
+- **`inspect_*_with_options` on every entry point** - `inspect_npz_with_options`,
+  `inspect_npz_from_reader_with_options`,
+  `inspect_gguf_from_reader_with_options`,
+  `inspect_pth_from_reader_with_options`, plus `inspect_with_options` on
+  `ParsedGguf`, `ParsedPth`, `GgufFrontMatter` and `PthFrontMatter`.
+
+- **`amn inspect --to bf16|f32|f16`** - the CLI could not ask for the width it
+  intended, so its size estimate was pinned to the `BF16` assumption. That is
+  the identical bug v0.7.4 fixed for `remember`'s summary line and did not
+  carry across. On a `Q6_K` `SmolLM2-135M` the same file now reports
+  `Dequantized: 257 MB (BF16)` or `513 MB (F32)`, next to the unchanged
+  `Total size: 130 MB`.
+
+- **`ParsedGguf::remember` / `remember_with_options` / `remember_to_bytes` /
+  `remember_to_bytes_with_options`** (Phase 7.6, item 1) — whole-model
+  dequantise-and-write for a `GGUF` input, mirroring `ParsedModel`'s spelling
+  method for method. Until now the only whole-model `GGUF` `remember` in the
+  crate lived **inside the CLI**: 121 lines in `run_remember_gguf` that
+  transcribed what `convert`'s reader already did. The transcription was
+  sequential, took no thread budget (so `amn remember model.gguf --threads 8`
+  was accepted and silently ignored), and could not be called from the library
+  at all, which would have made a Python binding the third copy of the same
+  loop. Both paths now run one `hub_from_gguf`.
+
+  **Measured** (medians of 5, `--release`, `target-cpu=native`, output
+  `SHA-256`-identical before and after): `SmolLM2-135M-Q6_K` 241 → 194 ms
+  (**1.24×**), `Qwen2.5-1.5B-IQ2_M` 5854 → 2631 ms (**2.23×**). The gap widens
+  with model size as the fixed parse/write cost amortises. Recorded as
+  Experiment 16 in `docs/perf-experiments.md`.
+
+- **`NpzTensor::new` and `PthTensor::new`** — both types are *returned* by
+  `parse_npz` / `ParsedPth::tensors` **and** consumed by
+  `npz_to_safetensors[_bytes]` / `pth_to_safetensors[_bytes]`, so marking them
+  `#[non_exhaustive]` without a constructor would have silently removed a
+  capability the public encode API offers. The constructors are the
+  construction path that absorbs any field added later without breaking the
+  callers that synthesise tensors.
+- **Crate-level `# API evolution` section** (`src/lib.rs`) stating the rule
+  once — return types are non-exhaustive, encode-side inputs are not — so the
+  policy is discoverable rather than inferred from twenty attributes.
+
 ## [0.7.5] - 2026-08-18
 
 ### Added

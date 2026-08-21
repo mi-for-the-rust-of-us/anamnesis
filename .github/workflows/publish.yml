@@ -44,8 +44,11 @@ jobs:
       - name: Tests
         run: cargo test --all-features
 
+      # `--document-private-items` as well as the public surface: a broken link
+      # on a `pub(crate)` item is invisible to a public-items run, and CI's
+      # `docs` job checks the same thing across feature combinations.
       - name: Doc check
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --all-features --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
 

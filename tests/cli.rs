@@ -417,3 +417,97 @@ fn cli_version_flag() {
         "stdout: {stdout}"
     );
 }
+
+/// `amn remember` accepts an `NPZ`, which it refused until v0.7.6 while
+/// `amn convert --to safetensors` on the same file did exactly the same job.
+///
+/// The verb has to mean one thing across all four formats, or a Python binding
+/// inherits four meanings. `--to` is accepted and vacuous here, resolved the
+/// same way the `.pth` arm resolves it: nothing in an `NPZ` is quantised, so
+/// there is nothing to narrow or widen, and refusing a dtype on a file that is
+/// already that dtype would be hostile.
+#[cfg(feature = "npz")]
+#[test]
+fn cli_remember_accepts_npz_and_matches_convert() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let via_remember = dir.path().join("remember.safetensors");
+    let via_convert = dir.path().join("convert.safetensors");
+
+    let out = Command::new(binary_path())
+        .args([
+            "remember",
+            "tests/fixtures/npz_reference/gemma_scope_small.npz",
+            "-o",
+            via_remember.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run amn remember");
+    assert!(
+        out.status.success(),
+        "remember on an NPZ failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(binary_path())
+        .args([
+            "convert",
+            "tests/fixtures/npz_reference/gemma_scope_small.npz",
+            "--to",
+            "safetensors",
+            "-o",
+            via_convert.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run amn convert");
+    assert!(
+        out.status.success(),
+        "convert on an NPZ failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&via_remember).expect("read remember output"),
+        std::fs::read(&via_convert).expect("read convert output"),
+        "remember and convert must produce the same file for an NPZ input"
+    );
+}
+
+/// The vacuous dtype is accepted, and a value that is not a dtype at all is
+/// still rejected.
+#[cfg(feature = "npz")]
+#[test]
+fn cli_remember_npz_accepts_a_vacuous_dtype_but_not_nonsense() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for flag in ["bf16", "f32", "f16", "safetensors"] {
+        let out_path = dir.path().join(format!("{flag}.safetensors"));
+        let out = Command::new(binary_path())
+            .args([
+                "remember",
+                "tests/fixtures/npz_reference/gemma_scope_small.npz",
+                "--to",
+                flag,
+                "-o",
+                out_path.to_str().expect("path"),
+            ])
+            .output()
+            .expect("run amn remember");
+        assert!(
+            out.status.success(),
+            "remember --to {flag} on an NPZ failed"
+        );
+    }
+
+    let out = Command::new(binary_path())
+        .args([
+            "remember",
+            "tests/fixtures/npz_reference/gemma_scope_small.npz",
+            "--to",
+            "int8",
+        ])
+        .output()
+        .expect("run amn remember");
+    assert!(
+        !out.status.success(),
+        "a value that is not an output dtype must still be rejected"
+    );
+}

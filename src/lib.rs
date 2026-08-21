@@ -45,7 +45,7 @@
 //! | `BitsAndBytes` `INT8` encode | `bnb` | byte-exact vs `bitsandbytes`' on-disk bytes on every fixture |
 //!
 //! Subsequent encode-kernel families (`FP8`, `GGUF` legacy / `K-quants`
-//! / `IQ` / `TQ` / `MXFP4`) land in Phase 7.5 and reuse the
+//! / `IQ` / `TQ` / `MXFP4`) land in Phase 8.5 and reuse the
 //! `lethe::round_trip` harness introduced here.
 //!
 //! # Format Conversion Pipeline (Phase 6, v0.6.0)
@@ -57,7 +57,7 @@
 //! - `write_gguf` / `write_gguf_to_writer` / `GgufWriteTensor` — the
 //!   format-symmetric inverse of `parse_gguf`. Phase 6 emits scalar
 //!   dtypes only (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`); quantised
-//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 7.5 through
+//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 8.5 through
 //!   the same writer scaffold. Behind the `gguf` feature.
 //! - `npz_to_safetensors` / `npz_to_safetensors_bytes` — lossless
 //!   `NPZ → safetensors` conversion. Every `NpzDtype` variant maps
@@ -226,7 +226,27 @@
 //! built with a separate `panic = "unwind"` profile so `PyO3` can surface a panic
 //! as a catchable `PanicException`; see `docs/python-interop.md`.
 //!
-//! # Quick Start
+//! # API evolution
+//!
+//! Every type this crate *returns* is `#[non_exhaustive]`, so it can gain a
+//! field without a breaking change: the parsed headers ([`SafetensorsHeader`],
+//! [`TensorEntry`]), the per-format inspect summaries and front matter, the
+//! per-tensor views, and the quantisation configs. Construct them by calling a
+//! parse or inspect entry point, never by writing a struct literal, and read
+//! them by field or accessor. The two types a caller legitimately *builds* are
+//! exempt and stay literal-constructible (`BnbWriteInput`, `GgufWriteTensor`,
+//! both encode-side inputs); the two that are both produced and consumed
+//! (`NpzTensor`, `PthTensor`) are non-exhaustive but carry a `new`
+//! constructor for the encode direction.
+//!
+//! Public enums have carried `#[non_exhaustive]` since they were introduced,
+//! for the same reason plus the obvious one: new dtypes and new formats arrive.
+//! Match them with a wildcard arm.
+//!
+//! The rule exists because v0.8.0 mirrors this surface into a `PyPI` package,
+//! where a signature change is far more expensive than on `crates.io`, and
+//! adding the attribute later would itself be the breaking change.
+//!//! # Quick Start
 //!
 //! Path-based dequantisation (FP8 → BF16):
 //!
@@ -420,12 +440,13 @@
 #![allow(unknown_lints)]
 
 /// Command-line interface implementation shared by the `anamnesis` and
-/// `amn` binaries. Feature-gated behind `cli`; pulls in [`clap`] only
+/// `amn` binaries. Feature-gated behind `cli`; pulls in `clap` only
 /// when enabled.
 // Raw-byte backing store (memory map or owned copy) shared by every
 // parsed-model type. Crate-internal: the `Backing` enum distinguishes the
 // trusted mmap fast path from the owned-copy untrusted-input path.
 mod backing;
+pub mod cancel;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod convert;
@@ -441,9 +462,14 @@ mod parallel;
 pub mod parse;
 pub mod remember;
 
-pub use convert::{ConvertOptions, ConvertStats, ConvertTarget, convert};
+pub use cancel::CancelToken;
+pub use convert::{
+    ConvertOptions, ConvertStats, ConvertTarget, Format, convert, convert_bytes,
+    convert_bytes_with_progress, convert_with_progress, detect_format, detect_format_from_bytes,
+    detect_format_from_bytes_with_limits,
+};
 pub use error::{AnamnesisError, Result};
-pub use inspect::{InspectInfo, InspectOptions, format_bytes};
+pub use inspect::{InspectInfo, InspectOptions, InspectSummary, format_bytes};
 #[cfg(feature = "bnb")]
 pub use lethe::{
     BnbNf4WriteStats, BnbWriteInput, FP4_CODEBOOK, NF4_BLOCK_SIZE, NF4_CODEBOOK, classify_inputs,
@@ -467,23 +493,26 @@ pub use parse::{
 #[cfg(feature = "gguf")]
 pub use parse::{
     GgufFrontMatter, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
-    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf, inspect_gguf_from_reader, parse_gguf,
-    parse_gguf_bytes, parse_gguf_bytes_with_limits, parse_gguf_from_reader,
-    parse_gguf_from_reader_with_limits, parse_gguf_front_matter_from_reader,
-    parse_gguf_front_matter_from_reader_with_limits, parse_gguf_with_limits, write_gguf,
-    write_gguf_to_writer,
+    GgufTensorInfo, GgufType, GgufWriteTensor, ParsedGguf, inspect_gguf_from_reader,
+    inspect_gguf_from_reader_with_options, parse_gguf, parse_gguf_bytes,
+    parse_gguf_bytes_with_limits, parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
+    parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
+    parse_gguf_with_limits, write_gguf, write_gguf_to_writer,
 };
 #[cfg(feature = "npz")]
 pub use parse::{
     NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo, inspect_npz, inspect_npz_from_reader,
-    parse_npz, parse_npz_with_limits,
+    inspect_npz_from_reader_with_options, inspect_npz_with_options, parse_npz, parse_npz_bytes,
+    parse_npz_bytes_with_limits, parse_npz_from_reader, parse_npz_from_reader_with_limits,
+    parse_npz_with_limits,
 };
 #[cfg(feature = "pth")]
 pub use parse::{
     ParsedPth, PthDtype, PthFrontMatter, PthInspectInfo, PthTensor, PthTensorInfo,
-    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
-    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_front_matter_from_reader,
-    parse_pth_front_matter_from_reader_with_limits, parse_pth_with_limits,
+    inspect_pth_from_reader, inspect_pth_from_reader_with_options, parse_pth, parse_pth_bytes,
+    parse_pth_bytes_with_limits, parse_pth_from_reader, parse_pth_from_reader_with_limits,
+    parse_pth_front_matter_from_reader, parse_pth_front_matter_from_reader_with_limits,
+    parse_pth_with_limits,
 };
 pub use remember::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(feature = "awq")]

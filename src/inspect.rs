@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::limits::ParseLimits;
 use crate::model::TargetDtype;
 use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRole};
 
@@ -24,7 +25,7 @@ use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRol
 /// [`ConvertOptions`](crate::ConvertOptions): one spelling for one concept
 /// across the three option types.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectOptions {
     /// Output dtype the dequantised-size estimate assumes.
     ///
@@ -32,17 +33,33 @@ pub struct InspectOptions {
     /// [`ParsedModel::remember`](crate::ParsedModel::remember)'s own default,
     /// so `inspect()` and an unqualified `remember()` always agree.
     pub output_dtype: TargetDtype,
+    /// Resource budget applied to the parse the inspect performs, if any.
+    ///
+    /// Read **only** by the entry points that read an artefact —
+    /// `inspect_npz[_from_reader]_with_options`,
+    /// `inspect_gguf_from_reader_with_options`,
+    /// `inspect_pth_from_reader_with_options`. The methods that summarise an
+    /// **already-parsed** value
+    /// ([`ParsedModel::inspect_with_options`](crate::ParsedModel::inspect_with_options)
+    /// and its `GGUF` / `.pth` counterparts) have nothing left to bound and
+    /// ignore it: the budget that mattered was the one passed to the parse.
+    ///
+    /// Defaults to [`ParseLimits::default`], i.e. unbounded beyond the
+    /// permanent per-format caps. Added in v0.7.6, because before it there was
+    /// **no way at all** to bound a summary inspect — the recommended first
+    /// call on an untrusted file was the one call a caller could not tighten,
+    /// which inverts the whole point of [`ParseLimits`].
+    pub limits: ParseLimits,
 }
 
 impl InspectOptions {
-    /// Returns options with the built-in defaults (a `BF16` size estimate).
-    ///
-    /// `const`: the struct is a single `Copy` enum, so there is nothing to
-    /// allocate.
+    /// Returns options with the built-in defaults: a `BF16` size estimate and
+    /// an unbounded budget.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             output_dtype: TargetDtype::BF16,
+            limits: ParseLimits::unbounded(),
         }
     }
 
@@ -50,6 +67,16 @@ impl InspectOptions {
     #[must_use]
     pub const fn with_output_dtype(mut self, dtype: TargetDtype) -> Self {
         self.output_dtype = dtype;
+        self
+    }
+
+    /// Sets the resource budget for the parse this inspect performs.
+    ///
+    /// Ignored by the methods that summarise an already-parsed value; see
+    /// [`limits`](Self::limits).
+    #[must_use]
+    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
+        self.limits = limits;
         self
     }
 }
@@ -77,6 +104,15 @@ impl Default for InspectOptions {
 pub struct InspectInfo {
     /// Detected quantization scheme (e.g., `FineGrainedFp8`, `PerTensorFp8`).
     pub format: QuantScheme,
+    /// Number of tensors the header declares, counting **every** role.
+    ///
+    /// The role-specific counts below partition this total, so they sum to it;
+    /// summing them was the only way to obtain it before v0.7.6, and that sum
+    /// silently under-counted, because [`TensorRole::QuantState`] has no
+    /// counter of its own. Present so
+    /// [`InspectSummary::tensor_count`] means the same thing here as it does
+    /// for every other format.
+    pub tensor_count: usize,
     /// Number of quantized weight tensors.
     pub quantized: usize,
     /// Number of scale factor tensors (non-zero only for fine-grained `FP8`).
@@ -115,15 +151,22 @@ impl From<&SafetensorsHeader> for InspectInfo {
     /// The `BF16` special case of `InspectInfo::with_options`, preserved so
     /// every pre-v0.7.4 caller compiles unchanged.
     fn from(header: &SafetensorsHeader) -> Self {
-        Self::with_options(header, InspectOptions::new())
+        Self::with_options(header, &InspectOptions::new())
     }
 }
 
 impl InspectInfo {
     /// Builds the summary, sizing [`dequantized_size`](Self::dequantized_size)
     /// for `options.output_dtype`.
-    pub(crate) fn with_options(header: &SafetensorsHeader, options: InspectOptions) -> Self {
-        let out_bytes = u64::try_from(options.output_dtype.byte_size()).unwrap_or(2);
+    pub(crate) fn with_options(header: &SafetensorsHeader, options: &InspectOptions) -> Self {
+        // By reference, not by value: `InspectOptions` stopped being `Copy` when
+        // it gained `limits`, and the crate's rule for a non-`Copy` argument that
+        // is only read is `&T`. `options.limits` is deliberately untouched here —
+        // this summarises a header already parsed under whatever budget the parse
+        // was given.
+        let output_dtype = options.output_dtype;
+        let out_bytes = u64::try_from(output_dtype.byte_size()).unwrap_or(2);
+        let tensor_count = header.tensors.len();
         let quantized = header.quantized_count();
         let scales = header.scale_count();
         let passthrough = header.passthrough_count();
@@ -198,6 +241,7 @@ impl InspectInfo {
 
         Self {
             format: header.scheme,
+            tensor_count,
             quantized,
             scales,
             passthrough,
@@ -208,7 +252,7 @@ impl InspectInfo {
             nested_scales,
             current_size,
             dequantized_size,
-            output_dtype: options.output_dtype,
+            output_dtype,
         }
     }
 
@@ -309,6 +353,111 @@ impl fmt::Display for InspectInfo {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InspectSummary — the one question asked of four formats
+// ---------------------------------------------------------------------------
+
+/// Seals [`InspectSummary`] against outside implementations.
+///
+/// The trait describes what *this crate's* four inspect types report; an
+/// external implementation could not be produced by any entry point here, so
+/// permitting one would only invite a type that the inspect-before-parse gate
+/// cannot actually be handed. Same shape as `OutputElement`'s seal.
+pub(crate) mod sealed {
+    /// Implemented only for the four inspect summaries in this crate.
+    pub trait Sealed {}
+}
+
+/// The four numbers every format's inspect can answer, whatever else it carries.
+///
+/// Before v0.7.6 only safetensors' [`InspectInfo`] could answer the third and
+/// fourth: `GgufInspectInfo`, `PthInspectInfo` and `NpzInspectInfo` reported
+/// on-disk totals only, so the [`ParseLimits`] inspect-before-parse gate could
+/// not ask *"how much memory will this become at the width I intend"* about a
+/// `GGUF` — the one format whose answer cannot be guessed from the file size,
+/// because the expansion ratio is per-kernel (a `Q2_K` tensor and a `Q6_K`
+/// tensor of equal length expand by different multiples).
+///
+/// Implementations are per-format and the trait is sealed; obtain one from that
+/// format's `inspect*` entry point.
+///
+/// ```rust
+/// # #[cfg(feature = "gguf")]
+/// # fn run(info: &anamnesis::GgufInspectInfo) {
+/// use anamnesis::InspectSummary;
+///
+/// // The same three lines read every format's summary.
+/// let on_disk = info.current_size();
+/// let in_memory = info.dequantized_size();
+/// let width = info.output_dtype();
+/// # let _ = (on_disk, in_memory, width);
+/// # }
+/// ```
+pub trait InspectSummary: sealed::Sealed {
+    /// Number of tensors the artefact declares.
+    #[must_use]
+    fn tensor_count(&self) -> usize;
+
+    /// Total tensor-data size **as stored**, in bytes.
+    ///
+    /// What the file costs to hold or transfer, before any dequantisation.
+    #[must_use]
+    fn current_size(&self) -> u64;
+
+    /// Estimated tensor-data size in bytes **after** dequantisation to
+    /// [`output_dtype`](Self::output_dtype).
+    ///
+    /// This is the figure the inspect-before-parse policy gate checks. It is
+    /// equal to [`current_size`](Self::current_size) for the formats that store
+    /// nothing block-quantised (`NPZ`, `.pth`), and strictly larger for a
+    /// quantised safetensors or `GGUF`.
+    ///
+    /// Saturating: an absurd declared shape yields [`u64::MAX`], which a gate
+    /// reads as "too big" — the fail-closed direction.
+    #[must_use]
+    fn dequantized_size(&self) -> u64;
+
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// Carried alongside the figure so a number can never be read without the
+    /// width it was computed for. On `NPZ` and `.pth` the width is *vacuous*
+    /// rather than wrong: nothing is dequantised, so the requested dtype is
+    /// recorded and changes no byte — the same way `remember --to f32` on a
+    /// `.pth` is accepted and narrows nothing.
+    #[must_use]
+    fn output_dtype(&self) -> TargetDtype;
+
+    /// Bytes of precision that dequantisation restores, i.e.
+    /// `dequantized_size - current_size`.
+    ///
+    /// Zero when the artefact is unquantised. Provided rather than required:
+    /// no implementation needs to override it.
+    #[must_use]
+    fn expansion(&self) -> u64 {
+        self.dequantized_size().saturating_sub(self.current_size())
+    }
+}
+
+impl sealed::Sealed for InspectInfo {}
+
+impl InspectSummary for InspectInfo {
+    fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    fn current_size(&self) -> u64 {
+        self.current_size
+    }
+
+    fn dequantized_size(&self) -> u64 {
+        self.dequantized_size
+    }
+
+    fn output_dtype(&self) -> TargetDtype {
+        self.output_dtype
     }
 }
 
@@ -536,8 +685,10 @@ mod tests {
             (TargetDtype::F16, 2),
             (TargetDtype::F32, 4),
         ] {
-            let info =
-                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            let info = InspectInfo::with_options(
+                &header,
+                &InspectOptions::new().with_output_dtype(target),
+            );
             assert_eq!(
                 info.dequantized_size,
                 quantized_elements * width + passthrough_bytes,
@@ -554,7 +705,7 @@ mod tests {
     fn default_options_match_the_bare_from_impl() {
         let header = fp8_header();
         let bare = InspectInfo::from(&header);
-        let explicit = InspectInfo::with_options(&header, InspectOptions::new());
+        let explicit = InspectInfo::with_options(&header, &InspectOptions::new());
         assert_eq!(bare.dequantized_size, explicit.dequantized_size);
         assert_eq!(bare.output_dtype, TargetDtype::BF16);
     }
@@ -589,8 +740,10 @@ mod tests {
         };
 
         for target in [TargetDtype::BF16, TargetDtype::F16, TargetDtype::F32] {
-            let info =
-                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            let info = InspectInfo::with_options(
+                &header,
+                &InspectOptions::new().with_output_dtype(target),
+            );
             // The exact figure is meaningless once saturated; the contract is
             // only that we reached here without a panic/wrap and produced the
             // fail-closed sentinel.
@@ -625,8 +778,10 @@ mod tests {
         };
         // 1024 stored bytes -> 2048 values.
         for (target, want) in [(TargetDtype::BF16, 2048 * 2), (TargetDtype::F32, 2048 * 4)] {
-            let info =
-                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            let info = InspectInfo::with_options(
+                &header,
+                &InspectOptions::new().with_output_dtype(target),
+            );
             assert_eq!(info.dequantized_size, want, "{target}");
         }
     }
@@ -662,8 +817,10 @@ mod tests {
                 awq_config: None,
                 bnb_config: None,
             };
-            let info =
-                InspectInfo::with_options(&header, InspectOptions::new().with_output_dtype(target));
+            let info = InspectInfo::with_options(
+                &header,
+                &InspectOptions::new().with_output_dtype(target),
+            );
 
             assert_eq!(info.output_dtype, target);
             assert_eq!(info.dequantized_size, want_bytes, "{target}");
@@ -688,6 +845,9 @@ mod tests {
     #[test]
     fn display_per_tensor_fp8() {
         let info = InspectInfo {
+            // Set explicitly: the role counts below partition it, and the
+            // `Display` under test does not read it.
+            tensor_count: 0,
             format: QuantScheme::PerTensorFp8,
             quantized: 224,
             scales: 0,
@@ -713,6 +873,9 @@ mod tests {
     #[test]
     fn display_fine_grained_fp8() {
         let info = InspectInfo {
+            // Set explicitly: the role counts below partition it, and the
+            // `Display` under test does not read it.
+            tensor_count: 0,
             format: QuantScheme::FineGrainedFp8,
             quantized: 180,
             scales: 180,
@@ -737,6 +900,9 @@ mod tests {
     #[test]
     fn display_fine_grained_fp8_bf16_scales() {
         let info = InspectInfo {
+            // Set explicitly: the role counts below partition it, and the
+            // `Display` under test does not read it.
+            tensor_count: 0,
             format: QuantScheme::FineGrainedFp8,
             quantized: 180,
             scales: 180,
@@ -759,6 +925,9 @@ mod tests {
     #[test]
     fn display_unquantized_omits_lethe() {
         let info = InspectInfo {
+            // Set explicitly: the role counts below partition it, and the
+            // `Display` under test does not read it.
+            tensor_count: 0,
             format: QuantScheme::Unquantized,
             quantized: 0,
             scales: 0,

@@ -22,7 +22,7 @@ pub(crate) mod zip;
 pub mod gguf;
 
 /// `GGUF` file writing — the format-symmetric inverse of [`gguf`]. Scalar
-/// dtype passthrough only in Phase 6; quantised emit lands in Phase 7.5.
+/// dtype passthrough only in Phase 6; quantised emit lands in Phase 8.5.
 #[cfg(feature = "gguf")]
 pub mod gguf_write;
 
@@ -41,7 +41,8 @@ pub(crate) mod utils;
 #[cfg(feature = "gguf")]
 pub use gguf::{
     GgufFrontMatter, GgufInspectInfo, GgufMetadataArray, GgufMetadataValue, GgufTensor,
-    GgufTensorInfo, GgufType, ParsedGguf, inspect_gguf_from_reader, parse_gguf, parse_gguf_bytes,
+    GgufTensorInfo, GgufType, ParsedGguf, inspect_gguf_from_reader,
+    inspect_gguf_from_reader_with_options, parse_gguf, parse_gguf_bytes,
     parse_gguf_bytes_with_limits, parse_gguf_from_reader, parse_gguf_from_reader_with_limits,
     parse_gguf_front_matter_from_reader, parse_gguf_front_matter_from_reader_with_limits,
     parse_gguf_with_limits,
@@ -51,16 +52,19 @@ pub use gguf_write::{GgufWriteTensor, write_gguf, write_gguf_to_writer};
 #[cfg(feature = "npz")]
 pub use npz::{
     NpzDtype, NpzInspectInfo, NpzTensor, NpzTensorInfo, inspect_npz, inspect_npz_from_reader,
-    parse_npz, parse_npz_with_limits,
+    inspect_npz_from_reader_with_options, inspect_npz_with_options, parse_npz, parse_npz_bytes,
+    parse_npz_bytes_with_limits, parse_npz_from_reader, parse_npz_from_reader_with_limits,
+    parse_npz_with_limits,
 };
 #[cfg(feature = "ollama")]
 pub use ollama::resolve_ollama_model;
 #[cfg(feature = "pth")]
 pub use pth::{
     ParsedPth, PthDtype, PthFrontMatter, PthInspectInfo, PthTensor, PthTensorInfo,
-    inspect_pth_from_reader, parse_pth, parse_pth_bytes, parse_pth_bytes_with_limits,
-    parse_pth_from_reader, parse_pth_from_reader_with_limits, parse_pth_front_matter_from_reader,
-    parse_pth_front_matter_from_reader_with_limits, parse_pth_with_limits,
+    inspect_pth_from_reader, inspect_pth_from_reader_with_options, parse_pth, parse_pth_bytes,
+    parse_pth_bytes_with_limits, parse_pth_from_reader, parse_pth_from_reader_with_limits,
+    parse_pth_front_matter_from_reader, parse_pth_front_matter_from_reader_with_limits,
+    parse_pth_with_limits,
 };
 pub use safetensors::{
     AwqCompanions, AwqConfig, Bnb4Companions, BnbConfig, Dtype, GptqCompanions, GptqConfig,

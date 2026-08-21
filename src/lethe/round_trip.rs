@@ -4,7 +4,7 @@
 //!
 //! Every encode kernel in [`lethe`](mod@crate::lethe) whose forward map is
 //! a nearest-codebook-entry lookup (`NF4`, `FP4`, every `GGUF` family
-//! shipping in Phase 7.5) shares one validation property: the codebook
+//! shipping in Phase 8.5) shares one validation property: the codebook
 //! itself is the oracle. If the codebook entries are distinct, then for
 //! every valid index `i` and every non-`NaN` scale `s`,
 //!
@@ -28,7 +28,7 @@
 //! codebook anamnesis parses.
 //!
 //! This module hosts the harness primitives that Phase 5 (`BnB`) and
-//! Phase 7.5 (`FP8`, `GGUF` …) wire their kernels through. Each helper
+//! Phase 8.5 (`FP8`, `GGUF` …) wire their kernels through. Each helper
 //! constructs a minimal synthetic input that exercises every valid index
 //! at every supplied scale, then asserts byte-equal recovery.
 

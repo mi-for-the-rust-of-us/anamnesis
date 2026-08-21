@@ -143,6 +143,15 @@ pub struct ConvertOptions {
     /// is a packaging concern for a downstream crate.
     #[cfg(feature = "gguf")]
     pub gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
+    /// Cooperative cancellation handle, polled once per tensor.
+    ///
+    /// `None` (the default) means the run cannot be cancelled and costs
+    /// nothing: no token is allocated and the poll is a `None` check. `Some`
+    /// makes the run stop at the next tensor boundary once
+    /// [`CancelToken::cancel`](crate::CancelToken::cancel) is called from any
+    /// thread, returning [`AnamnesisError::Cancelled`] with no output file
+    /// written.
+    pub cancel: Option<crate::CancelToken>,
     /// Element type written for tensors this conversion **dequantises**.
     /// `None` (the default) means [`Dtype::BF16`], which is what every release
     /// before v0.7.3 emitted unconditionally.
@@ -195,6 +204,17 @@ impl ConvertOptions {
     #[must_use]
     pub fn with_limits(mut self, limits: ParseLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Attaches a cancellation handle, polled once per tensor.
+    ///
+    /// Keep a clone: the token is how another thread — a signal handler, a
+    /// watchdog, a request-timeout task — reaches an in-flight call. See
+    /// [`crate::cancel`] for the `PyO3` shape this exists for.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -290,8 +310,22 @@ pub(crate) struct Hub {
 // ---------------------------------------------------------------------------
 
 /// A detected input format.
+///
+/// Public since v0.7.6. It was crate-private, which meant an embedder — or the
+/// v0.8.0 Python binding — that wanted the polymorphic `parse(path)` /
+/// `inspect(path)` the CLI offers had to re-sniff extensions and magic bytes
+/// itself, duplicating logic this crate already has and can keep correct.
+///
+/// Note that [`parse`](fn@crate::parse) is **safetensors-only** while
+/// `amn parse` dispatches over all four formats: the CLI's polymorphism lives
+/// in its own dispatch, not in the library entry point of the same name.
+/// Detect first, then call that format's parser.
+///
+/// `#[non_exhaustive]`: a new format is a new variant, and the variants that
+/// exist depend on which Cargo features are enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Format {
+#[non_exhaustive]
+pub enum Format {
     /// `.safetensors` (or an unrecognised extension that is not `GGUF`).
     Safetensors,
     /// `PyTorch` `.pth` / `.pt` (or a `.bin` with ZIP magic).
@@ -334,6 +368,162 @@ fn has_magic(path: &Path, magic: [u8; 4]) -> bool {
         .is_ok_and(|()| buf == magic)
 }
 
+/// Detects the input format from an in-memory artefact, by magic bytes.
+///
+/// The counterpart of [`detect_format`] for callers holding bytes rather than a
+/// path — a downloaded response, an upload, a `PyO3` `bytes` argument — and the
+/// detector [`convert_bytes`] itself uses. Extensions are unavailable here, so
+/// this is magic-first and therefore *stricter*: it recognises what the bytes
+/// actually are.
+///
+/// `ZIP`-container formats need one extra step, because `.npz` and `.pth` share
+/// the `PK\x03\x04` magic. The central directory is read (bounded by the
+/// permanent `ZIP` caps) and the entry names decide: any `.npy` member means
+/// `NPZ`, a `data.pkl` member means `.pth`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the bytes match no supported format, or
+/// if a `ZIP` container is malformed.
+/// Returns [`AnamnesisError::Unsupported`] if the bytes are a recognised format
+/// whose Cargo feature is disabled in this build.
+pub fn detect_format_from_bytes(bytes: &[u8]) -> crate::Result<Format> {
+    detect_format_from_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Detects the input format from an in-memory artefact under a caller-supplied
+/// [`ParseLimits`] budget.
+///
+/// Identical to [`detect_format_from_bytes`] except that the `ZIP`
+/// central-directory walk — the one step of detection that allocates in
+/// proportion to attacker-controlled input — is charged to `limits` rather than
+/// only to the permanent `ZIP` caps. `GGUF` and safetensors detection read a
+/// fixed number of bytes and allocate nothing, so the budget is inert for them.
+///
+/// This is the entry point [`convert_bytes`] uses, so a caller who tightens
+/// `ConvertOptions::limits` tightens detection too. Without it, detection would
+/// be the one unbounded step in an otherwise bounded pipeline — the same
+/// inversion Phase 7.6 item 7 removed from the summary `inspect` calls, and it
+/// would be odd to reintroduce it in the same release.
+///
+/// # Errors
+///
+/// As [`detect_format_from_bytes`], plus [`AnamnesisError::LimitExceeded`] when
+/// the `ZIP` central directory exceeds `limits`.
+///
+/// # Memory
+///
+/// `O(1)` for `GGUF` and safetensors. For a `ZIP` container, one entry record
+/// per member (name plus offsets), bounded by `limits` and by the permanent
+/// `ZIP_MAX_ENTRIES` floor. No member data is read.
+// `limits` reaches only the `ZIP` branch, which is compiled out when neither
+// `npz` nor `pth` is enabled; the parameter stays in the signature so the public
+// API does not change shape with the feature set.
+#[cfg_attr(not(any(feature = "npz", feature = "pth")), allow(unused_variables))]
+pub fn detect_format_from_bytes_with_limits(
+    bytes: &[u8],
+    limits: &ParseLimits,
+) -> crate::Result<Format> {
+    // `GGUF`: a four-byte magic, and nothing else in this set starts with it.
+    if bytes.get(..4) == Some(b"GGUF".as_slice()) {
+        #[cfg(feature = "gguf")]
+        {
+            return Ok(Format::Gguf);
+        }
+        #[cfg(not(feature = "gguf"))]
+        {
+            return Err(missing_feature_err("GGUF", "GGUF bytes", "gguf"));
+        }
+    }
+
+    // `ZIP`: shared by `.npz` and `.pth`, so the members decide.
+    if bytes.get(..4) == Some(b"PK\x03\x04".as_slice()) {
+        #[cfg(any(feature = "npz", feature = "pth"))]
+        {
+            return detect_zip_flavour(bytes, limits);
+        }
+        #[cfg(not(any(feature = "npz", feature = "pth")))]
+        {
+            return Err(missing_feature_err(
+                "ZIP-container",
+                "a .npz or .pth archive",
+                "npz` or `pth",
+            ));
+        }
+    }
+
+    // safetensors: an 8-byte little-endian header length, then a JSON object.
+    // Checked as a pair — the length alone is any eight bytes, and the brace
+    // alone is any text file, but a plausible length *followed by* `{` at
+    // exactly offset 8 is the format's own framing.
+    if let Some(len_bytes) = bytes.get(..8) {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(len_bytes);
+        let header_len = u64::from_le_bytes(buf);
+        // CAST: usize → u64, lossless widening on all supported targets.
+        #[allow(clippy::as_conversions)]
+        let total = bytes.len() as u64;
+        if header_len > 0 && header_len.saturating_add(8) <= total && bytes.get(8) == Some(&b'{') {
+            return Ok(Format::Safetensors);
+        }
+    }
+
+    Err(AnamnesisError::Parse {
+        reason: "bytes match no supported format (expected safetensors framing, \
+                 `GGUF` magic, or a `ZIP` container holding .npy or data.pkl)"
+            .into(),
+    })
+}
+
+/// Decides whether `ZIP` bytes are an `NPZ` or a `.pth`, by member name.
+///
+/// Split out so the feature-gated arms stay readable; both formats route
+/// through the same vendored central-directory reader the parsers use, so the
+/// classification cannot disagree with what the parser will then accept.
+#[cfg(any(feature = "npz", feature = "pth"))]
+fn detect_zip_flavour(bytes: &[u8], limits: &ParseLimits) -> crate::Result<Format> {
+    let mut src = crate::parse::zip::SliceSource::new(bytes);
+    let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
+
+    let mut saw_npy = false;
+    let mut saw_pickle = false;
+    for entry in &entries {
+        let name = crate::parse::zip::strip_archive_prefix(&entry.name);
+        if name.ends_with(".npy") {
+            saw_npy = true;
+        } else if name == "data.pkl" {
+            saw_pickle = true;
+        }
+    }
+
+    // `.npy` first: a `.pth` never holds one, so the check is unambiguous in
+    // the direction that matters.
+    if saw_npy {
+        #[cfg(feature = "npz")]
+        {
+            return Ok(Format::Npz);
+        }
+        #[cfg(not(feature = "npz"))]
+        {
+            return Err(missing_feature_err("NumPy NPZ", "an .npz archive", "npz"));
+        }
+    }
+    if saw_pickle {
+        #[cfg(feature = "pth")]
+        {
+            return Ok(Format::Pth);
+        }
+        #[cfg(not(feature = "pth"))]
+        {
+            return Err(missing_feature_err("PyTorch", "a .pth archive", "pth"));
+        }
+    }
+
+    Err(AnamnesisError::Parse {
+        reason: "ZIP container holds neither an .npy member (NPZ) nor data.pkl (.pth)".into(),
+    })
+}
+
 /// Detects the model format from file extension, falling back to magic bytes.
 ///
 /// `.safetensors` → safetensors. `.pth` / `.pt` → `PyTorch`. `.npz` → NPZ.
@@ -345,10 +535,13 @@ fn has_magic(path: &Path, magic: [u8; 4]) -> bool {
 /// Returns [`AnamnesisError::Unsupported`] when the input matches a format whose
 /// Cargo feature is disabled in this build, rather than misrouting it to the
 /// safetensors parser.
+///
+/// Public since v0.7.6, together with [`Format`]. Use
+/// [`detect_format_from_bytes`] when the artefact is already in memory.
 // `clippy::unnecessary_wraps`: with all of `pth`/`npz`/`gguf` enabled every arm
 // is `Ok(_)`; other feature combinations make the wrap load-bearing.
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) fn detect_format(path: &Path) -> crate::Result<Format> {
+pub fn detect_format(path: &Path) -> crate::Result<Format> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -574,8 +767,47 @@ pub fn convert(
     output: &Path,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
-    let hub = read_hub(input, options)?;
-    write_hub(&hub, target, output, options)
+    convert_with_progress(input, target, output, options, || {})
+}
+
+/// Converts `input` into `target`, reporting per-tensor progress.
+///
+/// Behaves identically to [`convert`] — same output bytes, same errors — but
+/// calls `on_tensor` once per tensor the reader produces. New in v0.7.6:
+/// `remember` has had a progress hook since v0.7.2 and `convert` had none, so a
+/// caller converting a 70 B model had no way to show that anything was
+/// happening.
+///
+/// **`on_tensor` fires on the calling thread, and on the parallel path it fires
+/// as each worker joins rather than as each tensor completes**, so progress
+/// arrives in bursts. That is deliberate — an `FnMut` closing over a progress
+/// bar never crosses a thread boundary — and it is why *cancellation* is a
+/// [`CancelToken`](crate::CancelToken) on the options rather than a return
+/// value from this callback: the token is polled by the workers themselves and
+/// so takes effect within one tensor, while this hook could not.
+///
+/// # Errors
+///
+/// As [`convert`].
+///
+/// # Memory
+///
+/// As [`convert`]: the hook adds nothing.
+pub fn convert_with_progress<F>(
+    input: &Path,
+    target: ConvertTarget,
+    output: &Path,
+    options: &ConvertOptions,
+    mut on_tensor: F,
+) -> crate::Result<ConvertStats>
+where
+    F: FnMut(),
+{
+    // TRAIT_OBJECT: the hook threads through several private readers with
+    // different generic parameters; one `&mut dyn FnMut()` keeps a single
+    // signature instead of a type parameter on each of them.
+    let hub = read_hub(input, options, &mut on_tensor)?;
+    write_hub(&hub, target, Sink::File(output), options)
 }
 
 /// The output element type a conversion writes for the tensors it dequantises.
@@ -607,17 +839,198 @@ fn resolve_output_dtype(options: &ConvertOptions) -> crate::Result<Dtype> {
     }
 }
 
+/// Parses in-memory bytes into the hub, dispatching on the **magic-detected**
+/// format.
+///
+/// The bytes twin of [`read_hub`]. Every reader it calls is the same one the
+/// path version uses past the parse step, so the two produce identical hubs
+/// from identical artefacts — which is what makes `convert_bytes` byte-exact
+/// against `convert`.
+fn read_hub_from_bytes(
+    bytes: &[u8],
+    options: &ConvertOptions,
+    on_tensor: &mut dyn FnMut(),
+) -> crate::Result<Hub> {
+    let threads = crate::model::resolve_thread_budget(options.threads);
+    let cancel = options.cancel.as_ref();
+    let out_dtype = resolve_output_dtype(options)?;
+    match detect_format_from_bytes_with_limits(bytes, &options.limits)? {
+        Format::Safetensors => {
+            let model = crate::parse_bytes_with_limits(bytes.to_vec(), &options.limits)?;
+            hub_from_model(&model, threads, cancel, on_tensor, out_dtype)
+        }
+        #[cfg(feature = "pth")]
+        Format::Pth => hub_from_pth(&crate::parse_pth_bytes_with_limits(
+            bytes.to_vec(),
+            &options.limits,
+        )?),
+        #[cfg(feature = "npz")]
+        Format::Npz => hub_from_npz(crate::parse_npz_bytes_with_limits(
+            bytes.to_vec(),
+            &options.limits,
+        )?),
+        #[cfg(feature = "gguf")]
+        Format::Gguf => {
+            let parsed = crate::parse_gguf_bytes_with_limits(bytes.to_vec(), &options.limits)?;
+            hub_from_gguf_dyn(&parsed, threads, cancel, on_tensor, out_dtype)
+        }
+    }
+}
+
+/// The output-width dispatch for a parsed `GGUF`, shared by the path and bytes
+/// readers so the `match` on the width exists once.
+#[cfg(feature = "gguf")]
+pub(crate) fn hub_from_gguf_dyn(
+    parsed: &crate::ParsedGguf,
+    threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
+    out_dtype: Dtype,
+) -> crate::Result<Hub> {
+    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
+    // already rejected everything outside these three.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match out_dtype {
+        Dtype::BF16 => hub_from_gguf::<crate::Bf16Out>(parsed, threads, cancel, on_tensor),
+        Dtype::F32 => hub_from_gguf::<crate::F32Out>(parsed, threads, cancel, on_tensor),
+        Dtype::F16 => hub_from_gguf::<crate::F16Out>(parsed, threads, cancel, on_tensor),
+        other => Err(AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!(
+                "output dtype {other} is not a dequantisation output width \
+                 (supported: bf16, f32, f16)"
+            ),
+        }),
+    }
+}
+
+/// The output-width dispatch for a parsed safetensors model, shared by the path
+/// and bytes readers.
+fn hub_from_model(
+    model: &crate::ParsedModel,
+    threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
+    out_dtype: Dtype,
+) -> crate::Result<Hub> {
+    // EXHAUSTIVE: as `hub_from_gguf_dyn`.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let (tensors, dequantized) = match out_dtype {
+        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads, cancel, on_tensor)?,
+        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads, cancel, on_tensor)?,
+        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads, cancel, on_tensor)?,
+        other => {
+            return Err(AnamnesisError::Unsupported {
+                format: "safetensors".into(),
+                detail: format!(
+                    "output dtype {other} is not a dequantisation output width \
+                     (supported: bf16, f32, f16)"
+                ),
+            });
+        }
+    };
+    Ok(Hub {
+        tensors,
+        st_metadata: model.header.metadata.clone(),
+        dequantized,
+        #[cfg(feature = "gguf")]
+        gguf_metadata: HashMap::new(),
+    })
+}
+
+/// Converts in-memory bytes into `target`, returning the produced bytes.
+///
+/// The in-memory twin of [`convert`], new in v0.7.6. The verb was `Path` →
+/// `Path` only, while `parse` and `remember` each had bytes forms, so a caller
+/// working from a download or handing bytes across an `FFI` boundary had to
+/// round-trip through two temporary files for an operation that never needed
+/// the filesystem.
+///
+/// The input format is detected from **magic bytes** via
+/// [`detect_format_from_bytes`], not from an extension there is no longer any
+/// of. Every reader and writer past that point is the one [`convert`] uses, so
+/// the output is byte-identical to converting the same artefact from a file.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the bytes match no supported format or
+/// the input is malformed, [`AnamnesisError::Unsupported`] for a target or
+/// output dtype this build cannot produce, [`AnamnesisError::LimitExceeded`] if
+/// the input exceeds `options.limits`, and
+/// [`AnamnesisError::Cancelled`] if the run was cancelled through
+/// `options.cancel`.
+///
+/// # Memory
+///
+/// Higher than [`convert`]'s, and knowably so. Three things are live at once:
+/// `input` as the caller's slice, an **owned copy** of it (each byte-form parser
+/// takes ownership of its buffer), and the hub; the output buffer then joins
+/// them before the hub drops. Budget roughly `2 × input + hub + output`, against
+/// the file path's `input + hub` where the input is a mapping rather than a copy
+/// and the output streams to disk.
+///
+/// The owned copy is inherent to taking `&[u8]`: the byte parsers own their
+/// buffers, so a borrowed slice must be copied once. A caller who already holds
+/// a `Vec<u8>` and wants that copy back can call the format's own
+/// `parse_*_bytes` entry point directly.
+pub fn convert_bytes(
+    input: &[u8],
+    target: ConvertTarget,
+    options: &ConvertOptions,
+) -> crate::Result<(Vec<u8>, ConvertStats)> {
+    convert_bytes_with_progress(input, target, options, || {})
+}
+
+/// Converts in-memory bytes into `target`, reporting per-tensor progress.
+///
+/// [`convert_bytes`] with the hook [`convert_with_progress`] adds to
+/// [`convert`]; the same coarseness caveat applies.
+///
+/// # Errors
+///
+/// As [`convert_bytes`].
+///
+/// # Memory
+///
+/// As [`convert_bytes`].
+pub fn convert_bytes_with_progress<F>(
+    input: &[u8],
+    target: ConvertTarget,
+    options: &ConvertOptions,
+    mut on_tensor: F,
+) -> crate::Result<(Vec<u8>, ConvertStats)>
+where
+    F: FnMut(),
+{
+    let hub = read_hub_from_bytes(input, options, &mut on_tensor)?;
+    let mut out = Vec::new();
+    let stats = write_hub(&hub, target, Sink::Memory(&mut out), options)?;
+    Ok((out, stats))
+}
+
 /// Parses `input` into the hub, dispatching on the detected format.
 ///
 /// `out_dtype` reaches only the readers that actually dequantise. A reader that
 /// cannot honour a non-`BF16` request rejects it here rather than silently
 /// emitting `BF16`, so the caller never receives a file whose dtype differs
 /// from what they asked for.
-fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
+fn read_hub(
+    input: &Path,
+    options: &ConvertOptions,
+    on_tensor: &mut dyn FnMut(),
+) -> crate::Result<Hub> {
     let threads = crate::model::resolve_thread_budget(options.threads);
+    let cancel = options.cancel.as_ref();
     let out_dtype = resolve_output_dtype(options)?;
     match detect_format(input)? {
-        Format::Safetensors => read_safetensors(input, &options.limits, threads, out_dtype),
+        Format::Safetensors => read_safetensors(
+            input,
+            &options.limits,
+            threads,
+            cancel,
+            on_tensor,
+            out_dtype,
+        ),
         // NPZ and `.pth` dequantise nothing: every tensor is already full
         // precision and is passed through in its source dtype. A non-`BF16`
         // `output_dtype` is therefore vacuous rather than wrong, and is
@@ -628,7 +1041,14 @@ fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
         #[cfg(feature = "npz")]
         Format::Npz => read_npz(input, &options.limits),
         #[cfg(feature = "gguf")]
-        Format::Gguf => read_gguf(input, &options.limits, threads, out_dtype),
+        Format::Gguf => read_gguf(
+            input,
+            &options.limits,
+            threads,
+            cancel,
+            on_tensor,
+            out_dtype,
+        ),
     }
 }
 
@@ -642,13 +1062,13 @@ fn read_hub(input: &Path, options: &ConvertOptions) -> crate::Result<Hub> {
 fn write_hub(
     hub: &Hub,
     target: ConvertTarget,
-    output: &Path,
+    sink: Sink<'_>,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
     match target {
-        ConvertTarget::Safetensors => write_safetensors(hub, output),
+        ConvertTarget::Safetensors => write_safetensors_to(hub, sink),
         #[cfg(feature = "gguf")]
-        ConvertTarget::Gguf => write_gguf_target(hub, output, options),
+        ConvertTarget::Gguf => write_gguf_target(hub, sink, options),
         #[cfg(not(feature = "gguf"))]
         ConvertTarget::Gguf => Err(AnamnesisError::Unsupported {
             format: "gguf".into(),
@@ -657,7 +1077,7 @@ fn write_hub(
                 .into(),
         }),
         #[cfg(feature = "bnb")]
-        ConvertTarget::BnbNf4 => write_bnb_nf4_target(hub, output),
+        ConvertTarget::BnbNf4 => write_bnb_nf4_target(hub, sink),
         #[cfg(not(feature = "bnb"))]
         ConvertTarget::BnbNf4 => Err(AnamnesisError::Unsupported {
             format: "bnb-nf4".into(),
@@ -695,31 +1115,12 @@ fn read_safetensors(
     path: &Path,
     limits: &ParseLimits,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
     let model = crate::parse_with_limits(path, limits)?;
-    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
-    // already rejected everything outside these three, so the wildcard is
-    // defence in depth rather than a reachable path.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    let (tensors, dequantized) = match out_dtype {
-        Dtype::BF16 => model.hub_tensors::<crate::Bf16Out>(threads)?,
-        Dtype::F32 => model.hub_tensors::<crate::F32Out>(threads)?,
-        Dtype::F16 => model.hub_tensors::<crate::F16Out>(threads)?,
-        other => {
-            return Err(AnamnesisError::Unsupported {
-                format: "safetensors".into(),
-                detail: format!("{other} is not a dequantisation output width"),
-            });
-        }
-    };
-    Ok(Hub {
-        tensors,
-        st_metadata: model.header.metadata.clone(),
-        dequantized,
-        #[cfg(feature = "gguf")]
-        gguf_metadata: HashMap::new(),
-    })
+    hub_from_model(&model, threads, cancel, on_tensor, out_dtype)
 }
 
 /// Reads an `NPZ` archive into the hub. Every `NPZ` tensor is full precision, so
@@ -727,7 +1128,18 @@ fn read_safetensors(
 /// name order for a deterministic output.
 #[cfg(feature = "npz")]
 fn read_npz(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
-    let mut map = crate::parse_npz_with_limits(path, limits)?;
+    hub_from_npz(crate::parse_npz_with_limits(path, limits)?)
+}
+
+/// Normalises an already-parsed `NPZ` map into the hub, draining it.
+///
+/// Split out of [`read_npz`] at v0.7.6 so the path and bytes readers share one
+/// mapping. Takes the map **by value**: draining avoids cloning every array's
+/// bytes, which would be a full-model copy.
+#[cfg(feature = "npz")]
+fn hub_from_npz(
+    mut map: std::collections::HashMap<String, crate::NpzTensor>,
+) -> crate::Result<Hub> {
     // Sort the (cheap) name keys, then move each tensor out of the owned map —
     // draining avoids cloning every tensor's bytes (a full-model copy).
     let mut names: Vec<String> = map.keys().cloned().collect();
@@ -758,7 +1170,15 @@ fn read_npz(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
 /// dtypes are preserved.
 #[cfg(feature = "pth")]
 fn read_pth(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
-    let parsed = crate::parse_pth_with_limits(path, limits)?;
+    hub_from_pth(&crate::parse_pth_with_limits(path, limits)?)
+}
+
+/// Normalises an already-parsed `.pth` into the hub.
+///
+/// Split out of [`read_pth`] at v0.7.6 so the path and bytes readers share one
+/// mapping. Nothing is dequantised: a `state_dict` is already full precision.
+#[cfg(feature = "pth")]
+fn hub_from_pth(parsed: &crate::ParsedPth) -> crate::Result<Hub> {
     let pth_tensors = parsed.tensors()?;
 
     let mut tensors = Vec::with_capacity(pth_tensors.len());
@@ -809,35 +1229,45 @@ fn read_gguf(
     path: &Path,
     limits: &ParseLimits,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
     out_dtype: Dtype,
 ) -> crate::Result<Hub> {
-    // EXHAUSTIVE: `Dtype` is `#[non_exhaustive]`; `resolve_output_dtype` has
-    // already rejected everything outside these three, so the wildcard is
-    // defence in depth rather than a reachable path.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    match out_dtype {
-        Dtype::BF16 => read_gguf_as::<crate::Bf16Out>(path, limits, threads),
-        Dtype::F32 => read_gguf_as::<crate::F32Out>(path, limits, threads),
-        Dtype::F16 => read_gguf_as::<crate::F16Out>(path, limits, threads),
-        other => Err(AnamnesisError::Unsupported {
-            format: "GGUF".into(),
-            detail: format!(
-                "output dtype {other} is not a dequantisation output width \
-                 (supported: bf16, f32, f16)"
-            ),
-        }),
-    }
+    let parsed = crate::parse_gguf_with_limits(path, limits)?;
+    hub_from_gguf_dyn(&parsed, threads, cancel, on_tensor, out_dtype)
 }
 
-/// The monomorphised body of [`read_gguf`], with the output element type fixed.
+/// Normalises an already-parsed `GGUF` into the hub: quantised tensors
+/// dequantised to `E`, everything else passed through in its source dtype,
+/// shapes reversed into row-major order.
+///
+/// Split out of the `GGUF` reader at v0.7.6 so `ParsedGguf::remember` and the
+/// `convert` reader run the **same** code rather than two transcriptions of it.
+/// Until then the `remember` path for a `GGUF` input lived only in the CLI, was
+/// sequential, ignored `--threads`, and could not be called from the library at
+/// all; `tests/cli_convert.rs` pins the two paths byte-for-byte so they cannot
+/// drift again.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if a tensor's element count overflows
+/// `usize` or a dequant worker thread panics, and
+/// [`AnamnesisError::Unsupported`] for a `GGUF` dtype with no safetensors
+/// equivalent.
+///
+/// # Memory
+///
+/// Allocates one owned `Vec<u8>` per tensor and holds them all: peak is the
+/// whole model at `E`'s width for the dequantised share plus the source width
+/// for the passthrough share. Identical to what `ParsedModel::remember` holds
+/// for a safetensors input; per-tensor streaming is ROADMAP Phase 10.
 #[cfg(feature = "gguf")]
-fn read_gguf_as<E: crate::OutputElement>(
-    path: &Path,
-    limits: &ParseLimits,
+pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
+    parsed: &crate::ParsedGguf,
     threads: usize,
+    cancel: Option<&crate::CancelToken>,
+    on_tensor: &mut dyn FnMut(),
 ) -> crate::Result<Hub> {
-    let parsed = crate::parse_gguf_with_limits(path, limits)?;
-
     // Materialise the tensor views up front so the dispatch has an indexable
     // slice. The views borrow the mapped bytes (name, shape and data are all
     // references), so this costs one small struct per tensor and copies no
@@ -856,6 +1286,7 @@ fn read_gguf_as<E: crate::OutputElement>(
         &views,
         threads,
         work_bytes,
+        cancel,
         |_, tensor| {
             let mut shape: Vec<usize> = tensor.shape.to_vec();
             shape.reverse();
@@ -892,7 +1323,7 @@ fn read_gguf_as<E: crate::OutputElement>(
                 })
             }
         },
-        |_| {},
+        |_| on_tensor(),
     )?;
 
     // Counted from the inputs rather than incremented during the dispatch, so no
@@ -915,8 +1346,32 @@ fn read_gguf_as<E: crate::OutputElement>(
 // Writers — hub → format
 // ---------------------------------------------------------------------------
 
-/// Writes the hub as a safetensors file, each tensor in its hub dtype.
-fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
+/// Where a writer puts its bytes.
+///
+/// Introduced at v0.7.6 with [`convert_bytes`]. Each writer builds its tensor
+/// list once and then matches on this, so a file conversion and an in-memory
+/// one cannot drift on dtype mapping, shape handling, or metadata merging —
+/// they run the same code and differ only in the last call.
+pub(crate) enum Sink<'a> {
+    /// Write to this path.
+    File(&'a Path),
+    /// Append to this buffer.
+    Memory(&'a mut Vec<u8>),
+}
+
+/// Builds the safetensors views for every hub tensor, in hub order.
+///
+/// The single view-construction site behind [`write_safetensors_to`], so the
+/// file and in-memory destinations cannot drift on dtype mapping, shape, or
+/// tensor order — they differ only in the call that consumes these views. The
+/// views borrow `hub`, so the returned `Vec` is tied to it.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] for a hub dtype with no safetensors
+/// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects the
+/// shape/length pairing.
+fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'_>)>> {
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {
@@ -927,26 +1382,53 @@ fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
             })?;
         views.push((t.name.clone(), view));
     }
+    Ok(views)
+}
 
-    safetensors::tensor::serialize_to_file(views, hub.st_metadata.clone(), output).map_err(
-        // EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
-            other => AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
+/// Maps an upstream `safetensors` serialisation failure onto this crate's error
+/// type, keeping `IoError` distinguishable from a malformed-input `Parse`.
+///
+/// Shared by the file and in-memory writers so a caller sees the same variant
+/// whichever destination it picked.
+// EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
+    match e {
+        safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
+        other => AnamnesisError::Parse {
+            reason: format!("failed to write safetensors file: {other}"),
         },
-    )?;
+    }
+}
 
-    Ok(ConvertStats {
+/// Counts the written set for a safetensors destination.
+///
+/// A dequantised tensor did *not* go out in its incoming dtype, so the two
+/// counts partition the written set rather than overlapping.
+fn safetensors_stats(hub: &Hub) -> ConvertStats {
+    ConvertStats {
         tensors: hub.tensors.len(),
         dequantized: hub.dequantized,
         quantized: 0,
-        // A dequantised tensor did *not* go out in its incoming dtype, so the
-        // two counts partition the written set rather than overlapping.
         passthrough: hub.tensors.len().saturating_sub(hub.dequantized),
-    })
+    }
+}
+
+/// Writes the hub as safetensors to `sink`, each tensor in its hub dtype.
+pub(crate) fn write_safetensors_to(hub: &Hub, sink: Sink<'_>) -> crate::Result<ConvertStats> {
+    let views = build_hub_views(hub)?;
+    match sink {
+        Sink::File(output) => {
+            safetensors::tensor::serialize_to_file(views, hub.st_metadata.clone(), output)
+                .map_err(map_serialize_err)?;
+        }
+        Sink::Memory(buf) => {
+            let bytes = safetensors::tensor::serialize(views, hub.st_metadata.clone())
+                .map_err(map_serialize_err)?;
+            buf.extend_from_slice(&bytes);
+        }
+    }
+    Ok(safetensors_stats(hub))
 }
 
 /// Writes the hub as an unquantised `GGUF` file, reversing shapes back to
@@ -954,7 +1436,7 @@ fn write_safetensors(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
 #[cfg(feature = "gguf")]
 fn write_gguf_target(
     hub: &Hub,
-    output: &Path,
+    sink: Sink<'_>,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
     use crate::{GgufWriteTensor, write_gguf};
@@ -996,7 +1478,17 @@ fn write_gguf_target(
             );
             Cow::Owned(merged)
         };
-    write_gguf(output, &tensors, &metadata)?;
+    match sink {
+        Sink::File(output) => write_gguf(output, &tensors, &metadata)?,
+        Sink::Memory(buf) => {
+            // `write_gguf_to_writer` needs `Write + Seek` because the writer
+            // back-patches the tensor-data offsets once the header size is
+            // known; a `Cursor` over the buffer provides both.
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            crate::write_gguf_to_writer(&mut cursor, &tensors, &metadata)?;
+            buf.extend_from_slice(&cursor.into_inner());
+        }
+    }
 
     Ok(ConvertStats {
         tensors: tensors.len(),
@@ -1011,7 +1503,7 @@ fn write_gguf_target(
 /// contract is `BF16`, so float tensors are converted on the way in; 2-D weights
 /// are encoded to NF4 and everything else passes through as `BF16`.
 #[cfg(feature = "bnb")]
-fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats> {
+fn write_bnb_nf4_target(hub: &Hub, sink: Sink<'_>) -> crate::Result<ConvertStats> {
     use crate::{BnbWriteInput, classify_inputs, write_bnb_nf4_safetensors};
 
     let mut owned: Vec<(String, Vec<usize>, Cow<'_, [u8]>)> = Vec::with_capacity(hub.tensors.len());
@@ -1032,7 +1524,12 @@ fn write_bnb_nf4_target(hub: &Hub, output: &Path) -> crate::Result<ConvertStats>
         .collect();
 
     let stats = classify_inputs(&inputs);
-    write_bnb_nf4_safetensors(&inputs, output)?;
+    match sink {
+        Sink::File(output) => write_bnb_nf4_safetensors(&inputs, output)?,
+        Sink::Memory(buf) => {
+            buf.extend_from_slice(&crate::write_bnb_nf4_safetensors_bytes(&inputs)?);
+        }
+    }
 
     Ok(ConvertStats {
         tensors: inputs.len(),
@@ -1889,10 +2386,12 @@ mod stats_tests {
 )]
 mod quantized_gguf_tests {
     use super::{
-        ConvertOptions, ConvertTarget, convert, derive_output_path, derive_output_path_for_dtype,
+        AnamnesisError, ConvertOptions, ConvertTarget, Format, convert, convert_bytes,
+        convert_with_progress, derive_output_path, derive_output_path_for_dtype,
     };
     use crate::GgufType;
     use crate::parallel::MIN_PARALLEL_BYTES;
+    use crate::parse::safetensors::Dtype;
     use std::path::PathBuf;
 
     /// `GGUF` default tensor-data alignment.
@@ -2272,6 +2771,482 @@ mod quantized_gguf_tests {
         );
     }
 
+    /// `ParsedGguf::remember` and `convert --to safetensors` are the **same
+    /// operation** on a `GGUF` input, so they must produce the same file.
+    ///
+    /// This is the regression guard for the v0.7.6 refactor. Until then the
+    /// `remember` path for a `GGUF` lived in the CLI as a 121-line transcription
+    /// of `convert`'s reader; the two happened to agree byte-for-byte, which is
+    /// exactly the property a transcription loses first and silently. Both now
+    /// call `hub_from_gguf`, and this pins that they cannot drift again — at
+    /// every output width, and through the in-memory twin as well as the file.
+    #[test]
+    fn remember_matches_convert_byte_for_byte_at_every_width() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let widths: &[(crate::TargetDtype, Dtype, &str)] = &[
+            (crate::TargetDtype::BF16, Dtype::BF16, "bf16"),
+            (crate::TargetDtype::F32, Dtype::F32, "f32"),
+            (crate::TargetDtype::F16, Dtype::F16, "f16"),
+        ];
+
+        for &(target, out_dtype, label) in widths {
+            let via_convert = dir_out.path().join(format!("convert-{label}.safetensors"));
+            convert(
+                &path,
+                ConvertTarget::Safetensors,
+                &via_convert,
+                &ConvertOptions::new()
+                    .with_output_dtype(out_dtype)
+                    .with_threads(4),
+            )
+            .expect("convert to safetensors");
+            let expected = std::fs::read(&via_convert).expect("read convert output");
+
+            let via_remember = dir_out.path().join(format!("remember-{label}.safetensors"));
+            parsed
+                .remember_with_options(
+                    &via_remember,
+                    target,
+                    crate::RememberOptions::new().with_threads(4),
+                )
+                .expect("remember");
+            assert_bytes_eq(
+                &std::fs::read(&via_remember).expect("read remember output"),
+                &expected,
+                &format!("remember vs convert at {label}"),
+            );
+
+            let in_memory = parsed
+                .remember_to_bytes_with_options(
+                    target,
+                    crate::RememberOptions::new().with_threads(4),
+                )
+                .expect("remember_to_bytes");
+            assert_bytes_eq(
+                &in_memory,
+                &expected,
+                &format!("remember_to_bytes vs convert at {label}"),
+            );
+        }
+    }
+
+    /// `convert_bytes` produces byte-identical output to `convert`, for every
+    /// target reachable from a quantised `GGUF` source.
+    ///
+    /// This is what makes the in-memory verb safe to reach for: it is not a
+    /// second implementation, it is the same readers and writers with a
+    /// different sink, and this asserts that rather than assuming it. A
+    /// `GGUF` source exercises the widest path — dequantisation, shape
+    /// reversal, and metadata inheritance on the `gguf → gguf` arm.
+    #[test]
+    fn convert_bytes_matches_convert_for_every_target() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let source = std::fs::read(&path).expect("read fixture bytes");
+
+        let targets: &[(ConvertTarget, &str)] = &[
+            (ConvertTarget::Safetensors, "safetensors"),
+            (ConvertTarget::Gguf, "gguf"),
+            #[cfg(feature = "bnb")]
+            (ConvertTarget::BnbNf4, "bnb-nf4"),
+        ];
+
+        for &(target, label) in targets {
+            let out_path = dir_out.path().join(format!("file-{label}"));
+            let file_stats = convert(
+                &path,
+                target,
+                &out_path,
+                &ConvertOptions::new().with_threads(4),
+            )
+            .expect("convert to file");
+
+            let (bytes, byte_stats) =
+                convert_bytes(&source, target, &ConvertOptions::new().with_threads(4))
+                    .expect("convert_bytes");
+
+            assert_bytes_eq(
+                &bytes,
+                &std::fs::read(&out_path).expect("read file output"),
+                &format!("convert_bytes vs convert for {label}"),
+            );
+            assert_eq!(
+                byte_stats.tensors, file_stats.tensors,
+                "{label}: stats must agree too"
+            );
+            assert_eq!(byte_stats.dequantized, file_stats.dequantized);
+        }
+    }
+
+    /// Detection is bounded by the caller's budget, not only by the permanent
+    /// `ZIP` floor.
+    ///
+    /// The `ZIP` central-directory walk is the one step of detection that
+    /// allocates in proportion to attacker-controlled input, and
+    /// `convert_bytes` runs it *before* anything else. Leaving it unbounded
+    /// would have made detection the single untightenable step in an otherwise
+    /// bounded pipeline — the inversion Phase 7.6 item 7 had just removed from
+    /// the summary `inspect` calls.
+    #[cfg(feature = "npz")]
+    #[test]
+    fn detection_and_convert_bytes_honour_the_caller_budget() {
+        // A small NPZ, built through the same writer the NPZ tests use.
+        let mut archive = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut archive));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy"] {
+                zip.start_file(name, opts).expect("start entry");
+                let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2,), }";
+                let mut npy = b"\x93NUMPY\x01\x00".to_vec();
+                let mut padded = header.as_bytes().to_vec();
+                while !(10 + padded.len() + 1).is_multiple_of(64) {
+                    padded.push(b' ');
+                }
+                padded.push(b'\n');
+                // CAST: usize → u16, the padded header is 64 bytes by
+                // construction and the format's own field is `u16`.
+                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                npy.extend_from_slice(&(padded.len() as u16).to_le_bytes());
+                npy.extend_from_slice(&padded);
+                npy.extend_from_slice(&[0u8; 8]);
+                std::io::Write::write_all(&mut zip, &npy).expect("write entry");
+            }
+            zip.finish().expect("finish archive");
+        }
+
+        // Unbounded detection sees an NPZ.
+        assert_eq!(
+            crate::detect_format_from_bytes(&archive).expect("detect"),
+            Format::Npz
+        );
+
+        // A budget below the declared entry count rejects during detection.
+        let tight = crate::ParseLimits::default().with_max_item_count(1);
+        let err = crate::detect_format_from_bytes_with_limits(&archive, &tight)
+            .expect_err("an item-count budget must bound the detection walk");
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
+
+        // And `convert_bytes` inherits it from `ConvertOptions::limits`.
+        let err = convert_bytes(
+            &archive,
+            ConvertTarget::Safetensors,
+            &ConvertOptions::new().with_limits(tight),
+        )
+        .expect_err("convert_bytes must not detect outside its own budget");
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    /// The magic-byte detector recognises what the parsers accept, and refuses
+    /// what they would not.
+    #[test]
+    fn detect_format_from_bytes_recognises_each_container() {
+        let (_dir, path, _specs) = write_fixture();
+        let gguf = std::fs::read(&path).expect("read gguf fixture");
+        assert_eq!(
+            crate::detect_format_from_bytes(&gguf).expect("gguf detect"),
+            Format::Gguf
+        );
+
+        // A safetensors artefact, produced rather than hand-built, so the
+        // detector is checked against the real framing.
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let st_path = dir_out.path().join("out.safetensors");
+        convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &st_path,
+            &ConvertOptions::new(),
+        )
+        .expect("convert to safetensors");
+        let st = std::fs::read(&st_path).expect("read safetensors");
+        assert_eq!(
+            crate::detect_format_from_bytes(&st).expect("safetensors detect"),
+            Format::Safetensors
+        );
+
+        for bad in [
+            b"".as_slice(),
+            b"not a model".as_slice(),
+            b"GGU".as_slice(),
+            &[0u8; 32],
+        ] {
+            assert!(
+                crate::detect_format_from_bytes(bad).is_err(),
+                "bytes {bad:?} must not be claimed as a supported format"
+            );
+        }
+    }
+
+    /// A cancelled run returns `Cancelled` and writes **no output file**.
+    ///
+    /// The "no file" half is the part worth pinning: every path builds its
+    /// result in memory before serialising, so the check lands strictly before
+    /// any byte reaches the filesystem. If that ever stops being true, a
+    /// cancelled convert starts leaving truncated safetensors behind, and the
+    /// failure would be silent.
+    #[test]
+    fn a_cancelled_convert_writes_nothing() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let out = dir_out.path().join("cancelled.safetensors");
+
+        let token = crate::CancelToken::new();
+        token.cancel();
+
+        let err = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &out,
+            &ConvertOptions::new().with_cancel(token).with_threads(4),
+        )
+        .expect_err("a cancelled convert must not succeed");
+
+        assert!(
+            matches!(err, AnamnesisError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            !out.exists(),
+            "a cancelled convert must not leave an output file behind"
+        );
+    }
+
+    /// Cancellation is observed at every thread count, sequential included.
+    ///
+    /// The sequential path polls at the top of its loop and the parallel path
+    /// polls where the cursor hands out an item; both have to agree, or
+    /// cancellation would be a feature of the thread budget.
+    #[test]
+    fn cancellation_is_observed_at_every_thread_count() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        for n in [1usize, 2, 4, 8] {
+            let token = crate::CancelToken::new();
+            token.cancel();
+            let err = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new()
+                        .with_threads(n)
+                        .with_cancel(token),
+                )
+                .expect_err("a cancelled remember must not succeed");
+            assert!(
+                matches!(err, AnamnesisError::Cancelled),
+                "at {n} threads: expected Cancelled, got {err:?}"
+            );
+        }
+    }
+
+    /// An **uncancelled** token changes nothing: same bytes as no token at all.
+    ///
+    /// The regression this guards is a poll placed somewhere that skips work
+    /// rather than stopping it.
+    #[test]
+    fn an_uncancelled_token_changes_no_byte() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let baseline = parsed
+            .remember_to_bytes(crate::TargetDtype::BF16)
+            .expect("baseline remember");
+
+        for n in [1usize, 4] {
+            let with_token = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new()
+                        .with_threads(n)
+                        .with_cancel(crate::CancelToken::new()),
+                )
+                .expect("remember with a live token");
+            assert_bytes_eq(
+                &with_token,
+                &baseline,
+                &format!("an uncancelled token at {n} threads"),
+            );
+        }
+    }
+
+    /// `convert_with_progress` fires once per tensor and produces the same file.
+    #[test]
+    fn convert_with_progress_counts_tensors_and_changes_no_byte() {
+        let (_dir, path, _specs) = write_fixture();
+        let dir_out = tempfile::tempdir().expect("tempdir");
+        let plain = dir_out.path().join("plain.safetensors");
+        let hooked = dir_out.path().join("hooked.safetensors");
+
+        let stats = convert(
+            &path,
+            ConvertTarget::Safetensors,
+            &plain,
+            &ConvertOptions::new().with_threads(4),
+        )
+        .expect("plain convert");
+
+        let mut seen = 0usize;
+        let hooked_stats = convert_with_progress(
+            &path,
+            ConvertTarget::Safetensors,
+            &hooked,
+            &ConvertOptions::new().with_threads(4),
+            || seen += 1,
+        )
+        .expect("convert with progress");
+
+        assert_eq!(
+            seen, stats.tensors,
+            "the hook must fire once per tensor the reader produced"
+        );
+        assert_eq!(hooked_stats.tensors, stats.tensors);
+        assert_bytes_eq(
+            &std::fs::read(&hooked).expect("read hooked output"),
+            &std::fs::read(&plain).expect("read plain output"),
+            "a progress hook must not change an output byte",
+        );
+    }
+
+    /// `GgufInspectInfo::dequantized_size` predicts what `remember` actually
+    /// writes, at every width.
+    ///
+    /// The point of the estimate is that a host can gate on it *before*
+    /// committing, so "roughly right" is not the bar: this asserts it equals the
+    /// exact tensor-data byte count of the file `remember` then produces. Before
+    /// v0.7.6 the figure did not exist for `GGUF` at all, and `GGUF` is the
+    /// format where it cannot be guessed — the expansion ratio is per-kernel, so
+    /// the on-disk total predicts nothing.
+    #[test]
+    fn gguf_dequantized_size_predicts_what_remember_writes() {
+        use crate::InspectSummary as _;
+
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        for &(target, label) in &[
+            (crate::TargetDtype::BF16, "bf16"),
+            (crate::TargetDtype::F32, "f32"),
+            (crate::TargetDtype::F16, "f16"),
+        ] {
+            let info = parsed
+                .inspect_with_options(&crate::InspectOptions::new().with_output_dtype(target));
+            assert_eq!(
+                info.output_dtype(),
+                target,
+                "{label}: the figure must carry the width it assumes"
+            );
+
+            let bytes = parsed.remember_to_bytes(target).expect("remember_to_bytes");
+            let written = crate::parse_safetensors_header(&bytes)
+                .expect("parse the produced header")
+                .tensors
+                .iter()
+                .fold(0u64, |acc, t| {
+                    // CAST: usize → u64, lossless widening.
+                    #[allow(clippy::as_conversions)]
+                    let len = t.byte_len() as u64;
+                    acc + len
+                });
+
+            assert_eq!(
+                info.dequantized_size(),
+                written,
+                "{label}: estimate {} vs {written} bytes actually written",
+                info.dequantized_size()
+            );
+        }
+    }
+
+    /// The four `InspectSummary` numbers agree with the concrete fields, and the
+    /// estimate really does move with the requested width.
+    ///
+    /// `current_size` must **not** move: it is what the file costs as stored,
+    /// which no output-dtype request can change. Getting that backwards would
+    /// make the gate compare two figures that both moved.
+    #[test]
+    fn inspect_summary_reads_the_same_numbers_as_the_fields() {
+        use crate::InspectSummary as _;
+
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let bf16 = parsed.inspect();
+        assert_eq!(bf16.tensor_count(), bf16.tensor_count);
+        assert_eq!(bf16.current_size(), bf16.total_bytes);
+        assert_eq!(bf16.dequantized_size(), bf16.dequantized_size);
+        assert_eq!(bf16.output_dtype(), crate::TargetDtype::BF16);
+
+        let f32 = parsed.inspect_with_options(
+            &crate::InspectOptions::new().with_output_dtype(crate::TargetDtype::F32),
+        );
+        assert_eq!(
+            f32.current_size(),
+            bf16.current_size(),
+            "the stored size cannot depend on the width the caller intends"
+        );
+        assert!(
+            f32.dequantized_size() > bf16.dequantized_size(),
+            "an F32 request must estimate larger than BF16 ({} vs {})",
+            f32.dequantized_size(),
+            bf16.dequantized_size()
+        );
+        assert!(
+            bf16.expansion() > 0,
+            "a quantised fixture must expand on dequantisation"
+        );
+    }
+
+    /// `--threads` reaches the `GGUF` `remember` path and does not change a byte.
+    ///
+    /// Before v0.7.6 the CLI arm took no thread budget at all, so the flag was
+    /// accepted and discarded; the sibling `convert` test could not see that
+    /// because it exercised a different function. The fixture clears
+    /// [`MIN_PARALLEL_BYTES`] (asserted by `fixture_clears_the_parallel_threshold`),
+    /// so the parallel dispatch really runs.
+    #[test]
+    fn remember_is_deterministic_across_thread_counts() {
+        let (_dir, path, _specs) = write_fixture();
+        let parsed = crate::parse_gguf(&path).expect("parse gguf fixture");
+
+        let baseline = parsed
+            .remember_to_bytes_with_options(
+                crate::TargetDtype::BF16,
+                crate::RememberOptions::new().with_threads(1),
+            )
+            .expect("sequential remember");
+
+        for n in [1usize, 2, 4, 8, 16] {
+            let out = parsed
+                .remember_to_bytes_with_options(
+                    crate::TargetDtype::BF16,
+                    crate::RememberOptions::new().with_threads(n),
+                )
+                .expect("threaded remember");
+            assert_bytes_eq(&out, &baseline, &format!("GGUF remember at {n} threads"));
+        }
+
+        // The default (hardware-resolved) budget must agree too.
+        let default_out = parsed
+            .remember_to_bytes(crate::TargetDtype::BF16)
+            .expect("default remember");
+        assert_bytes_eq(
+            &default_out,
+            &baseline,
+            "the default thread budget vs the sequential baseline",
+        );
+    }
+
     /// The determinism contract holds for the other two targets reachable from a
     /// `GGUF` source, not just safetensors: the `GGUF` writer (dequantise in
     /// place, inheriting the source KV) and the `BnB`-NF4 encoder.
@@ -2634,12 +3609,12 @@ mod hub_scaling_bench {
             let options = ConvertOptions::new().with_threads(threads);
             // Warm-up: also pages the mmap in, so the timed samples measure
             // dequant rather than first-touch page faults.
-            drop(read_hub(&input, &options).expect("warm-up read_hub"));
+            drop(read_hub(&input, &options, &mut || {}).expect("warm-up read_hub"));
 
             let mut samples: Vec<f64> = Vec::with_capacity(SAMPLES);
             for _ in 0..SAMPLES {
                 let start = Instant::now();
-                let hub = read_hub(&input, &options).expect("read_hub");
+                let hub = read_hub(&input, &options, &mut || {}).expect("read_hub");
                 samples.push(start.elapsed().as_secs_f64() * 1000.0);
                 drop(hub);
             }

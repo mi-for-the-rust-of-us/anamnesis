@@ -465,6 +465,7 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
 /// `GPTQ` quantization configuration inferred from safetensors metadata
 /// and/or tensor shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct GptqConfig {
     /// Quantization bit width (4 or 8).
     pub bits: u8,
@@ -474,6 +475,7 @@ pub struct GptqConfig {
 
 /// Companion tensors for a `GPTQ` `.qweight` tensor.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GptqCompanions<'a> {
     /// Per-group scale factors (`.scales`).
     pub scales: &'a TensorEntry,
@@ -490,6 +492,7 @@ pub struct GptqCompanions<'a> {
 /// `AWQ` quantization configuration inferred from safetensors metadata
 /// and/or tensor shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct AwqConfig {
     /// Quantization bit width (4 or 8).
     pub bits: u8,
@@ -503,6 +506,7 @@ pub struct AwqConfig {
 /// direction (packed along `out_features` instead of `in_features`).
 /// `AWQ` never has `.g_idx`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AwqCompanions<'a> {
     /// Per-group scale factors (`.scales`).
     pub scales: &'a TensorEntry,
@@ -519,6 +523,7 @@ pub struct AwqCompanions<'a> {
 /// Inferred from tensor shapes. The `quant_map` distinguishes `NF4` from `FP4`
 /// (different lookup table values), but both use the same dequantization code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct BnbConfig {
     /// Block size for absmax quantization (typically 64).
     pub block_size: usize,
@@ -528,6 +533,7 @@ pub struct BnbConfig {
 
 /// Companion tensors for a `BitsAndBytes` `NF4`/`FP4` `.weight` tensor.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Bnb4Companions<'a> {
     /// Per-block absolute maximum values (`.weight.absmax`).
     /// `F32` for plain `NF4`/`FP4`, `U8` for double-quant.
@@ -549,6 +555,7 @@ pub struct Bnb4Companions<'a> {
 
 /// Metadata for a single tensor parsed from a `.safetensors` header.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TensorEntry {
     /// Tensor name as it appears in the header
     /// (e.g., `"model.layers.0.self_attn.q_proj.weight"`).
@@ -596,6 +603,7 @@ impl TensorEntry {
 /// needed to decide how to dequantize (remember) or inspect the file, without
 /// having read any tensor data yet.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SafetensorsHeader {
     /// All tensors found in the header, sorted by name.
     pub tensors: Vec<TensorEntry>,

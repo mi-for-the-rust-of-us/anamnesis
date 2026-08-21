@@ -66,7 +66,22 @@ Size:        96 B (FP8) -> 144 B (BF16)
 Lethe took:  ~48 B of precision
 ```
 
-The headline is what you learn *without committing*: the format and scheme, how many tensors are quantized vs passed through, and the size — both on disk and what it will become if you dequantize. On a real model that size line is the load-bearing one. For a large GGUF, for instance, `inspect` prints `Total size: 99 MB` straight from the header, so you know the bandwidth and memory cost before a single weight byte is read.
+The headline is what you learn *without committing*: the format and scheme, how many tensors are quantized vs passed through, and the size, both on disk and what it will become if you dequantize. On a real model that size line is the load-bearing one.
+
+On a quantized GGUF the second half of that is the number you actually need, and it is the one you cannot work out yourself: the expansion ratio is per-kernel, so a `Q2_K` tensor and a `Q6_K` tensor of the same element count take different space on disk and the *same* space in memory. `inspect` reports both, at the width you say you intend:
+
+```console
+$ amn inspect SmolLM2-135M-Instruct-Q6_K.gguf --to f32
+Format:      GGUF v3
+Arch:        llama
+Tensors:     272
+Total size:  130 MB
+Dequantized: 513 MB (F32)
+Dtypes:      Q8_0, F32, Q6_K
+Alignment:   32 bytes
+```
+
+`--to` defaults to `bf16` and is worth setting deliberately, because it is the whole point of the line: the same file reports 257 MB at `bf16` and 513 MB at `f32`, and a budget check against the wrong one under-reserves by exactly 2×. (On `.npz` and `.pth` nothing is quantized, so the flag is accepted and changes no figure.) Both numbers come out of the header; not a single weight byte is read.
 
 ## Step 2 — `parse`: the full commitment
 

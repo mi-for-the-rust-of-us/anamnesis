@@ -113,6 +113,30 @@ impl TargetDtype {
             Self::F32 => 4,
         }
     }
+
+    /// The element [`Dtype`] this output width names.
+    ///
+    /// `TargetDtype` and [`Dtype`] describe the same three widths from two
+    /// directions: one is what a caller *asks* for, the other is what a tensor
+    /// *is*. The `remember` paths speak the first and the `convert` paths the
+    /// second, so without this the two would each need their own three-arm
+    /// dispatch to the same three monomorphisations — which is exactly the
+    /// duplication Phase 7.6 exists to remove.
+    ///
+    /// Total and infallible: every `TargetDtype` is an output width by
+    /// construction, which is the point of the type.
+    ///
+    /// Gated on `gguf` because that is where the two dispatch styles meet; a
+    /// build without it has only one and needs no bridge.
+    #[cfg(feature = "gguf")]
+    #[must_use]
+    pub(crate) const fn as_dtype(self) -> Dtype {
+        match self {
+            Self::BF16 => Dtype::BF16,
+            Self::F32 => Dtype::F32,
+            Self::F16 => Dtype::F16,
+        }
+    }
 }
 
 impl fmt::Display for TargetDtype {
@@ -433,6 +457,15 @@ pub struct RememberOptions {
     /// `parallel` Cargo feature disabled the budget is always 1 (fully
     /// sequential) regardless of this field.
     pub threads: Option<usize>,
+    /// Cooperative cancellation handle, polled once per tensor.
+    ///
+    /// `None` (the default) means the run cannot be cancelled and costs
+    /// nothing: no token is allocated and the poll is a `None` check. `Some`
+    /// makes the run stop at the next tensor boundary once
+    /// [`CancelToken::cancel`](crate::CancelToken::cancel) is called from any
+    /// thread, returning [`AnamnesisError::Cancelled`] with no output file
+    /// written.
+    pub cancel: Option<crate::CancelToken>,
 }
 
 impl RememberOptions {
@@ -443,7 +476,10 @@ impl RememberOptions {
     /// allocate.
     #[must_use]
     pub const fn new() -> Self {
-        Self { threads: None }
+        Self {
+            threads: None,
+            cancel: None,
+        }
     }
 
     /// Sets the per-tensor dequantisation thread budget (clamped to at least 1).
@@ -461,6 +497,17 @@ impl RememberOptions {
     /// let opts = RememberOptions::new().with_threads(2);
     /// assert_eq!(opts.threads, Some(2));
     /// ```
+    /// Attaches a cancellation handle, polled once per tensor.
+    ///
+    /// Keep a clone: the token is how another thread — a signal handler, a
+    /// watchdog, a request-timeout task — reaches an in-flight call. See
+    /// [`crate::cancel`] for the `PyO3` shape this exists for.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
     #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = Some(n.max(1));
@@ -471,7 +518,7 @@ impl RememberOptions {
     /// [`resolve_thread_budget`]). Consumes the options (the builder is spent
     /// once its budget has been read).
     #[must_use]
-    fn resolved_threads(self) -> usize {
+    pub(crate) fn resolved_threads(self) -> usize {
         resolve_thread_budget(self.threads)
     }
 }
@@ -486,7 +533,7 @@ impl ParsedModel {
     /// [`remember_with_options`](Self::remember_with_options). No I/O — purely
     /// derived from the parsed header.
     pub fn inspect(&self) -> InspectInfo {
-        self.inspect_with_options(InspectOptions::new())
+        self.inspect_with_options(&InspectOptions::new())
     }
 
     /// Returns inspection info with a caller-supplied [`InspectOptions`].
@@ -502,7 +549,7 @@ impl ParsedModel {
     ///
     /// let model = parse("model-fp8.safetensors")?;
     /// let info = model.inspect_with_options(
-    ///     InspectOptions::new().with_output_dtype(TargetDtype::F32),
+    ///     &InspectOptions::new().with_output_dtype(TargetDtype::F32),
     /// );
     /// // `info.dequantized_size` now sizes an F32 request, and
     /// // `info.output_dtype` records which width it assumed.
@@ -510,7 +557,7 @@ impl ParsedModel {
     /// ```
     ///
     /// No I/O — purely derived from the parsed header.
-    pub fn inspect_with_options(&self, options: InspectOptions) -> InspectInfo {
+    pub fn inspect_with_options(&self, options: &InspectOptions) -> InspectInfo {
         InspectInfo::with_options(&self.header, options)
     }
 
@@ -790,15 +837,22 @@ impl ParsedModel {
     where
         F: FnMut(),
     {
+        // Split the builder into its two knobs before spending it: the
+        // token is cloned out because the dispatch borrows it for the whole
+        // run, and `resolved_threads` consumes what is left.
+        let cancel = opts.cancel.clone();
+        let cancel = cancel.as_ref();
         let threads = opts.resolved_threads();
         let path = output_path.as_ref();
         // The single runtime boundary for the file destination: past this
         // `match` the output width is a static type parameter and there is no
         // per-tensor branch, let alone a per-element one.
         match target {
-            TargetDtype::BF16 => self.remember_inner::<Bf16Out, F>(path, threads, on_tensor),
-            TargetDtype::F32 => self.remember_inner::<F32Out, F>(path, threads, on_tensor),
-            TargetDtype::F16 => self.remember_inner::<F16Out, F>(path, threads, on_tensor),
+            TargetDtype::BF16 => {
+                self.remember_inner::<Bf16Out, F>(path, threads, cancel, on_tensor)
+            }
+            TargetDtype::F32 => self.remember_inner::<F32Out, F>(path, threads, cancel, on_tensor),
+            TargetDtype::F16 => self.remember_inner::<F16Out, F>(path, threads, cancel, on_tensor),
         }
     }
 
@@ -862,17 +916,19 @@ impl ParsedModel {
         target: TargetDtype,
         opts: RememberOptions,
     ) -> crate::Result<Vec<u8>> {
+        let cancel = opts.cancel.clone();
+        let cancel = cancel.as_ref();
         let threads = opts.resolved_threads();
         // The single runtime boundary for the in-memory destination; see
         // `remember_with_progress_and_options` for the file one.
         match target {
-            TargetDtype::BF16 => self.remember_to_bytes_inner::<Bf16Out>(threads),
-            TargetDtype::F32 => self.remember_to_bytes_inner::<F32Out>(threads),
-            TargetDtype::F16 => self.remember_to_bytes_inner::<F16Out>(threads),
+            TargetDtype::BF16 => self.remember_to_bytes_inner::<Bf16Out>(threads, cancel),
+            TargetDtype::F32 => self.remember_to_bytes_inner::<F32Out>(threads, cancel),
+            TargetDtype::F16 => self.remember_to_bytes_inner::<F16Out>(threads, cancel),
         }
     }
 
-    /// Normalises this model into [`crate::convert`]'s hub form: quantised
+    /// Normalises this model into [`mod@crate::convert`]'s hub form: quantised
     /// entries dequantised to `E`, passthrough entries copied in their
     /// **original** dtype. Returns the tensors plus how many were dequantised.
     ///
@@ -896,8 +952,16 @@ impl ParsedModel {
     pub(crate) fn hub_tensors<E: OutputElement>(
         &self,
         threads: usize,
+        cancel: Option<&crate::CancelToken>,
+        on_tensor: &mut dyn FnMut(),
     ) -> crate::Result<(Vec<crate::convert::HubTensor>, usize)> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all::<E, _>(threads, || {})?;
+        // TRAIT_OBJECT: the progress hook crosses several private `convert`
+        // readers with different generic parameters, so it arrives as one
+        // `&mut dyn FnMut()` rather than a type parameter on each of them. It
+        // fires on the calling thread only, exactly as `dequantize_all`'s own
+        // hook does.
+        let (dequantized_data, passthrough_refs) =
+            self.dequantize_all::<E, _>(threads, cancel, &mut *on_tensor)?;
 
         let dequantized = dequantized_data.len();
         let mut tensors = Vec::with_capacity(dequantized.saturating_add(passthrough_refs.len()));
@@ -1351,6 +1415,7 @@ impl ParsedModel {
     fn dequantize_all<E: OutputElement, F>(
         &self,
         threads: usize,
+        cancel: Option<&crate::CancelToken>,
         mut on_tensor: F,
     ) -> crate::Result<(DequantizedTensors, PassthroughRefs<'_>)>
     where
@@ -1404,6 +1469,7 @@ impl ParsedModel {
             &quantized,
             threads,
             work_bytes,
+            cancel,
             |_, &(_, entry)| self.dequantize_quantized_entry::<E>(entry),
             |dq| {
                 if matches!(dq, TensorDequant::Owned(..)) {
@@ -1496,13 +1562,14 @@ impl ParsedModel {
         &self,
         output_path: &Path,
         threads: usize,
+        cancel: Option<&crate::CancelToken>,
         on_tensor: F,
     ) -> crate::Result<()>
     where
         F: FnMut(),
     {
         let (dequantized_data, passthrough_refs) =
-            self.dequantize_all::<E, F>(threads, on_tensor)?;
+            self.dequantize_all::<E, F>(threads, cancel, on_tensor)?;
         let views = self.build_views::<E>(&dequantized_data, &passthrough_refs)?;
 
         // Serialize to file. The safetensors writer streams tensor bodies one at
@@ -1525,8 +1592,13 @@ impl ParsedModel {
     }
 
     /// Internal: dequantize to `E` and return the serialized safetensors bytes.
-    fn remember_to_bytes_inner<E: OutputElement>(&self, threads: usize) -> crate::Result<Vec<u8>> {
-        let (dequantized_data, passthrough_refs) = self.dequantize_all::<E, _>(threads, || {})?;
+    fn remember_to_bytes_inner<E: OutputElement>(
+        &self,
+        threads: usize,
+        cancel: Option<&crate::CancelToken>,
+    ) -> crate::Result<Vec<u8>> {
+        let (dequantized_data, passthrough_refs) =
+            self.dequantize_all::<E, _>(threads, cancel, || {})?;
         let views = self.build_views::<E>(&dequantized_data, &passthrough_refs)?;
 
         let metadata = self.header.metadata.clone();

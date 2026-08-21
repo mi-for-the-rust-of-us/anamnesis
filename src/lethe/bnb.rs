@@ -332,7 +332,7 @@ fn encode_bnb4_core(
         // --- Pass 2 (normalize + lookup): f32 / absmax → nearest codebook → pack ---
         // The codebook search is a gather over 16 entries; not currently
         // auto-vectorised, but the divide-and-search inner kernel is
-        // identical for every kernel in the Phase 7.5 family and is the
+        // identical for every kernel in the Phase 8.5 family and is the
         // natural target for an explicit SIMD pass in a future phase.
         // INDEX: scratch_view.len() == block_size, paired with chunks_exact(2)
         #[allow(clippy::indexing_slicing)]

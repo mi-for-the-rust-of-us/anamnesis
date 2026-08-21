@@ -62,4 +62,9 @@ fn gguf_tensor_view_is_send_and_sync() {
 fn option_types_are_send_and_sync() {
     assert_send_sync::<anamnesis::RememberOptions>();
     assert_send_sync::<anamnesis::ConvertOptions>();
+    // Asserted in its own right, not merely through the options structs that
+    // hold one: a `CancelToken` exists to be cloned to another thread and set
+    // there, so if it ever stopped being `Send + Sync` the failure should name
+    // it rather than surfacing as an inscrutable bound on an options type.
+    assert_send_sync::<anamnesis::CancelToken>();
 }

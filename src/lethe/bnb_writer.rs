@@ -281,6 +281,7 @@ pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::R
 /// Summary of how a list of `BnbWriteInput` was classified — useful for
 /// CLI reporting before/during the write.
 #[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
 #[must_use]
 pub struct BnbNf4WriteStats {
     /// Number of input tensors quantised to `BnB-NF4`.

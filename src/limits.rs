@@ -70,8 +70,8 @@ pub struct ParseLimits {
     max_single_alloc_bytes: u64,
 
     /// Upper bound, in bytes, on the *cumulative* parse-time heap a file may
-    /// drive — the running sum of every eager allocation [`max_single_alloc_bytes`]
-    /// gates. Closes the many-small-items blow-up: a file declaring thousands
+    /// drive — the running sum of every eager allocation
+    /// [`Self::max_single_alloc_bytes`] gates. Closes the many-small-items blow-up: a file declaring thousands
     /// of buffers each just under the single-allocation cap is rejected once
     /// their total crosses this budget, before the host `OOM`s. Since Phase
     /// 6.11 the running sum also includes the `.pth` pickle VM's working set —
@@ -371,9 +371,15 @@ impl Budget {
         }
     }
 
-    /// An unbounded accountant — convenience for the inspect paths (not yet
-    /// `ParseLimits`-aware) and tests.
-    #[cfg_attr(not(feature = "npz"), allow(dead_code))]
+    /// An unbounded accountant, for tests that exercise a parser helper without
+    /// a budget in the picture.
+    ///
+    /// `#[cfg(test)]` since v0.7.6. It used to be reachable from production
+    /// code as *"convenience for the inspect paths (not yet `ParseLimits`-aware)"*,
+    /// and that parenthesis was the whole defect Phase 7.6 item 7 closed: the
+    /// inspect paths are `ParseLimits`-aware now, so nothing outside a test
+    /// wants an accountant that cannot say no.
+    #[cfg(test)]
     pub(crate) fn unbounded() -> Self {
         Self::new(&ParseLimits::unbounded())
     }

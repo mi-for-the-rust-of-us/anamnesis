@@ -148,6 +148,7 @@ impl fmt::Display for NpzDtype {
 /// row-major (C) order. Framework consumers can interpret `data` directly
 /// according to `dtype` and `shape`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NpzTensor {
     /// Tensor name as stored in the archive (without `.npy` extension).
     /// Matches the `HashMap` key returned by [`parse_npz`].
@@ -159,6 +160,31 @@ pub struct NpzTensor {
     /// Raw bytes in row-major (C) order, little-endian.
     /// Length equals `product(shape) × dtype.byte_size()`.
     pub data: Vec<u8>,
+}
+
+impl NpzTensor {
+    /// Builds a tensor from its parts.
+    ///
+    /// The construction path for callers that *synthesise* `NPZ` tensors to
+    /// feed `npz_to_safetensors` (or the `_bytes` form), rather than obtaining
+    /// them from [`parse_npz`]. It exists because the struct is
+    /// `#[non_exhaustive]` since v0.7.6: a literal cannot be written from
+    /// outside the crate, and this constructor absorbs any field added later
+    /// without breaking the callers that build one.
+    ///
+    /// The arguments are moved, not validated: `data` is trusted to be
+    /// `product(shape) × dtype.byte_size()` bytes in little-endian, row-major
+    /// (C) order, exactly as [`parse_npz`] produces it. A mismatch surfaces
+    /// downstream, where the safetensors writer checks it.
+    #[must_use]
+    pub const fn new(name: String, shape: Vec<usize>, dtype: NpzDtype, data: Vec<u8>) -> Self {
+        Self {
+            name,
+            shape,
+            dtype,
+            data,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +526,119 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 /// overflows `usize`, if `data_bytes` exceeds the entry's declared size, the
 /// `NPZ_MAX_ARRAY_BYTES` cap, or the caller's `budget` (per-item
 /// single-allocation cap + cumulative aggregate), or if the read fails.
+/// Rewrites Fortran-order (column-major) `data` into C-order (row-major),
+/// returning a fresh buffer.
+///
+/// `NumPy` writes `fortran_order: True` for any array that is `F`-contiguous
+/// and not `C`-contiguous, which a transposed view is: `np.savez("w.npz",
+/// w=x.T)` produces one from an ordinary two-line script. Until v0.7.6 this
+/// crate rejected such an archive outright, which was defensible while the
+/// audience was Rust consumers of `C`-order `SAE` archives and is a
+/// first-contact failure for a `pip` user on a file `NumPy` wrote unprompted.
+///
+/// **Why materialise rather than record the order and hand the bytes back.**
+/// Every consumer downstream of here assumes row-major: `npz_to_safetensors`,
+/// the `convert` hub, and any framework loading the result. A flag the caller
+/// might ignore is precisely the silent-orientation trap
+/// [Phase 6.10](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
+/// already had to fix once for `AWQ`/`GPTQ`, and a wrong orientation is not a
+/// crash — it is plausible numbers in the wrong places.
+///
+/// Rank 0 and rank 1 return `data` untouched (the two orders coincide), as does
+/// any shape with a zero dimension. Higher ranks are one code path: `F`-order is
+/// `C`-order with the dimensions reversed, so reversed strides handle rank 2 and
+/// rank *n* alike.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if the destination buffer exceeds
+/// `budget`, and [`AnamnesisError::Parse`] if `data` is not exactly
+/// `product(shape) × elem_size` bytes (the caller has already validated this;
+/// the check is what lets the copy loop below run without per-element bounds
+/// tests).
+///
+/// # Memory
+///
+/// Allocates a second buffer the size of the array, charged to `budget` before
+/// the allocation. Transient: `data` is dropped on return, so peak is `2 ×` the
+/// array for the duration of the copy and `1 ×` afterwards.
+fn to_c_order(
+    data: Vec<u8>,
+    shape: &[usize],
+    elem_size: usize,
+    budget: &mut Budget,
+) -> crate::Result<Vec<u8>> {
+    let rank = shape.len();
+    let n_elements: usize = shape.iter().copied().fold(1usize, usize::saturating_mul);
+    if rank < 2 || n_elements == 0 || elem_size == 0 {
+        // EXPLICIT: the two orders coincide below rank 2 and for an empty
+        // array, so the transposition is the identity and the copy is skipped.
+        return Ok(data);
+    }
+
+    let expected = n_elements
+        .checked_mul(elem_size)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "fortran-order array byte length overflow".into(),
+        })?;
+    if data.len() != expected {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "fortran-order array is {} bytes, expected {expected} from shape {shape:?}",
+                data.len()
+            ),
+        });
+    }
+
+    // CAST: usize → u64, lossless widening on all supported targets.
+    #[allow(clippy::as_conversions)]
+    let expected_u64 = expected as u64;
+    budget.charge_alloc(expected_u64, "NPZ fortran-order transposition")?;
+
+    // Column-major strides, in elements: stride[0] = 1, stride[d] = prod(shape[..d]).
+    let mut f_strides = vec![0usize; rank];
+    let mut acc = 1usize;
+    for (stride, &dim) in f_strides.iter_mut().zip(shape.iter()) {
+        *stride = acc;
+        acc = acc.saturating_mul(dim);
+    }
+
+    let mut out = vec![0u8; expected];
+    // Walk the output in C order with an odometer over the coordinates, and
+    // carry the matching source offset incrementally so the inner step is an
+    // add rather than a dot product.
+    let mut coord = vec![0usize; rank];
+    let mut src_elem = 0usize;
+
+    // VECTORIZED: scalar fallback - the source offset is a computed gather over
+    // reversed strides, so no run of source bytes is contiguous with the
+    // destination and there is nothing for the compiler to widen.
+    #[allow(clippy::indexing_slicing)]
+    for dst_elem in 0..n_elements {
+        // INDEX: `data.len() == out.len() == n_elements * elem_size` is checked
+        // above, and both offsets are `< n_elements`, so both ranges are in
+        // bounds by construction.
+        let d0 = dst_elem * elem_size;
+        let s0 = src_elem * elem_size;
+        out[d0..d0 + elem_size].copy_from_slice(&data[s0..s0 + elem_size]);
+
+        // Increment the odometer, last dimension fastest (C order), keeping
+        // `src_elem` in step with the column-major strides.
+        for d in (0..rank).rev() {
+            coord[d] += 1;
+            src_elem += f_strides[d];
+            if coord[d] < shape[d] {
+                break;
+            }
+            // This dimension wrapped: rewind it and carry into the next.
+            src_elem -= f_strides[d] * shape[d];
+            coord[d] = 0;
+        }
+    }
+
+    Ok(out)
+}
+
 fn read_array_data(
     reader: &mut impl Read,
     header: &NpyHeader,
@@ -606,6 +745,7 @@ fn open_npz_entry_reader<'a, R: Read + Seek>(
 /// Produced by [`inspect_npz`]. Contains only `NPY` header information —
 /// no tensor data is read from the archive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NpzTensorInfo {
     /// Tensor name (without `.npy` extension).
     pub name: String,
@@ -623,6 +763,7 @@ pub struct NpzTensorInfo {
 /// is proportional to the number of tensors (metadata only), not the
 /// file size.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 #[must_use]
 pub struct NpzInspectInfo {
     /// Per-tensor metadata.
@@ -631,6 +772,44 @@ pub struct NpzInspectInfo {
     pub total_bytes: u64,
     /// Distinct dtypes found (in order of first occurrence).
     pub dtypes: Vec<NpzDtype>,
+    /// Estimated tensor-data size in bytes after conversion, at
+    /// [`output_dtype`](Self::output_dtype).
+    ///
+    /// **Always equal to [`total_bytes`](Self::total_bytes)**, and that is the
+    /// answer rather than a placeholder: `NPZ` arrays are already full
+    /// precision, so a conversion copies every array through in its **source**
+    /// dtype. Present so a caller reading
+    /// [`InspectSummary`](crate::InspectSummary) gets the same question
+    /// answered for every format instead of having to know which formats
+    /// expand.
+    pub dequantized_size: u64,
+    /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
+    ///
+    /// Recorded, but **vacuous** for this format rather than wrong: nothing is
+    /// dequantised, so the figure is the same at every width — the same sense
+    /// in which `amn convert weights.npz --out-dtype f32` is accepted and
+    /// widens nothing.
+    pub output_dtype: crate::TargetDtype,
+}
+
+impl crate::inspect::sealed::Sealed for NpzInspectInfo {}
+
+impl crate::InspectSummary for NpzInspectInfo {
+    fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    fn current_size(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn dequantized_size(&self) -> u64 {
+        self.dequantized_size
+    }
+
+    fn output_dtype(&self) -> crate::TargetDtype {
+        self.output_dtype
+    }
 }
 
 impl fmt::Display for NpzInspectInfo {
@@ -680,8 +859,9 @@ impl fmt::Display for NpzInspectInfo {
 /// Returns [`AnamnesisError::LimitExceeded`] if a `ZIP` entry count / name
 /// length or an `NPY` header size exceeds a permanent cap (always-on).
 ///
-/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
-/// or an unsupported dtype.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype. Fortran-order arrays are **accepted** since v0.7.6 and rewritten
+/// into C-order on the way out.
 ///
 /// # Memory
 ///
@@ -694,8 +874,31 @@ impl fmt::Display for NpzInspectInfo {
 /// The distinction is intentional: `inspect_npz` is best-effort metadata
 /// extraction, while `parse_npz` must validate before allocating buffers.
 pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
+    inspect_npz_with_options(path, &crate::InspectOptions::new())
+}
+
+/// Inspects an `NPZ` archive on disk under a caller-supplied
+/// [`InspectOptions`](crate::InspectOptions).
+///
+/// The path-based twin of [`inspect_npz_from_reader_with_options`], and the
+/// `NPZ` counterpart of `parse_npz_with_limits`: the parse could be bounded
+/// before v0.7.6, the inspect that is supposed to *precede* it could not.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the file cannot be opened or read, and
+/// otherwise as [`inspect_npz_from_reader_with_options`].
+///
+/// # Memory
+///
+/// As [`inspect_npz_from_reader_with_options`]: `O(n_arrays)` metadata, no
+/// array data.
+pub fn inspect_npz_with_options(
+    path: impl AsRef<Path>,
+    options: &crate::InspectOptions,
+) -> crate::Result<NpzInspectInfo> {
     let file = std::fs::File::open(path.as_ref())?;
-    inspect_npz_from_reader(file)
+    inspect_npz_from_reader_with_options(file, options)
 }
 
 /// Inspects an `NPZ` archive from any `Read + Seek` source, returning
@@ -755,8 +958,9 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// Returns [`AnamnesisError::LimitExceeded`] if a `ZIP` entry count / name
 /// length or an `NPY` header size exceeds a permanent cap (always-on).
 ///
-/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
-/// or an unsupported dtype.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype. Fortran-order arrays are **accepted** since v0.7.6 and rewritten
+/// into C-order on the way out.
 ///
 /// # Memory
 ///
@@ -771,11 +975,45 @@ pub fn inspect_npz(path: impl AsRef<Path>) -> crate::Result<NpzInspectInfo> {
 /// `u64::MAX`. Behaviour matches [`inspect_npz`] and differs from
 /// `parse_npz`, which returns `Err` on the same overflow.
 pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzInspectInfo> {
+    inspect_npz_from_reader_with_options(reader, &crate::InspectOptions::new())
+}
+
+/// Inspects an `NPZ` archive from any `Read + Seek` source, under a
+/// caller-supplied [`InspectOptions`](crate::InspectOptions).
+///
+/// The two-knob form of [`inspect_npz_from_reader`], new in v0.7.6.
+/// `output_dtype` is recorded and vacuous here (`NPZ` arrays are already full
+/// precision), so the knob that does work is **`limits`**, and it closes the
+/// sharpest instance of the gap in the family: `NPZ` had no bounded inspect at
+/// all, not even the front-matter alternative `GGUF` and `.pth` offer. The walk
+/// is `O(entries)` in both I/O and allocation, and the permanent
+/// `ZIP_MAX_ENTRIES` floor is `1 << 20`, so a hostile archive could force a
+/// million-entry central directory, a million `NPY` header reads, and a
+/// `Vec<NpzTensorInfo>` no caller could cap — on the very call
+/// [`README.md`](https://github.com/mi-for-the-rust-of-us/anamnesis#parsing-untrusted-input)
+/// tells a multi-tenant host to make **first**. `limits` now bounds the
+/// central-directory read, the item count, and every `NPY` header, cumulatively
+/// as well as individually.
+///
+/// # Errors
+///
+/// As [`inspect_npz_from_reader`], plus [`AnamnesisError::LimitExceeded`] when
+/// a declared count or allocation exceeds `options.limits` rather than only
+/// when it exceeds a permanent cap.
+///
+/// # Memory
+///
+/// `O(n_arrays)` metadata — names, shapes and dtypes — plus one `NPY` header at
+/// a time. No array data is read.
+pub fn inspect_npz_from_reader_with_options<R: Read + Seek>(
+    reader: R,
+    options: &crate::InspectOptions,
+) -> crate::Result<NpzInspectInfo> {
     let mut src = crate::parse::zip::ReaderSource::new(reader)?;
-    // Inspect path is intentionally limit-free (it reports totals for the host's
-    // inspect-before-parse gate); the permanent ZIP_MAX_ENTRIES floor still
-    // applies inside the reader.
-    let entries = crate::parse::zip::read_central_directory(&mut src, &ParseLimits::unbounded())?;
+    let entries = crate::parse::zip::read_central_directory(&mut src, &options.limits)?;
+    // One accountant for the whole walk, so the running total bounds the header
+    // set rather than each header in isolation.
+    let mut budget = Budget::new(&options.limits);
 
     // Clamp the pre-allocation hint: the central-directory entry count is
     // attacker-influenced (a many-empty-entries zip), so trusting it for
@@ -794,23 +1032,19 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
             None => continue,
         };
 
-        // Inspect path is intentionally limit-free: it reports the totals a host
-        // checks against its policy (the inspect-before-parse gate), then calls
-        // `parse_npz_with_limits` for enforcement. Unbounded budget keeps the
-        // permanent NPY_MAX_HEADER_BYTES cap as the only bound here.
+        // The header read is charged to the caller's budget. Before v0.7.6 this
+        // was `Budget::unbounded()` by design, which left the permanent
+        // `NPY_MAX_HEADER_BYTES` cap as the only bound on the call a host is
+        // told to make *first* on an untrusted archive — the one call it could
+        // not tighten. One accountant for the whole walk, so the cumulative
+        // total bounds the headers as a set and not merely one at a time.
         let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
-        let header = parse_npy_header(&mut entry_reader, &mut Budget::unbounded())?;
+        let header = parse_npy_header(&mut entry_reader, &mut budget)?;
 
-        if header.fortran_order {
-            return Err(AnamnesisError::Unsupported {
-                format: "NPZ".into(),
-                detail: format!(
-                    "fortran-order arrays not supported (array '{name}'). \
-                     ML frameworks save C-order by default"
-                ),
-            });
-        }
-
+        // Memory order does not change the shape, the dtype, or the byte
+        // count, so an inspect has nothing to reject here. Before v0.7.6 it
+        // rejected anyway, which meant a host could not even *look* at an
+        // archive holding a transposed array.
         let n_elements: usize = header
             .shape
             .iter()
@@ -840,6 +1074,10 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
         tensors,
         total_bytes,
         dtypes,
+        // Not a copy made out of symmetry: `NPZ` arrays are passed through in
+        // their source dtype, so the post-conversion size *is* the stored size.
+        dequantized_size: total_bytes,
+        output_dtype: options.output_dtype,
     })
 }
 
@@ -861,8 +1099,9 @@ pub fn inspect_npz_from_reader<R: Read + Seek>(reader: R) -> crate::Result<NpzIn
 /// length, an `NPY` header size, or a declared array size exceeds a permanent
 /// cap (all always-on, reachable even at default limits).
 ///
-/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
-/// or an unsupported dtype.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype. Fortran-order arrays are **accepted** since v0.7.6 and rewritten
+/// into C-order on the way out.
 ///
 /// # Memory
 ///
@@ -894,8 +1133,9 @@ pub fn parse_npz(path: impl AsRef<Path>) -> crate::Result<HashMap<String, NpzTen
 /// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed, an
 /// `NPY` header is invalid, or array data is truncated.
 ///
-/// Returns [`AnamnesisError::Unsupported`] if an array uses Fortran order
-/// or an unsupported dtype.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype. Fortran-order arrays are **accepted** since v0.7.6 and rewritten
+/// into C-order on the way out.
 ///
 /// # Memory
 ///
@@ -907,7 +1147,118 @@ pub fn parse_npz_with_limits(
     limits: &ParseLimits,
 ) -> crate::Result<HashMap<String, NpzTensor>> {
     let file = std::fs::File::open(path.as_ref())?;
-    let mut src = crate::parse::zip::ReaderSource::new(file)?;
+    parse_npz_from_zip_reader(file, limits)
+}
+
+/// Parses `NPZ` bytes already held in memory, returning the arrays as a
+/// name-to-tensor map.
+///
+/// The `NPZ` member of the copy-based, mmap-free family every other format has
+/// had since [Phase 6.13](https://github.com/mi-for-the-rust-of-us/anamnesis/blob/main/ROADMAP.md)
+/// — `parse_bytes` for safetensors, `parse_gguf_bytes`, `parse_pth_bytes`. Its
+/// absence was not a design decision but an omission, and it meant the
+/// untrusted-input contract those siblings document had no `NPZ` instance: a
+/// caller holding bytes had to write a temporary file first.
+///
+/// [`parse_npz_bytes`] is the [`ParseLimits::default`] (unbounded) special case
+/// of [`parse_npz_bytes_with_limits`].
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the `ZIP` archive is malformed, an
+/// `NPY` header is invalid, or array data is truncated.
+/// Returns [`AnamnesisError::LimitExceeded`] if a declared count, allocation,
+/// or decompression ratio exceeds a permanent `NPZ` cap.
+/// Returns [`AnamnesisError::Unsupported`] if an array uses an unsupported
+/// dtype.
+/// Returns [`AnamnesisError::Io`] only from the in-memory cursor, which does
+/// not fail in practice.
+///
+/// # Memory
+///
+/// Holds `bytes` for the duration of the parse **and** allocates one `Vec<u8>`
+/// per array, so peak is the archive plus the decompressed arrays. Contrast
+/// [`parse_npz`], which streams from a file and peaks at the arrays alone.
+pub fn parse_npz_bytes(bytes: Vec<u8>) -> crate::Result<HashMap<String, NpzTensor>> {
+    parse_npz_bytes_with_limits(bytes, &ParseLimits::default())
+}
+
+/// Parses owned `NPZ` bytes under a caller-supplied [`ParseLimits`] budget.
+///
+/// Rejects an input larger than [`ParseLimits::max_single_alloc_bytes`] before
+/// parsing, then enforces every applicable ceiling exactly as
+/// [`parse_npz_with_limits`] does.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if `bytes` exceeds `limits`, or if
+/// a declared count, allocation or decompression ratio does. Otherwise as
+/// [`parse_npz_bytes`].
+///
+/// # Memory
+///
+/// As [`parse_npz_bytes`].
+pub fn parse_npz_bytes_with_limits(
+    bytes: Vec<u8>,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    // CAST: usize → u64, lossless widening on all supported targets.
+    #[allow(clippy::as_conversions)]
+    let len = bytes.len() as u64;
+    limits.check_alloc(len, "NPZ bytes")?;
+    parse_npz_from_zip_reader(std::io::Cursor::new(bytes), limits)
+}
+
+/// Parses an `NPZ` archive from any reader, returning the arrays as a
+/// name-to-tensor map — the copy-based, mmap-free path for untrusted streams.
+///
+/// The whole stream is read into an owned buffer (bounded by [`ParseLimits`])
+/// and parsed from memory, so a truncated or hostile stream is a clean `Err`.
+/// Takes `Read` alone, not `Read + Seek`, matching `parse_pth_from_reader` and
+/// `parse_gguf_from_reader`: the seeks the `ZIP` container needs happen over the
+/// owned buffer, so an HTTP body or a pipe works without a seekable adapter.
+/// (`inspect_npz_from_reader` does require `Seek`, because it deliberately
+/// avoids buffering the archive at all.)
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the reader fails.
+/// Returns [`AnamnesisError::LimitExceeded`] if the bytes read exceed `limits`.
+/// Otherwise as [`parse_npz_bytes`].
+///
+/// # Memory
+///
+/// Reads the stream into an owned `Vec<u8>` of at most
+/// `max_single_alloc_bytes + 1` bytes, then as [`parse_npz_bytes`].
+pub fn parse_npz_from_reader<R: Read>(reader: R) -> crate::Result<HashMap<String, NpzTensor>> {
+    parse_npz_from_reader_with_limits(reader, &ParseLimits::default())
+}
+
+/// Parses an `NPZ` archive from any reader under a caller-supplied
+/// [`ParseLimits`] budget — the bounded, mmap-free path for untrusted input.
+///
+/// # Errors
+///
+/// As [`parse_npz_from_reader`].
+///
+/// # Memory
+///
+/// As [`parse_npz_from_reader`].
+pub fn parse_npz_from_reader_with_limits<R: Read>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    let bytes = limits.read_to_vec_bounded(reader, "NPZ archive")?;
+    parse_npz_bytes_with_limits(bytes, limits)
+}
+
+/// The single parse body shared by the path, bytes and reader entry points, so
+/// the three cannot drift on limit enforcement or `NPY` interpretation.
+fn parse_npz_from_zip_reader<R: Read + Seek>(
+    reader: R,
+    limits: &ParseLimits,
+) -> crate::Result<HashMap<String, NpzTensor>> {
+    let mut src = crate::parse::zip::ReaderSource::new(reader)?;
     // The reader enforces `limits` (item-count + the central-directory single
     // allocation) fail-fast, before materialising the entry vector — so a
     // tight-budget caller bounds the container metadata, not only the
@@ -941,17 +1292,18 @@ pub fn parse_npz_with_limits(
         let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
         let header = parse_npy_header(&mut entry_reader, &mut budget)?;
 
-        if header.fortran_order {
-            return Err(AnamnesisError::Unsupported {
-                format: "NPZ".into(),
-                detail: format!(
-                    "fortran-order arrays not supported (array '{name}'). \
-                     ML frameworks save C-order by default"
-                ),
-            });
-        }
-
-        let data = read_array_data(&mut entry_reader, &header, entry_size, &mut budget)?;
+        let raw = read_array_data(&mut entry_reader, &header, entry_size, &mut budget)?;
+        // `NumPy` records the order it found, and a transposed view is
+        // `F`-contiguous, so this arm is reached by ordinary scripts rather
+        // than exotic ones. Materialising C-order here keeps the row-major
+        // promise every downstream consumer relies on. A C-order array — the
+        // overwhelming majority — pays nothing: no branch inside a loop, no
+        // second buffer, the bytes move straight into the map.
+        let data = if header.fortran_order {
+            to_c_order(raw, &header.shape, header.dtype.byte_size(), &mut budget)?
+        } else {
+            raw
+        };
 
         result.insert(
             name.clone(),
@@ -1272,39 +1624,58 @@ mod tests {
         assert!(parse_npy_header(&mut reader, &mut Budget::unbounded()).is_err());
     }
 
+    /// The header flag is read, which is what the transposition branches on.
+    ///
+    /// Renamed at v0.7.6: it was `fortran_order_rejected_in_parse_npz` and its
+    /// comment apologised that "we can't easily test `parse_npz` with Fortran
+    /// order without creating a real NPZ file". Two tests below now do exactly
+    /// that, so this one is left doing the narrow job it actually did.
     #[test]
-    fn fortran_order_rejected_in_parse_npz() {
-        // We can't easily test parse_npz with Fortran order without creating
-        // a real NPZ file, but we can verify the extraction logic.
+    fn fortran_order_flag_is_extracted() {
         let header = "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 3), }";
         assert!(extract_fortran_order(header));
     }
 
     // -- Gap tests (review findings G32–G36) ---------------------------------
 
-    // G32: Fortran-order rejection through parse_npz end-to-end
+    // G32: Fortran order through parse_npz end-to-end.
+    //
+    // Was `fortran_order_rejected_end_to_end` until v0.7.6, when the rejection
+    // became a transposition (Phase 7.6 item 8). Kept, inverted, because the
+    // path it exercises — a real archive through the path-based entry point —
+    // is exactly the one a `pip` user hits with a file `np.savez` wrote from a
+    // transposed view.
     #[test]
-    fn fortran_order_rejected_end_to_end() {
-        // Build a minimal NPZ containing a single Fortran-order NPY entry.
+    fn fortran_order_accepted_end_to_end() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
+        // The 2x2 matrix [[1, 2], [3, 4]] stored column-major: 1 3 2 4.
+        let f_order: Vec<u8> = [1.0f32, 3.0, 2.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         {
             let file = std::fs::File::create(tmp.path()).unwrap();
             let mut zip = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zip.start_file("arr.npy", options).unwrap();
-
-            // Build NPY v1 with fortran_order: True
             let header_str = "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 2), }";
-            let npy = make_npy_v1(header_str, &[0u8; 16]); // 4 f32 zeros
+            let npy = make_npy_v1(header_str, &f_order);
             zip.write_all(&npy).unwrap();
             zip.finish().unwrap();
         }
-        let err = parse_npz(tmp.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Fortran-order") || msg.contains("fortran"),
-            "expected Fortran-order error, got: {msg}"
+
+        let parsed = parse_npz(tmp.path()).expect("F-order archives parse since v0.7.6");
+        let arr = parsed.get("arr").expect("array arr");
+        assert_eq!(arr.shape, vec![2, 2]);
+
+        let expected: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            arr.data, expected,
+            "the stored column-major bytes must come back row-major"
         );
     }
 
@@ -1630,6 +2001,218 @@ mod tests {
         );
     }
 
+    /// Phase 7.6 item 8: a Fortran-order array round-trips to the same values a
+    /// C-order archive of the same matrix would produce.
+    ///
+    /// The fixture is the 2x3 matrix
+    ///
+    /// ```text
+    ///   1  2  3
+    ///   4  5  6
+    /// ```
+    ///
+    /// stored twice: once C-order (`1 2 3 4 5 6` on disk) and once F-order
+    /// (`1 4 2 5 3 6` on disk, which is what `np.savez(f, w=x.T)` writes for
+    /// the transpose of the 3x2 matrix). Both must parse to the same
+    /// row-major bytes, because that is the promise `NpzTensor::data` makes.
+    #[test]
+    fn fortran_order_arrays_are_materialised_in_c_order() {
+        // f4 values 1.0 ..= 6.0 as little-endian bytes.
+        let val = |v: f32| v.to_le_bytes();
+        let c_order: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .flat_map(|&v| val(v))
+            .collect();
+        let f_order: Vec<u8> = [1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0]
+            .iter()
+            .flat_map(|&v| val(v))
+            .collect();
+
+        let build = |header: &str, data: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zip.start_file("w.npy", options).unwrap();
+                zip.write_all(&make_npy_v1(header, data)).unwrap();
+                zip.finish().unwrap();
+            }
+            buf
+        };
+
+        let c_npz = build(
+            "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3), }",
+            &c_order,
+        );
+        let f_npz = build(
+            "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 3), }",
+            &f_order,
+        );
+
+        let from_c = parse_npz_bytes(c_npz).expect("C-order parse");
+        let from_f = parse_npz_bytes(f_npz).expect("F-order parse");
+
+        let c_tensor = from_c.get("w").expect("array w");
+        let f_tensor = from_f.get("w").expect("array w");
+
+        assert_eq!(f_tensor.shape, vec![2, 3], "the logical shape is unchanged");
+        assert_eq!(
+            f_tensor.data, c_tensor.data,
+            "an F-order array must yield the same row-major bytes as its C-order twin"
+        );
+        assert_eq!(
+            f_tensor.data, c_order,
+            "and those bytes are the row-major ones"
+        );
+    }
+
+    /// The transposition is the identity below rank 2 and on an empty array, and
+    /// it is *not* applied to C-order input.
+    ///
+    /// The second half is the bug the compiler caught while this landed: an
+    /// unconditional call would have transposed every C-order array in the
+    /// world, which is a silent-orientation defect rather than a crash.
+    #[test]
+    fn c_order_and_low_rank_arrays_are_untouched() {
+        let data: Vec<u8> = (0u8..24).collect();
+
+        // A rank-1 array declared F-order: the two orders coincide.
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("v.npy", options).unwrap();
+            zip.write_all(&make_npy_v1(
+                "{'descr': '|u1', 'fortran_order': True, 'shape': (24,), }",
+                &data,
+            ))
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let parsed = parse_npz_bytes(buf).expect("rank-1 F-order parse");
+        assert_eq!(parsed.get("v").expect("array v").data, data);
+
+        // And the helper itself, directly, on a C-order-shaped call.
+        let mut budget = Budget::unbounded();
+        let same = to_c_order(data.clone(), &[24], 1, &mut budget).unwrap();
+        assert_eq!(same, data, "rank 1 must be the identity");
+        let empty = to_c_order(Vec::new(), &[0, 5], 4, &mut budget).unwrap();
+        assert!(empty.is_empty(), "an empty array must be the identity");
+    }
+
+    /// A rank-3 F-order array transposes correctly too, which is what makes the
+    /// reversed-strides formulation worth having over a special-cased 2-D swap.
+    #[test]
+    fn fortran_order_handles_rank_three() {
+        // shape (2, 3, 4): C-order value at (i, j, k) is i*12 + j*4 + k.
+        let shape = [2usize, 3, 4];
+        let n = 24usize;
+        let c_order: Vec<u8> = (0..n).map(|i| u8::try_from(i).unwrap()).collect();
+        // F-order storage: index i + j*2 + k*6 holds the value at (i, j, k).
+        let mut f_order = vec![0u8; n];
+        for i in 0..shape[0] {
+            for j in 0..shape[1] {
+                for k in 0..shape[2] {
+                    let c_idx = i * 12 + j * 4 + k;
+                    let f_idx = i + j * 2 + k * 6;
+                    f_order[f_idx] = u8::try_from(c_idx).unwrap();
+                }
+            }
+        }
+
+        let mut budget = Budget::unbounded();
+        let out = to_c_order(f_order, &shape, 1, &mut budget).unwrap();
+        assert_eq!(out, c_order, "rank-3 reversed-strides transposition");
+    }
+
+    /// The transposition's second buffer is charged to the caller's budget, like
+    /// every other allocation in this parser.
+    #[test]
+    fn fortran_transposition_is_charged_to_the_budget() {
+        let mut budget = Budget::new(&ParseLimits::default().with_max_single_alloc(8));
+        let err = to_c_order(vec![0u8; 24], &[2, 3], 4, &mut budget)
+            .expect_err("a 8-byte ceiling cannot admit a 24-byte destination");
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    /// Phase 7.6 item 7: the inspect the host is told to run **first** is now
+    /// bounded by the host's own budget.
+    ///
+    /// Until v0.7.6 the summary inspects were "intentionally limit-free", so the
+    /// only bound on this call was the permanent `ZIP_MAX_ENTRIES` floor of
+    /// `1 << 20` — a hostile archive could force a million-entry walk and a
+    /// `Vec<NpzTensorInfo>` no caller could cap, on the call `README.md`
+    /// recommends making before anything else. That inverts `ParseLimits`, whose
+    /// whole premise is that a caller can always tighten.
+    #[test]
+    fn inspect_npz_honours_the_caller_budget() {
+        let data = vec![0u8; 4000];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let file = std::fs::File::create(tmp.path()).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy", "c.npy"] {
+                zip.start_file(name, options).unwrap();
+                let npy = make_npy_v1(
+                    "{'descr': '<f4', 'fortran_order': False, 'shape': (1000,), }",
+                    &data,
+                );
+                zip.write_all(&npy).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        // Unbounded: three arrays, as stored.
+        let info = inspect_npz(tmp.path()).unwrap();
+        assert_eq!(info.tensors.len(), 3);
+
+        // An item-count budget below the declared entry count rejects before the
+        // entry vector is materialised.
+        let tight =
+            crate::InspectOptions::new().with_limits(ParseLimits::default().with_max_item_count(2));
+        let err = inspect_npz_with_options(tmp.path(), &tight).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "an item-count budget must bound the inspect walk, got {err:?}"
+        );
+
+        // A per-allocation budget below one `NPY` header rejects the header read.
+        let tiny = crate::InspectOptions::new()
+            .with_limits(ParseLimits::default().with_max_single_alloc(8));
+        let err = inspect_npz_with_options(tmp.path(), &tiny).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "a per-allocation budget must bound the header reads, got {err:?}"
+        );
+
+        // The same budget through the reader-generic entry point.
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let err =
+            inspect_npz_from_reader_with_options(std::io::Cursor::new(&bytes), &tight).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { .. }),
+            "the reader form must enforce the same budget, got {err:?}"
+        );
+
+        // And a generous budget still succeeds, so the gate is not simply stuck.
+        let roomy = crate::InspectOptions::new()
+            .with_limits(ParseLimits::default().with_max_item_count(100));
+        assert_eq!(
+            inspect_npz_with_options(tmp.path(), &roomy)
+                .unwrap()
+                .tensors
+                .len(),
+            3
+        );
+    }
+
     /// Phase 6.8 Step 5: the documented inspect-before-parse policy gate.
     /// `inspect_npz`'s reported `total_bytes` lets a host predict an
     /// over-budget file *without parsing*; `parse_npz_with_limits` then enforces
@@ -1816,21 +2399,27 @@ mod tests {
         assert!(info.dtypes.is_empty());
     }
 
-    /// `inspect_npz_from_reader` propagates Fortran-order rejection through
-    /// the same code path as `inspect_npz`. Confirms the refactor did not
-    /// silently lose the unsupported-format guard.
+    /// `inspect_npz_from_reader` summarises a Fortran-order archive rather than
+    /// refusing to look at it.
+    ///
+    /// Was `inspect_from_reader_rejects_fortran_order` until v0.7.6. Memory
+    /// order changes no shape, dtype or byte count, so an inspect never had
+    /// anything to reject; refusing meant a host could not run its
+    /// inspect-before-parse gate on an archive it would now happily parse.
     #[test]
-    fn inspect_from_reader_rejects_fortran_order() {
+    fn inspect_from_reader_summarises_fortran_order() {
         let buf = make_in_memory_npz(
             "arr",
             "{'descr': '<f4', 'fortran_order': True, 'shape': (2, 2), }",
             &[0u8; 16],
         );
-        let err = inspect_npz_from_reader(std::io::Cursor::new(&buf)).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Fortran-order") || msg.contains("fortran"),
-            "expected Fortran-order error, got: {msg}"
+        let info = inspect_npz_from_reader(std::io::Cursor::new(&buf))
+            .expect("an inspect has nothing to reject about memory order");
+        assert_eq!(info.tensors.len(), 1);
+        assert_eq!(info.tensors[0].shape, vec![2, 2]);
+        assert_eq!(
+            info.total_bytes, 16,
+            "the byte count is the same either way round"
         );
     }
 

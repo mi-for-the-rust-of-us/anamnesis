@@ -7,8 +7,10 @@
 //! Phase 8 bindings must be able to surface as a catchable `PanicException`).
 //!
 //! Every re-exported parse/inspect entry point of all four formats is driven
-//! here — the owned-bytes, reader, **and path/mmap** variants, each under both
-//! `ParseLimits::default()` and a deliberately hostile tight budget (so the
+//! here — the owned-bytes, reader, **and path/mmap** variants, plus (since
+//! v0.7.6) the budget-taking `inspect_*_with_options` forms and the
+//! format-agnostic `detect_format_from_bytes*` / `convert_bytes` — each under
+//! both `ParseLimits::default()` and a deliberately hostile tight budget (so the
 //! `check_alloc` / bounded-reader / `Budget::charge_alloc` / count / ratio
 //! rejection arithmetic is on the hook too) — over a battery of adversarial
 //! inputs (synthetic malformed shapes + truncations and bit-flips of the
@@ -361,7 +363,11 @@ fn pth_entry_points_never_panic() {
 #[cfg(feature = "npz")]
 #[test]
 fn npz_entry_points_never_panic() {
-    use anamnesis::{inspect_npz, inspect_npz_from_reader, parse_npz, parse_npz_with_limits};
+    use anamnesis::{
+        InspectOptions, inspect_npz, inspect_npz_from_reader, inspect_npz_from_reader_with_options,
+        inspect_npz_with_options, parse_npz, parse_npz_bytes, parse_npz_bytes_with_limits,
+        parse_npz_from_reader, parse_npz_from_reader_with_limits, parse_npz_with_limits,
+    };
     use std::io::Cursor;
 
     let tmp = tempfile::NamedTempFile::new().expect("temp file");
@@ -388,5 +394,111 @@ fn npz_entry_points_never_panic() {
             &format!("npz parse_npz_with_limits(path)[tight] / {label}"),
             || parse_npz_with_limits(path, &tight),
         );
+
+        // The owned-bytes and reader family, new in v0.7.6. `NPZ` was the one
+        // format without a copy-based parse, so these are the entry points this
+        // suite's own header promised ("every re-exported parse/inspect entry
+        // point of all four formats") before they existed.
+        assert_no_panic(&format!("npz parse_npz_bytes / {label}"), || {
+            parse_npz_bytes(bytes.clone())
+        });
+        assert_no_panic(
+            &format!("npz parse_npz_bytes_with_limits[default] / {label}"),
+            || parse_npz_bytes_with_limits(bytes.clone(), &default),
+        );
+        assert_no_panic(
+            &format!("npz parse_npz_bytes_with_limits[tight] / {label}"),
+            || parse_npz_bytes_with_limits(bytes.clone(), &tight),
+        );
+        assert_no_panic(&format!("npz parse_npz_from_reader / {label}"), || {
+            parse_npz_from_reader(Cursor::new(bytes.clone()))
+        });
+        assert_no_panic(
+            &format!("npz parse_npz_from_reader_with_limits[default] / {label}"),
+            || parse_npz_from_reader_with_limits(Cursor::new(bytes.clone()), &default),
+        );
+        assert_no_panic(
+            &format!("npz parse_npz_from_reader_with_limits[tight] / {label}"),
+            || parse_npz_from_reader_with_limits(Cursor::new(bytes.clone()), &tight),
+        );
+
+        // The bounded inspect forms, also v0.7.6: a hostile budget puts the
+        // rejection arithmetic on the hook, not just the parse.
+        let opts_default = InspectOptions::new().with_limits(default.clone());
+        let opts_tight = InspectOptions::new().with_limits(tight.clone());
+        assert_no_panic(
+            &format!("npz inspect_npz_with_options[default] / {label}"),
+            || inspect_npz_with_options(path, &opts_default),
+        );
+        assert_no_panic(
+            &format!("npz inspect_npz_with_options[tight] / {label}"),
+            || inspect_npz_with_options(path, &opts_tight),
+        );
+        assert_no_panic(
+            &format!("npz inspect_npz_from_reader_with_options[tight] / {label}"),
+            || inspect_npz_from_reader_with_options(Cursor::new(bytes.clone()), &opts_tight),
+        );
+    }
+}
+
+/// The format-agnostic entry points added in v0.7.6: magic-byte detection and
+/// the in-memory `convert`.
+///
+/// Both take raw caller bytes and are reachable before any other validation —
+/// `detect_format_from_bytes` walks a `ZIP` central directory to tell an `NPZ`
+/// from a `.pth`, which is real parsing on hostile input — so they belong in
+/// this battery as much as the per-format parsers do.
+#[test]
+fn format_agnostic_entry_points_never_panic() {
+    use anamnesis::{
+        ConvertOptions, ConvertTarget, convert_bytes, detect_format_from_bytes,
+        detect_format_from_bytes_with_limits,
+    };
+
+    let default = ParseLimits::default();
+    let tight = tight();
+
+    for (label, bytes) in adversarial_inputs() {
+        assert_no_panic(&format!("detect_format_from_bytes / {label}"), || {
+            detect_format_from_bytes(&bytes)
+        });
+        assert_no_panic(
+            &format!("detect_format_from_bytes_with_limits[default] / {label}"),
+            || detect_format_from_bytes_with_limits(&bytes, &default),
+        );
+        assert_no_panic(
+            &format!("detect_format_from_bytes_with_limits[tight] / {label}"),
+            || detect_format_from_bytes_with_limits(&bytes, &tight),
+        );
+
+        // Built as a `Vec` rather than an array literal with `cfg`-gated
+        // elements: in a build with neither `gguf` nor `bnb` that literal
+        // collapses to one element and the loop trips `single_element_loop`.
+        // `mut` only when a feature adds a target, so the binding's mutability
+        // is itself feature-conditional.
+        #[cfg_attr(not(any(feature = "gguf", feature = "bnb")), allow(unused_mut))]
+        let mut targets: Vec<(&str, ConvertTarget)> =
+            vec![("safetensors", ConvertTarget::Safetensors)];
+        #[cfg(feature = "gguf")]
+        targets.push(("gguf", ConvertTarget::Gguf));
+        #[cfg(feature = "bnb")]
+        targets.push(("bnb-nf4", ConvertTarget::BnbNf4));
+
+        for (target_label, target) in targets {
+            assert_no_panic(
+                &format!("convert_bytes[{target_label}, default] / {label}"),
+                || convert_bytes(&bytes, target, &ConvertOptions::new()),
+            );
+            assert_no_panic(
+                &format!("convert_bytes[{target_label}, tight] / {label}"),
+                || {
+                    convert_bytes(
+                        &bytes,
+                        target,
+                        &ConvertOptions::new().with_limits(tight.clone()),
+                    )
+                },
+            );
+        }
     }
 }

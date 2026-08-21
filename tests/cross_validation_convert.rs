@@ -230,12 +230,9 @@ fn assert_bytes_equal_with_diagnostic(left: &[u8], right: &[u8], label: &str) {
 // ===========================================================================
 
 fn make_npz_tensor(name: &str, dtype: NpzDtype, shape: Vec<usize>, data: Vec<u8>) -> NpzTensor {
-    NpzTensor {
-        name: name.to_owned(),
-        shape,
-        dtype,
-        data,
-    }
+    // `NpzTensor` is `#[non_exhaustive]` since v0.7.6, so an external crate
+    // (which this integration test is) builds one through the constructor.
+    NpzTensor::new(name.to_owned(), shape, dtype, data)
 }
 
 // ===========================================================================
@@ -1298,12 +1295,14 @@ fn t14_perf_vs_python_size_matched() {
     //    matching the perf shape. PthTensor is owned, so we can build it
     //    inline without a file round-trip.
     use std::borrow::Cow;
-    let pth_tensors = vec![anamnesis::PthTensor {
-        name: "w".into(),
-        shape: vec![PERF_SHAPE.0, PERF_SHAPE.1],
-        dtype: anamnesis::PthDtype::BF16,
-        data: Cow::Borrowed(&bf16_buf),
-    }];
+    // `PthTensor` is `#[non_exhaustive]` since v0.7.6: an external crate builds
+    // one through the constructor.
+    let pth_tensors = vec![anamnesis::PthTensor::new(
+        "w".into(),
+        vec![PERF_SHAPE.0, PERF_SHAPE.1],
+        anamnesis::PthDtype::BF16,
+        Cow::Borrowed(&bf16_buf),
+    )];
     let (_, pth_us) = timed("pth->st @ perf", || {
         pth_to_safetensors_bytes(&pth_tensors).unwrap()
     });

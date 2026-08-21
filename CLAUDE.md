@@ -13,7 +13,53 @@ Before every commit, run and fix any issues from:
 2. `cargo fmt`
 3. `cargo clippy --all-targets --all-features -- -D warnings`
 4. `cargo test`
-4. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
+5. **If the commit touches any `///` or `//!` comment**, run the rustdoc sweep — see [Documentation Checks](#documentation-checks). `--all-features` alone cannot see a link that breaks under an intermediate feature combination, and a public-items run cannot see a broken link on a `pub(crate)` item at all.
+6. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
+
+## Documentation Checks
+
+Rustdoc is checked in CI by the `docs` job in `.github/workflows/ci.yml`, which
+runs **twelve feature combinations** with `RUSTDOCFLAGS="-D warnings"` and
+`--document-private-items`. Both halves are load-bearing, and each was added
+because the missing half had already let breakage through:
+
+- **Feature combinations.** An intra-doc link naming a feature-gated item
+  resolves under `--all-features` and fails under a combination that gates the
+  item out. `--all-features` cannot see this class by construction.
+- **`--document-private-items`.** A broken link on a `pub(crate)` item is
+  invisible to a public-items run. Phase 7.6 left three behind in its own
+  refactor and found five more that predated it.
+
+To reproduce the CI job locally, run the same loop it runs:
+
+```powershell
+$env:RUSTDOCFLAGS = "-D warnings"
+cargo doc --no-deps --document-private-items
+foreach ($c in @(
+    "--all-features",
+    "--no-default-features",
+    "--no-default-features --features npz",
+    "--no-default-features --features pth",
+    "--no-default-features --features gguf",
+    "--no-default-features --features bnb",
+    "--no-default-features --features gptq",
+    "--no-default-features --features awq",
+    "--no-default-features --features cli",
+    "--no-default-features --features ollama",
+    "--features cli,gguf,npz,pth")) {
+    Write-Host "cargo doc $c"
+    cargo doc --no-deps --document-private-items $c.Split(" ")
+    if ($LASTEXITCODE -ne 0) { throw "rustdoc failed for: $c" }
+}
+$env:RUSTDOCFLAGS = $null
+```
+
+**When a link genuinely cannot resolve in every configuration** — an optional
+dependency such as `clap`, a feature-gated item referenced from an always-on
+one, or anything in a `pub(crate)` module's own `//!` header, which `rustdoc`
+will not resolve even fully qualified — use a plain code span rather than link
+syntax, per `CONVENTIONS.md` § *Intra-Doc Link Safety*, and say why in a
+comment.
 
 ## Performance Changes
 
@@ -40,7 +86,7 @@ Before tagging a release (`v*`), complete these steps in order:
    cargo clippy --all-targets --all-features -- -D warnings;
    cargo test --all-features;
    $env:RUSTDOCFLAGS = "-D warnings";
-   cargo doc --all-features --no-deps;
+   cargo doc --all-features --no-deps --document-private-items;
    $env:RUSTDOCFLAGS = $null;
    cargo publish --dry-run --allow-dirty
    ```

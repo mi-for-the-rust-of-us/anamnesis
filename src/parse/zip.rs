@@ -29,16 +29,23 @@
 //!
 //! Every length, count, and offset is attacker-controllable. The reader
 //! follows the `CONVENTIONS.md` *"When Parsing Untrusted Input"* invariants:
-//! every multi-byte field is read through a bounds-checked [`ByteCursor`]
+//! every multi-byte field is read through a bounds-checked `ByteCursor`
 //! (never direct indexing); every offset/size combination uses `checked_*`
-//! arithmetic; the declared entry count is capped at [`ZIP_MAX_ENTRIES`] and
-//! each entry name at [`ZIP_MAX_NAME_LEN`] **before** allocating; each entry's
+//! arithmetic; the declared entry count is capped at `ZIP_MAX_ENTRIES` and
+//! each entry name at `ZIP_MAX_NAME_LEN` **before** allocating; each entry's
 //! `data_start + compressed_size` is cross-checked against the source length;
 //! and compression methods are **allowlisted** (`Stored` / `Deflate`), never
-//! denylisted. On top of those permanent floors, [`read_central_directory`]
-//! also honours the caller's [`ParseLimits`] (`max_item_count` and
+//! denylisted. On top of those permanent floors, `read_central_directory`
+//! also honours the caller's `ParseLimits` (`max_item_count` and
 //! `max_single_alloc_bytes`) fail-fast, so a memory-constrained caller bounds
 //! the container metadata to *its* budget (CWE-770).
+//!
+//! *Identifiers in this module header are plain code spans rather than
+//! intra-doc links: `rustdoc` cannot resolve links in the `//!` docs of a
+//! `pub(crate)` module, even fully qualified, so under
+//! `--document-private-items` they are hard errors. Item-level docs below use
+//! real links, which do resolve. Same rule `CONVENTIONS.md` already gives for
+//! links that cannot be guaranteed to resolve.*
 
 use std::borrow::Cow;
 use std::io::{Read, Seek};
@@ -149,13 +156,13 @@ pub(crate) trait ZipSource {
 /// `ReaderSource` — so it is gated on `pth` to keep an `npz`-only build free of
 /// dead code. `test` keeps it available to this module's own unit tests in every
 /// feature combination.
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 pub(crate) struct SliceSource<'a> {
     /// The whole archive bytes (the mmap).
     data: &'a [u8],
 }
 
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 impl<'a> SliceSource<'a> {
     /// Wraps `data` as a [`ZipSource`].
     #[must_use]
@@ -164,7 +171,7 @@ impl<'a> SliceSource<'a> {
     }
 }
 
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 impl ZipSource for SliceSource<'_> {
     fn total_len(&self) -> u64 {
         // CAST: usize → u64, lossless widening on all supported targets
@@ -956,7 +963,7 @@ pub(crate) fn data_start<S: ZipSource>(src: &mut S, entry: &ZipEntry) -> crate::
 /// Only the `.pth` reader strips the prefix today (`.npz` keys on the full entry
 /// name), so it is gated on `pth` to keep an `npz`-only build free of dead code;
 /// `test` keeps it available to this module's unit tests.
-#[cfg(any(feature = "pth", test))]
+#[cfg(any(feature = "pth", feature = "npz", test))]
 #[must_use]
 pub(crate) fn strip_archive_prefix(name: &str) -> Cow<'_, str> {
     match name.find('/') {

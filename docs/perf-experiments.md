@@ -43,6 +43,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 14 | Phase 7.4 `remember`-path output dtype — what the arithmetic/narrowing split cost, and a bench that was measuring the wrong crate | **Two findings, one of them a real production bug. (a) The isolated `tests/` bench was measuring *external-caller* codegen: making `dequantize_*_to_bf16` an `#[inline]` generic wrapper let a downstream crate instantiate the kernel locally, where four private helpers could not inline — ~2.9× slower for every downstream caller, invisible to the whole-model bench. `#[inline]` on those four helpers fixed it (1.934 → 0.672 ms/Melem). (b) Post-fix the split is a net **win**: `FP8` 2.2× faster at the kernel, 1.8× whole-model; `BnB`/`AWQ`/`GPTQ` pay an honest 1.06–1.15×. Separately: whole-program code layout alone moves a kernel timing up to **23 %** on this host, which bounds every sub-20 % per-kernel claim made on it** | Shipped (v0.7.4, Phase 7.4) |
 | 15 | Phase 7.4 `BnB` `INT8` association fix — bit-exactness at `F32` versus one packed multiply | **A correctness fix with a measured price, kept anyway. `w × (SCB/127)` and `bitsandbytes`' `(w × SCB) × (1/127)` are the same real number and the same `BF16`, but differ by 1 `ULP` on **26.9 %** of elements at `F32` — which is why 0/65536 `BF16` cross-validation never caught it. Matching the canonical association costs **16.82 → 17.48 ms** at 4096 × 11008 (1.04×, min of 10 interleaved rounds) for one extra `vmulps` per 8 lanes. Not recoverable by hoisting: `w × (SCB × c)` is a *third* association, measured **worse** (17299/65536 mismatches)** | Shipped (v0.7.4, Phase 7.4) |
 | 12 | Phase 7.2 `GGUF`-reader parallelisation — product scaling, `MIN_PARALLEL_BYTES` calibration, and a `gguf-py` baseline | **Stage-isolated `read_hub` 1.90×/1.95× at 4 threads (plateau ~2.1× at 16) — lands at Experiment 11's *`Vec`-per-tensor* ceiling (2.2×), not its disjoint-slice 2.9×, because the hub is a `Vec` per tensor by construction. End-to-end `convert()` only 1.26×/1.36× locally, and **0.99× on CodSpeed macro runners** (see the Experiment 14 postscript) — the output write is ~60 % of the wall clock (Amdahl) and is slower still on CI storage, so treat the end-to-end threading figure as host-dependent rather than a property of the code. Pool cost measured at 236 µs (4 workers, Windows) → break-even ~0.5 MiB, threshold set to 4 MiB. vs `gguf-py` 0.18.0: 17.3–27.9× single-threaded, 33.8–52.9× at 4** | Shipped (v0.7.2, Phase 7.2) |
+| 16 | Phase 7.6 `GGUF` `remember` moved out of the CLI — what the duplicated sequential path cost | **A duplication, not an optimisation: `amn remember model.gguf` ran a 121-line CLI transcription of `convert`'s reader that was sequential and silently ignored `--threads`, while `convert --to safetensors` on the same file ran the threaded library path and produced `SHA-256`-identical bytes. Routing the CLI at the library gives **1.24×** on `SmolLM2-135M-Q6_K` (241 → 194 ms) and **2.23×** on `Qwen2.5-1.5B-IQ2_M` (5854 → 2631 ms), medians of 5, `target-cpu=native`, output byte-identical before and after. The gap widens with model size because the fixed parse/write cost amortises, which is also why the small fixture understates it** | Shipped (v0.7.6, Phase 7.6) |
 
 ---
 
@@ -642,7 +643,7 @@ future regressions.
 
 ## Experiment 7 — Sign-of-zero preservation rule (`BnB FP4` decode tweak)
 
-**Scope note:** Unlike Experiments 1–6, this is a **correctness** experiment, not a perf one. Included in this file because the template is identical: an initial framing claimed a property was impossible; empirical observation on a real fixture narrowed the framing; a targeted code change recovered the desired invariant; cross-architecture validation confirmed the change generalises. Future encode kernels (`FP8`, `GGUF`, `IQ`, `TQ`, `MXFP4` in Phase 7.5) may surface analogous "codebook-quirk-driven" findings — this entry sets the precedent.
+**Scope note:** Unlike Experiments 1–6, this is a **correctness** experiment, not a perf one. Included in this file because the template is identical: an initial framing claimed a property was impossible; empirical observation on a real fixture narrowed the framing; a targeted code change recovered the desired invariant; cross-architecture validation confirmed the change generalises. Future encode kernels (`FP8`, `GGUF`, `IQ`, `TQ`, `MXFP4` in Phase 8.5) may surface analogous "codebook-quirk-driven" findings — this entry sets the precedent.
 
 **Initial claim during Phase 5 step 1 design discussion:** "*Byte-level round-trip of `BnB FP4` is mathematically impossible — bitsandbytes' Python on-disk `quant_map` stores `+0.0` at both index 0 and index 8 (collapsing the `±0` pair), so decoding nibble 8 produces `+0.0` BF16, indistinguishable from nibble 0, and no encoder can recover which original nibble produced it.*" Conclusion drawn at the time: "the operative contract for FP4 is decode-equivalence (`decode(re_encoded) == decode(weight_data)` at the BF16 level), not byte-exact round-trip."
 
@@ -693,7 +694,7 @@ The downstream cost of dropping the constraint is bounded:
 
 **Cross-reference:** The full design discussion that led to this rule is summarised in [`ROADMAP.md`](../ROADMAP.md)'s Phase 5 "Boundary-pushing finding (sign-of-zero preservation)" paragraph and in commit `a5c452d`'s commit-message body.
 
-**Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 7.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
+**Template for future encode-side correctness findings:** when adding a new encode kernel family in Phase 8.5 (FP8, GGUF legacy/K/IQ/TQ/MXFP4), check whether the on-disk codebook has any collapsed-entry pairs of the form `codebook[i].to_bits() == codebook[j].to_bits()` for `i != j`. If so, the same template applies: (1) measure baseline round-trip error, (2) identify whether decode could disambiguate via some carrier the existing kernel ignores, (3) apply the narrowest possible decode + encode tweak pair, (4) verify on cross-architecture fixtures.
 
 ---
 
@@ -1491,3 +1492,75 @@ Two method notes worth carrying forward:
   instrument counts work, not stalls, so it would have reported `F32` at roughly
   its instruction ratio and missed the bandwidth ceiling entirely — the same
   failure mode `codspeed.yml`'s header warns about for Experiment 10.
+
+---
+
+## Experiment 16 — Phase 7.6 `GGUF` `remember`: what a duplicated sequential path cost
+
+**Date:** 2026-08-20 · **Phase:** 7.6 · **Status:** shipped
+
+### Hypothesis
+
+Not a hypothesis about an optimisation, which is why this entry exists at all.
+The 2026-08-20 API-shape audit found that `amn remember model.gguf` and
+`amn convert model.gguf --to safetensors` are the *same operation* implemented
+twice: `cli.rs::run_remember_gguf` carried 121 lines transcribing what
+`convert.rs::read_gguf_as` already did, and the transcription was **sequential**,
+took no thread budget (so `--threads` was accepted and discarded), and could not
+be called from the library at all. The prediction was therefore mechanical: the
+CLI verb should gain exactly the threading the library path already had.
+
+### Method
+
+Both binaries built `--release --features cli,gguf` with
+`RUSTFLAGS="-C target-cpu=native"`, from the same working tree (the "before"
+binary from `git stash`, so nothing but this change differs). Runs interleaved
+before/after to blunt the ~23 % code-layout sensitivity Experiment 14 measured on
+this host. Wall clock via PowerShell `Measure-Command`, five runs each, median
+reported with the full range.
+
+```powershell
+foreach ($i in 1..5) {
+  Measure-Command { & $before remember $m --to bf16 -o $out_b }
+  Measure-Command { & $after  remember $m --to bf16 -o $out_a }
+}
+```
+
+### Results
+
+| Fixture | before (median) | after (median) | speedup |
+|---|---|---|---|
+| `SmolLM2-135M-Instruct-Q6_K.gguf` (132 MiB → 257 MiB `BF16`) | **241 ms** [234, 4754] | **194 ms** [178, 206] | **1.24×** |
+| `Qwen2.5-1.5B-Instruct-IQ2_M.gguf` (574 MiB → 2.9 GiB `BF16`) | **5854 ms** [5792, 6358] | **2631 ms** [2559, 2832] | **2.23×** |
+
+Raw runs, in interleaved order:
+
+- 135M before `292 / 241 / 235 / 4754 / 234`, after `206 / 178 / 196 / 193 / 194`
+- 1.5B before `5792 / 5908 / 5830 / 5854 / 6358`, after `2631 / 2758 / 2588 / 2559 / 2832`
+
+The 4754 ms outlier in the 135M "before" set is a single host hiccup and is
+reported rather than dropped; the median is what the claim rests on, which is
+exactly why the protocol specifies a median and not a mean.
+
+**Output is `SHA-256`-identical before and after on both fixtures**, which is the
+part that makes the number safe to act on: this is the same computation running
+on more threads, not a different one.
+
+### What it says
+
+1. **The gap scales with model size** (1.24× → 2.23×), because the fixed parse
+   and write costs amortise. A small fixture *understates* this class of defect,
+   which is worth remembering the next time a CI-sized fixture is used to decide
+   whether a path is worth threading.
+2. **The 2.23× sits inside Experiment 12's band, not outside it.** That
+   experiment measured the stage-isolated `read_hub` at 1.90×/1.95× at 4 threads
+   and the end-to-end `convert()` at 1.26–1.36× locally, with the output write as
+   ~60 % of the wall clock. This measures the *same* end-to-end shape and gets
+   more, because the baseline here is fully sequential rather than
+   partially-threaded: 2.23× against a 1-thread reader is consistent with a
+   reader that scales ~1.9× sitting in front of a write that does not.
+3. **The measurement was worth taking even though the direction was obvious.**
+   `CLAUDE.md` requires it for a perf-claim commit, and the value delivered was
+   the *size* of the claim, not its sign: the audit's earlier best-of-3 default
+   build put the same two fixtures at 1.39× and 2.35×, close enough to confirm
+   the effect and different enough to show why the protocol pins the build flags.

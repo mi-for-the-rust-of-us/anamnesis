@@ -52,8 +52,8 @@ you need via feature flags (`gptq`, `awq`, `bnb`, `npz`, `pth`, `gguf`, `ollama`
 | Command | |
 |---------|---|
 | `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`, `.npz`, `.gguf`) |
-| `amn inspect <file>` | Show format, tensor counts, size estimates, dtypes, byte order |
-| `amn remember <file>` | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf` → `.safetensors` |
+| `amn inspect <file>` | Show format, tensor counts, size estimates, dtypes, byte order — `--to bf16\|f32\|f16` sizes the estimate for the width you intend |
+| `amn remember <file>` | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf`/`.npz` → `.safetensors` |
 | `amn convert <file> --to <target>` | Convert any input to `safetensors` / `gguf` / `bnb-nf4` through one dispatch |
 
 Aliases: `amn info` = `amn inspect`, `amn dequantize` = `amn remember`. Format
@@ -81,6 +81,7 @@ Format:      GGUF v3
 Arch:        llama
 Tensors:     147
 Total size:  1.22 GB
+Dequantized: 2.30 GB (BF16)
 Dtypes:      F32, Q8_0
 Alignment:   32 bytes
 
@@ -126,10 +127,15 @@ or too-large file against limits **it** chooses, before committing memory. The
 recipe is **inspect → check policy → parse under limits**:
 
 ```rust
-use anamnesis::{inspect_npz_from_reader, parse_npz_with_limits, ParseLimits};
+use anamnesis::{inspect_npz_from_reader_with_options, parse_npz_with_limits, InspectOptions, ParseLimits};
 
-// 1. Inspect cheaply: header-only, bounded; never materialises tensor data.
-let info = inspect_npz_from_reader(&mut reader)?;
+// 1. Inspect cheaply: header-only, and bounded by YOUR budget — the walk over
+//    the archive's central directory and every NPY header is charged to it, so
+//    the call you make *first* on an untrusted file is one you can tighten.
+let info = inspect_npz_from_reader_with_options(
+    &mut reader,
+    &InspectOptions::new().with_limits(ParseLimits::default().with_max_item_count(4096)),
+)?;
 
 // 2. Reject early against YOUR environment's policy: no parse, no allocation.
 if info.total_bytes > my_ram_budget || info.tensors.len() > my_tensor_cap {
