@@ -167,6 +167,7 @@ path = "src/bin/tsan_harness.rs"
 required-features = ["parallel"]
 
 [dev-dependencies]
+tango-bench = "0.8"
 # Phase 6.5 dev-only benchmark harness. Provides statistical-rigour
 # throughput measurement (Welch t-tests, bootstrap CIs), HTML report
 # generation, and regression detection across runs. The `html_reports`
@@ -224,6 +225,11 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # Phase 6.5: dequantisation throughput benchmarks (decode side).
 # Will gain `benches/encode.rs` at Phase 7.5 when the encode kernels
 # land; today's deferred-split rationale lives in ROADMAP.md.
+[[bench]]
+name = "ab"
+harness = false
+required-features = ["gptq", "awq", "bnb", "gguf"]
+
 [[bench]]
 name = "dequant"
 harness = false
