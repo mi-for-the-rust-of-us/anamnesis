@@ -106,7 +106,7 @@ of the convention that does the most work, and the part most easily skipped:
 | File | Target | Status |
 |------|--------|--------|
 | [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146: `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Posted |
-| [anamnesis-new-bnb-int8-f16-aarch64-p1.md](anamnesis-new-bnb-int8-f16-aarch64-p1.md) | anamnesis (own tracker, unfiled): `BnB` `INT8` at `F16` is ~5 % faster on x86-64 and ~21 % slower on `aarch64`; asks for an Apple Silicon measurement | Draft |
+| [anamnesis-11-p1.md](anamnesis-11-p1.md) | anamnesis #11: `BnB` `INT8` at `F16` is ~5 % faster on x86-64 and ~21 % slower on `aarch64`; asks for an Apple Silicon measurement | Posted |
 
 A second issue, `target.<triple>.rustflags` not reaching `-Zbuild-std` units,
 was drafted and **abandoned before filing**. The evidence was confounded (two

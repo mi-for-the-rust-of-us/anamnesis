@@ -1,11 +1,10 @@
-# anamnesis #new, reply 1 (Draft)
+# anamnesis #11, reply 1 (Posted)
 
-- **Target issue:** not yet filed. To be opened on
-  https://github.com/mi-for-the-rust-of-us/anamnesis/issues **after `v0.7.7` is
-  tagged and published**, because the reproduction says `git checkout v0.7.7`
-  and the `CHANGELOG` advice to pin `0.7.6` only parses once `0.7.7` exists.
-  Rename this file to `anamnesis-<number>-p1.md` once filed.
-- **Status:** Draft (2026-08-22).
+- **Target issue:** https://github.com/mi-for-the-rust-of-us/anamnesis/issues/11
+- **Status:** Posted (2026-08-22), immediately after the `v0.7.7` tag and
+  `cargo publish` — deliberately in that order, because the reproduction says
+  `git checkout v0.7.7` and the `CHANGELOG` advice to pin `0.7.6` only parses
+  once `0.7.7` exists. The body below matches what is live verbatim.
 - **Context:** The first entry in this archive that is **not** an upstream reply.
   Phase 7.7 migrated `dequantize_bnb_int8`'s tile loop and measured it faster on
   x86-64 and slower on `aarch64`. v0.7.7 ships it knowingly, disclosed in
