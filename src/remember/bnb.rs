@@ -36,11 +36,34 @@
 //
 //   -5.22 %, -2.87 %, -5.96 %   (all significant at a 2.5 % threshold)
 //
-// No reproduced regression at any other width or in any other family; the
-// `BF16` and `F32` arms sat inside the floor. Note the discipline that made
-// this readable: untouched kernels ran beside it as controls, and `AWQ` moving
-// +3.03 % in one run while nothing had touched it is exactly why single-run
-// readings are not trusted here.
+// No reproduced regression at any other width or in any other family *on
+// x86-64*; the `BF16` and `F32` arms sat inside the floor. Note the discipline
+// that made this readable: untouched kernels ran beside it as controls, and
+// `AWQ` moving +3.03 % in one run while nothing had touched it is exactly why
+// single-run readings are not trusted here.
+//
+// **KNOWN REGRESSION ON `aarch64`, SHIPPED DELIBERATELY.** The same arm goes
+// the other way there: `dequant_bnb_int8` at `F16` measured **+21.35 %** across
+// the merge that introduced this change and **+20.82 %** against pre-merge
+// `main`, on CodSpeed walltime, with untouched families moving at most 3.42 %.
+// Two independent baselines, ~6x the control spread. So this kernel is ~5 %
+// faster at `F16` on x86-64 and ~21 % slower at `F16` on `aarch64`.
+//
+// The hardware behind that number is **Linux server-class ARM**, which is *not*
+// Apple Silicon: M-series parts have `ARMv8.2` `FEAT_FP16` hardware
+// half-precision arithmetic, and on this target the `F16` narrowing is a
+// *software* conversion (`F16Out::write_scratch` compiles to 91 instructions
+// with zero `fcvt`). Whether the regression exists on an M-series chip is
+// **unmeasured**, and it is the platform most likely to care, so the change
+// ships pending that measurement rather than being reverted on a proxy.
+//
+// Static counts do not explain it and pointed the wrong way, as in item 1:
+// instruction count fell 435 -> 433 and out-of-line calls 4 -> 3 while wall
+// clock rose 21 %.
+//
+// **If the regression reproduces on Apple Silicon, revert this migration.** The
+// x86-64 gain does not pay for it. Reverting is a clean single-file operation
+// and bit-exact: `git checkout 033e763 -- src/remember/bnb.rs`.
 //
 // Bit-exactness is unchanged: the `cross_validation_bnb` and
 // `cross_validation_bnb_encode` suites pass, as does the full 700-test battery.

@@ -32,12 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `F32Out` is quantified in the same pass: **1.09x to 1.63x**, *less* than its
   doubled output bytes suggest.
 
-- **`BnB` `INT8` dequantisation is about 3-6 % faster at `F16` output.** Measured
-  with the paired harness in `benches/ab.rs` on x86-64: -5.22 %, -2.87 % and
-  -5.96 % across three runs, all significant against that harness's measured
-  ~2 % floor, with no reproduced regression at `BF16` or `F32` or in any other
-  kernel family. Output bytes are unchanged and remain bit-exact against the
-  `bitsandbytes` goldens.
+- **`BnB` `INT8` dequantisation is about 3-6 % faster at `F16` output on
+  x86-64, and about 21 % SLOWER at `F16` on `aarch64`.** Both readings are
+  reproduced and both are shipped, knowingly. x86-64: -5.22 %, -2.87 % and
+  -5.96 % across three paired runs against a ~2 % floor. `aarch64`: +21.35 %
+  and +20.82 % on CodSpeed walltime from two independent baselines, with
+  untouched kernel families moving at most 3.42 %. `BF16` and `F32` are
+  unaffected on both. Output bytes are unchanged and remain bit-exact against
+  the `bitsandbytes` goldens either way.
+
+  The `aarch64` hardware measured is Linux server-class ARM, **not Apple
+  Silicon**, whose `ARMv8.2` hardware `FP16` may behave differently — and which
+  is the platform most likely to care. That measurement is open, and the change
+  ships pending it rather than being reverted on a proxy. **If you dequantise
+  `BnB` `INT8` to `F16` on ARM and care about throughput, pin `0.7.6`** until
+  it is settled.
 
 - **`GPTQ` dequantisation is about 10 % faster**, at every output width.
   Measured on CodSpeed macro runners (walltime, bare metal, isolated):
