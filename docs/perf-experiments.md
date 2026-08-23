@@ -1731,7 +1731,39 @@ No code change. Both `F16Out` and `F32Out` gained measured cost sections, and
 legitimate while choosing it *believing it free because it is the same width as
 the default* is not.
 
-**Not measured on Apple Silicon**, and that is left explicitly open: M-series
-parts have `ARMv8.2` hardware `FP16` arithmetic and a materially different
-microarchitecture. Both platforms measured so far agree, so the direction is
-unlikely to reverse, but the magnitude there is unknown.
+### Third platform, and a prediction this experiment got wrong
+
+The paragraph that stood here said Apple Silicon was unmeasured, and that with
+two platforms agreeing "the direction is unlikely to reverse". **It reverses.**
+An external contributor measured it on an **Apple M3 Pro** (issue #11), and the
+seven-family spread there is **0.94x to 2.59x** against 2.0x to 3.1x on the
+other two:
+
+| Family | x86-64 | server `aarch64` | **Apple M3 Pro** |
+|---|---:|---:|---:|
+| `gguf_q4_k` | 3.11x | 2.36x | **2.59x** |
+| `bnb_int8` | 3.10x | 2.28x | **0.94x** |
+| `gptq_int4` | 2.71x | 2.93x | **1.27x** |
+| `awq_int4` | 2.65x | 2.10x | **1.47x** |
+| `fp8_fine_grained` | 2.48x | 2.13x | **1.09x** |
+| `bnb_nf4` | 2.47x | 2.33x | **1.42x** |
+| `fp8_per_tensor` | 2.02x | 2.21x | **1.10x** |
+
+`bnb_int8` at `F16` is **faster than its own `BF16`** there, the only
+below-parity cell on any platform. `ARMv8.2` hardware `FP16` is the plausible
+reason.
+
+**The methodological lesson is the one this file exists for.** Two agreeing
+platforms felt like enough to state a direction. They were not: agreement
+between x86-64 and server `aarch64` said something about *software* `f16`
+conversion, which both were doing, and nothing about a part that does it in
+hardware. Generalising from a sample that shares the mechanism you are
+generalising about is not evidence.
+
+`F32` moved too, and further: on M3 it runs **0.51x to 1.07x** `BF16` against
+1.09x to 1.63x on x86-64, and is strictly *faster* than `BF16` in four of the
+seven families. Where narrowing is expensive relative to memory traffic, writing
+twice the bytes and skipping the conversion wins.
+
+Scope: **one M3 Pro**, macOS 26.5.2, rustc 1.92.0, criterion medians, three
+paired runs for the A/B. One machine, one tier, contributed from outside.

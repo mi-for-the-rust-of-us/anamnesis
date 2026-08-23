@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The `BnB` `INT8` `F16` regression is confined to server-class ARM, and
+  Apple Silicon is now measured.** v0.7.7 shipped that change disclosed, with a
+  recommendation to pin `0.7.6` on ARM. An external contributor measured it on
+  an **Apple M3 Pro** (issue #11, PR #12): the regression **does not reproduce**
+  there, the migrated kernel being ~4.8 % *faster* at `F16`, matching x86-64.
+  **The pin recommendation therefore applies only to `F16` output on ARM
+  *servers* without hardware `FP16` (Graviton, Ampere), not to Apple Silicon.**
+
+- **`F16Out` and `F32Out` cost figures are now platform-qualified**, because
+  they were not, and were wrong outside x86-64. `F16` costs 2.0x to 3.1x `BF16`
+  on x86-64 and server `aarch64`, but **0.94x to 2.59x on an M3 Pro**, where
+  `bnb_int8` is *faster* at `F16` than at `BF16`. `F32` runs 1.09x to 1.63x
+  `BF16` on x86-64 but **0.51x to 1.07x** on M3, where it is strictly faster
+  than `BF16` in four of seven families.
+
+- `/__reports__` excluded from the published crate: contributed measurement
+  studies are useful in the repository and dead weight in the tarball.
+
 ## [0.7.7] - 2026-08-22
 
 ### Added

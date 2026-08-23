@@ -39,7 +39,10 @@ default-run = "anamnesis"
 # `.github/workflows/publish.yml` runs `cargo test --all-features` before it
 # runs `cargo publish`. `/benches` deliberately stays, because the `[[bench]]`
 # targets below are declared explicitly and would dangle without their sources.
-exclude = ["/fuzz", "/tests"]
+# `/__reports__` holds contributed measurement studies (charts + raw data).
+# Useful in the repository, dead weight in the published crate: the issue #11
+# Apple-Silicon study alone is 252 KiB against a ~788 KiB crate.
+exclude = ["/fuzz", "/tests", "/__reports__"]
 
 # `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys
 # (features, targets, all-features, no-default-features). Other Cargo
