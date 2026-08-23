@@ -290,6 +290,15 @@ pub struct Bf16Out;
 /// work that `F32` simply does not do. Widest is `gguf_q4_k` at 1.63x,
 /// narrowest `fp8_per_tensor` at 1.09x. Compare [`F16Out`], which is the *same
 /// width as `BF16`* and yet costs 2.02x to 3.11x.
+///
+/// **Those figures are x86-64's, and the ordering does not survive the trip to
+/// Apple Silicon.** On an M3 Pro the same measurement gives **0.51x to 1.07x**,
+/// and `F32` is strictly *faster* than `BF16` in four of the seven families
+/// (`bnb_int8` 7.38 ms against 14.36 ms, `gguf_q4_k` 5.39 against 7.36). Once
+/// the narrowing is expensive enough relative to memory traffic, writing twice
+/// the bytes and skipping the conversion wins. So on that platform `F32` can be
+/// the *cheapest* of the three widths as well as the most precise. One machine,
+/// contributed via issue #11; measure before relying on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct F32Out;
 
@@ -314,7 +323,8 @@ pub struct F32Out;
 /// cross-validation permanently at odds with `NumPy` and `PyTorch`, which both
 /// produce infinity here.
 ///
-/// # Cost: expect **2x to 3x** [`Bf16Out`], at the same output width
+/// # Cost: **2x to 3x** [`Bf16Out`] on x86-64 and server `aarch64`, but
+/// **platform-dependent**, and on Apple Silicon it can invert
 ///
 /// This is the surprising one, and until Phase 7.7 nothing here said it. `F16`
 /// and `BF16` are both 2 bytes per element, so there is no bandwidth story to
@@ -323,19 +333,24 @@ pub struct F32Out;
 /// Measured across every dequant family, both architectures, whole-kernel wall
 /// clock (so the narrowing is only part of each figure):
 ///
-/// | Kernel | `BF16` | `F16` | ratio |
-/// |---|---:|---:|---:|
-/// | `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** |
-/// | `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** |
-/// | `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** |
-/// | `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** |
-/// | `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** |
-/// | `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** |
-/// | `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** |
+/// | Kernel | `BF16` (x86) | `F16` (x86) | x86-64 | **Apple M3 Pro** |
+/// |---|---:|---:|---:|---:|
+/// | `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** | **2.59x** |
+/// | `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** | **0.94x** |
+/// | `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** | **1.27x** |
+/// | `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** | **1.47x** |
+/// | `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** | **1.09x** |
+/// | `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** | **1.42x** |
+/// | `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** | **1.10x** |
 ///
-/// x86-64, criterion medians from `benches/dequant.rs`, 4096 x 11008.
-/// `aarch64` walltime agrees on the same seven kernels at **2.10x to 2.93x**,
-/// so this is not one platform's quirk.
+/// x86-64 and Apple M3 Pro are criterion medians from `benches/dequant.rs` at
+/// 4096 x 11008. Server `aarch64` (Linux, no hardware `FP16`) sits with x86-64
+/// at **2.10x to 2.93x**.
+///
+/// **Apple Silicon is a third regime, not a third data point.** Its ratios run
+/// 0.94x to 2.59x where the other two platforms run 2.0x to 3.1x, and
+/// `bnb_int8` is *faster* at `F16` than at `BF16` there. Plan for 2x to 3x on
+/// x86-64 and server ARM; measure before assuming it on an M-series part.
 ///
 /// *Criterion rather than the paired harness, deliberately.* A ratio between
 /// two output widths is a **within-binary** comparison: both arms are compiled
@@ -359,11 +374,17 @@ pub struct F32Out;
 /// already has the inline and still pays 2x to 3x. The conversion is the cost,
 /// not the call.
 ///
-/// **Not measured on Apple Silicon.** The `aarch64` figures come from Linux
-/// server-class bare metal. M-series parts have `ARMv8.2` hardware `FP16`
-/// arithmetic and a materially different microarchitecture, so the ratio there
-/// is an open question — though both platforms measured so far agree, which
-/// makes the direction unlikely to reverse.
+/// **Apple Silicon is now measured, and it broke this section's own
+/// prediction.** An earlier revision of this text said the direction was
+/// "unlikely to reverse" because the two platforms then measured agreed. It
+/// reverses: on an Apple M3 Pro, `bnb_int8` at `F16` is **0.94x** its own
+/// `BF16`, the only family below parity on any platform, and the seven-family
+/// spread there is 0.94x to 2.59x rather than 2.0x to 3.1x. M-series parts have
+/// `ARMv8.2` hardware `FP16` arithmetic, which is the plausible reason, and the
+/// inference from two agreeing platforms to a third was simply not warranted.
+/// Contributed by an external measurement on hardware the maintainers do not
+/// own (issue #11); scope is **one M3 Pro, macOS 26.5.2, rustc 1.92.0**, so read
+/// it as one machine rather than as "Apple Silicon".
 ///
 /// None of this is an argument against `F16`. It is the right choice when you
 /// need its 3 extra significand bits and your data fits its exponent range.

@@ -12,7 +12,15 @@
   Apple Silicon to measure the one platform neither of our instruments covers,
   because the `aarch64` hardware we *can* reach is Linux server-class ARM without
   hardware `FP16`, and M-series has `ARMv8.2 FEAT_FP16`.
-- **Outcome:** (none yet; unfiled)
+- **Outcome:** **Answered, and the answer was no.** An external contributor
+  (@LittleCoinCoin) measured it on an Apple M3 Pro and opened
+  [PR #12](https://github.com/mi-for-the-rust-of-us/anamnesis/pull/12) with the
+  study, charts and raw data. The `aarch64` regression **does not reproduce**;
+  the migrated kernel is ~4.8 % *faster* at `F16` there, matching x86-64. Per
+  the issue's pre-registered decision rule, the change stays. Two things the
+  reply did not anticipate: the migration costs `F32` ~5.2 % on that machine,
+  and `F32` is faster than `BF16` in four of seven families there, which made
+  our `F32Out` documentation x86-specific without saying so.
 - **Lesson / Leverage angle:** The archive's convention assumed replies onto
   other people's threads. This is our own issue, asking for hardware we lack.
   Kept here anyway rather than inventing a second folder, because the value is
@@ -30,9 +38,11 @@
      body tells the reader to calibrate on their own machine before trusting
      either, and the thermal caveat for laptops is a real confound at this
      effect size, not boilerplate.
-  4. **Apple Silicon behaviour is entirely unmeasured**, including whether the
-     separate `F16`-costs-2–3×-`BF16` finding holds there. Both are stated as
-     open questions rather than predictions.
+  4. **Apple Silicon behaviour was entirely unmeasured** when this was filed,
+     including whether the separate `F16`-costs-2–3×-`BF16` finding held there.
+     Both were stated as open questions rather than predictions, which was the
+     right call: the answer to the first was *no*, and the second turned out
+     **platform-dependent**, inverting for one family on M3.
 
 ---
 

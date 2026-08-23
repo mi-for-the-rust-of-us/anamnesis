@@ -53,17 +53,31 @@
 // Apple Silicon: M-series parts have `ARMv8.2` `FEAT_FP16` hardware
 // half-precision arithmetic, and on this target the `F16` narrowing is a
 // *software* conversion (`F16Out::write_scratch` compiles to 91 instructions
-// with zero `fcvt`). Whether the regression exists on an M-series chip is
-// **unmeasured**, and it is the platform most likely to care, so the change
-// ships pending that measurement rather than being reverted on a proxy.
+// with zero `fcvt`).
+//
+// **APPLE SILICON IS NOW MEASURED, AND THE REGRESSION DOES NOT REPRODUCE.**
+// Contributed against issue #11 on hardware the maintainers do not own: on an
+// **Apple M3 Pro** the migrated kernel is **~4.8 % FASTER** at `F16`
+// (+4.59 / +5.06 / +4.83 % across three paired runs, threshold calibrated to
+// that machine's own ~2.5 % floor, untouched families within +/-1.8 %). The
+// direction matches x86-64, not server `aarch64`.
+//
+// So the regression is specific to server-class ARM without hardware `FP16`,
+// and v0.7.7's decision to ship rather than revert on a proxy was the right
+// one. Two of three platforms gain; one narrow slice (`F16` output on ARM
+// servers such as Graviton or Ampere) pays ~21 %.
+//
+// **One finding outside the question asked**, and it is not free: on that same
+// M3, the migration costs **`F32` about 5.2 %** while gaining `F16` 4.8 %. It
+// trades one width against another there rather than being a clean win. Not yet
+// explained, and not yet reproduced on a second M-series tier.
 //
 // Static counts do not explain it and pointed the wrong way, as in item 1:
 // instruction count fell 435 -> 433 and out-of-line calls 4 -> 3 while wall
 // clock rose 21 %.
 //
-// **If the regression reproduces on Apple Silicon, revert this migration.** The
-// x86-64 gain does not pay for it. Reverting is a clean single-file operation
-// and bit-exact: `git checkout 033e763 -- src/remember/bnb.rs`.
+// The revert remains a clean single-file, bit-exact operation should the
+// balance ever change: `git checkout 033e763 -- src/remember/bnb.rs`.
 //
 // Bit-exactness is unchanged: the `cross_validation_bnb` and
 // `cross_validation_bnb_encode` suites pass, as does the full 700-test battery.
