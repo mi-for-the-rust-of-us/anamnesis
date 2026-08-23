@@ -1,6 +1,7 @@
 # CodSpeed: a retour d'expérience
 
-*Written 2026-08-23, after roughly three weeks of use on `anamnesis` and one
+*Written 2026-08-23, after four weeks of use on `anamnesis` (first run
+2026-07-26) and one
 phase (7.7) that leaned on it hard. Scope: one Rust crate, one organisation on
 the free plan, ~61 runs. This is an engineering report, not a verdict: several
 items below are properties of benchmarking rather than of CodSpeed, and they are
@@ -9,9 +10,9 @@ marked as such.*
 ## What we used it for
 
 Continuous performance tracking on a quantised-tensor library whose whole value
-proposition is speed and bit-exactness. Nine benchmark groups grew to twenty-two
-during the period, across seven dequantisation kernel families and three output
-widths, plus whole-model convert and parse paths.
+proposition is speed and bit-exactness. The dequant suite grew from nine
+benchmark ids to twenty-two during the period, across seven kernel families and
+three output widths, plus whole-model convert and parse paths.
 
 ## What worked, and worked well
 
@@ -19,7 +20,7 @@ widths, plus whole-model convert and parse paths.
 Comparing two `main` commits whose diff under `src/` was comments and attributes
 only, so the kernels were provably codegen-identical, six benchmarks moved by at
 most **0.90 %**, mean 0.59 %. Our own development desktop, measured the same way,
-sits at 10 to 23 %. That is roughly a twentyfold improvement in run-to-run
+sits at 10 to 23 %. That is a ten to twenty-five fold improvement in run-to-run
 stability, and it is the product's core promise delivered.
 
 **Setup was genuinely small.** A workflow file, an OIDC permission, and
@@ -58,8 +59,9 @@ instrument therefore measures a platform we do not ship from. We now treat it as
 an ARM drift watch and decide changes locally, which is a reasonable outcome, but
 it was not the one we expected when we adopted it.
 
-**2. The feedback loop is about 18 minutes, including a fixed build tax.** Around
-5 minutes of that is build and setup, paid on every question regardless of size.
+**2. The feedback loop is about 18 minutes, including a fixed build tax.**
+Measured on one run: **3 m 51 s from job start to the first benchmark**, paid on
+every question regardless of size.
 One question we spent 18 minutes on was later answered in **30 seconds** locally
 with a paired harness. Loop length changes which questions you are willing to
 ask, which is a subtler cost than the minutes.
@@ -70,15 +72,18 @@ run log was stable at **168.32 to 168.47 ms across five consecutive `main` runs*
 CodSpeed's reported `BASE` for the same benchmark id was **89.9 ms**. Every other
 group agreed between the two within 1 %. We could not determine which number to
 trust for those groups, and the divergence was confined to the file-writing ones,
-which suggests it is related to item 2 above rather than arbitrary. Still: when
+which suggests it is related to their I/O rather than arbitrary. Still: when
 two numbers for the same identifier differ by 2x, the reader needs to know which
 is the number.
 
 **4. A false regression on a pull request that changed no library code.** The
 report read *"Merging this PR will degrade performance by 34.31 %"* on a change
-that touched only `benches/` and `Cargo.toml`. Driven by the two file-writing
-groups. The practical harm is not the wrong number, it is that a red check people
-learn to click past stops working as a check at all.
+that touched only `benches/` and a roadmap file, so no library code at all.
+Driven by the two file-writing groups. **The same run also produced two checks
+that disagreed**: `Run benchmarks` passed while `CodSpeed Performance Analysis`
+failed, which is coherent once you know one is execution and the other is the
+verdict, and confusing before you do. The practical harm is not the wrong number,
+it is that a red check people learn to click past stops working as a check.
 
 **5. There is no path to bring your own measurements.** The action's inputs are
 `run`, `mode`, `token`, `working-directory`, `config`, `instruments`,
@@ -94,9 +99,23 @@ is about **33 runs a month**. We spent 22 in three days and exhausted August.
 Sixteen of those were pushes to `main`, most of them documentation commits that
 could not possibly move a benchmark. The fix is a `paths:` filter on the trigger,
 which we have now added; a default or a documented recommendation would have
-saved us the lesson.
+saved us the lesson. As an illustration of how easily this happens: **the commit
+that added this very report triggered another run**, because it landed on `main`
+before the filter did.
 
-**7. The x86-64 fallback is a different instrument, not a cheaper one.** The
+**Suite growth compounds it silently.** Adding thirteen benchmark ids, which was
+the right call for coverage, took a run from ~13 to ~20 minutes. That is a
+permanent tax on every future run, and nothing in the product surfaces the
+trade between coverage and remaining allowance at the moment you make it.
+
+**7. There is no quota visibility, and an exhausted allowance queues rather than
+fails.** We learned we were out by email, mid-session, after the fact: no warning
+in the workflow at 80 %, and no counter we could read from CI. Worse for
+diagnosis, runs submitted after exhaustion sit in `queued` rather than failing
+fast, so a workflow neither succeeds nor tells you why. One is queued as this is
+written.
+
+**8. The x86-64 fallback is a different instrument, not a cheaper one.** The
 simulation mode runs anywhere, including free x86 runners, but it derives its
 figures from instruction-level simulation. Phase 7.7's central finding was that
 **instruction counts do not predict wall clock**: one kernel's counts fell at
