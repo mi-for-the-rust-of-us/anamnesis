@@ -13,6 +13,12 @@ The binding rule for any new perf-claim commit lives in [`CLAUDE.md`'s
 Performance Changes section](../CLAUDE.md). This file is the historical record
 backing it.
 
+For the *instruments* rather than the experiments, see
+[`codspeed-experience-report.md`](codspeed-experience-report.md): what continuous
+benchmarking on CodSpeed did and did not give this project, what turned out to be
+a property of benchmarking rather than of the tool, and the measured floors that
+decide which instrument may settle which size of claim.
+
 ## Why this file exists
 
 In late April 2026 a multi-finding "algorithmic-weakness audit" was run against
