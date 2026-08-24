@@ -1767,3 +1767,13 @@ twice the bytes and skipping the conversion wins.
 
 Scope: **one M3 Pro**, macOS 26.5.2, rustc 1.92.0, criterion medians, three
 paired runs for the A/B. One machine, one tier, contributed from outside.
+
+**Provenance.** The study these figures come from is in
+[`__reports__/issue11_bnb_int8_f16_m3/`](../__reports__/issue11_bnb_int8_f16_m3/):
+the findings briefing, the raw criterion medians as `dequant_medians.json`, the
+three charts, and `plots.py` to regenerate them. Contributed by
+[@LittleCoinCoin](https://github.com/LittleCoinCoin) and merged verbatim in
+[PR #12](https://github.com/mi-for-the-rust-of-us/anamnesis/pull/12) rather than
+edited into this file, so every number above can be checked against its source
+instead of trusted. The table here is a reading of that data; the folder is the
+data.

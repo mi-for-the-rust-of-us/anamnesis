@@ -3,9 +3,13 @@
 This folder archives comments drafted or posted on upstream issues where
 anamnesis's own work surfaced or diagnosed a problem — **and, since v0.7.7,
 issues drafted for anamnesis's *own* tracker** where we need something we cannot
-provide ourselves, such as a measurement on hardware nobody here owns. The
-mechanics are identical: a reviewed body that pastes verbatim, with its accuracy
-flags stated. Use the repo's own name (`anamnesis`) where the convention says
+provide ourselves, such as a measurement on hardware nobody here owns, **and,
+since `anamnesis-12-p1`, replies to contributors on our own pull requests** when
+the reply carries a decision they are owed. The mechanics are identical in all
+three cases: a reviewed body that pastes verbatim, with its accuracy flags
+stated. The third case earns a file for the same reason as the others, that a
+reply which decides something should be drafted and checked before it is sent,
+not typed into a comment box. Use the repo's own name (`anamnesis`) where the convention says
 `<upstream-repo>`. Currently
 [rust-lang/cargo](https://github.com/rust-lang/cargo/issues) and
 [rust-lang/rust](https://github.com/rust-lang/rust/issues); previously
@@ -107,6 +111,7 @@ of the convention that does the most work, and the part most easily skipped:
 |------|--------|--------|
 | [cargo-13146-p1.md](cargo-13146-p1.md) | cargo #13146: `-Zbuild-std` + `cargo test`; a `--bin` workaround for the sanitizer use case | Posted |
 | [anamnesis-11-p1.md](anamnesis-11-p1.md) | anamnesis #11: `BnB` `INT8` at `F16` is ~5 % faster on x86-64 and ~21 % slower on `aarch64`; asks for an Apple Silicon measurement | Posted |
+| [anamnesis-12-p1.md](anamnesis-12-p1.md) | anamnesis #12: accepting the contributed M3 Pro study, answering the `__reports__/` placement question the contributor asked twice, and closing #11 | Posted |
 
 A second issue, `target.<triple>.rustflags` not reaching `-Zbuild-std` units,
 was drafted and **abandoned before filing**. The evidence was confounded (two
