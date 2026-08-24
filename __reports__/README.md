@@ -31,6 +31,12 @@ works if the two are kept apart and the source is left alone.
 - **The linking direction is `docs/` → here.** The `docs/` claim carries the
   pointer to its provenance; a study does not need to track every place it is
   cited.
+- **This index names the contributor; the study is not edited to add a byline.**
+  A study arrives as its author wrote it, and most do not sign their own files.
+  Since the verbatim rule forbids adding one after the fact, attribution lives
+  in the table below, which is maintained here. Git history is the authoritative
+  record either way, but a reader browsing the folder should not have to run
+  `git log` to learn who did the work.
 
 ## Packaging
 
@@ -42,6 +48,10 @@ Keep studies small. Charts belong here; multi-megabyte artefacts do not.
 
 ## Current studies
 
-| Study | Question | Verdict |
-|---|---|---|
-| [`issue11_bnb_int8_f16_m3/`](issue11_bnb_int8_f16_m3/) | Does the v0.7.7 `BnB` `INT8` `F16` migration regress on Apple Silicon the way it does on server `aarch64` (+21 %)? | **No.** ~5 % *faster* on an M3 Pro, matching x86-64. The change stays, per [issue #11](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/11)'s pre-registered rule. Read in [`docs/perf-experiments.md`](../docs/perf-experiments.md) Experiment 18. |
+| Study | Contributed by | Hardware | Question | Verdict |
+|---|---|---|---|---|
+| [`issue11_bnb_int8_f16_m3/`](issue11_bnb_int8_f16_m3/) | [@LittleCoinCoin](https://github.com/LittleCoinCoin) ([PR #12](https://github.com/mi-for-the-rust-of-us/anamnesis/pull/12), 2026-08-24) | Apple M3 Pro, macOS 26.5.2, rustc 1.92.0 | Does the v0.7.7 `BnB` `INT8` `F16` migration regress on Apple Silicon the way it does on server `aarch64` (+21 %)? | **No.** ~5 % *faster* on an M3 Pro, matching x86-64. The change stays, per [issue #11](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/11)'s pre-registered rule. Read in [`docs/perf-experiments.md`](../docs/perf-experiments.md) Experiment 18. |
+
+**This is the project's first external contribution.** It answered a question no
+maintainer could answer, on hardware none of us owns, and it corrected a claim
+this project had put in writing and believed.
