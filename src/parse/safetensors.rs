@@ -871,7 +871,13 @@ fn infer_gptq_config(
 ) -> Option<GptqConfig> {
     // Try metadata first (AutoGPTQ format).
     if let Some(meta) = metadata {
-        let bits = meta.get("gptq_bits").and_then(|v| v.parse::<u8>().ok());
+        // Only the widths the kernel implements; anything else (a hostile
+        // `"0"` divided `32 / bits` downstream) falls through to shape
+        // inference exactly as a missing key does.
+        let bits = meta
+            .get("gptq_bits")
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|b| matches!(b, 4 | 8));
         let group_size = meta
             .get("gptq_group_size")
             .and_then(|v| v.parse::<usize>().ok());

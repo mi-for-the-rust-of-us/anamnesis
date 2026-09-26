@@ -1108,7 +1108,18 @@ impl ParsedModel {
                 // Derive in_features and out_features from qweight shape.
                 // qweight shape: [in_features/pack_factor, out_features]
                 let (packed_rows, out_features) = Self::shape_to_rows_cols(&entry.shape)?;
-                // CAST: u8 → usize, bits is 4 or 8
+                // `GptqConfig`'s fields are public, so re-check the width here
+                // rather than trust the header parser: `32 / 0` panics.
+                if !matches!(config.bits, 4 | 8) {
+                    return Err(AnamnesisError::Unsupported {
+                        format: "GPTQ".into(),
+                        detail: format!(
+                            "{}-bit quantization not supported (expected 4 or 8)",
+                            config.bits
+                        ),
+                    });
+                }
+                // CAST: u8 → usize, bits is 4 or 8 (checked above)
                 #[allow(clippy::as_conversions)]
                 let pack_factor = 32 / config.bits as usize;
                 let in_features =

@@ -83,6 +83,7 @@ pub fn pth_to_safetensors_bytes(tensors: &[PthTensor<'_>]) -> crate::Result<Vec<
 fn pth_views<'a>(
     tensors: &'a [PthTensor<'_>],
 ) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'a>)>> {
+    crate::parse::utils::reject_duplicate_names(tensors.iter().map(|t| t.name.as_str()))?;
     let mut views: Vec<(String, safetensors::tensor::TensorView<'a>)> =
         Vec::with_capacity(tensors.len());
     for tensor in tensors {

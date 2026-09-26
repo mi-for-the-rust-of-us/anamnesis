@@ -2430,7 +2430,8 @@ pub fn parse_pth_from_reader_with_limits<R: Read>(
 /// Returns [`AnamnesisError::Parse`] for any malformed opcode, stack
 /// underflow, disallowed `GLOBAL`, or invalid `_rebuild_tensor_v2` argument
 /// shape — same error surface as the pickle VM and tensor-reference
-/// extractors return on their own.
+/// extractors return on their own — and when the state dict names one
+/// tensor twice.
 fn interpret_pickle_to_meta(
     pkl_data: &[u8],
     limits: &ParseLimits,
@@ -2454,6 +2455,10 @@ fn interpret_pickle_to_meta(
             });
         }
     }
+    // A pickled `OrderedDict` can repeat a key; `torch.load` would keep the
+    // last value, but an archive that disagrees with itself is refused here,
+    // as duplicate ZIP entries are.
+    crate::parse::utils::reject_duplicate_names(meta.iter().map(|m| m.name.as_str()))?;
     Ok(meta)
 }
 

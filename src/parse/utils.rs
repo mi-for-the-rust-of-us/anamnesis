@@ -71,6 +71,35 @@ pub(crate) fn classify_decode_error(e: std::io::Error, what: &str) -> crate::Ana
     }
 }
 
+/// Rejects a tensor set that names one tensor twice.
+///
+/// A name is how every output format addresses a tensor, so two tensors with
+/// one name make the set ambiguous: which one a consumer loads depends on the
+/// writer. Worse, the upstream `safetensors` serializer indexes a name table
+/// sized by the *distinct* names and panics on a duplicate (found by
+/// `fuzz_convert_bytes`, v0.7.8). Called where names enter (the `.pth` state
+/// dict) and before every write, so no path can hand the serializer one.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`](crate::AnamnesisError::Parse) naming the
+/// first duplicate in sorted order.
+pub(crate) fn reject_duplicate_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+) -> crate::Result<()> {
+    let mut sorted: Vec<&str> = names.collect();
+    sorted.sort_unstable();
+    if let Some(dup) = sorted.windows(2).find_map(|pair| match pair {
+        [a, b] if a == b => Some(*a),
+        _ => None,
+    }) {
+        return Err(crate::AnamnesisError::Parse {
+            reason: format!("duplicate tensor name `{dup}`"),
+        });
+    }
+    Ok(())
+}
+
 /// Computes the product of a tensor's shape dimensions with overflow checking.
 ///
 /// Returns `None` if the product overflows `usize` — an adversarial or
@@ -151,6 +180,17 @@ mod tests {
         // The product overflows before the zero is reached; the tensor is
         // still empty, and must be reported as such.
         assert_eq!(checked_num_elements(&[usize::MAX, usize::MAX, 0]), Some(0));
+    }
+
+    #[test]
+    fn reject_duplicate_names_finds_repeats() {
+        assert!(reject_duplicate_names(["a", "b", "c"].into_iter()).is_ok());
+        assert!(reject_duplicate_names(std::iter::empty()).is_ok());
+        let result = reject_duplicate_names(["b", "a", "b"].into_iter());
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("duplicate tensor name `b`")),
+            "{result:?}"
+        );
     }
 
     #[test]
