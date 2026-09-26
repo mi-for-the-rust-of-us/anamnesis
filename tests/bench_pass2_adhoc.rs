@@ -8,8 +8,9 @@
 //! questions Phase 7 hinges on:
 //!
 //! 1. **Is the shared writer bandwidth-bound?** `bench_pure_writer` runs the
-//!    exact loop that [`crate::remember::gguf::write_scratch_to_bf16`] runs
-//!    (replicated here because that helper is `pub(crate)`), and
+//!    loop that `Bf16Out::write_scratch` in `src/remember/output.rs` runs
+//!    (it shipped as `write_scratch_to_bf16` before v0.7.3; replicated here
+//!    because its rounding helper `f32_bits_to_bf16_bits` is `pub(crate)`), and
 //!    `bench_memcpy_ceiling` measures the practical streaming ceiling on this
 //!    machine. If the writer's GB/s approaches the memcpy ceiling it is
 //!    bandwidth-bound and explicit AVX2 cannot help it; if it sits well below,
@@ -62,11 +63,16 @@
     clippy::doc_markdown
 )]
 
+mod common;
+
 use std::time::Instant;
 
 use anamnesis::dequantize_per_tensor_fp8_to_bf16;
 #[cfg(feature = "gguf")]
 use anamnesis::{GgufType, dequantize_gguf_to_bf16};
+
+#[cfg(feature = "gguf")]
+use common::bench::{build_q4_0_buffer, build_q8_0_buffer};
 
 // ---------------------------------------------------------------------------
 // Timing helpers (mirrors tests/bench_dequant_adhoc.rs)
@@ -127,7 +133,11 @@ fn report(label: &str, samples: &[f64], bytes_streamed: usize) {
 // `remember::fp8::f32_bits_to_bf16_bits` (the `pub(crate)` original is not
 // reachable from an integration test). Round-to-nearest-even via the
 // `0x7FFF + lsb` bias. This replica is ALSO the golden-vector oracle the
-// Stage-2 AVX2/NEON intrinsics will be checked against.
+// hand-written AVX2 prototype below is checked against
+// (`avx2_writer_is_bit_exact`). The product AVX2/NEON intrinsics it was meant
+// to guard were never written: `docs/perf-experiments.md` Experiment 10
+// measured that prototype at 1.02x over the auto-vectorized scalar writer,
+// and Phase 7 rejected explicit SIMD on those numbers.
 // ---------------------------------------------------------------------------
 
 fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
@@ -136,7 +146,7 @@ fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
     (bits.wrapping_add(rounding_bias) >> 16) as u16
 }
 
-/// The exact loop shape of `write_scratch_to_bf16`: contiguous f32 read,
+/// The loop shape of `Bf16Out::write_scratch`: contiguous f32 read,
 /// branch-free convert, contiguous 2-byte write, distinct in/out slices.
 fn scalar_write_bf16(scratch: &[f32], out: &mut [u8]) {
     for (&val, out_pair) in scratch.iter().zip(out.as_chunks_mut::<2>().0) {
@@ -486,31 +496,6 @@ fn bench_parallel_fp8_disjoint_slices() {
             (N * 2) as f64 / 1_000_000.0 / (median / 1000.0),
         );
     }
-}
-
-/// Synthesizes `n_blocks` of `Q8_0` bytes (34 B/block: `f16 d` + `i8 qs[32]`).
-/// `d = f16(1.0)` so the `d * qs` multiplies are not folded away.
-#[cfg(feature = "gguf")]
-fn build_q8_0_buffer(n_blocks: usize) -> Vec<u8> {
-    const BLOCK_BYTES: usize = 34;
-    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
-    for block in buf.as_chunks_mut::<BLOCK_BYTES>().0 {
-        block[0] = 0x00;
-        block[1] = 0x3C;
-    }
-    buf
-}
-
-/// Synthesizes `n_blocks` of `Q4_0` bytes (18 B/block: `f16 d` + 16 packed nibbles).
-#[cfg(feature = "gguf")]
-fn build_q4_0_buffer(n_blocks: usize) -> Vec<u8> {
-    const BLOCK_BYTES: usize = 18;
-    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
-    for block in buf.as_chunks_mut::<BLOCK_BYTES>().0 {
-        block[0] = 0x00;
-        block[1] = 0x3C;
-    }
-    buf
 }
 
 /// GGUF `Q8_0` — bandwidth-bound (no bit unpacking), Experiment 3 flagged it as

@@ -2,7 +2,28 @@
 
 //! Ad-hoc `.pth` parsing benchmark + phase profiling on torchvision models.
 //!
-//! Run: `cargo test --release --features pth --test bench_pth_adhoc -- --nocapture`
+//! Not part of CI: every test is gated `#[ignore]` and needs three torchvision
+//! checkpoints (45 MB, 98 MB and 330 MB) that are not committed. Run with:
+//!
+//! ```text
+//! cargo test --release --features pth --test bench_pth_adhoc -- --nocapture --ignored
+//! ```
+//!
+//! ## Fetching the fixtures
+//!
+//! `.gitignore` keeps `tests/fixtures/pth_benchmark/` out of the repository.
+//! Populate it once from the repository root (in `pwsh`; needs `torch` and
+//! `torchvision`), saving each model's pretrained `state_dict` under the file
+//! name the tests look for:
+//!
+//! ```text
+//! New-Item -ItemType Directory -Force tests/fixtures/pth_benchmark
+//! python -c "import torch, torchvision.models as m; [torch.save(getattr(m, n)(weights='DEFAULT').state_dict(), f'tests/fixtures/pth_benchmark/{n}.pth') for n in ('resnet18', 'resnet50', 'vit_b_16')]"
+//! ```
+//!
+//! `torch.save` writes the ZIP-based format (`PyTorch` 1.6 and later) that
+//! `parse_pth` reads. A missing file is reported as `SKIP` rather than failing,
+//! so the harness still runs with any subset present.
 
 #![cfg(feature = "pth")]
 #![allow(
@@ -76,25 +97,20 @@ fn profile_phases(label: &str, filename: &str, iters: u64) {
     }
     let mmap_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Phase 2: mmap + ZipArchive::new
-    let start = Instant::now();
-    for _ in 0..iters {
-        let file = std::fs::File::open(&path).unwrap();
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
-        let cursor = std::io::Cursor::new(&mmap[..]);
-        let archive = zip::ZipArchive::new(cursor).unwrap();
-        std::hint::black_box(&archive);
-    }
-    let zip_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    // No separate ZIP-directory phase. This used to time `zip::ZipArchive::new`,
+    // but `parse_pth` has read the container with the vendored
+    // `src/parse/zip.rs` reader since v0.6.7, so that number described a crate
+    // production no longer runs. The vendored reader is `pub(crate)`, so its
+    // cost is folded into the "container + pickle + index + copy" line below.
 
-    // Phase 3: full parse_pth
+    // Phase 2: full parse_pth
     let start = Instant::now();
     for _ in 0..iters {
         let _ = anamnesis::parse_pth(&path).unwrap();
     }
     let total_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Phase 4: memcpy baseline (simulates the unavoidable tensor copy cost)
+    // Phase 3: memcpy baseline (simulates the unavoidable tensor copy cost)
     let file = std::fs::File::open(&path).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     let start = Instant::now();
@@ -104,7 +120,7 @@ fn profile_phases(label: &str, filename: &str, iters: u64) {
     }
     let memcpy_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Phase 5: fs::read for comparison
+    // Phase 4: fs::read for comparison
     let start = Instant::now();
     for _ in 0..iters {
         let raw = std::fs::read(&path).unwrap();
@@ -112,39 +128,41 @@ fn profile_phases(label: &str, filename: &str, iters: u64) {
     }
     let fsread_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    let rest_ms = total_ms - zip_ms;
+    let rest_ms = total_ms - mmap_ms;
 
     println!("  {label} ({size_mb:.0} MB) phase breakdown:");
     println!("    mmap:             {mmap_ms:6.1} ms");
     println!(
-        "    + ZipArchive:     {zip_ms:6.1} ms  (zip dir = {:.1} ms)",
-        zip_ms - mmap_ms
+        "    full parse_pth:   {total_ms:6.1} ms  (container+pickle+index+copy = {rest_ms:.1} ms)"
     );
-    println!("    full parse_pth:   {total_ms:6.1} ms  (pickle+index+copy = {rest_ms:.1} ms)");
     println!("    memcpy baseline:  {memcpy_ms:6.1} ms  (mmap[..].to_vec)");
     println!("    fs::read (ref):   {fsread_ms:6.1} ms");
     println!();
 }
 
 #[test]
+#[ignore = "requires local torchvision checkpoints under tests/fixtures/pth_benchmark/"]
 fn bench_pth_resnet18() {
     println!();
     bench_file("resnet18 (45 MB)", "resnet18.pth", 20);
 }
 
 #[test]
+#[ignore = "requires local torchvision checkpoints under tests/fixtures/pth_benchmark/"]
 fn bench_pth_resnet50() {
     println!();
     bench_file("resnet50 (98 MB)", "resnet50.pth", 10);
 }
 
 #[test]
+#[ignore = "requires local torchvision checkpoints under tests/fixtures/pth_benchmark/"]
 fn bench_pth_vit_b_16() {
     println!();
     bench_file("vit_b_16 (330 MB)", "vit_b_16.pth", 5);
 }
 
 #[test]
+#[ignore = "requires local torchvision checkpoints under tests/fixtures/pth_benchmark/"]
 fn profile_pth_phases() {
     println!("\n  === Phase Profiling (mmap path) ===\n");
     profile_phases("resnet18", "resnet18.pth", 20);
