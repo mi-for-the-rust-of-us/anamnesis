@@ -168,7 +168,8 @@ host branches without string-matching: a budget/cap breach (a `ParseLimits` axis
 (→ *413*); a malformed/truncated file is `Parse` (→ *400*); a `.pth` pickle
 referencing a `GLOBAL` outside the `torch.*` allowlist is `DisallowedGlobal { module, name }`
 (a security signal); a recognised-but-unimplemented format/dtype is `Unsupported`;
-I/O failures are `Io`. The v0.8.0 Python bindings map these one-to-one:
+a caller-requested stop through a `CancelToken` is `Cancelled`; I/O failures
+are `Io`. The v0.8.0 Python bindings map these one-to-one:
 
 | `AnamnesisError` | Python exception |
 |---|---|
@@ -176,6 +177,7 @@ I/O failures are `Io`. The v0.8.0 Python bindings map these one-to-one:
 | `Unsupported` | `UnsupportedError` |
 | `LimitExceeded` | `LimitExceededError` |
 | `DisallowedGlobal` | `SecurityError` |
+| `Cancelled` | builtin `KeyboardInterrupt` |
 | `Io` | builtin `OSError` |
 
 **No panic, no abort.** No public parse/inspect entry point panics or aborts on

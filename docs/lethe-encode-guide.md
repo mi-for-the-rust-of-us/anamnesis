@@ -1,12 +1,12 @@
 # Lethe — Encode-Side Walkthrough
 
-**Status:** v0.5.0 (Phase 5 step 1a/1b/1c shipped). Covers `BnB` encode only — `FP8` / `GGUF` / `IQ` / `TQ` / `MXFP4` encode land in Phase 8.5.
+**Status:** v0.7.8. The `BnB` encode kernels shipped in v0.5.0 (Phase 5 step 1a/1b/1c) and the `BnB-NF4` safetensors writer behind `amn convert --to bnb-nf4` in v0.6.0 (Phase 6). Covers `BnB` encode only: `FP8` / `GGUF` / `IQ` / `TQ` / `MXFP4` encode land in Phase 8.5.
 
 This document walks through the `lethe` namespace — the encode-side inverse of [`remember`](../src/remember/). Three audiences:
 
 - **Round-trip consumers** (testing tools, fixture validators): use the strict-mirror API where you supply the same metadata the decoder originally read.
 - **Fresh-quantise consumers** (Phase 6 conversion path, end-user CLIs): use the `_compute_*` convenience variants that derive metadata from the source `BF16`.
-- **Downstream embedders** (`candle-mi`, future Python bindings in Phase 7): consume the kernels as library primitives that produce raw bytes, no framework coupling.
+- **Downstream embedders** (`candle-mi`, the Python bindings planned for Phase 8, v0.8.0): consume the kernels as library primitives that produce raw bytes, no framework coupling.
 
 ---
 
@@ -21,12 +21,16 @@ This document walks through the `lethe` namespace — the encode-side inverse of
 | [`encode_bnb_int8_compute_scb`](../src/lethe/bnb.rs) | quantise from BF16 source | derives per-row `SCB` internally | `(weight_bytes, scb_bytes)` |
 | [`NF4_CODEBOOK`](../src/lethe/bnb.rs) | constant | — | `[f32; 16]` |
 | [`FP4_CODEBOOK`](../src/lethe/bnb.rs) | constant | — | `[f32; 16]` (preserves `-0.0` at index 8) |
+| [`write_bnb_nf4_safetensors`](../src/lethe/bnb_writer.rs) | quantise from BF16 source, whole file | derives per-block absmax (single-quant, `block_size` 64) | a `.safetensors` file on disk |
+| [`write_bnb_nf4_safetensors_bytes`](../src/lethe/bnb_writer.rs) | as above, in memory | as above | serialised safetensors bytes (`Vec<u8>`) |
+| [`is_eligible_for_nf4`](../src/lethe/bnb_writer.rs) | eligibility test | a tensor shape | `bool`: 2-D, at least 64 elements, a multiple of 64 |
+| [`classify_inputs`](../src/lethe/bnb_writer.rs) | dry-run count | a slice of `BnbWriteInput` | `BnbNf4WriteStats` (`quantized`, `passthrough`) |
 
 All functions are `#[cfg(feature = "bnb")]`. Add `bnb` to your `[dependencies]` features list:
 
 ```toml
 [dependencies]
-anamnesis = { version = "0.5", features = ["bnb"] }
+anamnesis = { version = "0.7", features = ["bnb"] }
 ```
 
 ---
@@ -161,7 +165,7 @@ let packed_weight = encode_bnb4_double_quant(
 
 The encoder recovers the per-block `F32` absmax internally via `nested_quant_map[absmax_byte] * nested_absmax[nested_block_idx]` — the same formula the decoder applies — then delegates to the inner `encode_bnb4_core`. Round-trip is byte-exact when the supplied metadata matches what the decoder originally read.
 
-> **Note:** there is no `encode_bnb4_double_quant_compute_*` convenience entry point in v0.5.0. The fresh-quantise-from-`BF16`-source path (Phase 6 conversion matrix) requires deriving absmax + nested_absmax + the nested codebook from the source — that work is deferred to the Phase 6 conversion-CLI commit.
+> **Note:** there is still no `encode_bnb4_double_quant_compute_*` convenience entry point. The fresh-quantise-from-`BF16`-source path that shipped in Phase 6 (`amn convert --to bnb-nf4`, `write_bnb_nf4_safetensors`) writes single-quant absmax and does not need one. Deriving absmax, nested_absmax, and the nested codebook from a fresh source is encode-completion work (Phase 8.5).
 
 ---
 
@@ -177,11 +181,11 @@ For a deeper read see [`src/lethe/bnb.rs`](../src/lethe/bnb.rs) (the module-leve
 
 ## What anamnesis does *not* do (yet) on the encode side
 
-- **No CLI `quantize` / `forget` / `convert` subcommand yet.** Phase 6 will ship `amn convert model.safetensors --to bnb-nf4 -o quantised.safetensors`. Today the kernels are library-only.
-- **No `encode_bnb4_double_quant_compute_*` convenience** (deferred to the Phase 6 conversion-CLI work).
-- **No FP8 / GPTQ / AWQ / GGUF / IQ / TQ / MXFP4 encode** — all targeted at Phase 8.5 ("Lethe Encode Completion"), shipping after the BnB encode pipeline has been validated end-to-end through Python bindings in Phase 7.
-- **No Python bindings yet.** Phase 7 (PyO3) exposes the encode + decode + convert primitives to the Python ecosystem.
-- **No SIMD on encode hot paths.** Encode kernels are currently 4–6× slower than PyTorch's broadcast-vectorised quantize on `BnB4`, 32× slower on `INT8`. Phase 9 (CPU SIMD pass) is the natural target — the same loop-fission + `target-cpu=native` infrastructure that gave the decode path its 18–54× wins is the candidate retrofit on the encode side.
+- **No CLI `quantize` / `forget` subcommand yet.** Encoding from the command line goes through `convert`, which has existed since v0.6.0: `amn convert model.safetensors --to bnb-nf4 -o quantised.safetensors` (any input format, quantised inputs dequantised first through the hub). It emits plain single-quant `NF4` only; `FP4`, `INT8`, and double-quant encode remain library-only. A `forget` dispatch and subcommand are Phase 8.5 step 7.
+- **No `encode_bnb4_double_quant_compute_*` convenience** (deferred to Phase 8.5; see the note under Walkthrough 4).
+- **No FP8 / GPTQ / AWQ / GGUF / IQ / TQ / MXFP4 encode.** All are targeted at Phase 8.5 ("Lethe Encode Completion"), shipping after the BnB encode pipeline has been validated end-to-end through the Python bindings in Phase 8.
+- **No Python bindings yet.** Phase 8 (PyO3, v0.8.0) exposes the encode + decode + convert primitives to the Python ecosystem.
+- **No SIMD on encode hot paths.** Encode kernels are currently 4–6× slower than PyTorch's broadcast-vectorised quantize on `BnB4`, 32× slower on `INT8`. Phase 7 was the CPU SIMD pass, and on the decode side it measured null: a bit-exact hand-written AVX2 `f32 → BF16` writer gained 1.02×, because the compiler already vectorises and the writer is bandwidth-bound ([Experiment 10](perf-experiments.md)). Phase 7 shipped multi-threading instead. The encode loops' nearest-codebook scan has not been measured the same way, so whether explicit SIMD would pay there is an open question rather than a plan.
 
 See [`ROADMAP.md`](../ROADMAP.md) for the full sequencing.
 
@@ -189,8 +193,8 @@ See [`ROADMAP.md`](../ROADMAP.md) for the full sequencing.
 
 ## See also
 
-- [`README.md`](../README.md) — "BitsAndBytes Quantization (Lethe — Phase 5)" section with the cross-architecture fixture table
-- [`CHANGELOG.md`](../CHANGELOG.md) — `[0.5.0]` entry block
+- [`docs/validation.md`](validation.md#quantization-lethe--phase-5): the Lethe section with the cross-architecture fixture table
+- [`CHANGELOG.md`](../CHANGELOG.md): `[0.5.0]` entry block (the kernels) and `[0.6.0]` (the `bnb-nf4` convert target)
 - [`ROADMAP.md`](../ROADMAP.md) — Phase 5 step 1a/1b/1c (shipped) + Phase 8.5 (deferred encode kernels)
 - [`docs/rust-ecosystem-comparison.md`](rust-ecosystem-comparison.md) — where anamnesis's encode-side coverage stands in the wider Rust + cross-language landscape
 - [`docs/perf-experiments.md`](perf-experiments.md) — case-study entry for the sign-of-zero preservation rule (Experiment 7)

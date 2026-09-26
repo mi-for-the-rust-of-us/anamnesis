@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
+<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
 
 Every subcommand, flag, and output shape for the `anamnesis` / `amn` CLI. The
 [README](../README.md) has the quick tour; this is the complete reference.
@@ -33,7 +33,7 @@ available.
 |---|---|
 | `amn parse <file>` | Parse and summarize a model file (`.safetensors`, `.pth`/`.pt`, `.npz`, `.gguf`, `.bin`) |
 | `amn inspect <file>` *(alias `info`)* | Show format, tensor counts, size estimates, dtypes, byte order |
-| `amn remember <file>` *(alias `dequantize`)* | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.gguf` → `.safetensors` |
+| `amn remember <file>` *(alias `dequantize`)* | Dequantize to safetensors at `bf16` (default), `f32`, or `f16`, or convert `.pth`/`.npz`/`.gguf` → `.safetensors` |
 | `amn convert <file> --to <target>` | Convert any input to `safetensors` / `gguf` / `bnb-nf4` through one dispatch |
 
 Format detection is automatic (see [Format detection](#format-detection)).
@@ -92,12 +92,12 @@ Dtypes:      F32
 ## `amn remember <file>` (alias `dequantize`)
 
 Recover precision: dequantize a quantized safetensors, or convert a
-`.pth` / `.gguf` to safetensors (dequantizing any quantized GGUF tensors,
+`.pth` / `.npz` / `.gguf` to safetensors (dequantizing any quantized GGUF tensors,
 passing scalar tensors through).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--to <value>` | `bf16` | Output dtype for **dequantised** tensors: `bf16`, `f32`, `f16`. `safetensors` is accepted as an alias for `bf16` on `.pth` / `.gguf` inputs (they always produce safetensors). See [Output dtype on `remember`](#output-dtype-on-remember). |
+| `--to <value>` | `bf16` | Output dtype for **dequantised** tensors: `bf16`, `f32`, `f16`. `safetensors` is accepted as an alias for `bf16` on `.pth` / `.npz` / `.gguf` inputs (they always produce safetensors). See [Output dtype on `remember`](#output-dtype-on-remember). |
 | `--output`, `-o <path>` | *(derived)* | Output path; derived from the input if omitted (see [Output paths](#output-path-derivation)). |
 | `--threads <N>` | `min(cores, 4)` | Dequantisation worker threads (see [Threads](#threads)). |
 
@@ -133,14 +133,16 @@ choice is spelled [`--out-dtype`](#output-dtype).
 The semantics are identical to `convert`'s, and so are the trade-offs:
 
 - **`f32`** removes anamnesis's own narrowing step, so you get the reference
-  implementation's own `f32`. Doubles the output bytes and runs slower on a
-  bandwidth-bound path.
+  implementation's own `f32`. Doubles the output bytes, and on x86-64 runs
+  slower on a bandwidth-bound path; on an Apple M3 Pro the kernels measured 0.51x to
+  1.07x the `bf16` time, faster in four of seven kernel families.
 - **`f16`** buys 3 significand bits over `bf16` and pays twice for them. First a
   far narrower exponent range (overflow to infinity above 65504, flush to zero
-  below about `2⁻²⁴`); plain IEEE semantics, never saturation. Second **2x to 3x
-  the run time of `bf16` at identical output size** — slower even than `f32`,
-  which writes twice the bytes, because the cost is the conversion rather than
-  the traffic.
+  below about `2⁻²⁴`); plain IEEE semantics, never saturation. Second, on
+  x86-64 and server `aarch64`, **2x to 3x the run time of `bf16` at identical
+  output size**: slower even than `f32`, which writes twice the bytes, because
+  the cost is the conversion rather than the traffic. On an Apple M3 Pro the
+  ratio is 0.94x to 2.59x, so measure before assuming it on an M-series part.
 - **It governs dequantised tensors only.** Passthrough tensors keep their source
   dtype, so the output is legitimately mixed-dtype.
 - On a `.pth` input nothing is dequantised, so the value is accepted and inert.
@@ -180,16 +182,19 @@ Converting model.gguf -> model-f32.safetensors
 ```
 
 - **`f32`** removes anamnesis's own narrowing step, so the values you get are the
-  `f32` that `gguf-py` itself produces. Expect it to be **slower**, not faster: it
-  doubles the output bytes on a bandwidth-bound path (measured 1.54–1.61×
-  end to end). That is the honest cost of the precision.
+  `f32` that `gguf-py` itself produces. On x86-64 expect it to be **slower**, not
+  faster: it doubles the output bytes on a bandwidth-bound path (measured 1.54–1.61×
+  end to end). That is the honest cost of the precision. Apple Silicon differs:
+  on an M3 Pro the kernels ran 0.51x to 1.07x the `bf16` time.
 - **`f16`** buys 3 significand bits over `bf16` and pays a far narrower exponent
   range: it overflows to infinity above 65504 and flushes to zero below about
   `2⁻²⁴`, where `bf16` shares `f32`'s range. anamnesis follows plain IEEE
   semantics rather than saturating, so its output matches NumPy and PyTorch.
-  It is also **2x to 3x slower than `bf16` at the same output size**, and so
-  slower than `f32` despite writing half the bytes: the cost is the conversion,
-  not the write. Measured per kernel in
+  On x86-64 and server `aarch64` it is also **2x to 3x slower than `bf16` at
+  the same output size**, and so slower than `f32` despite writing half the
+  bytes: the cost is the conversion, not the write. On an Apple M3 Pro the
+  ratio is 0.94x to 2.59x, and `bnb_int8` is faster at `f16` than at `bf16`.
+  Measured per kernel and per platform in
   [Choosing an output dtype](tutorials/choosing-an-output-dtype.md).
 - The derived output filename tracks the dtype (`model-f32.safetensors`), so a
   file never claims a width it does not hold.
@@ -207,7 +212,7 @@ width, so a quantised safetensors input honours all three dtypes too. `NPZ` and
 choice is available on `remember` as
 [`--to`](#output-dtype-on-remember).
 
-### Conversion matrix (v0.6.9)
+### Conversion matrix (v0.6.9, output dtypes v0.7.3 and v0.7.4)
 
 | Input ↓ \ Target → | `safetensors` / `bf16` | `gguf` | `bnb-nf4` |
 |---|---|---|---|
@@ -323,11 +328,16 @@ The flag has no effect in a build made with `--no-default-features` (the
 
 ## Output path derivation
 
-When `--output` / `-o` is omitted, the output path is derived from the input:
-a known quantization suffix is stripped from the stem, then `-{target}.{ext}` is
-appended.
+When `--output` / `-o` is omitted, the output path is derived from the input.
+For `convert`, and for `remember` on a safetensors input, a known quantization
+suffix is stripped from the stem, then `-{target}.{ext}` is appended.
 
-- `remember`: → `<stem>-bf16.safetensors`
+- `remember` on a safetensors input: → `<stem>-{bf16|f32|f16}.safetensors`,
+  the suffix following `--to` (the same derivation `convert` uses, quantization
+  suffix stripped).
+- `remember` on a `.pth` / `.npz` / `.gguf` input: → `<stem>.safetensors`. Only
+  the extension is replaced; no quantization suffix is stripped and no dtype
+  suffix is added, whatever `--to` says.
 - `convert`: → `<stem>-{bf16|f32|f16|gguf|bnb-nf4}.{safetensors|gguf}`. For a
   `safetensors` target the suffix **follows `--out-dtype`**, so the filename
   never claims a width the file does not hold. The `gguf` and `bnb-nf4` suffixes

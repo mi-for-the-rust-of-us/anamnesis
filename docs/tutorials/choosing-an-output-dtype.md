@@ -4,7 +4,7 @@
 
 *~1200 words · about 5 min read*
 
-<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
+<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -16,7 +16,7 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    parenthesis, or full stop. Do not substitute an en-dash or a hyphen
    for one either: the point is the sentence, not the glyph.
 3. Every number in this file is measured, not estimated, and is sourced
-   from docs/perf-experiments.md (Experiments 13, 14, 15) or from the
+   from docs/perf-experiments.md (Experiments 13, 14, 15, 18) or from the
    cross-validation suites. If you change a number, change it there first
    and cite the same source.
 4. Scope: features that ship today. `remember --to` landed in v0.7.4 and
@@ -88,25 +88,27 @@ Three situations where you want them:
 
 **Your pipeline computes in `float32` anyway.** If the next step widens the weights back to `f32`, doing it from a `bf16` file just means the low bits are zeros instead of values. You paid for a narrowing you did not want.
 
-What it costs: double the output bytes, and slower in roughly the way that implies. On the `convert` path the kernel-level figure was measured at 1.79x slower than `bf16` against exactly 2.00x the output bytes, so the cost is the doubled write and essentially nothing else. End to end it came out at 1.54x to 1.61x, less than the kernel figure because the fixed parse cost does not scale with output width. The full numbers are in [`docs/perf-experiments.md`](../perf-experiments.md), Experiment 13.
+What it costs on x86-64: double the output bytes, and slower in roughly the way that implies. On the `convert` path the kernel-level figure was measured at 1.79x slower than `bf16` against exactly 2.00x the output bytes, so the cost is the doubled write and essentially nothing else. End to end it came out at 1.54x to 1.61x, less than the kernel figure because the fixed parse cost does not scale with output width. The full numbers are in [`docs/perf-experiments.md`](../perf-experiments.md), Experiment 13. On Apple Silicon the picture changes, and `f32` can be the *faster* width: see the next section.
 
 ## Why `f16` is a trap
 
 `f16` and `bf16` are both 2 bytes per element, which makes `f16` look like a free upgrade: same size, 3 more bits of significand (11 versus 8). It is not free, and it costs you twice: once in exponent range, and once in time.
 
-**It is 2x to 3x slower than `bf16`, at identical output size.** Measured across all seven dequantisation families (criterion medians, 4096 × 11008, x86-64):
+**On x86-64 it is 2x to 3x slower than `bf16`, at identical output size.** Measured across all seven dequantisation families (criterion medians, 4096 × 11008; the times are x86-64's, and the last column is the same ratio on an Apple M3 Pro):
 
-| Kernel | `bf16` | `f16` | ratio |
-|---|---:|---:|---:|
-| `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** |
-| `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** |
-| `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** |
-| `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** |
-| `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** |
-| `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** |
-| `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** |
+| Kernel | `bf16` | `f16` | x86-64 ratio | Apple M3 Pro ratio |
+|---|---:|---:|---:|---:|
+| `gguf_q4_k` | 25.70 ms | 79.87 ms | **3.11x** | 2.59x |
+| `bnb_int8` | 24.84 ms | 76.95 ms | **3.10x** | 0.94x |
+| `gptq_int4` | 28.78 ms | 78.04 ms | **2.71x** | 1.27x |
+| `awq_int4` | 38.20 ms | 101.10 ms | **2.65x** | 1.47x |
+| `fp8_fine_grained` | 43.19 ms | 107.28 ms | **2.48x** | 1.09x |
+| `bnb_nf4` | 45.43 ms | 112.04 ms | **2.47x** | 1.42x |
+| `fp8_per_tensor` | 46.55 ms | 94.20 ms | **2.02x** | 1.10x |
 
-`aarch64` agrees at 2.10x to 2.93x on the same seven, so this is not one machine's quirk. Note what it means for the comparison above: **`f16` is slower than `f32`**, which writes twice the bytes. The cost is the conversion, not the traffic — on x86-64 the `F16C` instruction narrows 4 lanes per instruction where `bf16`'s shift-and-round does 8; on `aarch64` the narrowing is not inlined at all. The full write-up is [`docs/perf-experiments.md`](../perf-experiments.md), Experiment 18.
+Server `aarch64` (Linux, no hardware `FP16`) agrees with x86-64 at 2.10x to 2.93x on the same seven. Note what that means for the comparison above: on those two platforms **`f16` is slower than `f32`**, which writes twice the bytes. The cost is the conversion, not the traffic. On x86-64 the `F16C` instruction narrows 4 lanes per instruction where `bf16`'s shift-and-round does 8; on server `aarch64` the narrowing is not inlined at all.
+
+Apple Silicon is a different regime. On one Apple M3 Pro (an external measurement, issue #11) the ratios run 0.94x to 2.59x, and `bnb_int8` is *faster* at `f16` than at `bf16`. `f32` moves too: it runs 0.51x to 1.07x `bf16` there, strictly faster in four of the seven families. So plan for 2x to 3x on x86-64 and server ARM, and measure before assuming it on an M-series part. The full write-up is [`docs/perf-experiments.md`](../perf-experiments.md), Experiment 18.
 
 The range cost is the one more likely to bite your *results*, so it comes next.
 
@@ -118,7 +120,7 @@ Reach for `f16` when a downstream consumer specifically requires IEEE half and y
 
 ## Checking the cost before you commit
 
-Two costs, and `inspect` only answers one of them. **It reports size, not time** — and as the table above shows, the two do not track each other: `f16` and `bf16` produce byte-identical output sizes while differing 2x to 3x in run time. For the time cost, use the table above rather than reasoning from the size figure.
+Two costs, and `inspect` only answers one of them. **It reports size, not time**, and as the table above shows, the two do not track each other: `f16` and `bf16` produce byte-identical output sizes while differing by up to 3x in run time, by an amount that depends on the platform. For the time cost, use the table above rather than reasoning from the size figure.
 
 For size: the estimate `inspect` reports assumes a width, so ask it for the one you actually intend. From the library:
 
@@ -142,7 +144,7 @@ The rendered size line names the width it assumed, so the number can never be re
 
 The output dtype is a real choice with a real cost, and the default is the right answer most of the time.
 
-`bf16` is what the ecosystem loads and is half the bytes. `f32` gives you the reference implementation's own value with no narrowing of anamnesis's, at double the size and roughly 1.5x to 1.8x the time, and it is the right call when you are validating, debugging, or feeding an `f32` pipeline. `f16` trades exponent range for significand bits and should be a deliberate choice, not a default.
+`bf16` is what the ecosystem loads and is half the bytes. `f32` gives you the reference implementation's own value with no narrowing of anamnesis's, at double the size and, on x86-64, roughly 1.5x to 1.8x the time, and it is the right call when you are validating, debugging, or feeding an `f32` pipeline. `f16` trades exponent range for significand bits and should be a deliberate choice, not a default.
 
 And whichever you pick, the flag applies to dequantized tensors only. Your passthrough tensors keep their source dtype, and that mixed-dtype output file is working as designed.
 

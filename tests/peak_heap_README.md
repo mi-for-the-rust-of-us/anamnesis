@@ -1,9 +1,11 @@
 # anamnesis peak-heap validation
 
-This directory holds three `dhat-rs`-instrumented heap-assertion test
-files that catch peak-memory regressions in the hot dequantisation
-kernels. Phase 6.5 of the [ROADMAP](../ROADMAP.md) introduces them as
-dev-only infrastructure (zero impact on the published crate) so that:
+This directory holds five `dhat-rs`-instrumented `peak_heap_*.rs` test
+files. Four of them catch peak-memory regressions in the hot
+dequantisation kernels; the fifth (`peak_heap_zip_metadata.rs`, Phase
+6.12) measures the `.pth` ZIP container's metadata heap. Phase 6.5 of
+the [ROADMAP](../ROADMAP.md) introduces them as dev-only
+infrastructure (zero impact on the published crate) so that:
 
 1. **Regressions are caught at commit time, not at deployment** — if
    a future refactor accidentally turns a `O(out_features)` scratch
@@ -30,6 +32,7 @@ deterministic synthetic data.
 | `peak_heap_awq.rs` | `dequantize_awq_to_bf16` | same as `GPTQ` (identical scratch shape) | `cargo test --release --features awq --test peak_heap_awq -- --ignored --nocapture` |
 | `peak_heap_bnb_dq.rs` | `dequantize_bnb4_double_quant_to_bf16` | "no intermediate byte-serialisation allocation" | `cargo test --release --features bnb --test peak_heap_bnb_dq -- --ignored --nocapture` |
 | `peak_heap_gguf.rs` | `dequantize_gguf::<E>` / `dequantize_gguf_blocks::<E>` | `peak == output_size` exactly, **per output dtype**; streaming peak `== 0` | `cargo test --release --features gguf --test peak_heap_gguf -- --ignored --nocapture` |
+| `peak_heap_zip_metadata.rs` | `parse_pth` (vendored ZIP central-directory reader) vs the `zip` crate's `ZipArchive::new` | resident container metadata of the vendored reader stays below the `zip` crate's (reports both, plus the reduction ratio, on a 50 000-entry archive) | `cargo test --release --features pth --test peak_heap_zip_metadata -- --ignored --nocapture` |
 
 > **`peak_heap_gguf.rs` asserts a stronger claim than its siblings.** `GPTQ` and
 > `AWQ` allow `output_size + O(out_features)` of scratch; `GGUF` allows **no heap
@@ -50,7 +53,13 @@ Each file declares `dhat::Alloc` as `#[global_allocator]` for its
 own test binary (`tests/<file>.rs` becomes one binary per Cargo's
 auto-discovery), so the dhat allocator overhead is scoped per-binary
 and does not leak into other test runs. The tests are `#[ignore]`d
-so default `cargo test` skips them entirely — opt in via `--ignored`.
+so default `cargo test` skips them entirely: opt in via `--ignored`.
+
+The helpers these binaries share live in
+[`tests/common/heap.rs`](common/heap.rs): `dhat_lock` (serialises the
+`dhat::Profiler` scopes within one binary), `fill_deterministic` and
+`synth_bytes` (deterministic synthetic input, built **before** the
+profiler starts so it never counts toward the measured peak).
 
 ---
 
@@ -60,9 +69,11 @@ so default `cargo test` skips them entirely — opt in via `--ignored`.
 
 Both kernels allocate **three reused `Vec<f32>[out_features]`
 scratch buffers** (unpacked weights, zeros, scales) refilled lazily
-when the cached group changes — see
-[src/remember/gptq.rs:355-357](../src/remember/gptq.rs) and
-[src/remember/awq.rs:263-265](../src/remember/awq.rs). The assertion:
+when the cached group changes: see `unpacked_buf`, `zeros_buf` and
+`scales_buf` in `dequantize_gptq` in
+[`src/remember/gptq.rs`](../src/remember/gptq.rs) and in
+`dequantize_awq` in [`src/remember/awq.rs`](../src/remember/awq.rs)
+(the `_to_bf16` entry points delegate to these). The assertion:
 
 ```rust
 peak_heap <= output_size + K × out_features × 4    // K = 5
@@ -89,8 +100,10 @@ The kernel allocates exactly two scratch buffers:
 - `Vec<f32>[block_size]` — block-iteration scratch inside the core
   dequant loop
 
-See [src/remember/bnb.rs:386-426](../src/remember/bnb.rs). The
-assertion:
+See `recover_double_quant_absmax` (which returns the absmax) and
+`dequantize_bnb4_core` (which allocates the block scratch), both called
+from `dequantize_bnb4_double_quant` in
+[`src/remember/bnb.rs`](../src/remember/bnb.rs). The assertion:
 
 ```rust
 expected = output_size + num_blocks × 4 + block_size × 4
