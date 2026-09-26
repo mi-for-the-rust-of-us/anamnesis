@@ -21,7 +21,9 @@ default-run = "anamnesis"
 # binary goldens, which took the published `.crate` to 4.8 MiB gzipped against
 # the registry's 10 MiB cap. Measured with `cargo package`, excluding it leaves
 # a 2.2 MiB payload that is almost entirely text and gzips to **628 687 bytes
-# (0.60 MiB)**, an 8.0x reduction. The cap was also starting to constrain how wide
+# (0.60 MiB)** at v0.7.3, an 8.0x reduction. The crate has grown with its docs
+# since (803 KiB at the v0.7.8 close-out); "under 1 MiB" is the figure the
+# README and the Release notes quote. The cap was also starting to constrain how wide
 # those goldens could be, which is backwards: the test corpus should be sized by
 # the correctness claim it has to support, and the artefact by what consumers
 # actually need.
@@ -41,7 +43,7 @@ default-run = "anamnesis"
 # targets below are declared explicitly and would dangle without their sources.
 # `/__reports__` holds contributed measurement studies (charts + raw data).
 # Useful in the repository, dead weight in the published crate: the issue #11
-# Apple-Silicon study alone is 252 KiB against a ~788 KiB crate.
+# Apple-Silicon study alone is 252 KiB against a ~0.8 MiB crate.
 exclude = ["/fuzz", "/tests", "/__reports__"]
 
 # `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys

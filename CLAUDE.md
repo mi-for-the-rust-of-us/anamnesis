@@ -105,7 +105,7 @@ Before tagging a release (`v*`), complete these steps in order:
 8. Wait for the publish workflow to go GREEN. Since v0.7.3 it does **two**
    things: `cargo publish`, then `gh release create` for the tag. The Release
    is what carries the test corpus, because `Cargo.toml`'s `exclude` keeps
-   `tests/` out of the published crate (0.60 MiB instead of 4.8 MiB), and
+   `tests/` out of the published crate (under 1 MiB instead of 4.8 MiB), and
    GitHub's per-tag source tarball ships it verbatim.
 9. Check the Release actually appeared and its notes are the right section.
    If the job failed *after* `cargo publish` succeeded, **do not re-run the

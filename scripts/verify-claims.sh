@@ -19,7 +19,7 @@ if [ ! -d tests/fixtures ]; then
 error: tests/fixtures/ is missing.
 
 You are probably in a crate unpacked from crates.io, which excludes tests/
-to keep the published artefact at 0.60 MiB instead of 4.8 MiB.
+to keep the published artefact under 1 MiB instead of 4.8 MiB.
 
 Get the corpus from the matching GitHub Release (the "Source code (tar.gz)"
 asset carries tests/ verbatim), or clone the repository:
@@ -39,17 +39,17 @@ echo "=================================="
 echo
 
 SUITES=(
-  "cross_validation_safetensors:FP8 E4M3 (fine-grained / per-channel / per-tensor), BF16 + F32:PyTorch's own fp8 cast"
+  "cross_validation:FP8 E4M3 (fine-grained / per-channel / per-tensor), BF16 + F32:PyTorch's own fp8 cast"
   "cross_validation_gptq:GPTQ INT4 + INT8, group-wise, g_idx, BF16 + F32:GPTQModel dequantize_weight"
   "cross_validation_awq:AWQ INT4, per-group, BF16 + F32:AutoAWQ unpack_awq + reverse_awq_order"
   "cross_validation_bnb:BitsAndBytes NF4 / FP4 / INT8, BF16 + F32:bitsandbytes dequantize_4bit"
-  "cross_validation_bnb_encode:BitsAndBytes NF4 encode (byte-exact on disk):bitsandbytes on-disk bytes"
+  "cross_validation_bnb_encode:BitsAndBytes NF4 + INT8 encode (byte-exact on disk):bitsandbytes on-disk bytes"
   "cross_validation_gguf:all 22 GGUF block-quant kernels, BF16 + F32:gguf-py (mirrors ggml-quants.c)"
   "cross_validation_ollama:GGUF Q8_0 from a real Ollama blob:gguf-py"
   "cross_validation_npz:NPZ / NPY parsing:NumPy"
   "cross_validation_pth:PyTorch .pth (pickle + tensor recovery):torch.load"
   "cross_validation_convert:format-conversion pipeline:per-format references"
-  "cross_validation:end-to-end dequantisation:per-format references"
+  "cross_validation_safetensors:safetensors header parsing (FP8 / GPTQ / AWQ / BnB layouts):the safetensors Python library"
 )
 
 FAILED=0
