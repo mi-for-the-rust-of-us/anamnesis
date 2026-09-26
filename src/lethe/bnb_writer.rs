@@ -261,6 +261,9 @@ pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::R
     // Re-sort the OUTPUT tensors by name so the safetensors header is
     // deterministic regardless of which inputs were eligible for NF4.
     owned_storage.sort_by(|a, b| a.0.cmp(&b.0));
+    // Checked on the OUTPUT names: two inputs can collide, and so can an input
+    // named like a generated companion (`x.weight.absmax` beside `x`'s own).
+    crate::parse::utils::reject_duplicate_names(owned_storage.iter().map(|t| t.0.as_str()))?;
 
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(owned_storage.len());

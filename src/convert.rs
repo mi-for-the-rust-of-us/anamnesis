@@ -1063,6 +1063,9 @@ fn write_hub(
     sink: Sink<'_>,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
+    // Every target addresses tensors by name; refuse an ambiguous set before
+    // any writer sees it.
+    crate::parse::utils::reject_duplicate_names(hub.tensors.iter().map(|t| t.name.as_str()))?;
     match target {
         ConvertTarget::Safetensors => write_safetensors_to(hub, sink),
         #[cfg(feature = "gguf")]
@@ -1367,6 +1370,7 @@ pub(crate) enum Sink<'a> {
 /// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects the
 /// shape/length pairing.
 fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'_>)>> {
+    crate::parse::utils::reject_duplicate_names(hub.tensors.iter().map(|t| t.name.as_str()))?;
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {

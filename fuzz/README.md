@@ -150,8 +150,28 @@ counterpart is `tests/no_panic.rs` (a `catch_unwind` battery in stable CI).
 targets, one per file in `fuzz_targets/`. Six were added after the Phase 6.13
 campaign: `fuzz_gguf_front_matter` (v0.7.1), `fuzz_pth_front_matter` (v0.7.5),
 `fuzz_npz_bytes` and `fuzz_detect_format` (both Phase 7.6), and
-`fuzz_safetensors_limits` and `fuzz_convert_bytes` (both v0.7.8). All 19 were
-checked to compile at v0.7.8 (`cargo +nightly check --manifest-path
-fuzz/Cargo.toml --bins`), but **no campaign results are recorded for these
-six**: until a run is written up in this section, their fuzzing coverage is
-unverified.
+`fuzz_safetensors_limits` and `fuzz_convert_bytes` (both v0.7.8).
+
+**v0.7.8 campaign (2026-09-26)**, WSL2 Ubuntu, nightly + `cargo-fuzz` 0.13.1,
+180 s per target, `-rss_limit_mb=2048`, the six targets above. The two new
+targets were seeded with the small `.safetensors` / `.npz` / `.pth` fixtures
+behind an all-`0xFF` (unbounded) limits prefix; the other four ran unseeded.
+
+| Target | Runs | Coverage | RSS | Result |
+|---|---:|---:|---:|---|
+| `fuzz_detect_format` | 80.4 M | 140 | 468 MB | clean |
+| `fuzz_pth_front_matter` | 62.7 M | 165 | 536 MB | clean |
+| `fuzz_npz_bytes` | 34.7 M | 211 | 447 MB | clean |
+| `fuzz_gguf_front_matter` | 11.2 M | 671 | 163 MB | clean |
+| `fuzz_safetensors_limits` | (crashed) | 2803 | 459 MB | **panic: `32 / bits` with `"gptq_bits": "0"`** |
+| `fuzz_convert_bytes` | (crashed) | 4184 | 350 MB | **panic in upstream `safetensors` on a duplicate tensor name from a `.pth`** |
+
+Both crashes were real bugs reachable from the public API on hostile input,
+and are fixed (duplicate tensor names rejected where they enter and before
+every write; unsupported `gptq_bits` ignored and re-checked at the division),
+with the crash bodies pinned in `tests/fuzz_regressions.rs`. **Re-run on the
+fixed code, from the accumulated corpora:** `fuzz_safetensors_limits` 7.9 M
+runs (coverage 3479), `fuzz_convert_bytes` 2.7 M runs (coverage 5943, up from
+4184 now that the fuzzer gets past the old crash): **zero crashes**. The lesson
+is recorded in `CLAUDE.md` § Fuzzing: a compile check is not coverage, and
+both targets crashed within three minutes of their first real run.

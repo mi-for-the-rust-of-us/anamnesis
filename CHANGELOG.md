@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two panics on hostile input, found by the v0.7.8 fuzz campaign.** Both
+  would abort a release build and surface as a `PanicException` under the
+  Python bindings, instead of a typed error:
+  - a `.pth` whose pickled state dict names one tensor twice reached the
+    upstream `safetensors` serializer, which panicked on the duplicate
+    (`convert_bytes`, `pth_to_safetensors`). Duplicate tensor names are now
+    rejected with `AnamnesisError::Parse` where they enter, and before every
+    safetensors / `GGUF` / `BnB-NF4` write, including caller-built inputs to
+    `write_bnb_nf4_safetensors`;
+  - a safetensors header declaring `"gptq_bits": "0"` in `__metadata__` made
+    `remember` divide by zero. Unsupported widths are now ignored by the header
+    parser (falling back to shape inference) and rejected at the division.
+
 - **A `.pth` archive that repeats `data.pkl` or `byteorder` is now rejected on
   every path.** The parse paths kept the *last* copy and the reader-generic
   inspect / front-matter paths the *first*, so a crafted archive could show

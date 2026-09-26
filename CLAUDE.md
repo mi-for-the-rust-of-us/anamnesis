@@ -60,6 +60,17 @@ will not resolve even fully qualified — use a plain code span rather than link
 syntax, per `CONVENTIONS.md` § *Intra-Doc Link Safety*, and say why in a
 comment.
 
+## Fuzzing
+
+`cargo-fuzz` (libFuzzer) does not build on Windows-MSVC, but it **is installed in WSL2 Ubuntu on this machine** (nightly + `cargo-fuzz` 0.13.1), which is where every recorded campaign ran. Run it from WSL, with a Linux-side target dir so it neither crawls through `/mnt/c` nor mixes with the Windows build:
+
+```bash
+cd "/mnt/c/Users/Eric JACOPIN/Documents/Code/Source/anamnesis"
+CARGO_TARGET_DIR=~/anamnesis-fuzz-target cargo +nightly fuzz run fuzz_convert_bytes -- -max_total_time=180 -rss_limit_mb=2048
+```
+
+On Windows, `cargo +nightly check --manifest-path fuzz/Cargo.toml --bins` confirms the targets compile but runs nothing. When a fuzz target is added or its entry point changes, run a campaign and record it in `fuzz/README.md` § Status; a compile check is not coverage.
+
 ## Performance Changes
 
 anamnesis is meant to be fast: a change may make it faster or leave it as fast, never slower.
