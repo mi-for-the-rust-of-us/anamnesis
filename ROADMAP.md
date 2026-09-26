@@ -211,10 +211,10 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
   - `.github/workflows/ci.yml` + `.github/workflows/publish.yml` — reused from hf-fetch-model's pattern with `actions/checkout@v5`: format check, clippy (`--all-targets` + `--all-features`), tests, doc check on publish, tag-triggered `cargo publish`
   — **commit**
 - [x] Safetensors parsing foundation (`src/parse/safetensors.rs`) — read header JSON, extract tensor names, shapes, dtypes, byte offsets. Identify quantized tensors (FP8) vs passthrough (BF16/F32 norms, embeddings). Detect fine-grained FP8 metadata (scale factor tensors, block structure). This is the "make contact" layer — **commit**
-- [x] Inspect (`src/inspect.rs`) — built on parse. Report format, tensor count, quantized vs passthrough breakdown, size estimate (current and dequantized). Matches the flagship CLI output in `amn-flagship-v2.md` — **commit**
+- [x] Inspect (`src/inspect.rs`) — built on parse. Report format, tensor count, quantized vs passthrough breakdown, size estimate (current and dequantized). Matches the flagship CLI output in `docs/archive/amn-flagship-v2.md` — **commit**
 - [x] Fine-grained FP8 dequantization (`src/remember/fp8.rs`) — E4M3 with 128×128 block scale factors. Scalar implementation written for auto-vectorization: contiguous `&[u8]` → `&mut [u16]` slices, no branches in the hot path (bitwise select for NaN/subnormal), `chunks_exact(128)` matching block size, scale factor hoisted before inner loop. Verify with `cargo-show-asm` that the compiler emits SIMD instructions; annotate with `// VECTORIZED:`. Built on the parsed representation from `parse/safetensors` — **commit**
 - [x] Per-tensor FP8 dequantization — single scale factor per tensor (simpler case). Same module, same SIMD-friendly loop structure, different scale broadcast — **commit**
-- [x] Parse-first public API (`src/lib.rs`) — `parse(path)` returns a `ParsedModel` struct holding header metadata + byte data. `ParsedModel::inspect()` returns format info. `ParsedModel::remember(output_path, TargetDtype)` dequantizes and writes a standard safetensors file. No file is re-read after the initial parse. The Rust API in `amn-flagship-v2.md` should work — **commit**
+- [x] Parse-first public API (`src/lib.rs`) — `parse(path)` returns a `ParsedModel` struct holding header metadata + byte data. `ParsedModel::inspect()` returns format info. `ParsedModel::remember(output_path, TargetDtype)` dequantizes and writes a standard safetensors file. No file is re-read after the initial parse. The Rust API in `docs/archive/amn-flagship-v2.md` should work — **commit**
 - [x] CLI binary (`src/bin/main.rs`) — thin `clap` wrapper over the library API. Subcommands: `parse`, `inspect` (alias `info`), `remember` (alias `dequantize`). Each subcommand calls `anamnesis::parse()` then the appropriate method. Progress output via `indicatif` (optional, behind `indicatif` feature). Same binary serves both `anamnesis` and `amn` names — **commit**
 - [x] Download FP8 test models via `hf-fetch-model` (v0.8.1, with `list-files`). 7 models from 5 quantization tools, covering 3 FP8 schemes discovered during validation:
 
@@ -287,7 +287,7 @@ Commit style: imperative mood, lowercase, no trailing period. Examples:
 
 **Approach:** Implement a minimal pickle VM (~36 opcodes, not the full protocol) that interprets the `data.pkl` stream inside the ZIP archive, extracts tensor metadata (shape, dtype, storage reference), and reads raw bytes from `data/{index}` entries. Security boundary: explicit GLOBAL allowlist rejects non-`torch.*` callables. Lossless format conversion to safetensors via `safetensors::tensor::serialize_to_file`. Feature-gated behind `pth`.
 
-**Detailed plan:** See `PLAN-PTH-v0.3.1.md`.
+**Detailed plan:** See `docs/archive/PLAN-PTH-v0.3.1.md`.
 
 - [x] Extract `byteswap_inplace` from `npz.rs` to shared `src/parse/utils.rs` — **commit**
 - [x] Pickle VM + tensor extraction (`src/parse/pth.rs`) — minimal stack machine, GLOBAL allowlist, storage cache for shared storage, stride handling — **commit**

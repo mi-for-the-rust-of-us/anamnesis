@@ -1,5 +1,7 @@
 # anamnesis — Flagship Example
 
+> **HISTORICAL (archived at the v0.7.8 close-out).** The first flagship-example draft, superseded by `amn-flagship-v2.md` before Phase 1.
+
 **The problem in one sentence:** Mistral ships Ministral 3 3B Instruct as FP8 safetensors. No Rust ML framework can load it.
 
 ---

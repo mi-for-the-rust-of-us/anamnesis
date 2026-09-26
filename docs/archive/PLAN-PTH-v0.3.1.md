@@ -1,5 +1,7 @@
 # Implementation Plan: `.pth` Parsing — anamnesis v0.3.1
 
+> **HISTORICAL (archived at the v0.7.8 close-out).** The implementation plan for `.pth` support, which shipped in v0.3.1. The code and `ROADMAP.md` Phase 3.5 are the current record.
+
 ## Goal
 
 Add PyTorch `.pth` (state_dict) parsing and conversion to safetensors. This enables
