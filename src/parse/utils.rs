@@ -197,8 +197,10 @@ mod tests {
     fn saturating_num_elements_u64_saturates_and_zeroes() {
         assert_eq!(saturating_num_elements_u64(&[]), 1);
         assert_eq!(saturating_num_elements_u64(&[3, 4]), 12);
+        // Three `usize::MAX` dims exceed `u64` on 32-bit targets as well as
+        // 64-bit ones (two would fit on 32-bit).
         assert_eq!(
-            saturating_num_elements_u64(&[usize::MAX, usize::MAX]),
+            saturating_num_elements_u64(&[usize::MAX, usize::MAX, usize::MAX]),
             u64::MAX
         );
         assert_eq!(saturating_num_elements_u64(&[usize::MAX, usize::MAX, 0]), 0);

@@ -50,6 +50,14 @@ jobs:
       - name: Tests
         run: cargo test --all-features
 
+      # 64-bit layout asserts once made `--features gguf` fail to compile on
+      # 32-bit targets, which a Python wheel matrix (win32, armv7) can include.
+      # A check needs only the target's std, no cross linker.
+      - name: Check (32-bit, all features)
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          cargo check --target i686-unknown-linux-gnu --all-features
+
   # Rustdoc was checked only by `publish.yml`, at release time, with
   # `--all-features` and public items only. That misses two whole classes of
   # breakage, both of which this repository has actually shipped:

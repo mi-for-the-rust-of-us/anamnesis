@@ -762,7 +762,7 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent, or if a dequant worker thread panics.
+    /// shapes are inconsistent.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -907,8 +907,7 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent, if a dequant worker thread panics, or if
-    /// serialization fails.
+    /// shapes are inconsistent, or if serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
@@ -1423,8 +1422,8 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Propagates [`Self::dequantize_quantized_entry`]'s errors — deterministically,
-    /// the lowest-indexed failure, at any thread count — and returns
-    /// [`AnamnesisError::Parse`] if a dequant worker thread panics.
+    /// the lowest-indexed failure, at any thread count. A worker thread's panic
+    /// is re-raised as a panic, not converted to an error.
     fn dequantize_all<E: OutputElement, F>(
         &self,
         threads: usize,

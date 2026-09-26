@@ -745,13 +745,16 @@ mod tests {
                 &header,
                 &InspectOptions::new().with_output_dtype(target),
             );
-            // The exact figure is meaningless once saturated; the contract is
-            // only that we reached here without a panic/wrap and produced the
-            // fail-closed sentinel.
+            // On 64-bit the product exceeds `u64` and must saturate to the
+            // fail-closed `u64::MAX`; on a 32-bit target `usize::MAX × BYTES`
+            // fits and must come out exact. Either way: no panic, no wrap.
+            // CAST: usize → u128, lossless widening for the reference product
+            #[allow(clippy::as_conversions)]
+            let exact = (n as u128) * (target.byte_size() as u128);
+            let expected = u64::try_from(exact).unwrap_or(u64::MAX);
             assert_eq!(
-                info.dequantized_size,
-                u64::MAX,
-                "{target}: an overflowing estimate must saturate to u64::MAX (fail-closed)"
+                info.dequantized_size, expected,
+                "{target}: the estimate must be exact or saturate to u64::MAX (fail-closed)"
             );
             // `lethe_took` must stay panic-free on the saturated figures too.
             let _ = info.lethe_took();

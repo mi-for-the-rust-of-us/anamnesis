@@ -677,6 +677,13 @@ pub enum GgufMetadataArray {
 //
 // If either number drifts, the DoS-guard memory math in the parser's
 // module comments is stale and needs to be re-audited.
+//
+// 64-bit only: the figures are 64-bit layouts (a `Vec` is 24 bytes there, 12
+// on a 32-bit target), and asserting them unconditionally made
+// `--features gguf` fail to compile on i686 / armv7, which a Python wheel
+// matrix can include. On a 32-bit target every size is smaller, so the memory
+// math built on these figures stays an upper bound.
+#[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(
         std::mem::size_of::<GgufMetadataValue>() == 24,
@@ -3167,6 +3174,7 @@ mod tests {
         assert!(!arr.is_empty());
     }
 
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn metadata_value_size_is_bounded() {
         // Mirrors the compile-time `const _` assertions near the top of

@@ -68,3 +68,40 @@ fn option_types_are_send_and_sync() {
     // it rather than surfacing as an inscrutable bound on an options type.
     assert_send_sync::<anamnesis::CancelToken>();
 }
+
+/// Everything a Phase 8 binding will hold as a Python object, or move across a
+/// released `GIL`. Current `PyO3` requires a `#[pyclass]` to be `Send + Sync`,
+/// and the cancellation design runs the work on a spawned thread, so the result
+/// and error types cross threads too. Each of these holds today only because
+/// its fields happen to; these asserts keep a later field from breaking it.
+#[test]
+fn binding_surface_types_are_send_and_sync() {
+    assert_send_sync::<anamnesis::AnamnesisError>();
+    assert_send_sync::<anamnesis::ParseLimits>();
+    assert_send_sync::<anamnesis::InspectOptions>();
+    assert_send_sync::<anamnesis::InspectInfo>();
+    assert_send_sync::<anamnesis::ConvertStats>();
+}
+
+#[cfg(feature = "pth")]
+#[test]
+fn pth_binding_types_are_send_and_sync() {
+    assert_send_sync::<anamnesis::ParsedPth>();
+    assert_send_sync::<anamnesis::PthTensor<'static>>();
+    assert_send_sync::<anamnesis::PthInspectInfo>();
+    assert_send_sync::<anamnesis::PthFrontMatter>();
+}
+
+#[cfg(feature = "npz")]
+#[test]
+fn npz_binding_types_are_send_and_sync() {
+    assert_send_sync::<anamnesis::NpzTensor>();
+    assert_send_sync::<anamnesis::NpzInspectInfo>();
+}
+
+#[cfg(feature = "gguf")]
+#[test]
+fn gguf_binding_types_are_send_and_sync() {
+    assert_send_sync::<anamnesis::GgufInspectInfo>();
+    assert_send_sync::<anamnesis::GgufFrontMatter>();
+}

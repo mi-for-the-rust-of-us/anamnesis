@@ -61,7 +61,7 @@ use anamnesis::{
 };
 
 use common::bf16::bf16_bytes_from_f32_iter;
-use common::builders::{build_safetensors_bf16, write_temp};
+use common::builders::{build_npz_f32, build_safetensors_bf16, write_temp};
 
 // ===========================================================================
 // Fixture builders (deterministic; pure functions of their inputs)
@@ -1276,4 +1276,41 @@ fn t14_perf_vs_python_size_matched() {
         pth_to_safetensors_bytes(&pth_tensors).unwrap()
     });
     report_vs_python("pth_to_st", pth_us, &[PERF_SHAPE.0, PERF_SHAPE.1]);
+}
+
+/// A cancelled `convert` writes nothing, for every input format and target.
+///
+/// Until v0.7.8 only the safetensors and `GGUF` readers polled the token, so a
+/// pre-cancelled `NPZ` (or `.pth`) convert ran to completion and wrote its
+/// output file, contradicting the "never create one" guarantee in
+/// `src/cancel.rs`. `NPZ` stands in for both token-less readers here, into all
+/// three targets.
+#[test]
+fn a_cancelled_npz_convert_writes_nothing() {
+    let data: Vec<u8> = (0..64u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let npz = build_npz_f32(&[("w", &[8, 8], &data)]);
+    let (_dir, input) = write_temp(&npz, "npz");
+    for (target, ext) in [
+        ("safetensors", "safetensors"),
+        ("gguf", "gguf"),
+        ("bnb-nf4", "safetensors"),
+    ] {
+        let out = input.with_file_name(format!("cancelled-{target}.{ext}"));
+        let token = anamnesis::CancelToken::new();
+        token.cancel();
+        let result = convert(
+            &input,
+            ConvertTarget::parse(target).unwrap(),
+            &out,
+            &ConvertOptions::new().with_cancel(token),
+        );
+        assert!(
+            matches!(result, Err(anamnesis::AnamnesisError::Cancelled)),
+            "{target}: expected Cancelled, got {result:?}"
+        );
+        assert!(
+            !out.exists(),
+            "{target}: a cancelled convert must not write a file"
+        );
+    }
 }

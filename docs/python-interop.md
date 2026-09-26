@@ -15,9 +15,11 @@ input. A malformed, truncated, or hostile artefact is always a clean
 `Result::Err` (`AnamnesisError`), never an unwinding panic and never a `SIGBUS`
 (the copy-based `parse_bytes` / `parse_*_from_reader` paths from Step 1 use no
 mmap). This is pinned by `tests/no_panic.rs` (a `catch_unwind` battery over
-adversarial inputs across every entry point, run in debug so integer-overflow
-panics are in scope) and the coverage-guided `cargo fuzz` harness (including the
-owned-path `fuzz_*_bytes` targets).
+adversarial inputs across every entry point, and since v0.7.8 across the methods
+called on a successful result too, run in debug so integer-overflow panics are
+in scope), by `tests/fuzz_regressions.rs` (the inputs fuzzing has caught), and
+by the coverage-guided `cargo fuzz` harness (19 targets, run under WSL; see
+`fuzz/README.md`).
 
 **Why the binding must build `panic = "unwind"`.** PyO3 wraps each `#[pyfunction]`
 in a panic boundary that converts an unwinding Rust panic into a Python
@@ -47,12 +49,26 @@ stable CI today by `tests/panic_profile.rs` (asserts release = abort **and**
 python = unwind), so it cannot silently regress before the cdylib exists.
 
 **Net for a Python host.** Because (a) the core never panics on untrusted input
-and (b) the wheel unwinds, the binding can wrap a hostile upload in
-`try/except AnamnesisError` and map it to an HTTP response — a `LimitExceeded`
-→ *413*, a `Parse` → *400*, a `DisallowedGlobal` → a flagged security event — and
-even an *unexpected* panic (a bug, not an input) surfaces as a catchable
-`PanicException` instead of killing the worker. See the error → exception map on
-`AnamnesisError` (and the README "Parsing untrusted input" section).
+and (b) the wheel unwinds, the binding can map a hostile upload to an HTTP
+response: `LimitExceededError` to *413*, `ParseError` to *400*, `SecurityError`
+(a `DisallowedGlobal`) to a flagged security event. Those three, with
+`UnsupportedError`, subclass the package's `AnamnesisError` base and are caught by
+`except AnamnesisError`. Three outcomes are deliberately **not** under that base,
+so a handler has to name them:
+
+- `Io` maps to the builtin `OSError` (a disk or transport failure, not a bad
+  file);
+- `Cancelled` maps to the builtin `KeyboardInterrupt`, which derives from
+  `BaseException` and so escapes even `except Exception`;
+- an unexpected panic (a bug, not an input) surfaces as PyO3's
+  `PanicException`, which also derives from `BaseException`. It is catchable,
+  and the worker survives, but only a handler that names it or catches
+  `BaseException` sees it. Since v0.7.8 this holds whatever the thread budget: a
+  panicking parallel worker is re-raised as a panic rather than reported as a
+  `ParseError`.
+
+See the error → exception map on `AnamnesisError` (and the README "Parsing
+untrusted input" section).
 
 ## NumPy / BF16 data-ownership contract (Phase 6.13 Step 4)
 
@@ -74,10 +90,18 @@ the binding:
 
 | Format | Accessor | Today | Binding takes ownership via |
 |---|---|---|---|
-| safetensors | `ParsedModel::remember_to_bytes` | **owned** `Vec<u8>` (dequantised `BF16`) | already owned |
+| safetensors | `ParsedModel::remember_to_bytes(target)` | **owned** `Vec<u8>`, a serialised `.safetensors` file at the requested width | already owned; the binding still has to split it into arrays (see below) |
+| GGUF (dequantised) | `ParsedGguf::dequantize_tensor_as::<E>` | **owned** `Vec<u8>` of one tensor at `E`'s width | already owned |
 | npz | `NpzTensor::data` | **owned** `Vec<u8>` | already owned |
 | GGUF | `ParsedGguf::tensors` → `GgufTensor::data` | `Cow::Borrowed` into the `Backing` | `Cow::into_owned()` |
 | `.pth` | `ParsedPth::tensors` → `PthTensor::data` | `Cow::Borrowed` into the `Backing` | `Cow::into_owned()` |
+
+`GgufTensor::data` holds the **raw quantised blocks**, not values; a binding that
+wants numbers calls `dequantize_tensor_as` (above). And no public accessor yet
+returns a safetensors model's dequantised tensors **one by one**: the per-tensor,
+mixed-dtype form a `remember()` binding should return exists only crate-internally
+(the `convert` hub), so today the choice is a whole serialised file or a
+`pub(crate)` path. Settling that is on Phase 8's API-freeze list in `ROADMAP.md`.
 
 Only GGUF and `.pth` `tensors()` borrow (zero-copy `Cow::Borrowed` slices into the
 `Backing`); the binding calls `.into_owned()` before constructing the array, so no

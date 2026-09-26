@@ -12,8 +12,6 @@
 
 #![allow(clippy::panic)]
 
-use anamnesis::AnamnesisError;
-
 /// A `.pth` whose pickled `OrderedDict` names one tensor twice. The duplicate
 /// reached the upstream `safetensors` serializer, which indexes a table sized
 /// by the distinct names and panicked (`fuzz_convert_bytes`). Now rejected
@@ -25,14 +23,14 @@ fn pth_duplicate_state_dict_key_is_a_clean_error() {
 
     let parse = anamnesis::parse_pth_bytes(bytes.to_vec());
     assert!(
-        matches!(&parse, Err(AnamnesisError::Parse { reason }) if reason.contains("duplicate tensor name")),
+        matches!(&parse, Err(anamnesis::AnamnesisError::Parse { reason }) if reason.contains("duplicate tensor name")),
         "parse: {parse:?}"
     );
 
     let target = anamnesis::ConvertTarget::parse("safetensors").unwrap_or_else(|e| panic!("{e}"));
     let convert = anamnesis::convert_bytes(bytes, target, &anamnesis::ConvertOptions::new());
     assert!(
-        matches!(&convert, Err(AnamnesisError::Parse { .. })),
+        matches!(&convert, Err(anamnesis::AnamnesisError::Parse { .. })),
         "convert: {:?}",
         convert.as_ref().map(|(_, stats)| stats)
     );
@@ -51,6 +49,9 @@ fn gptq_bits_zero_is_a_clean_error() {
     if let Ok(model) = anamnesis::parse_bytes(bytes.to_vec()) {
         let _ = model.inspect();
         let result = model.remember_to_bytes(anamnesis::TargetDtype::BF16);
-        assert!(result.is_err(), "a crafted GPTQ layer should not dequantise");
+        assert!(
+            result.is_err(),
+            "a crafted GPTQ layer should not dequantise"
+        );
     }
 }
