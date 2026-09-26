@@ -52,6 +52,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 16 | Phase 7.6 `GGUF` `remember` moved out of the CLI — what the duplicated sequential path cost | **A duplication, not an optimisation: `amn remember model.gguf` ran a 121-line CLI transcription of `convert`'s reader that was sequential and silently ignored `--threads`, while `convert --to safetensors` on the same file ran the threaded library path and produced `SHA-256`-identical bytes. Routing the CLI at the library gives **1.24×** on `SmolLM2-135M-Q6_K` (241 → 194 ms) and **2.23×** on `Qwen2.5-1.5B-IQ2_M` (5854 → 2631 ms), medians of 5, `target-cpu=native`, output byte-identical before and after. The gap widens with model size because the fixed parse/write cost amortises, which is also why the small fixture understates it** | Shipped (v0.7.6, Phase 7.6) |
 | 17 | Phase 7.7 `clippy::chunks_exact_to_as_chunks` across the six suppressed sites in `src/` | **Unpredictable per site, and v0.7.6's figures were mostly instrument error.** 2 migrations are wins (`GPTQ` -9.87 %, `BnB` `INT8` -3 to -6 % at `F16`), 3 are measured losses (`AWQ` **+30 % aarch64 / ~+45 % x86-64**, `write_scratch` **+32 %** on `BnB` `INT8` `BF16`, `FP8` +3-5 %), 1 is unmeasurable. Identical source changes to near-identical kernels gave opposite answers, so **no site may be migrated on a sibling's number**. Secondary finding, larger than the primary one: **a static instruction count is not a proxy for wall clock** — `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 % | Shipped (v0.7.7, Phase 7.7) |
 | 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width, on both architectures — and the inline is not the lever.** x86-64 2.02x-3.11x across seven kernels, `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.09x-1.63x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
+| 19 | v0.7.8 close-out: sharing cold validation code between sibling kernels | **A refactor with no intended perf effect cost `gptq_int4_bf16` +69 % and `bnb_nf4` +4.5 to +6.5 %, and was reverted on those two paths.** Moving `GPTQ`'s entry validation into a shared helper: +69.4 / +68.8 / +75.2 / +73.8 / +71.1 % across five paired runs, `F32` / `F16` flat, not rescued by `#[inline]`. Adding a `checked_add` to `BnB`'s per-block `read_f32_le` and routing `dequantize_bnb4` through shared helpers: +4.50 % / +5.34 % (medians of 10); either change alone still +6 to +7 %, only reverting both is flat. Everything else in the release measured flat across all 21 arms (10 runs, every median within +/-1.5 %). **Code that is not in the hot loop can still decide the hot loop's codegen** | Reverted on `GPTQ` and plain `NF4` only (v0.7.8); the shared helpers stay for `AWQ`, double-quant and encode, which measured flat |
 
 ---
 
@@ -1777,3 +1778,57 @@ three charts, and `plots.py` to regenerate them. Contributed by
 edited into this file, so every number above can be checked against its source
 instead of trusted. The table here is a reading of that data; the folder is the
 data.
+
+---
+
+## Experiment 19: when sharing cold code changed hot codegen (v0.7.8)
+
+**Hypothesis (implicit, and wrong).** The v0.7.8 close-out audit found cold
+duplication between sibling kernels: `GPTQ` and `AWQ` validated their inputs
+with near-identical blocks, and the `BnB` decode and encode sides each parsed
+codebooks and absmax and validated block geometry in their own words. The
+refactor moved that code into shared helpers. None of it runs per element, so
+it was assumed to be performance-neutral and was not a perf claim.
+
+**Method.** `benches/ab.rs` (tango, paired, x86-64, ~2 % floor), each
+candidate exported with `cargo export` and compared against an export of `main`
+(`7fe6f8d`). The first full-suite runs were contended, so every verdict below is
+from runs filtered to one family, **10 runs per arm, medians**, except the
+`GPTQ` bisect, which reproduced five times at the same magnitude and needed no
+more.
+
+**Results.**
+
+| Change | Arm | Delta vs `main` |
+|---|---|---|
+| `GPTQ` entry validation moved to `quant_utils::validate_group_tensors` | `gptq_int4_bf16` | **+69.4, +68.8, +75.2, +73.8, +71.1 %** |
+| same, with `#[inline]` on every moved helper | `gptq_int4_bf16` | +73.8 % |
+| same, with the per-group scale unpack kept local | `gptq_int4_bf16` | +71.1 % |
+| validation restored in place, scale unpack still shared | `gptq_int4_bf16` | -2.85 / -3.34 % (flat) |
+| `BnB` shared helpers + `checked_add` in `read_f32_le` | `bnb_nf4_bf16` / `_f32` | **+4.50 / +5.34 %** |
+| only `read_f32_le` reverted | `bnb_nf4_bf16` / `_f32` | +6.12 / +6.54 % |
+| only `dequantize_bnb4`'s inline body restored | `bnb_nf4_bf16` / `_f32` | +7.32 / +1.04 % |
+| both reverted | `bnb_nf4_bf16` / `_f32` | +0.02 / +0.37 % (flat) |
+| the release as committed, all 21 arms | every arm | medians within +/-1.5 % |
+
+A control export at the step-1 commit (tests and benches only, no `src/`
+change) measured `gptq_int4_bf16` at -2.33 % and `bnb_nf4` at +0.23 / +0.04 /
++0.10 %, so the harness and the fixture refactor were not the cause. The fixture
+bytes are the same Knuth expression in both binaries.
+
+**What it says.** Only the `BF16` arms moved, and `BF16` is the one width
+reached through the `_to_bf16` wrappers, instantiated inside this crate rather
+than in the bench crate. That fits a codegen or placement effect in the crate's
+own monomorphisation, but it is an inference; the mechanism was not isolated,
+and Phase 7.7's rule is not to chase one inside a release. The result that
+transfers is the uncomfortable one: **"cold" is a claim about how often code
+runs, not about whether it can change how the hot loop is compiled.** A refactor
+touching a kernel's entry function is a codegen change and gets the paired
+harness like any other.
+
+**Outcome.** Both regressing paths were restored and carry a comment citing this
+entry (`remember/gptq.rs`, `remember/bnb.rs`). `AWQ` got its inline copy back
+too, so neither kernel keeps a single-caller helper. The shared helpers stay where
+they measured flat: the per-group scale unpack (`GPTQ` and `AWQ`), the `BnB`
+double-quant recovery and the encode side, which no benchmark times.
+

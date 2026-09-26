@@ -53,9 +53,7 @@
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
-use crate::remember::quant_utils::{
-    alloc_output, read_u32_le, unpack_scales_for_group, validate_group_tensors,
-};
+use crate::remember::quant_utils::{read_u32_le, unpack_scales_for_group};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -291,8 +289,26 @@ pub fn dequantize_gptq<E: OutputElement>(
     let pack_factor = 32 / bits as usize;
 
     // --- Validate dimensions ---
-    // GPTQ packs along `in_features`, so it alone needs this multiple;
-    // everything both schemes share is in `validate_group_tensors`.
+    //
+    // KEPT INLINE ON MEASUREMENT, not by oversight. This block and `AWQ`'s are
+    // near-identical, and the v0.7.8 close-out moved both into a shared
+    // `quant_utils::validate_group_tensors`. That cost `gptq_int4_bf16`
+    // +69.4 / +68.8 / +75.2 / +73.8 / +71.1 % across five runs of the paired
+    // harness (`benches/ab.rs`, tango, x86-64, ~2 % floor), with `F32` and
+    // `F16` flat. Shapes measured: the whole block moved out, with and without
+    // `#[inline]` on the helpers, and with the per-group scale unpack local or
+    // shared; only restoring this block in place recovered the number (+1.5 %).
+    // The mechanism is unexplained, and per `CONVENTIONS.md` rule 9 it is not
+    // chased here. `AWQ` keeps its copy inline too, so neither kernel carries a
+    // single-caller helper. See `docs/perf-experiments.md` Experiment 19.
+    if in_features == 0 || out_features == 0 || group_size == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "zero dimension: in_features={in_features}, out_features={out_features}, \
+                 group_size={group_size}"
+            ),
+        });
+    }
     if !in_features.is_multiple_of(pack_factor) {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -300,16 +316,70 @@ pub fn dequantize_gptq<E: OutputElement>(
             ),
         });
     }
-    let (_, num_groups) = validate_group_tensors(
-        qweight_data.len(),
-        scales_data.len(),
-        qzeros_data.len(),
-        in_features,
-        out_features,
-        group_size,
-        pack_factor,
-        scale_dtype,
-    )?;
+    if !out_features.is_multiple_of(pack_factor) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "out_features {out_features} is not a multiple of pack_factor {pack_factor}"
+            ),
+        });
+    }
+    if !in_features.is_multiple_of(group_size) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "in_features {in_features} is not a multiple of group_size {group_size}"
+            ),
+        });
+    }
+
+    let packed_rows = in_features / pack_factor;
+    let packed_cols = out_features / pack_factor;
+    let num_groups = in_features / group_size;
+
+    // --- Validate tensor sizes ---
+    let expected_qw_len = packed_rows
+        .checked_mul(out_features)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "qweight byte length overflow".into(),
+        })?;
+    if qweight_data.len() != expected_qw_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "qweight data length {} != expected {expected_qw_len}",
+                qweight_data.len()
+            ),
+        });
+    }
+
+    let expected_scales_len = num_groups
+        .checked_mul(out_features)
+        .and_then(|n| n.checked_mul(scale_dtype.byte_size()))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "scales byte length overflow".into(),
+        })?;
+    if scales_data.len() != expected_scales_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "scales data length {} != expected {expected_scales_len}",
+                scales_data.len()
+            ),
+        });
+    }
+
+    let expected_qzeros_len = num_groups
+        .checked_mul(packed_cols)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "qzeros byte length overflow".into(),
+        })?;
+    if qzeros_data.len() != expected_qzeros_len {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "qzeros data length {} != expected {expected_qzeros_len}",
+                qzeros_data.len()
+            ),
+        });
+    }
 
     // --- Parse g_idx if present ---
     let g_idx = g_idx_data
@@ -328,7 +398,13 @@ pub fn dequantize_gptq<E: OutputElement>(
     }
 
     // --- Allocate output ---
-    let mut output = alloc_output::<E>(in_features, out_features)?;
+    let out_byte_len = in_features
+        .checked_mul(out_features)
+        .and_then(|n| n.checked_mul(E::BYTES))
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "output size overflow".into(),
+        })?;
+    let mut output = vec![0u8; out_byte_len];
 
     // --- Precompute constants ---
     // CAST: u8 → u32, bits is 4 or 8

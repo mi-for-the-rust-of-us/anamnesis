@@ -123,7 +123,11 @@ const _: () = {
 ///
 /// Returns `None` if the slice does not contain 4 bytes at `offset`.
 pub(crate) fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
-    let bytes: &[u8] = data.get(offset..offset.checked_add(4)?)?;
+    // Unchecked `offset + 4` on purpose: every caller passes `i * 4` with `i`
+    // below a count whose `× 4` was already `checked_mul`'d, so it cannot
+    // overflow, and a `checked_add` here measurably slowed `NF4` decode
+    // (Experiment 19).
+    let bytes: &[u8] = data.get(offset..offset + 4)?;
     let arr: [u8; 4] = bytes.try_into().ok()?;
     Some(f32::from_le_bytes(arr))
 }
@@ -572,10 +576,94 @@ pub fn dequantize_bnb4<E: OutputElement>(
     block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
-    let num_blocks = validate_bnb4_blocks("BnB4", total_elements, block_size)?;
-    validate_bnb4_weight_len(weight_data, total_elements)?;
-    let absmax_f32 = parse_absmax(absmax_data, num_blocks)?;
-    let quant_map = parse_codebook(quant_map_data)?;
+    //
+    // KEPT INLINE ON MEASUREMENT. The v0.7.8 close-out routed this entry point
+    // through the shared `validate_bnb4_blocks` / `parse_absmax` /
+    // `parse_codebook` the double-quant and encode paths use. Paired harness
+    // (`benches/ab.rs`, tango, x86-64, 10 runs each, medians):
+    // `bnb_nf4_bf16` +4.50 % and `_f32` +5.34 % with the shared helpers, still
+    // +6.12 % / +6.54 % with only `read_f32_le`'s bounds reverted, still +7.32 %
+    // / +1.04 % with only this body restored; flat (+0.02 % / +0.37 %) only with
+    // both. A codegen-shape effect rather than cost that can be located, the same
+    // class `GPTQ` showed (see `remember/gptq.rs`), so it is not chased here.
+    // `docs/perf-experiments.md` Experiment 19.
+    if block_size == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: "BnB block_size must be > 0".into(),
+        });
+    }
+    // An odd block_size silently truncates `bytes_per_block = block_size / 2`,
+    // mis-aligning every block after the first and producing wrong (not
+    // out-of-bounds) output. Two nibbles pack into one byte, so a real BnB4
+    // block_size is always even (64 in practice).
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 block_size must be even (two nibbles per byte), got {block_size}"
+            ),
+        });
+    }
+    let expected_weight_bytes = if total_elements.is_multiple_of(2) {
+        Some(total_elements / 2)
+    } else {
+        None
+    };
+    if expected_weight_bytes != Some(weight_data.len()) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 weight byte count mismatch: expected {} for {} elements, got {}",
+                expected_weight_bytes.unwrap_or(0),
+                total_elements,
+                weight_data.len()
+            ),
+        });
+    }
+    if !total_elements.is_multiple_of(block_size) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 total_elements ({total_elements}) not divisible by block_size ({block_size})"
+            ),
+        });
+    }
+    let num_blocks = total_elements / block_size;
+    let expected_absmax_bytes = num_blocks
+        .checked_mul(4)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "absmax byte count overflow".into(),
+        })?;
+    if absmax_data.len() != expected_absmax_bytes {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 absmax byte count mismatch: expected {expected_absmax_bytes}, got {}",
+                absmax_data.len()
+            ),
+        });
+    }
+    // quant_map must be exactly 16 F32 values = 64 bytes
+    if quant_map_data.len() != 64 {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 quant_map must be 64 bytes (16×F32), got {}",
+                quant_map_data.len()
+            ),
+        });
+    }
+
+    // --- Pre-load quant_map (16 entries) ---
+    let mut quant_map = [0.0f32; 16];
+    for (i, val) in quant_map.iter_mut().enumerate() {
+        *val = read_f32_le(quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: "BnB4 quant_map read out of bounds".into(),
+        })?;
+    }
+
+    // --- Decode absmax bytes → f32 slice ---
+    let mut absmax_f32 = vec![0.0f32; num_blocks];
+    for (i, val) in absmax_f32.iter_mut().enumerate() {
+        *val = read_f32_le(absmax_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("BnB4 absmax read out of bounds at block {i}"),
+        })?;
+    }
 
     dequantize_bnb4_core::<E>(
         weight_data,
