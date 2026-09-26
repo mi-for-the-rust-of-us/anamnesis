@@ -1423,6 +1423,13 @@ Three arms earned a significance star while nothing had changed, so **a `*` mean
 9. No progress hook on `GGUF` `remember` (additive; could ship any time).
 10. A `DEFLATE` `data.pkl` inspects successfully and fails every parse path. Decide one behaviour.
 
+**Added by the Phase 8 readiness review (2026-09-26)**, after the small non-breaking findings were fixed in v0.7.8 (cancellation on every `convert` input, worker panics re-raised, bounded pickle error messages, 32-bit builds, wider contract tests):
+
+11. No public, owned, per-tensor result for `remember`: `ParsedModel::remember_to_bytes` returns a whole serialised file, the mixed-dtype per-tensor form lives in the `pub(crate)` `convert` hub, and `ParsedModel` has no raw tensor accessor. A `remember()` returning NumPy arrays needs one (new API).
+12. `resolve_ollama_model` reads `OLLAMA_MODELS` and the home directory at call time; with the `GIL` released, a Python thread writing `os.environ` races libc. Call it with the `GIL` held, or add a variant taking the root.
+13. Each call spawns up to `min(cores, 4)` workers, so N concurrent Python calls use 4N threads. Expose `threads=` and document it.
+14. `format_bytes` (a CLI display helper) sits in the crate root; do not bind it.
+
 - [ ] **Step 0 — write the pitch, before any code and before the API decisions** (`docs/python-pitch.md`, ~half a page) — **this is deliberately the first bullet, and the ordering is the point.** Every other phase in this roadmap starts with code because the audience was already known: Rust consumers with a problem anamnesis uniquely solves. Phase 8 does not have that luxury, for a reason recorded plainly below. The pitch must answer four questions in a form a stranger can read in a minute: **who is this for, what problem do they have today, what do they type, and why not just use Python.**
 
   **Why it gates the API rather than describing it.** The very next bullet is an irreversible decision about the encode surface, and it cannot be made sensibly in the abstract: "convert models in my pipeline" and "load quantised weights into NumPy" are different products implying different signatures. Positioning first, signature second. A pitch is a paragraph you rewrite for free; a published PyPI signature is permanent.

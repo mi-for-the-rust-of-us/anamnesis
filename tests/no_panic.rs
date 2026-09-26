@@ -74,6 +74,10 @@ const FIXTURES: &[&str] = &[
     "tests/fixtures/safetensors_reference/bnb_nf4.safetensors",
     "tests/fixtures/pth_reference/algzoo_rnn_small.pth",
     "tests/fixtures/npz_reference/gemma_scope_small.npz",
+    // Crash bodies from the v0.7.8 fuzz campaign (`tests/fuzz_regressions.rs`):
+    // their neighbours are exactly the "almost valid" inputs this battery wants.
+    "tests/fixtures/fuzz_regressions/pth_duplicate_state_dict_key.pth",
+    "tests/fixtures/fuzz_regressions/gptq_bits_zero.safetensors",
 ];
 
 /// The adversarial input battery: `(label, bytes)`.
@@ -140,6 +144,10 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
         };
         let len = bytes.len();
         let name = fixture_basename(path);
+        // The intact file too: every parse succeeds on the reference fixtures,
+        // which is what lets `methods_on_parsed_results_never_panic` reach the
+        // methods a binding calls on a result.
+        inputs.push((format!("{name}@whole"), bytes.clone()));
         for cut in [1usize, 4, 8, 16, len / 4, len / 2, len.saturating_sub(1)] {
             let cut = cut.min(len);
             inputs.push((format!("{name}@trunc{cut}"), bytes[..cut].to_vec()));
@@ -499,6 +507,90 @@ fn format_agnostic_entry_points_never_panic() {
                     )
                 },
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Methods on a successful result
+// ---------------------------------------------------------------------------
+
+/// Everything above stops at "the entry point returned". A binding goes on to
+/// call methods on the result (inspect it at a chosen width, list and extract
+/// tensors, dequantise, serialise), and those run over whatever the parser
+/// accepted. This drives each of them on every input that parses, including
+/// the intact fixtures and their near-misses. The v0.7.8 fuzz campaign found
+/// two panics in exactly this territory (`tests/fuzz_regressions.rs`).
+#[test]
+fn methods_on_parsed_results_never_panic() {
+    use anamnesis::{InspectInfo, InspectOptions, TargetDtype};
+
+    let widths = [TargetDtype::BF16, TargetDtype::F32, TargetDtype::F16];
+    for (label, bytes) in adversarial_inputs() {
+        if let Ok(model) = anamnesis::parse_bytes(bytes.clone()) {
+            assert_no_panic(&format!("st methods / {label}"), || {
+                let _ = model.inspect();
+                let _ = InspectInfo::from(&model.header);
+                for w in widths {
+                    let _ = model.inspect_with_options(&InspectOptions::new().with_output_dtype(w));
+                    let _ = model.remember_to_bytes(w);
+                }
+            });
+        }
+
+        #[cfg(feature = "gguf")]
+        {
+            let options = InspectOptions::new().with_output_dtype(TargetDtype::F32);
+            assert_no_panic(&format!("gguf inspect_with_options / {label}"), || {
+                anamnesis::inspect_gguf_from_reader_with_options(
+                    std::io::Cursor::new(bytes.clone()),
+                    &options,
+                )
+            });
+            if let Ok(front) =
+                anamnesis::parse_gguf_front_matter_from_reader(std::io::Cursor::new(bytes.clone()))
+            {
+                assert_no_panic(&format!("gguf front matter inspect / {label}"), || {
+                    front.inspect_with_options(&options)
+                });
+            }
+            if let Ok(gguf) = anamnesis::parse_gguf_bytes(bytes.clone()) {
+                assert_no_panic(&format!("gguf methods / {label}"), || {
+                    let _ = gguf.inspect_with_options(&options);
+                    let _ = gguf.tensors().count();
+                    for info in gguf.tensor_info() {
+                        let _ = gguf.dequantize_tensor(info);
+                        let _ = gguf.dequantize_tensor_as::<anamnesis::F32Out>(info);
+                    }
+                    let _ = gguf.remember_to_bytes(TargetDtype::BF16);
+                });
+            }
+        }
+
+        #[cfg(feature = "pth")]
+        {
+            let options = InspectOptions::new().with_output_dtype(TargetDtype::F32);
+            assert_no_panic(&format!("pth inspect_with_options / {label}"), || {
+                anamnesis::inspect_pth_from_reader_with_options(
+                    std::io::Cursor::new(bytes.clone()),
+                    &options,
+                )
+            });
+            if let Ok(front) =
+                anamnesis::parse_pth_front_matter_from_reader(std::io::Cursor::new(bytes.clone()))
+            {
+                assert_no_panic(&format!("pth front matter inspect / {label}"), || {
+                    front.inspect_with_options(&options)
+                });
+            }
+            if let Ok(pth) = anamnesis::parse_pth_bytes(bytes.clone()) {
+                assert_no_panic(&format!("pth methods / {label}"), || {
+                    let _ = pth.inspect_with_options(&options);
+                    let _ = pth.tensor_info();
+                    let _ = pth.tensors();
+                    let _ = pth.to_safetensors_bytes();
+                });
+            }
         }
     }
 }
