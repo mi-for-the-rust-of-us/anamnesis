@@ -7,6 +7,11 @@ the free plan, ~61 runs. This is an engineering report, not a verdict: several
 items below are properties of benchmarking rather than of CodSpeed, and they are
 marked as such.*
 
+*Status, 2026-09-26: the `paths:` filter this report describes as added was
+staged inside a commented-out trigger, because the August allowance was already
+spent. The job therefore did not run at all from 2026-08-23 until the v0.7.8
+close-out re-enabled it with the filter live. The report below is unchanged.*
+
 ## What we used it for
 
 Continuous performance tracking on a quantised-tensor library whose whole value

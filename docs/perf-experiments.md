@@ -1645,8 +1645,9 @@ SIMD change as a win.
    sit behind a `bench-fileio` feature that CI does not enable.
 3. **The arbiter measured the wrong architecture.** CodSpeed's walltime
    instrument is `aarch64`-only with no self-hosted option, while the crate is
-   developed and released on x86-64. It is now a `main`-only drift watch, and
-   deciding whether a change is faster happens locally.
+   developed and released on x86-64. It is now a `main`-only drift watch
+   (paths-filtered, and paused from 2026-08-23 to v0.7.8 when the free-plan
+   minutes ran out), and deciding whether a change is faster happens locally.
 
 ### What to do next time
 

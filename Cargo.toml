@@ -177,6 +177,9 @@ path = "src/bin/tsan_harness.rs"
 required-features = ["tsan"]
 
 [dev-dependencies]
+# Phase 7.7 paired A/B harness behind `benches/ab.rs`: loads two builds and
+# interleaves them sample by sample, so drift cancels. The instrument that
+# decides whether a change is faster (~2 % floor on x86-64).
 tango-bench = "0.8"
 # Phase 6.5 dev-only benchmark harness. Provides statistical-rigour
 # throughput measurement (Welch t-tests, bootstrap CIs), HTML report
@@ -186,7 +189,7 @@ tango-bench = "0.8"
 #
 # Aliased to `codspeed-criterion-compat` (a drop-in for criterion 0.5): a plain
 # `cargo bench` behaves exactly like upstream criterion, while under
-# `cargo codspeed` it emits CodSpeed measurements for CI regression tracking.
+# `cargo codspeed` it emits CodSpeed measurements for the `aarch64` drift watch.
 # The bench `.rs` sources keep their `use criterion::…` imports unchanged. See
 # `.github/workflows/codspeed.yml`.
 #
