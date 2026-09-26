@@ -18,32 +18,7 @@ use std::path::Path;
 
 use crate::convert::map_serialize_err;
 use crate::error::AnamnesisError;
-use crate::parse::npz::{NpzDtype, NpzTensor};
-
-/// Maps an [`NpzDtype`] to its `safetensors::Dtype` counterpart.
-///
-/// Every variant maps successfully — `safetensors` covers the full `NPZ`
-/// dtype range (`Bool`, `U8`/`I8`/…/`U64`/`I64`, `F16`, `BF16`, `F32`,
-/// `F64`). The function exists as an exhaustive match rather than a `From`
-/// impl so the wildcard arm reads as a compile-time error if `NpzDtype`
-/// ever gains a variant `safetensors` cannot represent.
-fn npz_dtype_to_safetensors(dtype: NpzDtype) -> safetensors::Dtype {
-    match dtype {
-        NpzDtype::Bool => safetensors::Dtype::BOOL,
-        NpzDtype::U8 => safetensors::Dtype::U8,
-        NpzDtype::I8 => safetensors::Dtype::I8,
-        NpzDtype::U16 => safetensors::Dtype::U16,
-        NpzDtype::I16 => safetensors::Dtype::I16,
-        NpzDtype::U32 => safetensors::Dtype::U32,
-        NpzDtype::I32 => safetensors::Dtype::I32,
-        NpzDtype::U64 => safetensors::Dtype::U64,
-        NpzDtype::I64 => safetensors::Dtype::I64,
-        NpzDtype::F16 => safetensors::Dtype::F16,
-        NpzDtype::BF16 => safetensors::Dtype::BF16,
-        NpzDtype::F32 => safetensors::Dtype::F32,
-        NpzDtype::F64 => safetensors::Dtype::F64,
-    }
-}
+use crate::parse::npz::NpzTensor;
 
 /// Converts the tensors parsed from an `NPZ` archive to a safetensors file
 /// on disk.
@@ -123,7 +98,7 @@ fn npz_views<S: BuildHasher>(
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(sorted.len());
     for (name, tensor) in sorted {
-        let st_dtype = npz_dtype_to_safetensors(tensor.dtype);
+        let st_dtype = tensor.dtype.to_safetensors_dtype()?;
         let view =
             safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)
                 .map_err(|e| AnamnesisError::Parse {
@@ -144,6 +119,7 @@ fn npz_views<S: BuildHasher>(
 )]
 mod tests {
     use super::*;
+    use crate::parse::npz::NpzDtype;
 
     fn make_tensor(name: &str, dtype: NpzDtype, shape: Vec<usize>, data: Vec<u8>) -> NpzTensor {
         NpzTensor {

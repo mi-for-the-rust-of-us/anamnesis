@@ -178,7 +178,7 @@ impl PthDtype {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
     /// exists (currently all variants map successfully).
-    pub fn to_dtype(self) -> crate::Result<Dtype> {
+    pub const fn to_dtype(self) -> crate::Result<Dtype> {
         match self {
             Self::F16 => Ok(Dtype::F16),
             Self::BF16 => Ok(Dtype::BF16),
@@ -200,7 +200,7 @@ impl PthDtype {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
     /// exists (currently all variants map successfully).
-    pub fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+    pub const fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
         match self {
             Self::F16 => Ok(safetensors::Dtype::F16),
             Self::BF16 => Ok(safetensors::Dtype::BF16),

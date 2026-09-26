@@ -1153,7 +1153,7 @@ fn hub_from_npz(
         tensors.push(HubTensor {
             name,
             shape: t.shape,
-            dtype: npz_dtype_to_hub(t.dtype),
+            dtype: t.dtype.to_dtype()?,
             data: t.data,
         });
     }
@@ -1186,7 +1186,7 @@ fn hub_from_pth(parsed: &crate::ParsedPth) -> crate::Result<Hub> {
         tensors.push(HubTensor {
             name: t.name,
             shape: t.shape,
-            dtype: pth_dtype_to_hub(t.dtype)?,
+            dtype: t.dtype.to_dtype()?,
             // BORROW: `into_owned()` copies the (possibly mmap-borrowed) bytes so
             // the hub outlives the `ParsedPth`.
             data: t.data.into_owned(),
@@ -1905,56 +1905,6 @@ fn json_to_metadata_value(
 // ---------------------------------------------------------------------------
 // Dtype mapping
 // ---------------------------------------------------------------------------
-
-/// Maps an [`NpzDtype`](crate::NpzDtype) to the hub dtype. Total — every `NPZ`
-/// dtype has a safetensors counterpart.
-#[cfg(feature = "npz")]
-const fn npz_dtype_to_hub(dtype: crate::NpzDtype) -> Dtype {
-    use crate::NpzDtype;
-    match dtype {
-        NpzDtype::Bool => Dtype::Bool,
-        NpzDtype::U8 => Dtype::U8,
-        NpzDtype::I8 => Dtype::I8,
-        NpzDtype::U16 => Dtype::U16,
-        NpzDtype::I16 => Dtype::I16,
-        NpzDtype::U32 => Dtype::U32,
-        NpzDtype::I32 => Dtype::I32,
-        NpzDtype::U64 => Dtype::U64,
-        NpzDtype::I64 => Dtype::I64,
-        NpzDtype::F16 => Dtype::F16,
-        NpzDtype::BF16 => Dtype::BF16,
-        NpzDtype::F32 => Dtype::F32,
-        NpzDtype::F64 => Dtype::F64,
-    }
-}
-
-/// Maps a [`PthDtype`](crate::PthDtype) to the hub dtype. Total — every `.pth`
-/// dtype the parser accepts has a safetensors counterpart.
-///
-/// # Errors
-///
-/// Currently infallible; returns `Result` so a future `PthDtype` without a
-/// counterpart can be rejected without a breaking change.
-#[cfg(feature = "pth")]
-// `clippy::unnecessary_wraps`: every arm is `Ok(_)` today; the `Result` is kept so
-// a future `PthDtype` without a safetensors counterpart can be rejected without a
-// breaking signature change.
-#[allow(clippy::unnecessary_wraps)]
-const fn pth_dtype_to_hub(dtype: crate::PthDtype) -> crate::Result<Dtype> {
-    use crate::PthDtype;
-    Ok(match dtype {
-        PthDtype::F16 => Dtype::F16,
-        PthDtype::BF16 => Dtype::BF16,
-        PthDtype::F32 => Dtype::F32,
-        PthDtype::F64 => Dtype::F64,
-        PthDtype::U8 => Dtype::U8,
-        PthDtype::I8 => Dtype::I8,
-        PthDtype::I16 => Dtype::I16,
-        PthDtype::I32 => Dtype::I32,
-        PthDtype::I64 => Dtype::I64,
-        PthDtype::Bool => Dtype::Bool,
-    })
-}
 
 /// Maps a **scalar** [`GgufType`](crate::GgufType) to the hub dtype.
 ///

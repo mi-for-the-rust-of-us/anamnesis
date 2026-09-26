@@ -115,6 +115,60 @@ impl NpzDtype {
             Self::U64 | Self::I64 | Self::F64 => 8,
         }
     }
+
+    /// Converts to the anamnesis [`Dtype`](crate::Dtype).
+    ///
+    /// The `NPZ` counterpart of `PthDtype::to_dtype`, with the same signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if no equivalent exists. Every
+    /// current variant maps; the `Result` keeps a future `NPZ` dtype with no
+    /// counterpart (a complex type, say) from being a breaking change.
+    pub const fn to_dtype(self) -> crate::Result<crate::Dtype> {
+        use crate::Dtype;
+        Ok(match self {
+            Self::Bool => Dtype::Bool,
+            Self::U8 => Dtype::U8,
+            Self::I8 => Dtype::I8,
+            Self::U16 => Dtype::U16,
+            Self::I16 => Dtype::I16,
+            Self::U32 => Dtype::U32,
+            Self::I32 => Dtype::I32,
+            Self::U64 => Dtype::U64,
+            Self::I64 => Dtype::I64,
+            Self::F16 => Dtype::F16,
+            Self::BF16 => Dtype::BF16,
+            Self::F32 => Dtype::F32,
+            Self::F64 => Dtype::F64,
+        })
+    }
+
+    /// Converts directly to `safetensors::Dtype`, skipping the intermediate
+    /// anamnesis `Dtype`. The `NPZ` counterpart of
+    /// `PthDtype::to_safetensors_dtype`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
+    /// exists (currently every variant maps).
+    pub const fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+        Ok(match self {
+            Self::Bool => safetensors::Dtype::BOOL,
+            Self::U8 => safetensors::Dtype::U8,
+            Self::I8 => safetensors::Dtype::I8,
+            Self::U16 => safetensors::Dtype::U16,
+            Self::I16 => safetensors::Dtype::I16,
+            Self::U32 => safetensors::Dtype::U32,
+            Self::I32 => safetensors::Dtype::I32,
+            Self::U64 => safetensors::Dtype::U64,
+            Self::I64 => safetensors::Dtype::I64,
+            Self::F16 => safetensors::Dtype::F16,
+            Self::BF16 => safetensors::Dtype::BF16,
+            Self::F32 => safetensors::Dtype::F32,
+            Self::F64 => safetensors::Dtype::F64,
+        })
+    }
 }
 
 /// Displays the canonical uppercase name (e.g., `"F32"`, `"BF16"`, `"BOOL"`).
@@ -1327,6 +1381,40 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    // -- NpzDtype::to_dtype / to_safetensors_dtype ---------------------------
+
+    /// Every variant maps, and both maps agree with `byte_size`, so the three
+    /// descriptions of one dtype cannot drift apart.
+    #[test]
+    fn dtype_maps_agree_with_byte_size() {
+        for dtype in [
+            NpzDtype::Bool,
+            NpzDtype::U8,
+            NpzDtype::I8,
+            NpzDtype::U16,
+            NpzDtype::I16,
+            NpzDtype::U32,
+            NpzDtype::I32,
+            NpzDtype::U64,
+            NpzDtype::I64,
+            NpzDtype::F16,
+            NpzDtype::BF16,
+            NpzDtype::F32,
+            NpzDtype::F64,
+        ] {
+            assert_eq!(
+                dtype.to_dtype().unwrap().byte_size(),
+                dtype.byte_size(),
+                "{dtype}"
+            );
+            assert_eq!(
+                dtype.to_safetensors_dtype().unwrap().bitsize(),
+                dtype.byte_size() * 8,
+                "{dtype}"
+            );
+        }
+    }
 
     // -- NpzDtype::byte_size -------------------------------------------------
 

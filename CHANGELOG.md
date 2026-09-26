@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`NpzDtype::to_dtype` and `NpzDtype::to_safetensors_dtype`**, matching the
+  pair `PthDtype` already had, with the same `Result` signatures so a future
+  `NPZ` dtype without a counterpart is not a breaking change. The crate's two
+  private `NPZ` dtype maps now go through them. `PthDtype`'s pair is now
+  `const fn`.
+
 ### Fixed
 
 - **A `.pth` archive that repeats `data.pkl` or `byteorder` is now rejected on
