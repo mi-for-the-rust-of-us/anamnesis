@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-failure messages change wording from `… read failed: …` to
   `failed to decode …: …`.
 
+- **The `.pth` reader-generic paths now honour `ParseLimits::max_decompression_ratio`.**
+  They inflate `DEFLATE` `data.pkl` / `byteorder` entries, but only the `NPZ`
+  path checked the caller's expansion-ratio budget, so a caller who tightened it
+  was silently not protected there. The inflation was already bounded by the
+  permanent `MAX_PKL_SIZE` cap; this makes the caller's own budget apply too.
+
 - **`cargo install anamnesis` no longer installs the dev-only `tsan-harness`
   binary.** It was gated on `parallel`, a default feature, so `cargo install
   anamnesis --features cli` installed it beside `anamnesis` / `amn`, and a bare

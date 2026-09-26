@@ -2814,12 +2814,12 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
                     ),
                 });
             }
-            parse_byteorder(&read_pth_entry_bytes(&mut src, entry)?)?
+            parse_byteorder(&read_pth_entry_bytes(&mut src, entry, limits)?)?
         }
         None => false, // default: little-endian
     };
 
-    let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry)?;
+    let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry, limits)?;
     Ok((big_endian, pkl_bytes))
 }
 
@@ -2979,13 +2979,24 @@ fn build_front_matter_inspect_info(
 ///
 /// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
 /// method other than `STORED` or `DEFLATE`.
+/// Returns [`AnamnesisError::LimitExceeded`] if the entry's declared expansion
+/// ratio exceeds `limits`' `max_decompression_ratio`.
 /// Returns [`AnamnesisError::Parse`] if the local header is malformed or the
 /// entry's bytes are truncated or fail to inflate.
 /// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_pth_entry_bytes<R: Read + Seek>(
     src: &mut crate::parse::zip::ReaderSource<R>,
     entry: &crate::parse::zip::ZipEntry,
+    limits: &ParseLimits,
 ) -> crate::Result<Vec<u8>> {
+    // Zip-bomb guard from archive metadata, before reading: the caller's
+    // expansion-ratio budget, exactly as the `.npz` path applies it. `STORED`
+    // entries have ratio 1 and pass.
+    limits.check_decompression_ratio(
+        entry.uncompressed_size,
+        entry.compressed_size,
+        &entry.name,
+    )?;
     // Already capped by the caller (`enforce_pkl_size_cap` / the byteorder cap).
     let limit = entry.uncompressed_size;
     let raw = src.entry_data_reader(entry)?;
@@ -4264,6 +4275,31 @@ mod tests {
         bytes[start] = 0b0000_0111;
         let err = inspect_pth_from_reader(std::io::Cursor::new(&bytes)).unwrap_err();
         assert!(matches!(err, AnamnesisError::Parse { .. }), "{err:?}");
+    }
+
+    // The reader paths inflate `DEFLATE` entries, so they honour the caller's
+    // expansion-ratio budget exactly as the `.npz` path does.
+    #[test]
+    fn deflate_data_pkl_respects_decompression_ratio() {
+        // A valid pickle that compresses well, from allowlisted opcodes only:
+        // PROTO 2, MARK, 4096 x NONE, TUPLE (a long tuple left on the stack),
+        // EMPTY_DICT, STOP. `STOP` returns the empty dict on top.
+        let mut pkl = b"\x80\x02(".to_vec();
+        pkl.extend(std::iter::repeat_n(b'N', 4096));
+        pkl.extend_from_slice(b"t}.");
+        let bytes = zip_with_entries(&[("a/data.pkl", zip::CompressionMethod::Deflated, &pkl)]);
+
+        let tight = ParseLimits::default().with_max_decompression_ratio(2);
+        let err =
+            parse_pth_front_matter_from_reader_with_limits(std::io::Cursor::new(&bytes), &tight)
+                .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_decompression_ratio"),
+            "{err:?}"
+        );
+        // The same archive under the default budget parses.
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        assert!(front.tensors.is_empty());
     }
 
     // A repeated tensor-storage suffix leaves it ambiguous which bytes a

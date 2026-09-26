@@ -90,13 +90,15 @@ pub struct ParseLimits {
     max_item_count: u64,
 
     /// Upper bound on a compressed archive entry's uncompressed-to-compressed
-    /// expansion ratio — the zip-bomb cap for `DEFLATE` `NPZ` entries. A few-KB
+    /// expansion ratio — the zip-bomb cap for `DEFLATE` archive entries. A few-KB
     /// entry that *honestly* declares a gigabyte-scale uncompressed size passes
     /// every byte-size check yet is a `1 000 000:1` amplification no real file
     /// produces; this rejects it from the archive metadata before allocating.
     /// `STORED` entries report equal sizes (ratio `1`) and always pass.
-    /// [`u64::MAX`] means unbounded. Applies to `NPZ` only (the sole `DEFLATE`
-    /// path; `.pth` is `STORED`-only, `GGUF` / safetensors are not zipped).
+    /// [`u64::MAX`] means unbounded. Applies to every `DEFLATE` entry anamnesis
+    /// inflates: `NPZ` arrays, and `data.pkl` / `byteorder` on the `.pth` reader
+    /// paths (the `.pth` mmap / bytes paths read `STORED` entries only; `GGUF` and
+    /// safetensors are not zipped).
     max_decompression_ratio: u64,
 }
 
@@ -270,9 +272,9 @@ impl ParseLimits {
     ///
     /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
     /// if the declared expansion ratio exceeds the configured maximum.
-    // Only the `npz` parse path reads `DEFLATE` (compressed) archive entries;
-    // with that feature disabled this helper has no caller.
-    #[cfg_attr(not(feature = "npz"), allow(dead_code))]
+    // Only the `npz` paths and the `.pth` reader paths read `DEFLATE`
+    // (compressed) archive entries; with neither feature this has no caller.
+    #[cfg_attr(not(any(feature = "npz", feature = "pth")), allow(dead_code))]
     pub(crate) fn check_decompression_ratio(
         &self,
         uncompressed: u64,
