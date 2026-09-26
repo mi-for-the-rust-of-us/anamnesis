@@ -191,10 +191,12 @@ arrives.
 
 What a cancelled run guarantees:
 
-- **It is polled once per tensor**, by the workers themselves, at the point the
-  scheduling cursor hands one out; never inside a kernel. Cancellation is
-  cooperative, so a worker already inside a tensor finishes it. The bound is
-  one tensor's dequantisation, not the whole model.
+- **It is polled once per tensor while dequantising** (safetensors and `GGUF`
+  inputs), by the workers themselves at the point the scheduling cursor hands
+  one out, never inside a kernel; and on the `convert` path also before
+  reading any format, before writing, and after a `BnB-NF4` encode.
+  Cancellation is cooperative, so a worker already inside a tensor finishes
+  it. The bound is one tensor's dequantisation, or one `NF4` encode.
 - **It returns `AnamnesisError::Cancelled`**, a variant of its own rather than a
   `Parse`, because the input may be perfectly valid and a retry may succeed.
   The binding maps it to the builtin `KeyboardInterrupt`, which is what the user

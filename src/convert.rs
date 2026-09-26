@@ -143,14 +143,15 @@ pub struct ConvertOptions {
     /// is a packaging concern for a downstream crate.
     #[cfg(feature = "gguf")]
     pub gguf_metadata: HashMap<String, crate::GgufMetadataValue>,
-    /// Cooperative cancellation handle, polled once per tensor.
+    /// Cooperative cancellation handle.
     ///
     /// `None` (the default) means the run cannot be cancelled and costs
     /// nothing: no token is allocated and the poll is a `None` check. `Some`
-    /// makes the run stop at the next tensor boundary once
-    /// [`CancelToken::cancel`](crate::CancelToken::cancel) is called from any
-    /// thread, returning [`AnamnesisError::Cancelled`] with no output file
-    /// written.
+    /// makes the run stop, returning [`AnamnesisError::Cancelled`] with no
+    /// output file written, once [`CancelToken::cancel`](crate::CancelToken::cancel)
+    /// is called from any thread. It is polled before reading, once per tensor
+    /// while dequantising (safetensors and `GGUF` inputs), before writing, and
+    /// after a `BnB-NF4` encode; see [`crate::cancel`] for the full list.
     pub cancel: Option<crate::CancelToken>,
     /// Element type written for tensors this conversion **dequantises**.
     /// `None` (the default) means [`Dtype::BF16`], which is what every release
@@ -663,8 +664,8 @@ const QUANT_SUFFIXES: &[&str] = &[
 /// Strips a known quantisation suffix from a file stem, if present.
 /// `model-GPTQ-Int4` → `model`; `weights` → `weights`.
 ///
-/// Shared with the CLI's `remember` output-path derivation so both stay on one
-/// suffix table.
+/// Used by [`derive_output_path_for_dtype`], which the CLI's `remember` and
+/// `convert` both call, so every derived name uses one suffix table.
 #[must_use]
 pub(crate) fn strip_quant_suffix(stem: &str) -> &str {
     QUANT_SUFFIXES
@@ -739,8 +740,9 @@ pub fn derive_output_path_for_dtype(
 /// Every supported `(input format × target)` pair routes through the in-memory
 /// hub: the input is parsed and normalised (quantised tensors dequantised to
 /// [`ConvertOptions::output_dtype`], `BF16` by default; scalar tensors kept in
-/// their original dtype), then written to the target. Format detection is automatic: by file extension, falling back to
-/// magic bytes for `.bin` and unrecognised extensions.
+/// their original dtype), then written to the target. Format detection is
+/// automatic: by file extension, falling back to magic bytes for `.bin` and
+/// unrecognised extensions.
 ///
 /// # Errors
 ///
@@ -1069,9 +1071,8 @@ fn write_hub(
     sink: Sink<'_>,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
-    // The last point a cancellation can stop the run before anything is
-    // written. The `BnB-NF4` encode runs inside `lethe`'s writer, which takes no
-    // token, so a request made during that encode is seen only once it ends.
+    // Checked before any writer runs. The `BnB-NF4` encode takes no token, so
+    // its target writer checks again after encoding and before writing.
     crate::cancel::check(options.cancel.as_ref())?;
     // Every target addresses tensors by name; refuse an ambiguous set before
     // any writer sees it.
@@ -1088,7 +1089,7 @@ fn write_hub(
                 .into(),
         }),
         #[cfg(feature = "bnb")]
-        ConvertTarget::BnbNf4 => write_bnb_nf4_target(hub, sink),
+        ConvertTarget::BnbNf4 => write_bnb_nf4_target(hub, sink, options.cancel.as_ref()),
         #[cfg(not(feature = "bnb"))]
         ConvertTarget::BnbNf4 => Err(AnamnesisError::Unsupported {
             format: "bnb-nf4".into(),
@@ -1380,6 +1381,8 @@ pub(crate) enum Sink<'a> {
 /// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects the
 /// shape/length pairing.
 fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'_>)>> {
+    // Also checked in `write_hub`; this one covers the `GGUF` `remember`
+    // callers, which reach the views without going through `write_hub`.
     crate::parse::utils::reject_duplicate_names(hub.tensors.iter().map(|t| t.name.as_str()))?;
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
         Vec::with_capacity(hub.tensors.len());
@@ -1514,8 +1517,12 @@ fn write_gguf_target(
 /// contract is `BF16`, so float tensors are converted on the way in; 2-D weights
 /// are encoded to NF4 and everything else passes through as `BF16`.
 #[cfg(feature = "bnb")]
-fn write_bnb_nf4_target(hub: &Hub, sink: Sink<'_>) -> crate::Result<ConvertStats> {
-    use crate::{BnbWriteInput, classify_inputs, write_bnb_nf4_safetensors};
+fn write_bnb_nf4_target(
+    hub: &Hub,
+    sink: Sink<'_>,
+    cancel: Option<&crate::CancelToken>,
+) -> crate::Result<ConvertStats> {
+    use crate::{BnbWriteInput, classify_inputs, write_bnb_nf4_safetensors_bytes};
 
     let mut owned: Vec<(String, Vec<usize>, Cow<'_, [u8]>)> = Vec::with_capacity(hub.tensors.len());
     for t in &hub.tensors {
@@ -1535,11 +1542,15 @@ fn write_bnb_nf4_target(hub: &Hub, sink: Sink<'_>) -> crate::Result<ConvertStats
         .collect();
 
     let stats = classify_inputs(&inputs);
+    // Encode to memory first, then re-check the token, then write: the encode
+    // is the long step and takes no token itself, so this is where a request
+    // made during it is honoured. Same peak as `write_bnb_nf4_safetensors`,
+    // which also serialises fully before its `fs::write`.
+    let bytes = write_bnb_nf4_safetensors_bytes(&inputs)?;
+    crate::cancel::check(cancel)?;
     match sink {
-        Sink::File(output) => write_bnb_nf4_safetensors(&inputs, output)?,
-        Sink::Memory(buf) => {
-            buf.extend_from_slice(&crate::write_bnb_nf4_safetensors_bytes(&inputs)?);
-        }
+        Sink::File(output) => std::fs::write(output, &bytes).map_err(AnamnesisError::Io)?,
+        Sink::Memory(buf) => buf.extend_from_slice(&bytes),
     }
 
     Ok(ConvertStats {
