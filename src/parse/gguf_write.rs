@@ -149,10 +149,12 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
     tensors: &[GgufWriteTensor<'_>],
     metadata: &HashMap<String, GgufMetadataValue, S>,
 ) -> crate::Result<()> {
-    // 1. Validate tensors and pre-compute total element counts.
+    // 1. Validate tensors and pre-compute total element counts. A repeated
+    //    name would write a file whose readers disagree on which tensor it is.
     for tensor in tensors {
         validate_tensor(tensor)?;
     }
+    crate::parse::utils::reject_duplicate_names(tensors.iter().map(|t| t.name))?;
 
     // 2. Resolve the effective alignment. If the caller supplied
     //    `general.alignment` we honour it (provided it is a non-zero
@@ -707,10 +709,6 @@ fn write_array_len(w: &mut impl Write, len: usize) -> crate::Result<()> {
     let len_u64 = len as u64;
     write_u64_le(w, len_u64)
 }
-
-// ---------------------------------------------------------------------------
-// GgufType → u32 discriminant
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Tests

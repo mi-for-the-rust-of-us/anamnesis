@@ -31,7 +31,7 @@ use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::utils::{
     PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, classify_decode_error,
-    saturating_num_elements,
+    reject_duplicate_names, saturating_num_elements,
 };
 
 // ---------------------------------------------------------------------------
@@ -269,8 +269,10 @@ struct NpyHeader {
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if the magic bytes, version, or header
-/// dict are malformed, or the header bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::Parse`] if the magic bytes or header dict are
+/// malformed, or the header bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::Unsupported`] if the `NPY` version is not 1, 2 or
+/// 3, or the dtype descriptor names an unsupported type.
 /// Returns [`AnamnesisError::LimitExceeded`] if the declared header length
 /// exceeds the cap or the `budget`.
 /// Returns [`AnamnesisError::Io`] if the underlying reader fails.
@@ -1072,6 +1074,10 @@ pub fn inspect_npz_from_reader_with_options<R: Read + Seek>(
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<NpzDtype> = Vec::new();
 
+    // A repeated array name makes the archive ambiguous: the map would keep
+    // the last copy while an inspect listed both. Refused on every path, as a
+    // repeated `.pth` entry is.
+    reject_duplicate_names(entries.iter().filter_map(|e| e.name.strip_suffix(".npy")))?;
     for entry in &entries {
         // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
         let name = match entry.name.strip_suffix(".npy") {
@@ -1314,6 +1320,10 @@ fn parse_npz_from_zip_reader<R: Read + Seek>(
     // `HashMap` allocation. The map grows as entries are inserted.
     let mut result = HashMap::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
 
+    // A repeated array name makes the archive ambiguous: the map would keep
+    // the last copy while an inspect listed both. Refused on every path, as a
+    // repeated `.pth` entry is.
+    reject_duplicate_names(entries.iter().filter_map(|e| e.name.strip_suffix(".npy")))?;
     for entry in &entries {
         // Strip .npy suffix; skip non-.npy entries (e.g., __MACOSX/).
         let name = match entry.name.strip_suffix(".npy") {
@@ -1585,6 +1595,48 @@ mod tests {
         let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3, 4), }";
         let shape = extract_shape(header).unwrap();
         assert_eq!(shape, vec![2, 3, 4]);
+    }
+
+    // -- Duplicate array names -----------------------------------------------
+
+    /// Parse kept the last copy of a repeated array name while inspect listed
+    /// both, so the two could describe different archives. The `zip` writer
+    /// refuses identical names, so the duplicate is made by renaming `b.npy`
+    /// to `a.npy` in the raw bytes (local headers and central directory);
+    /// entry names are not covered by the CRC, so the archive stays valid.
+    #[test]
+    fn duplicate_array_names_rejected_by_parse_and_inspect() {
+        let npy = make_npy_v1(
+            "{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }",
+            &[0u8; 4],
+        );
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for name in ["a.npy", "b.npy"] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(&npy).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let mut bytes = cursor.into_inner();
+        let mut renamed = 0;
+        for i in 0..bytes.len().saturating_sub(4) {
+            if &bytes[i..i + 5] == b"b.npy" {
+                bytes[i] = b'a';
+                renamed += 1;
+            }
+        }
+        assert_eq!(renamed, 2, "local header and central directory");
+
+        let parse = parse_npz_bytes(bytes.clone()).unwrap_err().to_string();
+        assert!(parse.contains("duplicate tensor name `a`"), "{parse}");
+        let inspect = inspect_npz_from_reader(std::io::Cursor::new(&bytes))
+            .unwrap_err()
+            .to_string();
+        assert!(inspect.contains("duplicate tensor name `a`"), "{inspect}");
     }
 
     // -- NPY header roundtrip ------------------------------------------------

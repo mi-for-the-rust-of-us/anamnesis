@@ -130,7 +130,9 @@ fn quant_state_json_bytes(shape: &[usize]) -> Vec<u8> {
 ///
 /// Returns [`AnamnesisError::Parse`] when an input's `bf16_data.len()`
 /// disagrees with `2 × product(shape)`, when shape contains a zero
-/// dimension, or when safetensors serialisation fails.
+/// dimension, when two output tensor names collide (duplicate inputs, or an
+/// input named like another's generated companion), or when safetensors
+/// serialisation fails.
 ///
 /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
 ///
@@ -277,9 +279,7 @@ pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::R
         views.push((name.clone(), view));
     }
 
-    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
-        reason: format!("failed to serialize BnB-NF4 safetensors: {e}"),
-    })
+    safetensors::tensor::serialize(views, None).map_err(crate::convert::map_serialize_err)
 }
 
 /// Summary of how a list of `BnbWriteInput` was classified — useful for

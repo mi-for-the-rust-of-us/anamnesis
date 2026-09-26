@@ -2003,8 +2003,7 @@ impl crate::ParsedGguf {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed, a
-    /// tensor's element count overflows `usize`, or a dequant worker thread
-    /// panics.
+    /// tensor's element count overflows `usize`, or two tensors share a name.
     /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
     /// safetensors equivalent.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -2036,8 +2035,7 @@ impl crate::ParsedGguf {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed, a
-    /// tensor's element count overflows `usize`, or a dequant worker thread
-    /// panics.
+    /// tensor's element count overflows `usize`, or two tensors share a name.
     /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
     /// safetensors equivalent.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
