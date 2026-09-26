@@ -47,13 +47,14 @@
 /// memory.
 // Deliberately not `Copy`: `ParseLimits` is a configuration/budget value passed
 // by `&ParseLimits` everywhere (and borrowed by the `.pth` pickle VM), so a
-// `Copy` derive would trip clippy's `trivially_copy_pass_by_ref` on the 16-byte
+// `Copy` derive would trip clippy's `trivially_copy_pass_by_ref` on the 32-byte
 // struct. `Clone` covers the rare by-value need.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The shared `max_` prefix is intentional — every field is a caller-set maximum
-// (`max_single_alloc_bytes`, `max_total_bytes`, `max_item_count`); the prefix is
-// what makes the budget axes read uniformly.
+// (`max_single_alloc_bytes`, `max_total_bytes`, `max_item_count`,
+// `max_decompression_ratio`); the prefix is what makes the budget axes read
+// uniformly.
 #[allow(clippy::struct_field_names)]
 pub struct ParseLimits {
     /// Upper bound, in bytes, on any single header-declared buffer a parser
@@ -328,7 +329,8 @@ impl ParseLimits {
     /// bound is `u64::MAX`, i.e. effectively the file size — matching the mmap
     /// path's no-inherent-limit behaviour.
     // Used by the copy-based `parse_*_from_reader` entry points (always-on
-    // safetensors + the `gguf`/`pth` features); never dead in the public sense.
+    // safetensors + the `gguf` / `npz` / `pth` features); never dead in the
+    // public sense.
     pub(crate) fn read_to_vec_bounded<R: std::io::Read>(
         &self,
         reader: R,

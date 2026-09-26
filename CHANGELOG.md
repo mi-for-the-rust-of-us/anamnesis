@@ -74,6 +74,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rustdoc corrections, several of them visible on docs.rs.** The crate
+  page's *Quick Start* heading was swallowed by a doubled `//!` prefix, and
+  `RememberOptions::with_threads` rendered with no documentation while
+  `with_cancel` showed the thread-budget doc and doctest. Both are fixed, along
+  with two other misplaced doc comments. `F16` output is now described as
+  overflowing to infinity past 65504, which is what it does, instead of
+  "saturating" (also in `amn --help`). `ConvertOptions::output_dtype` no longer
+  claims that only `GGUF` inputs honour it, true in v0.7.3 but not since v0.7.4.
+  Every `remember*_with_options` / `convert` `# Errors` section now lists
+  `AnamnesisError::Cancelled`, and the frozen Rust-to-Python exception table
+  gains its `Cancelled` row.
+
+- `dequantize_gguf` called with a scalar dtype now says the type "is not a
+  block-quantised type; there is nothing to dequantise" instead of
+  "dequantisation not yet supported". `amn convert --out-dtype` rejects a bad
+  value with `TargetDtype`'s wording ("supported target dtypes").
+
 - **The `BnB` `INT8` `F16` regression is confined to server-class ARM, and
   Apple Silicon is now measured.** v0.7.7 shipped that change disclosed, with a
   recommendation to pin `0.7.6` on ARM. An external contributor measured it on

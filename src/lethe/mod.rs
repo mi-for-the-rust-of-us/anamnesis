@@ -3,8 +3,8 @@
 //! Precision compression (encoding) — the inverse of [`remember`](mod@crate::remember).
 //!
 //! Each submodule handles one quantization family on the encode side. All
-//! operations take raw `BF16` bytes (the output dtype of every
-//! [`remember`](mod@crate::remember) kernel) and produce raw quantized
+//! operations take raw `BF16` bytes (the default output width of the
+//! [`remember`](mod@crate::remember) kernels) and produce raw quantized
 //! bytes suitable for writing back to a `.safetensors` file alongside
 //! per-block / per-row metadata (absmax, `SCB`, …).
 //!

@@ -93,10 +93,10 @@ pub enum TargetDtype {
     ///
     /// **Not uniformly the better 2-byte choice.** Against `BF16` it buys 3
     /// significand bits (11 versus 8) and pays a far narrower exponent range:
-    /// `BF16` shares `f32`'s range, while `F16` saturates at 65504 and flushes
-    /// to zero below about `2⁻²⁴`. Out-of-range values follow plain IEEE
-    /// semantics (infinity, flush-to-zero), never saturation — see
-    /// [`F16Out`] for why.
+    /// `BF16` shares `f32`'s range, while `F16`'s largest finite value is 65504
+    /// and it flushes to zero below about `2⁻²⁴`. Out-of-range values follow
+    /// plain IEEE semantics (overflow to infinity, flush to zero), never
+    /// saturation; see [`F16Out`] for why.
     F16,
 }
 
@@ -428,9 +428,9 @@ pub(crate) fn resolve_thread_budget(_threads: Option<usize>) -> usize {
 
 /// Caller-supplied options for the `remember` family of methods.
 ///
-/// Currently carries only the per-tensor dequantisation thread budget; the
-/// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
-/// change. Construct with [`RememberOptions::new`] (or
+/// Carries the per-tensor dequantisation thread budget and an optional
+/// [`CancelToken`](crate::CancelToken); the `#[non_exhaustive]` attribute lets
+/// future knobs be added without a breaking change. Construct with [`RememberOptions::new`] (or
 /// [`RememberOptions::default`], which is identical) and chain the setters:
 ///
 /// ```rust
@@ -469,14 +469,24 @@ impl RememberOptions {
     /// Returns options with the built-in defaults (the
     /// `min(available_parallelism, 4)` thread budget).
     ///
-    /// `const`: the struct is a single `Option<usize>`, so there is nothing to
-    /// allocate.
+    /// `const`: both fields start as `None`, so there is nothing to allocate.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             threads: None,
             cancel: None,
         }
+    }
+
+    /// Attaches a cancellation handle, polled once per tensor.
+    ///
+    /// Keep a clone: the token is how another thread — a signal handler, a
+    /// watchdog, a request-timeout task — reaches an in-flight call. See
+    /// [`crate::cancel`] for the `PyO3` shape this exists for.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Sets the per-tensor dequantisation thread budget (clamped to at least 1).
@@ -494,17 +504,6 @@ impl RememberOptions {
     /// let opts = RememberOptions::new().with_threads(2);
     /// assert_eq!(opts.threads, Some(2));
     /// ```
-    /// Attaches a cancellation handle, polled once per tensor.
-    ///
-    /// Keep a clone: the token is how another thread — a signal handler, a
-    /// watchdog, a request-timeout task — reaches an in-flight call. See
-    /// [`crate::cancel`] for the `PyO3` shape this exists for.
-    #[must_use]
-    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
-        self.cancel = Some(cancel);
-        self
-    }
-
     #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = Some(n.max(1));
@@ -767,6 +766,8 @@ impl ParsedModel {
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_with_options(
         &self,
         output_path: impl AsRef<Path>,
@@ -824,6 +825,8 @@ impl ParsedModel {
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_with_progress_and_options<F>(
         &self,
         output_path: impl AsRef<Path>,
@@ -857,7 +860,7 @@ impl ParsedModel {
     /// bytes in memory, instead of writing a file.
     ///
     /// The in-memory twin of [`remember`](Self::remember): identical dequant and
-    /// companion-grouping, but returns the serialized `BF16` safetensors as a
+    /// companion-grouping, but returns the serialized safetensors, at the requested width, as a
     /// `Vec<u8>` so an embedder can load the dequantised model without a disk
     /// round-trip (e.g. candle-mi's quantized loader → `from_buffered_safetensors`).
     /// Completes the file/bytes pairing the crate's other serializers already
@@ -898,7 +901,7 @@ impl ParsedModel {
     ///
     /// The in-memory twin of [`remember_with_options`](Self::remember_with_options):
     /// identical dequant and companion-grouping, byte-identical output for any
-    /// thread count, but returns the serialized `BF16` safetensors as a `Vec<u8>`
+    /// thread count, but returns the serialized safetensors as a `Vec<u8>`
     /// instead of writing a file.
     ///
     /// # Errors
@@ -908,6 +911,8 @@ impl ParsedModel {
     /// serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_to_bytes_with_options(
         &self,
         target: TargetDtype,

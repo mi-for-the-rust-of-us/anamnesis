@@ -67,7 +67,7 @@ enum Commands {
         /// `f32` emits the reference implementation's own `f32` with no
         /// narrowing step of anamnesis's, at double the output bytes. `f16`
         /// buys 3 significand bits over `bf16` and pays a far narrower exponent
-        /// range (it saturates at 65504).
+        /// range (it overflows to infinity past 65504).
         ///
         /// Applies to **dequantised** tensors only; passthrough tensors keep
         /// their source dtype, so the output is legitimately mixed-dtype. On a
@@ -128,7 +128,7 @@ enum Commands {
         /// `f32` emits the reference implementation's own `f32` with no
         /// narrowing step of anamnesis's, at double the output bytes. `f16`
         /// buys 3 significand bits over `bf16` and pays a far narrower exponent
-        /// range, saturating to infinity above 65504.
+        /// range, overflowing to infinity past 65504.
         ///
         /// Applies to **dequantised tensors only**. Passthrough tensors (norms,
         /// biases, anything not block-quantised) keep their source dtype, so

@@ -15,9 +15,9 @@
 //!
 //! - **Quantised** tensors (`FP8` / `GPTQ` / `AWQ` / `BnB` safetensors, quantised
 //!   `GGUF` blocks) are dequantised to [`ConvertOptions::output_dtype`], which
-//!   defaults to `BF16`. Since v0.7.3 a `GGUF` input can be asked for `F32`
-//!   instead, which is the only width that adds no narrowing step of the
-//!   crate's own, or `F16`.
+//!   defaults to `BF16`. Any quantised input can be asked for `F32` instead,
+//!   the only width that adds no narrowing step of the crate's own, or `F16`
+//!   (`GGUF` since v0.7.3, the safetensors schemes since v0.7.4).
 //! - **Scalar** tensors keep their **original dtype** (`F64` / `F32` / `F16` /
 //!   `BF16` / `I8`–`I64` / `U8` / `Bool`), so `.pth` → safetensors and
 //!   `NPZ`-`F32` → `GGUF` stay bit-for-bit lossless.
@@ -177,15 +177,12 @@ pub struct ConvertOptions {
     /// doubling its bytes. Callers who want a uniform-dtype file want a cast
     /// pass, which is a different operation from dequantisation.
     ///
-    /// # v0.7.3 scope: `GGUF` input only
+    /// # Which inputs it applies to
     ///
-    /// Only the `GGUF` reader can honour a non-`BF16` request today. The
-    /// safetensors reader dequantises through the `FP8` / `GPTQ` / `AWQ` /
-    /// `BnB` kernels, which fuse the narrowing into their hot loops and are
-    /// generalised in v0.7.4; asking for `F32` with a quantised safetensors
-    /// input is therefore a clean `Unsupported` error rather than a silent
-    /// `BF16` fallback. `NPZ` and `.pth` inputs dequantise nothing at all, so
-    /// the option is vacuous there and is accepted rather than rejected.
+    /// Every input that dequantises: `GGUF` (since v0.7.3) and the `FP8` /
+    /// `GPTQ` / `AWQ` / `BnB` safetensors schemes (since v0.7.4). `NPZ` and
+    /// `.pth` inputs dequantise nothing at all, so the option is vacuous there
+    /// and is accepted rather than rejected.
     pub output_dtype: Option<Dtype>,
 }
 
@@ -233,7 +230,7 @@ impl ConvertOptions {
     /// is rejected by [`convert`], not here, so that the builder stays
     /// infallible like its siblings. See
     /// [`output_dtype`](ConvertOptions::output_dtype) for the passthrough
-    /// policy and the v0.7.3 `GGUF`-only scope.
+    /// policy and which inputs it applies to.
     #[must_use]
     pub fn with_output_dtype(mut self, dtype: Dtype) -> Self {
         self.output_dtype = Some(dtype);
@@ -741,8 +738,8 @@ pub fn derive_output_path_for_dtype(
 ///
 /// Every supported `(input format × target)` pair routes through the in-memory
 /// hub: the input is parsed and normalised (quantised tensors dequantised to
-/// `BF16`, scalar tensors kept in their original dtype), then written to the
-/// target. Format detection is automatic: by file extension, falling back to
+/// [`ConvertOptions::output_dtype`], `BF16` by default; scalar tensors kept in
+/// their original dtype), then written to the target. Format detection is automatic: by file extension, falling back to
 /// magic bytes for `.bin` and unrecognised extensions.
 ///
 /// # Errors
@@ -754,6 +751,8 @@ pub fn derive_output_path_for_dtype(
 /// `options.limits` or a permanent per-format cap.
 /// Returns [`AnamnesisError::Parse`] on a malformed input, and
 /// [`AnamnesisError::Io`] if the input cannot be read or the output written.
+/// Returns [`AnamnesisError::Cancelled`] if `options.cancel` is set before the
+/// run completes; no output file is written.
 ///
 /// # Memory
 ///
@@ -1010,10 +1009,9 @@ where
 
 /// Parses `input` into the hub, dispatching on the detected format.
 ///
-/// `out_dtype` reaches only the readers that actually dequantise. A reader that
-/// cannot honour a non-`BF16` request rejects it here rather than silently
-/// emitting `BF16`, so the caller never receives a file whose dtype differs
-/// from what they asked for.
+/// `out_dtype` reaches only the readers that actually dequantise, and every one
+/// of them honours all three output widths, so the caller never receives a file
+/// whose dequantised dtype differs from what they asked for.
 fn read_hub(
     input: &Path,
     options: &ConvertOptions,

@@ -117,9 +117,10 @@
 //! # Validation infrastructure (Phase 6.5, dev-only)
 //!
 //! Phase 6.5 ships three dev-only validation tracks. None of them
-//! affect the published crate (`benches/`, `tests/peak_heap_*.rs`,
-//! and the `dhat` / `criterion` dev-dependencies are excluded from
-//! the published tarball by Cargo's defaults).
+//! affect a dependent's build: dev-dependencies (`dhat`, `criterion`) never
+//! reach a consumer, `tests/` is left out of the published crate by the
+//! manifest's `exclude`, and `benches/` ships only because its `[[bench]]`
+//! targets are declared explicitly, never built for a dependent.
 //!
 //! 1. **Criterion runtime benchmarks** (`benches/dequant.rs`,
 //!    `benches/parsing.rs`) — throughput baselines per kernel family
@@ -246,7 +247,8 @@
 //! The rule exists because v0.8.0 mirrors this surface into a `PyPI` package,
 //! where a signature change is far more expensive than on `crates.io`, and
 //! adding the attribute later would itself be the breaking change.
-//!//! # Quick Start
+//!
+//! # Quick Start
 //!
 //! Path-based dequantisation (FP8 → BF16):
 //!
@@ -312,29 +314,40 @@
 //!   tensor bytes in lazily.
 //! - [`ParsedModel::inspect`] — derive format, tensor counts, and size
 //!   estimates from the parsed header (zero further I/O)
-//! - [`ParsedModel::remember`] — dequantize all quantized tensors to `BF16`
-//!   and write a standard `.safetensors` file
+//! - [`ParsedModel::remember`] — dequantize all quantized tensors to the
+//!   caller's [`TargetDtype`] (`BF16`, `F32` or `F16`) and write a standard
+//!   `.safetensors` file
 //! - [`OutputElement`] with [`Bf16Out`] / [`F32Out`] / [`F16Out`] — the
-//!   element type a `GGUF` dequant kernel writes, chosen by the caller
-//!   since v0.7.3 and monomorphised so it costs no run-time branch.
-//!   `F32Out` performs **no narrowing at all**, so its output is the
-//!   `f32` the reference implementation itself produces. Reachable
-//!   through `dequantize_gguf` / `dequantize_gguf_blocks` (both requiring
-//!   the `gguf` feature), through
-//!   `ParsedGguf::dequantize_tensor_as` per tensor, and through
-//!   `ConvertOptions::output_dtype` (`amn convert --out-dtype`) for a
-//!   whole file. The `remember` path stays `BF16`-only until v0.7.4.
+//!   element type a dequant kernel writes, chosen by the caller and
+//!   monomorphised so it costs no run-time branch (`GGUF` since v0.7.3, the
+//!   safetensors schemes since v0.7.4). `F32Out` performs **no narrowing at
+//!   all**, so its output is the `f32` the reference implementation itself
+//!   produces. Reachable through [`TargetDtype`] on the `remember` path,
+//!   through `ConvertOptions::output_dtype` (`amn convert --out-dtype`) for a
+//!   whole file, and through the per-kernel generic entry points
+//!   (`dequantize_gguf`, `dequantize_fp8`, …).
 //! - [`ParsedModel::remember_to_bytes`] — the same dequant, returning the
 //!   `.safetensors` bytes in memory instead of writing a file (no disk
 //!   round-trip for an embedder)
+//! - [`convert::convert`] / [`convert::convert_bytes`] — any supported input
+//!   format to any supported target, through one in-memory hub; the library
+//!   side of `amn convert`
+//! - [`detect_format`] / [`detect_format_from_bytes`] — which format a file or
+//!   buffer holds, by extension and then by magic bytes
+//! - [`InspectSummary`] — the one trait every format's inspect result
+//!   implements, so a caller can read tensor counts and the dequantised-size
+//!   estimate without matching on the format
+//! - [`CancelToken`] — stops an in-flight `remember` or `convert` from another
+//!   thread, returning [`AnamnesisError::Cancelled`]
 //! - [`parse_safetensors_header`] / [`parse_safetensors_header_from_reader`]
 //!   — header-only safetensors parsing. The reader-generic variant accepts
 //!   any `Read` substrate (in-memory `Cursor`, `HTTP`-range-backed adapter,
 //!   …) and reads only the 8-byte length prefix plus the `JSON` header,
 //!   so a multi-GB shard's metadata can be inspected with a single
 //!   ~1 MiB sequential fetch.
-//! - `parse_npz()` — read an `.npz` archive into a `HashMap<String, NpzTensor>`
-//!   (requires `npz` feature)
+//! - `parse_npz()` / `parse_npz_bytes()` / `parse_npz_from_reader()` — read an
+//!   `.npz` archive into a `HashMap<String, NpzTensor>` from a path, an owned
+//!   buffer, or any `Read` source (requires `npz` feature)
 //! - `inspect_npz()` / `inspect_npz_from_reader()` — header-only `NPZ`
 //!   inspection. The reader-generic variant accepts any `Read + Seek`
 //!   substrate (in-memory `Cursor`, HTTP-range-backed adapter, …) so callers
@@ -439,14 +452,14 @@
 // clippy lint suppression is a potential MSRV CI break.
 #![allow(unknown_lints)]
 
-/// Command-line interface implementation shared by the `anamnesis` and
-/// `amn` binaries. Feature-gated behind `cli`; pulls in `clap` only
-/// when enabled.
 // Raw-byte backing store (memory map or owned copy) shared by every
 // parsed-model type. Crate-internal: the `Backing` enum distinguishes the
 // trusted mmap fast path from the owned-copy untrusted-input path.
 mod backing;
 pub mod cancel;
+/// Command-line interface implementation shared by the `anamnesis` and
+/// `amn` binaries. Feature-gated behind `cli`; pulls in `clap` only
+/// when enabled.
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod convert;

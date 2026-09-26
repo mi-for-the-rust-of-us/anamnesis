@@ -8,9 +8,9 @@ use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRol
 
 /// Caller-supplied options for [`ParsedModel::inspect_with_options`](crate::ParsedModel::inspect_with_options).
 ///
-/// Currently carries only the output dtype the size estimate should assume; the
-/// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
-/// change. Construct with [`InspectOptions::new`] (or
+/// Carries the output dtype the size estimate should assume and the
+/// [`ParseLimits`] a reader-generic inspect runs under; the `#[non_exhaustive]`
+/// attribute lets future knobs be added without a breaking change. Construct with [`InspectOptions::new`] (or
 /// [`InspectOptions::default`], which is identical) and chain the setters:
 ///
 /// ```rust
@@ -191,8 +191,9 @@ impl InspectInfo {
         // `out_elements * out_bytes` (up to ×4 at F32) and a running `+=` could
         // exceed `u64::MAX` — a debug-build panic and a silent release wrap of
         // the very figure the inspect-before-parse gate reads. `SafetensorsHeader`
-        // has public fields and is not `#[non_exhaustive]`, so a caller can hand
-        // us such a header directly, bypassing the upstream `safetensors`
+        // is `#[non_exhaustive]`, so a caller cannot build one from scratch, but
+        // its fields are public, so a caller holding a parsed header can rewrite
+        // a tensor's shape afterwards, bypassing the upstream `safetensors`
         // validation that guards the file-parse fronts. Saturating keeps this in
         // line with the crate-wide "checked/saturating on every header-derived
         // value" invariant and, on an absurd shape, yields `u64::MAX` — which the

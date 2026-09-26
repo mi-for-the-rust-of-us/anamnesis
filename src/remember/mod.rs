@@ -3,8 +3,9 @@
 //! Precision recovery (dequantization) — built on [`parse`](mod@crate::parse).
 //!
 //! Each submodule handles one quantization family. All operations take raw byte
-//! slices from the parsed `.safetensors` file and produce dequantized output as
-//! raw `BF16` bytes suitable for writing back to a standard `.safetensors` file.
+//! slices from the parsed file and produce dequantized output as raw bytes of
+//! the caller's [`OutputElement`] (`BF16`, `F32` or `F16`), suitable for writing
+//! back to a standard `.safetensors` file.
 
 #[cfg(feature = "awq")]
 pub mod awq;
