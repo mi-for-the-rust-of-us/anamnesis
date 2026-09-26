@@ -104,6 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there, the migrated kernel being ~4.8 % *faster* at `F16`, matching x86-64.
   **The pin recommendation therefore applies only to `F16` output on ARM
   *servers* without hardware `FP16` (Graviton, Ampere), not to Apple Silicon.**
+  It is not a clean win there either: on the same M3 the migrated kernel is
+  about 5.2 % *slower* at `F32`, trading one width against the other. That is
+  not yet explained, nor reproduced on a second M-series tier.
 
 - **`F16Out` and `F32Out` cost figures are now platform-qualified**, because
   they were not, and were wrong outside x86-64. `F16` costs 2.0x to 3.1x `BF16`
@@ -172,7 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *Caveat recorded rather than buried:* `dequant_gguf_q4_k` improved 4.16 %
   consistently across both runs without being touched, so the conservative floor
   on the `GPTQ`-specific gain is nearer 5.7 %. Attributing that is Phase 7.7
-  item 6.
+  item 8.
 
 - **v0.7.6's `chunks_exact` suppression comments have been corrected, each
   against its own measurement.** They stated costs of +18 % to +74 % for
