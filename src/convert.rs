@@ -1385,15 +1385,17 @@ fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor:
 /// Maps an upstream `safetensors` serialisation failure onto this crate's error
 /// type, keeping `IoError` distinguishable from a malformed-input `Parse`.
 ///
-/// Shared by the file and in-memory writers so a caller sees the same variant
-/// whichever destination it picked.
+/// The one mapping behind every safetensors writer in the crate: `convert`'s
+/// file and in-memory destinations, `ParsedModel::remember*`, and the `.pth` /
+/// `NPZ` writers in [`crate::remember`]. A caller sees the same variant and
+/// wording whichever path and destination it picked.
 // EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
+pub(crate) fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
     match e {
         safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
         other => AnamnesisError::Parse {
-            reason: format!("failed to write safetensors file: {other}"),
+            reason: format!("failed to serialize safetensors: {other}"),
         },
     }
 }

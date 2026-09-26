@@ -138,10 +138,12 @@ fn quant_state_json_bytes(shape: &[usize]) -> Vec<u8> {
 ///
 /// For each quantised tensor: one packed-weight `Vec<u8>` (`total/2`
 /// bytes), one `absmax` `Vec<u8>` (`num_blocks × 4` bytes), plus a 64-byte
-/// codebook and a small `quant_state` JSON blob. All four are retained
-/// simultaneously until `safetensors::serialize_to_file` returns — same
-/// retention shape as `ParsedModel::remember`. Passthrough tensors borrow
-/// their `bf16_data` slice without copying.
+/// codebook and a small `quant_state` JSON blob. Passthrough tensors are
+/// copied into an owned buffer of their `bf16_data` size. All of these are
+/// retained together while [`write_bnb_nf4_safetensors_bytes`] serialises,
+/// and the serialised output buffer (about the output file's size) is live
+/// alongside them until it is written, so peak heap is roughly twice the
+/// output size.
 pub fn write_bnb_nf4_safetensors(
     inputs: &[BnbWriteInput<'_>],
     output: impl AsRef<Path>,
@@ -160,7 +162,8 @@ pub fn write_bnb_nf4_safetensors(
 ///
 /// # Memory
 ///
-/// Same as [`write_bnb_nf4_safetensors`] plus the final output buffer.
+/// Same as [`write_bnb_nf4_safetensors`], whose peak already includes the
+/// serialised output buffer: here that buffer is the return value.
 pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::Result<Vec<u8>> {
     let mut owned_storage: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
 
@@ -271,8 +274,6 @@ pub fn write_bnb_nf4_safetensors_bytes(inputs: &[BnbWriteInput<'_>]) -> crate::R
         views.push((name.clone(), view));
     }
 
-    // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
-    #[allow(clippy::wildcard_enum_match_arm)]
     safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
         reason: format!("failed to serialize BnB-NF4 safetensors: {e}"),
     })
