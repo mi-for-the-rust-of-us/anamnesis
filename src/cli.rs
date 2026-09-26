@@ -45,9 +45,7 @@ enum Commands {
         /// The estimate feeds the inspect-before-parse decision, so it has to
         /// be sized at the width you actually intend to `remember` or
         /// `convert` at: an `F32` request against a `BF16` estimate
-        /// under-reserves by exactly `2 ×`. `remember --to` fixed this same
-        /// bug for its own summary line in v0.7.4; `inspect` had no flag at
-        /// all until v0.7.6.
+        /// under-reserves by exactly `2 ×`.
         ///
         /// Vacuous on `.pth` and `NPZ`, whose tensors are already full
         /// precision and pass through in their source dtype. Accepted there
@@ -61,8 +59,9 @@ enum Commands {
         /// Path to the input model file.
         path: PathBuf,
         /// Output dtype for dequantised tensors: `bf16` (default), `f32`, or
-        /// `f16`. `safetensors` is accepted as an alias for `bf16` on
-        /// `.pth`/`.gguf` inputs, which always produce a safetensors file.
+        /// `f16`. On `.pth`, `NPZ` and `GGUF` inputs, which always produce a
+        /// safetensors file, `safetensors` is also accepted as an alias for
+        /// `bf16`.
         ///
         /// `f32` emits the reference implementation's own `f32` with no
         /// narrowing step of anamnesis's, at double the output bytes. `f16`
@@ -87,12 +86,13 @@ enum Commands {
     },
     /// Convert a model file to a different format.
     ///
-    /// Targets available in this build (Phase 6):
-    /// - `safetensors` (alias `bf16`) — dequantise any quantised input to a
-    ///   BF16 safetensors file (passes through unquantised inputs losslessly).
-    /// - `gguf` — write an unquantised GGUF file. Quantised GGUF emit
-    ///   (`gguf-q4km`, …) is deferred to Phase 8.5 via the same dispatch.
-    /// - `bnb-nf4` — encode the BF16 source into a BitsAndBytes-NF4
+    /// Targets:
+    /// - `safetensors` (alias `bf16`): dequantise any quantised input to a
+    ///   safetensors file at `--out-dtype` (BF16 by default), passing
+    ///   unquantised tensors through losslessly.
+    /// - `gguf`: write an unquantised GGUF file. Quantised GGUF emit
+    ///   (`gguf-q4km`, …) is Phase 8.5 work, through the same dispatch.
+    /// - `bnb-nf4`: encode the BF16 source into a BitsAndBytes-NF4
     ///   safetensors file (2-D tensors only; biases / norms / embeddings
     ///   pass through unchanged in BF16).
     Convert {
@@ -134,11 +134,9 @@ enum Commands {
         /// biases, anything not block-quantised) keep their source dtype, so
         /// this is not "rewrite every tensor as f32".
         ///
-        /// Honoured for **every** input format that dequantises, since v0.7.4.
-        /// (v0.7.3 accepted non-`bf16` values for `GGUF` input only and
-        /// reported a clear error for quantised safetensors; that restriction
-        /// is gone.) `NPZ` and `.pth` dequantise nothing, so the value is
-        /// accepted and has no effect there.
+        /// Honoured for every input format that dequantises. `NPZ` and `.pth`
+        /// dequantise nothing, so the value is accepted and has no effect
+        /// there.
         #[arg(long, value_name = "DTYPE", default_value = "bf16")]
         out_dtype: String,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
