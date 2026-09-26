@@ -2354,10 +2354,7 @@ pub fn parse_pth_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<ParsedPth> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "pth bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "pth bytes")?;
+    limits.check_owned_input(&bytes, "pth bytes")?;
     parsed_pth_from_backing(Backing::Owned(bytes), limits)
 }
 

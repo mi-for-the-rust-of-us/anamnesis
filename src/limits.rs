@@ -200,6 +200,21 @@ impl ParseLimits {
         Ok(())
     }
 
+    /// Charges a caller-supplied, already-owned input buffer against
+    /// [`ParseLimits::max_single_alloc_bytes`], the first step of every
+    /// `*_bytes_with_limits` entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `bytes` is larger than the configured maximum single allocation.
+    pub(crate) fn check_owned_input(&self, bytes: &[u8], context: &str) -> crate::Result<()> {
+        // CAST: usize → u64, lossless widening on all supported targets.
+        #[allow(clippy::as_conversions)]
+        let len = bytes.len() as u64;
+        self.check_alloc(len, context)
+    }
+
     /// Rejects a declared item count if it exceeds the caller's
     /// [`ParseLimits::max_item_count`] budget. Called at every site that reads
     /// a file-declared count of tensors / arrays / KV entries, immediately

@@ -490,10 +490,9 @@ pub(crate) struct ZipEntry {
     /// Compressed (on-disk) size of the entry data, in bytes.
     pub(crate) compressed_size: u64,
     /// Uncompressed size of the entry data, in bytes (equal to
-    /// `compressed_size` for `STORED`). Consumed by the `.npz` path (the
-    /// `DEFLATE` inflate-size cross-check), wired in Phase 6.12 Step 2; the
-    /// `.pth` path is STORED-only and reads only `compressed_size`.
-    #[allow(dead_code)]
+    /// `compressed_size` for `STORED`). Bounds every `DEFLATE` inflation: the
+    /// `.npz` array-size cross-check and the `.pth` reader path's `data.pkl` /
+    /// `byteorder` caps.
     pub(crate) uncompressed_size: u64,
     /// Offset of the entry's local file header from the start of the archive.
     pub(crate) local_header_offset: u64,

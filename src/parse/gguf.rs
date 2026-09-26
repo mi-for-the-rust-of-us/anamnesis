@@ -1993,10 +1993,7 @@ pub fn parse_gguf_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<ParsedGguf> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "GGUF bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "GGUF bytes")?;
+    limits.check_owned_input(&bytes, "GGUF bytes")?;
     parsed_gguf_from_backing(Backing::Owned(bytes), limits)
 }
 

@@ -1246,10 +1246,7 @@ pub fn parse_npz_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<HashMap<String, NpzTensor>> {
-    // CAST: usize → u64, lossless widening on all supported targets.
-    #[allow(clippy::as_conversions)]
-    let len = bytes.len() as u64;
-    limits.check_alloc(len, "NPZ bytes")?;
+    limits.check_owned_input(&bytes, "NPZ bytes")?;
     parse_npz_from_zip_reader(std::io::Cursor::new(bytes), limits)
 }
 

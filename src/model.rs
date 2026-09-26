@@ -317,10 +317,7 @@ pub fn parse_bytes(bytes: Vec<u8>) -> crate::Result<ParsedModel> {
 ///
 /// Takes ownership of `bytes` (no copy); peak heap is the input size.
 pub fn parse_bytes_with_limits(bytes: Vec<u8>, limits: &ParseLimits) -> crate::Result<ParsedModel> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "safetensors bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "safetensors bytes")?;
+    limits.check_owned_input(&bytes, "safetensors bytes")?;
     parsed_model_from_backing(Backing::Owned(bytes), limits)
 }
 

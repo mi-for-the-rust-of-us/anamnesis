@@ -107,12 +107,9 @@ fn unpack_zeros_for_group(
     // CAST: u8 → usize, bits is 4 or 8
     #[allow(clippy::as_conversions)]
     let pack_factor = 32 / bits as usize;
-    let packed_cols =
-        out_features
-            .checked_div(pack_factor)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "pack_factor is zero".into(),
-            })?;
+    // `bits` is validated to 4 or 8 before this runs, so `pack_factor` is 8 or
+    // 4 and the division cannot be by zero.
+    let packed_cols = out_features / pack_factor;
 
     for (j, buf_val) in buf.iter_mut().enumerate() {
         let packed_col = j / pack_factor;
