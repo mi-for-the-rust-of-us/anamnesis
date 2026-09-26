@@ -297,8 +297,8 @@ pub fn dequantize_gptq<E: OutputElement>(
     // harness (`benches/ab.rs`, tango, x86-64, ~2 % floor), with `F32` and
     // `F16` flat. Shapes measured: the whole block moved out, with and without
     // `#[inline]` on the helpers, and with the per-group scale unpack local or
-    // shared; only restoring this block in place recovered the number (+1.5 %).
-    // The mechanism is unexplained, and per `CONVENTIONS.md` rule 9 it is not
+    // shared; only restoring this block in place recovered it (-2.85 / -3.34 %,
+    // flat). The mechanism is unexplained, and per Phase 7.7's practice it is not
     // chased here. `AWQ` keeps its copy inline too, so neither kernel carries a
     // single-caller helper. See `docs/perf-experiments.md` Experiment 19.
     if in_features == 0 || out_features == 0 || group_size == 0 {

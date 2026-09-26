@@ -125,9 +125,10 @@ const ZIP_MAX_NAME_LEN: usize = 4096;
 ///
 /// Implemented by [`SliceSource`] (a borrowed `&[u8]`: the `.pth` mmap and
 /// bytes paths, and `convert`'s format detection) and by [`ReaderSource`] (a
-/// `Read + Seek` adapter: the `.npz` paths and the `.pth` reader paths). Keeping the reader generic over this trait means the
-/// EOCD scan, `ZIP64` resolution, and central-directory parse are written once
-/// and shared by both substrates.
+/// `Read + Seek` adapter: the `.npz` paths and the `.pth` reader paths).
+/// Keeping the reader generic over this trait means the EOCD scan, `ZIP64`
+/// resolution, and central-directory parse are written once and shared by both
+/// substrates.
 pub(crate) trait ZipSource {
     /// Total length of the source, in bytes.
     fn total_len(&self) -> u64;

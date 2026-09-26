@@ -266,8 +266,9 @@ where
             // to check the `impl Drop`s for side effects like releasing a lock or
             // sending a message; there are none on either path. No lock is
             // released, no channel is written, and a panic payload is only
-            // moved out to be re-raised below, whichever edition applies. The scoped-thread `Packet`
-            // destructor belongs to `handles`, which this does not touch.
+            // moved out to be re-raised below, whichever edition applies. The
+            // scoped-thread `Packet` destructor belongs to `handles`, which this
+            // does not touch.
             let joined = handle.join();
             match joined {
                 Ok(Ok(local)) => {

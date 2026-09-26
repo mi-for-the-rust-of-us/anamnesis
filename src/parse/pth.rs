@@ -2483,8 +2483,8 @@ pub fn parse_pth_from_reader_with_limits<R: Read>(
 ///
 /// Returns [`AnamnesisError::Parse`] for any malformed opcode, stack
 /// underflow, disallowed `GLOBAL`, or invalid `_rebuild_tensor_v2` argument
-/// shape — same error surface as the pickle VM and tensor-reference
-/// extractors return on their own — and when the state dict names one
+/// shape (the same error surface as the pickle VM and tensor-reference
+/// extractors return on their own), and when the state dict names one
 /// tensor twice.
 fn interpret_pickle_to_meta(
     pkl_data: &[u8],
@@ -2705,17 +2705,21 @@ impl crate::InspectSummary for PthInspectInfo {
 /// Returns [`AnamnesisError::LimitExceeded`] if the `data.pkl` declared size
 /// exceeds the 100 MiB cap (`MAX_PKL_SIZE`, defensive against adversarial
 /// central directories), the `byteorder` entry declared size exceeds its
-/// `MAX_BYTEORDER_SIZE` cap, or the declared entry count / central-directory
-/// size exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits.
+/// `MAX_BYTEORDER_SIZE` cap, the declared entry count / central-directory
+/// size exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits, or a
+/// `DEFLATE` entry's declared expansion ratio exceeds the caller's
+/// `max_decompression_ratio`.
 ///
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is shorter than 4 bytes,
 /// the local-file header magic is not `PK\x03\x04`, the central directory is
-/// malformed, the `data.pkl` entry is missing, the `byteorder` bytes are not
-/// UTF-8 or not `"little"`/`"big"`, the pickle VM rejects the opcode stream, or
-/// any `_rebuild_tensor_v2` call has malformed arguments.
+/// malformed, the `data.pkl` entry is missing or appears twice, the
+/// `byteorder` entry appears twice or its bytes are not UTF-8 or not
+/// `"little"`/`"big"`, a `DEFLATE` entry is truncated or fails to inflate, the
+/// pickle VM rejects the opcode stream, any `_rebuild_tensor_v2` call has
+/// malformed arguments, or the state dict names one tensor twice.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-`PyTorch` 1.6)
 /// `.pth` files that begin with a raw pickle byte (`0x80` followed by a
@@ -3191,7 +3195,9 @@ fn find_unique_entry<'a>(
 /// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
 /// local-header data offset cannot be resolved, `data_start` or `size`
 /// overflows `usize`, or an entry's byte range exceeds the file size.
-/// Returns [`AnamnesisError::Parse`] if two entries share a suffix.
+/// Returns [`AnamnesisError::Parse`] if two `STORED` entries share a suffix, or
+/// if any two entries (whatever their compression) are named `data.pkl` or
+/// `byteorder`.
 fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryIndex> {
     let mut src = crate::parse::zip::SliceSource::new(raw);
     let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;

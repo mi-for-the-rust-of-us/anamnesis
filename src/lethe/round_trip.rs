@@ -50,18 +50,18 @@ use crate::error::AnamnesisError;
 ///
 /// # Arguments
 ///
-/// - `codebook` — 16-entry `f32` codebook. Entries must be pairwise
+/// - `codebook`: 16-entry `f32` codebook. Entries must be pairwise
 ///   distinct (in IEEE 754 bit-pattern terms) for the harness to be
 ///   meaningful; `+0.0` and `-0.0` count as distinct here.
-/// - `scales` — set of per-block absmax values to test. Each scale
+/// - `scales`: set of per-block absmax values to test. Each scale
 ///   produces a fresh decode-then-encode round-trip on the same
 ///   synthetic 32-element block.
-/// - `block_size` — elements per absmax block. Must be exactly 32, the
+/// - `block_size`: elements per absmax block. Must be exactly 32, the
 ///   harness's synthetic input length (`16 × 2` elements).
-/// - `decode` — closure invoking the kernel-under-test's decode entry
+/// - `decode`: closure invoking the kernel-under-test's decode entry
 ///   point with the standard `(weight_bytes, absmax_bytes,
 ///   quant_map_bytes, total_elements, block_size)` signature.
-/// - `encode` — closure invoking the kernel-under-test's encode entry
+/// - `encode`: closure invoking the kernel-under-test's encode entry
 ///   point with the standard `(bf16_bytes, absmax_bytes, quant_map_bytes,
 ///   total_elements, block_size)` signature.
 ///

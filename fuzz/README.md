@@ -98,7 +98,7 @@ it into an in-tree regression fixture.
 
 ## What is and isn't committed
 
-`Cargo.toml`, `fuzz_targets/`, this README, and `.gitignore` are tracked. The
+`Cargo.toml`, `fuzz_targets/`, `common/`, this README, and `.gitignore` are tracked. The
 generated `corpus/`, `artifacts/`, `target/`, and `coverage/` directories are
 git-ignored. The whole `fuzz/` tree is excluded from the published crate via
 `exclude = ["/fuzz"]` in the root `Cargo.toml`, so ordinary users never build

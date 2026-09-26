@@ -33,9 +33,9 @@
 // `#[allow(dead_code)]` over every item.
 #![allow(dead_code)]
 // The same test-code allowances every `tests/*.rs` crate declares for itself.
-// Declared here too because the consumers' own lists differ (`cli.rs` does not
-// allow `as_conversions`, for instance) and a shared helper must build under
-// each of them.
+// Declared here too because the consumers' own lists differ (not every
+// consumer allows `as_conversions` or `cast_possible_truncation`, for
+// instance) and a shared helper must build under each of them.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -43,7 +43,6 @@
     clippy::indexing_slicing,
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     clippy::same_item_push
 )]
 

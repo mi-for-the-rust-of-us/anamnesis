@@ -308,16 +308,16 @@
 //!
 //! # Architecture
 //!
-//! - [`parse()`] — memory-map a `.safetensors` file into a
+//! - [`parse()`]: memory-map a `.safetensors` file into a
 //!   [`ParsedModel`]. Inspect-only workflows touch only the header
 //!   (~1 MiB) regardless of file size; full dequantisation pages
 //!   tensor bytes in lazily.
-//! - [`ParsedModel::inspect`] — derive format, tensor counts, and size
+//! - [`ParsedModel::inspect`]: derive format, tensor counts, and size
 //!   estimates from the parsed header (zero further I/O)
-//! - [`ParsedModel::remember`] — dequantize all quantized tensors to the
+//! - [`ParsedModel::remember`]: dequantize all quantized tensors to the
 //!   caller's [`TargetDtype`] (`BF16`, `F32` or `F16`) and write a standard
 //!   `.safetensors` file
-//! - [`OutputElement`] with [`Bf16Out`] / [`F32Out`] / [`F16Out`] — the
+//! - [`OutputElement`] with [`Bf16Out`] / [`F32Out`] / [`F16Out`]: the
 //!   element type a dequant kernel writes, chosen by the caller and
 //!   monomorphised so it costs no run-time branch (`GGUF` since v0.7.3, the
 //!   safetensors schemes since v0.7.4). `F32Out` performs **no narrowing at
@@ -326,70 +326,70 @@
 //!   through `ConvertOptions::output_dtype` (`amn convert --out-dtype`) for a
 //!   whole file, and through the per-kernel generic entry points
 //!   (`dequantize_gguf`, `dequantize_fp8`, …).
-//! - [`ParsedModel::remember_to_bytes`] — the same dequant, returning the
+//! - [`ParsedModel::remember_to_bytes`]: the same dequant, returning the
 //!   `.safetensors` bytes in memory instead of writing a file (no disk
 //!   round-trip for an embedder)
-//! - [`convert::convert`] / [`convert::convert_bytes`] — any supported input
+//! - [`convert::convert`] / [`convert::convert_bytes`]: any supported input
 //!   format to any supported target, through one in-memory hub; the library
 //!   side of `amn convert`
-//! - [`detect_format`] / [`detect_format_from_bytes`] — which format a file or
+//! - [`detect_format`] / [`detect_format_from_bytes`]: which format a file or
 //!   buffer holds, by extension and then by magic bytes
-//! - [`InspectSummary`] — the one trait every format's inspect result
+//! - [`InspectSummary`]: the one trait every format's inspect result
 //!   implements, so a caller can read tensor counts and the dequantised-size
 //!   estimate without matching on the format
-//! - [`CancelToken`] — stops an in-flight `remember` or `convert` from another
+//! - [`CancelToken`]: stops an in-flight `remember` or `convert` from another
 //!   thread, returning [`AnamnesisError::Cancelled`]
 //! - [`parse_safetensors_header`] / [`parse_safetensors_header_from_reader`]
-//!   — header-only safetensors parsing. The reader-generic variant accepts
+//!   header-only safetensors parsing. The reader-generic variant accepts
 //!   any `Read` substrate (in-memory `Cursor`, `HTTP`-range-backed adapter,
 //!   …) and reads only the 8-byte length prefix plus the `JSON` header,
 //!   so a multi-GB shard's metadata can be inspected with a single
 //!   ~1 MiB sequential fetch.
-//! - `parse_npz()` / `parse_npz_bytes()` / `parse_npz_from_reader()` — read an
+//! - `parse_npz()` / `parse_npz_bytes()` / `parse_npz_from_reader()`: read an
 //!   `.npz` archive into a `HashMap<String, NpzTensor>` from a path, an owned
 //!   buffer, or any `Read` source (requires `npz` feature)
-//! - `inspect_npz()` / `inspect_npz_from_reader()` — header-only `NPZ`
+//! - `inspect_npz()` / `inspect_npz_from_reader()`: header-only `NPZ`
 //!   inspection. The reader-generic variant accepts any `Read + Seek`
 //!   substrate (in-memory `Cursor`, HTTP-range-backed adapter, …) so callers
 //!   can extract tensor metadata without materialising the data segment
 //!   (requires `npz` feature)
 //! - `parse_gguf()` / `inspect_gguf_from_reader()` /
-//!   `parse_gguf_front_matter_from_reader()` — `GGUF` parsing / inspection.
+//!   `parse_gguf_front_matter_from_reader()`: `GGUF` parsing / inspection.
 //!   The path-based variant memory-maps the file and returns a `ParsedGguf`
 //!   with zero-copy tensor views. Both reader-generic variants accept any
 //!   `Read + Seek` substrate and read only the front-loaded header, so a
 //!   multi-GB quantised `GGUF`'s metadata can be inspected in a few range
-//!   fetches without downloading the data section — they differ in what they
+//!   fetches without downloading the data section: they differ in what they
 //!   return: `inspect_gguf_from_reader` reduces to the aggregate
 //!   `GgufInspectInfo` (the cheap inspect-before-parse policy gate), while
 //!   `parse_gguf_front_matter_from_reader` (0.7.1) returns the full
-//!   `GgufFrontMatter` — the complete metadata table and per-tensor list
+//!   `GgufFrontMatter`: the complete metadata table and per-tensor list
 //!   (name, shape, dtype, offset), matching what `ParsedGguf` exposes for
 //!   the mmap-backed path (requires `gguf` feature)
 //! - `parse_pth()` / `inspect_pth_from_reader()` /
-//!   `parse_pth_front_matter_from_reader()` — `PyTorch` `.pth` parsing /
+//!   `parse_pth_front_matter_from_reader()`: `PyTorch` `.pth` parsing /
 //!   inspection. The path-based variant memory-maps the file and returns a
 //!   `ParsedPth` with zero-copy `tensors()`. Both reader-generic variants
 //!   accept any `Read + Seek` substrate and read only the ZIP central
-//!   directory and `data.pkl` entry — no tensor-data files inside the
-//!   archive are read — so a torchvision-class `.pth` is inspectable in a
+//!   directory and `data.pkl` entry (no tensor-data file inside the
+//!   archive is read), so a torchvision-class `.pth` is inspectable in a
 //!   single `<100 KiB` range fetch; they differ in what they return:
 //!   `inspect_pth_from_reader` reduces to the aggregate `PthInspectInfo`
 //!   (the cheap inspect-before-parse policy gate), while
 //!   `parse_pth_front_matter_from_reader` (0.7.5) returns the full
-//!   `PthFrontMatter` — the complete per-tensor list (name, shape, dtype,
+//!   `PthFrontMatter`: the complete per-tensor list (name, shape, dtype,
 //!   byte length), matching what `ParsedPth::tensor_info()` exposes for the
 //!   mmap-backed path (requires `pth` feature)
-//! - `pth_to_safetensors()` / `pth_to_safetensors_bytes()` — lossless
+//! - `pth_to_safetensors()` / `pth_to_safetensors_bytes()`: lossless
 //!   `.pth` → `.safetensors` conversion (requires `pth` feature)
-//! - `npz_to_safetensors()` / `npz_to_safetensors_bytes()` — lossless
+//! - `npz_to_safetensors()` / `npz_to_safetensors_bytes()`: lossless
 //!   `.npz` → `.safetensors` conversion (requires `npz` feature; Phase 6)
-//! - `write_gguf()` / `write_gguf_to_writer()` — emit a `.gguf` file
+//! - `write_gguf()` / `write_gguf_to_writer()`: emit a `.gguf` file
 //!   from scalar-dtype tensors plus a metadata `KV` table; the
 //!   format-symmetric inverse of `parse_gguf` (requires `gguf` feature;
 //!   Phase 6)
 //! - `write_bnb_nf4_safetensors()` / `write_bnb_nf4_safetensors_bytes()`
-//!   — end-to-end `BF16 → BnB-NF4 safetensors` path with the four-tensor
+//!   end-to-end `BF16 → BnB-NF4 safetensors` path with the four-tensor
 //!   companion layout (`weight`, `weight.absmax`, `weight.quant_map`,
 //!   `weight.quant_state.bitsandbytes__nf4`) (requires `bnb` feature;
 //!   Phase 6)

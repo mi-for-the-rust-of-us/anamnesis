@@ -36,9 +36,11 @@ use crate::parse::npz::NpzTensor;
 /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
 ///
 /// Returns [`AnamnesisError::Parse`] if safetensors serialisation fails
-/// (e.g., duplicate tensor names — `parse_npz` returns a `HashMap` so the
-/// inputs are already unique, but the safetensors writer may still reject
-/// other shape/data combinations).
+/// (`parse_npz` returns a `HashMap`, so names are already unique, but the
+/// writer may still reject a shape/data combination).
+///
+/// Returns [`AnamnesisError::Unsupported`] if a dtype has no safetensors
+/// equivalent (every current `NpzDtype` has one).
 ///
 /// # Memory
 ///

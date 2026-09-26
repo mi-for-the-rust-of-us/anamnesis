@@ -10,8 +10,9 @@ use crate::parse::safetensors::{Dtype, QuantScheme, SafetensorsHeader, TensorRol
 ///
 /// Carries the output dtype the size estimate should assume and the
 /// [`ParseLimits`] a reader-generic inspect runs under; the `#[non_exhaustive]`
-/// attribute lets future knobs be added without a breaking change. Construct with [`InspectOptions::new`] (or
-/// [`InspectOptions::default`], which is identical) and chain the setters:
+/// attribute lets future knobs be added without a breaking change. Construct
+/// with [`InspectOptions::new`] (or [`InspectOptions::default`], which is
+/// identical) and chain the setters:
 ///
 /// ```rust
 /// use anamnesis::{InspectOptions, TargetDtype};

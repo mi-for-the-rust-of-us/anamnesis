@@ -7,7 +7,8 @@
 //! Drives the slice header parse and the owned-bytes model parse under the
 //! same budget, then, when the bytes parse, `inspect` and `remember_to_bytes`.
 //! That last call runs every dequant kernel the header selects (`FP8`, `GPTQ`,
-//! `AWQ`, `BnB`) on attacker-shaped tensors, the path no other target reached.
+//! `AWQ`, `BnB`) on attacker-shaped tensors, directly on a parsed model
+//! (`fuzz_convert_bytes` reaches the same kernels through the `convert` hub).
 //! Every call must return `Ok` or a clean `Err`, never panic or OOM.
 
 #[path = "../common/mod.rs"]

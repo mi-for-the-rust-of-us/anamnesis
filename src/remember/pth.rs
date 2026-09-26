@@ -78,8 +78,8 @@ pub fn pth_to_safetensors_bytes(tensors: &[PthTensor<'_>]) -> crate::Result<Vec<
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] if a dtype has no safetensors
-/// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects a
-/// shape/length pairing.
+/// equivalent, and [`AnamnesisError::Parse`] if two tensors share a name or
+/// the upstream crate rejects a shape/length pairing.
 fn pth_views<'a>(
     tensors: &'a [PthTensor<'_>],
 ) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'a>)>> {
