@@ -36,13 +36,16 @@
     clippy::same_item_push
 )]
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use anamnesis::{
     ConvertOptions, ConvertTarget, GgufMetadataArray, GgufMetadataValue, GgufType, GgufWriteTensor,
     convert, write_gguf,
 };
+
+use common::builders::{build_npz_f32, build_safetensors_bf16, write_temp};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -70,52 +73,6 @@ fn synth_f32(n_elements: usize) -> Vec<u8> {
     out
 }
 
-fn build_safetensors_bf16(name: &str, shape: &[usize], data: &[u8]) -> Vec<u8> {
-    let view = safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, shape.to_vec(), data)
-        .unwrap();
-    safetensors::tensor::serialize([(name, view)], None).unwrap()
-}
-
-/// Minimal F32 `NPZ` (`ZIP` of `.npy`), mirroring `tests/cli_convert.rs`.
-fn build_npz_f32(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
-    use std::io::Write;
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
-    let options: zip::write::SimpleFileOptions =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (name, shape, data) in tensors {
-        zip.start_file(format!("{name}.npy"), options).unwrap();
-        let shape_str: Vec<String> = shape.iter().map(usize::to_string).collect();
-        let shape_tuple = if shape.len() == 1 {
-            format!("({},)", shape_str[0])
-        } else {
-            format!("({})", shape_str.join(", "))
-        };
-        let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_tuple}, }}");
-        let mut header = dict.into_bytes();
-        let header_total = 10 + header.len() + 1;
-        let pad = (64 - header_total % 64) % 64;
-        for _ in 0..pad {
-            header.push(b' ');
-        }
-        header.push(b'\n');
-        let header_len_u16 = u16::try_from(header.len()).unwrap();
-        let mut entry_bytes: Vec<u8> = Vec::with_capacity(10 + header.len() + data.len());
-        entry_bytes.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y', 1, 0]);
-        entry_bytes.extend_from_slice(&header_len_u16.to_le_bytes());
-        entry_bytes.extend_from_slice(&header);
-        entry_bytes.extend_from_slice(data);
-        zip.write_all(&entry_bytes).unwrap();
-    }
-    zip.finish().unwrap().into_inner()
-}
-
-fn write_temp(bytes: &[u8], ext: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(format!("fixture.{ext}"));
-    std::fs::write(&path, bytes).unwrap();
-    (dir, path)
-}
-
 fn report(label: &str, stats: &dhat::HeapStats) {
     eprintln!(
         "  [{label}]\n    peak (max_bytes)   = {:>13} B  ({:>8.1} MiB)\n    \
@@ -141,7 +98,7 @@ fn bench_convert_peak_heap() {
     {
         let shape = [8192usize, 8192];
         let bf16 = synth_bf16(shape[0] * shape[1]);
-        let st = build_safetensors_bf16("model.weight", &shape, &bf16);
+        let st = build_safetensors_bf16(&[("model.weight", &shape, &bf16)]);
         let (_dir, in_path) = write_temp(&st, "safetensors");
         let out = in_path.with_file_name("out-bnb.safetensors");
         drop(bf16);

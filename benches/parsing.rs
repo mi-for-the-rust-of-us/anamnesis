@@ -52,6 +52,8 @@
     clippy::map_unwrap_or
 )]
 
+mod common;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -63,6 +65,8 @@ use anamnesis::{
     inspect_pth_from_reader, parse_gguf_front_matter_from_reader,
     parse_pth_front_matter_from_reader, parse_safetensors_header_from_reader, write_gguf,
 };
+
+use common::synth_bytes;
 
 // ---------------------------------------------------------------------------
 // Synthetic fixture sizes
@@ -93,9 +97,7 @@ fn build_safetensors_fixture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("synth.safetensors");
 
-    let tensor_bytes: Vec<u8> = (0..ELEMENTS_PER_TENSOR * 4)
-        .map(|i| (i.wrapping_mul(2_654_435_761) & 0xFF) as u8)
-        .collect();
+    let tensor_bytes: Vec<u8> = synth_bytes(ELEMENTS_PER_TENSOR * 4);
 
     // Owned data has to live for the full TensorView lifetime.
     let owned: Vec<Vec<u8>> = (0..N_TENSORS).map(|_| tensor_bytes.clone()).collect();
@@ -126,9 +128,7 @@ fn build_npz_fixture() -> (tempfile::TempDir, PathBuf) {
     let options: zip::write::SimpleFileOptions =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-    let payload: Vec<u8> = (0..ELEMENTS_PER_TENSOR * 4)
-        .map(|i| (i.wrapping_mul(2_654_435_761) & 0xFF) as u8)
-        .collect();
+    let payload: Vec<u8> = synth_bytes(ELEMENTS_PER_TENSOR * 4);
 
     for i in 0..N_TENSORS {
         let entry = format!("layer_{i:03}.npy");
@@ -193,9 +193,7 @@ fn build_pth_fixture() -> (tempfile::TempDir, PathBuf) {
 fn build_gguf_fixture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("synth.gguf");
-    let tensor_bytes: Vec<u8> = (0..ELEMENTS_PER_TENSOR * 4)
-        .map(|i| (i.wrapping_mul(2_654_435_761) & 0xFF) as u8)
-        .collect();
+    let tensor_bytes: Vec<u8> = synth_bytes(ELEMENTS_PER_TENSOR * 4);
     let owned: Vec<Vec<u8>> = (0..N_TENSORS).map(|_| tensor_bytes.clone()).collect();
     let names: Vec<String> = (0..N_TENSORS)
         .map(|i| format!("blk.{i:03}.weight"))

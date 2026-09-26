@@ -18,6 +18,8 @@
     clippy::wildcard_enum_match_arm
 )]
 
+mod common;
+
 use std::time::Instant;
 
 use anamnesis::remember::bnb::{
@@ -28,162 +30,8 @@ use anamnesis::{
     dequantize_bnb4_to_bf16,
 };
 
-// ---------------------------------------------------------------------------
-// Fixture parsing
-// ---------------------------------------------------------------------------
-
-/// Magic prefix identifying a v2 `BnB` fixture container.
-const FIXTURE_MAGIC: &[u8; 4] = b"AMNB";
-
-/// Container version this reader understands.
-const FIXTURE_VERSION: u32 = 2;
-
-fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-    u32::from_le_bytes(bytes)
-}
-
-/// Asserts the v2 container prefix shared by both `BnB` fixture layouts.
-///
-/// v1 carried neither magic nor version, so this is what lets a stale checkout
-/// fail loudly rather than read the header at the wrong offsets.
-fn check_container(data: &[u8]) {
-    assert_eq!(
-        &data[..4],
-        FIXTURE_MAGIC,
-        "fixture is not a v2 `AMNB` container — regenerate with \
-         tests/fixtures/bnb_reference/generate_bnb.py"
-    );
-    let version = read_u32_le(data, 4);
-    assert_eq!(
-        version, FIXTURE_VERSION,
-        "unsupported fixture container version {version} (this reader understands \
-         {FIXTURE_VERSION})"
-    );
-}
-
-/// Parsed `NF4`/`FP4` fixture (`format_id` = 0 or 2).
-///
-/// Both goldens come from the canonical `bitsandbytes` `CUDA` kernel. The `F32`
-/// one is a **separate** `dequantize_4bit` at `QuantState(dtype=float32)`, not
-/// a widening of the stock-dtype result: the kernel rounds at the output store,
-/// so widening a `bf16`/`f16` result yields a different number on 38-91 % of
-/// elements (measured per fixture by `generate_bnb.py`).
-struct Bnb4Fixture {
-    format_id: u32,
-    total_elements: usize,
-    block_size: usize,
-    /// Double-quant absmax offset from the `quant_state` JSON blob
-    /// (`nested_offset`); `0.0` for plain (non-double-quant) fixtures.
-    nested_offset: f32,
-    weight_data: Vec<u8>,
-    absmax_data: Vec<u8>,
-    quant_map_data: Vec<u8>,
-    nested_absmax_data: Vec<u8>,
-    nested_quant_map_data: Vec<u8>,
-    expected_bf16: Vec<u8>,
-    expected_f32: Vec<u8>,
-}
-
-/// Parsed `INT8` fixture (`format_id` = 1).
-///
-/// `int8_vectorwise_dequant` returns `f32`, so the `F32` golden is its result
-/// before the `BF16` narrowing — no second call needed.
-struct BnbInt8Fixture {
-    out_features: usize,
-    in_features: usize,
-    weight_data: Vec<u8>,
-    scb_data: Vec<u8>,
-    expected_bf16: Vec<u8>,
-    expected_f32: Vec<u8>,
-}
-
-fn parse_bnb4_fixture(data: &[u8]) -> Bnb4Fixture {
-    check_container(data);
-    let format_id = read_u32_le(data, 8);
-    let total_elements = read_u32_le(data, 12) as usize;
-    let block_size = read_u32_le(data, 16) as usize;
-    let weight_len = read_u32_le(data, 20) as usize;
-    let absmax_len = read_u32_le(data, 24) as usize;
-    let quant_map_len = read_u32_le(data, 28) as usize;
-    let nested_absmax_len = read_u32_le(data, 32) as usize;
-    let nested_quant_map_len = read_u32_le(data, 36) as usize;
-    let expected_len = read_u32_le(data, 40) as usize;
-    let f32_len = read_u32_le(data, 44) as usize;
-    let nested_offset = f32::from_le_bytes(data[48..52].try_into().unwrap());
-
-    let header_size = 52;
-    let mut offset = header_size;
-
-    let weight_data = data[offset..offset + weight_len].to_vec();
-    offset += weight_len;
-    let absmax_data = data[offset..offset + absmax_len].to_vec();
-    offset += absmax_len;
-    let quant_map_data = data[offset..offset + quant_map_len].to_vec();
-    offset += quant_map_len;
-    let nested_absmax_data = data[offset..offset + nested_absmax_len].to_vec();
-    offset += nested_absmax_len;
-    let nested_quant_map_data = data[offset..offset + nested_quant_map_len].to_vec();
-    offset += nested_quant_map_len;
-    let expected_bf16 = data[offset..offset + expected_len].to_vec();
-    offset += expected_len;
-    let expected_f32 = data[offset..offset + f32_len].to_vec();
-
-    assert_eq!(expected_len, total_elements * 2, "BF16 golden length");
-    assert_eq!(f32_len, total_elements * 4, "F32 golden length");
-
-    Bnb4Fixture {
-        format_id,
-        total_elements,
-        block_size,
-        nested_offset,
-        weight_data,
-        absmax_data,
-        quant_map_data,
-        nested_absmax_data,
-        nested_quant_map_data,
-        expected_bf16,
-        expected_f32,
-    }
-}
-
-fn parse_int8_fixture(data: &[u8]) -> BnbInt8Fixture {
-    check_container(data);
-    let _format_id = read_u32_le(data, 8); // = 1
-    let out_features = read_u32_le(data, 12) as usize;
-    let in_features = read_u32_le(data, 16) as usize;
-    let weight_len = read_u32_le(data, 20) as usize;
-    let scb_len = read_u32_le(data, 24) as usize;
-    let expected_len = read_u32_le(data, 28) as usize;
-    let f32_len = read_u32_le(data, 32) as usize;
-
-    let header_size = 36;
-    let mut offset = header_size;
-
-    let weight_data = data[offset..offset + weight_len].to_vec();
-    offset += weight_len;
-    let scb_data = data[offset..offset + scb_len].to_vec();
-    offset += scb_len;
-    let expected_bf16 = data[offset..offset + expected_len].to_vec();
-    offset += expected_len;
-    let expected_f32 = data[offset..offset + f32_len].to_vec();
-
-    assert_eq!(
-        expected_len,
-        out_features * in_features * 2,
-        "BF16 golden length"
-    );
-    assert_eq!(f32_len, out_features * in_features * 4, "F32 golden length");
-
-    BnbInt8Fixture {
-        out_features,
-        in_features,
-        weight_data,
-        scb_data,
-        expected_bf16,
-        expected_f32,
-    }
-}
+use common::bf16::{SignedZero, compare_bf16_with};
+use common::bnb::{parse_bnb4_fixture, parse_int8_fixture};
 
 // ---------------------------------------------------------------------------
 // F32 comparison
@@ -260,57 +108,18 @@ fn compare_f32_exact(name: &str, actual: &[u8], expected: &[u8]) {
 // BF16 comparison
 // ---------------------------------------------------------------------------
 
+/// The shared `BF16` comparison with the `BnB` suite's one variant: signed
+/// zero counts as a match.
+///
+/// IEEE 754 signed-zero equivalence: +0 and -0 are arithmetically
+/// identical. anamnesis' `BnB4` decode emits -0 for nibble high-bit
+/// entries whose codebook value collapsed to +0 (the sign-of-zero
+/// preservation rule that lets encode round-trip the original
+/// nibble byte-exactly); `bitsandbytes`' Python decode emits +0 at
+/// those positions. The arithmetic value is the same. Every other suite
+/// compares with `SignedZero::Distinct`.
 fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u16) {
-    assert_eq!(actual.len(), expected.len(), "output length mismatch");
-    let mut mismatches = 0;
-    let mut max_diff: u16 = 0;
-
-    for (i, (a_pair, e_pair)) in actual
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(expected.as_chunks::<2>().0)
-        .enumerate()
-    {
-        let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);
-        let e_bits = u16::from_le_bytes([e_pair[0], e_pair[1]]);
-
-        // Handle NaN: both NaN is a match.
-        let a_is_nan = (a_bits & 0x7F80 == 0x7F80) && (a_bits & 0x007F != 0);
-        let e_is_nan = (e_bits & 0x7F80 == 0x7F80) && (e_bits & 0x007F != 0);
-        if a_is_nan && e_is_nan {
-            continue;
-        }
-        if a_is_nan != e_is_nan {
-            mismatches += 1;
-            continue;
-        }
-
-        // IEEE 754 signed-zero equivalence: +0 and -0 are arithmetically
-        // identical. anamnesis' BnB4 decode emits -0 for nibble high-bit
-        // entries whose codebook value collapsed to +0 (the sign-of-zero
-        // preservation rule that lets encode round-trip the original
-        // nibble byte-exactly); bitsandbytes' Python decode emits +0 at
-        // those positions. The arithmetic value is the same.
-        // BITWISE: low 15 bits zero ⇒ value is +0 or -0 (sign-only diff).
-        if a_bits.trailing_zeros() >= 15 && e_bits.trailing_zeros() >= 15 {
-            continue;
-        }
-
-        let diff = a_bits.abs_diff(e_bits);
-        if diff > max_ulp_diff {
-            mismatches += 1;
-            if i < 5 {
-                eprintln!(
-                    "  element {i}: actual=0x{a_bits:04X}, expected=0x{e_bits:04X}, diff={diff} ULP"
-                );
-            }
-        }
-        if diff > max_diff {
-            max_diff = diff;
-        }
-    }
-    (mismatches, max_diff)
+    compare_bf16_with(actual, expected, max_ulp_diff, SignedZero::Equivalent)
 }
 
 // ---------------------------------------------------------------------------
