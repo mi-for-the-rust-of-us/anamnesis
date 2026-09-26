@@ -1,7 +1,7 @@
 # Fuzzing anamnesis
 
-Coverage-guided fuzz harness (17 targets) over the parser entry points of the
-four supported formats plus format detection, built on
+Coverage-guided fuzz harness (19 targets) over the parser entry points of the
+four supported formats, format detection and the `convert_bytes` pipeline, built on
 [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) + libFuzzer. Each
 target feeds **arbitrary attacker bytes** to a parser and asserts the only
 acceptable outcomes are `Ok(_)` or a clean `AnamnesisError` — libFuzzer treats
@@ -13,16 +13,19 @@ tests *pin* them, and fuzzing *searches* for inputs we didn't think of.
 
 ## Targets
 
-Five flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
+Six flavours: **reader/inspect** targets (header + pickle VM, the `HTTP`-range
 inspection surface), **path/parse** targets (the full data-extraction path,
 materialising the input to a temp file), **limit-enforcement** targets
 (Phase 6.8 Step 5) that parse under a `ParseLimits` **derived from the input**,
-so the fuzzer co-explores `(malformed file × tightened limits)`, and
+so the fuzzer co-explores `(malformed file × tightened limits)` (the
+input-to-limits mapping is shared in `fuzz/common/mod.rs`; since v0.7.8 the
+safetensors target in this group also runs the dequant kernels), and
 **owned-bytes** targets (Phase 6.13 Step 1) that drive the copy-based,
 mmap-free full-parse entry points — the path the Python bindings route untrusted
 uploads through (`fuzz_npz_bytes` joined them in Phase 7.6), and a
 **format-detection** target (Phase 7.6) that drives magic-byte detection, which
-must walk a ZIP central directory to tell `.npz` from `.pth`.
+must walk a ZIP central directory to tell `.npz` from `.pth`, and a
+**whole-pipeline** target (v0.7.8) that runs `convert_bytes` end to end.
 
 | Target | Entry point | What it exercises |
 |---|---|---|
@@ -43,6 +46,8 @@ must walk a ZIP central directory to tell `.npz` from `.pth`.
 | `fuzz_pth_bytes` | `parse_pth_bytes` | the **copy-based** `.pth` full parse (ZIP walk + pickle VM + tensor extraction) over owned bytes |
 | `fuzz_npz_bytes` | `parse_npz_bytes` | the **copy-based** `NPZ` full parse (Phase 7.6) over owned bytes: vendored ZIP central-directory walk, `DEFLATE` inflate, `NPY` header parser and Fortran-order transposition |
 | `fuzz_detect_format` | `detect_format_from_bytes` | **magic-byte format detection** (Phase 7.6) over arbitrary bytes, including the ZIP central-directory walk that separates `.npz` from `.pth` before any parser has been chosen |
+| `fuzz_safetensors_limits` | `parse_safetensors_header_with_limits`, `parse_bytes_with_limits`, then `inspect` and `remember_to_bytes` | safetensors header and owned-bytes parse under input-derived `ParseLimits` (v0.7.8), then **dequantisation** of whatever the header declares (`FP8` / `GPTQ` / `AWQ` / `BnB`) on attacker-shaped tensors |
+| `fuzz_convert_bytes` | `convert_bytes` | the **whole conversion pipeline** (v0.7.8): detection, parse, dequant, the in-memory hub, and one of the three writers (byte 8 picks `safetensors` / `gguf` / `bnb-nf4`), under input-derived `ParseLimits` |
 
 ## Prerequisites — Linux / macOS / WSL (not Windows-MSVC)
 
@@ -141,10 +146,12 @@ the pickle-VM working-set floor holding well under the 2 GB limit) —
 (Phase 6.13 Step 3) on the recommended untrusted-input path. The always-run
 counterpart is `tests/no_panic.rs` (a `catch_unwind` battery in stable CI).
 
-**Since Phase 6.13: 17 targets.** `fuzz/Cargo.toml` now declares 17 `[[bin]]`
-targets, one per file in `fuzz_targets/`. Four were added after the Phase 6.13
+**Since Phase 6.13: 19 targets.** `fuzz/Cargo.toml` declares 19 `[[bin]]`
+targets, one per file in `fuzz_targets/`. Six were added after the Phase 6.13
 campaign: `fuzz_gguf_front_matter` (v0.7.1), `fuzz_pth_front_matter` (v0.7.5),
-`fuzz_npz_bytes` and `fuzz_detect_format` (both Phase 7.6). **No campaign
-results are recorded for these four**, and no build of all 17 is recorded here
-either: until a run is written up in this section, their fuzzing coverage is
+`fuzz_npz_bytes` and `fuzz_detect_format` (both Phase 7.6), and
+`fuzz_safetensors_limits` and `fuzz_convert_bytes` (both v0.7.8). All 19 were
+checked to compile at v0.7.8 (`cargo +nightly check --manifest-path
+fuzz/Cargo.toml --bins`), but **no campaign results are recorded for these
+six**: until a run is written up in this section, their fuzzing coverage is
 unverified.

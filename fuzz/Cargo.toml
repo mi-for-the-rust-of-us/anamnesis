@@ -15,7 +15,10 @@ tempfile = "3"
 
 [dependencies.anamnesis]
 path = ".."
-features = ["npz", "pth", "gguf"]
+# `gptq` / `awq` / `bnb` make the dequant kernels reachable from the
+# safetensors and `convert_bytes` targets, which run `remember` / the hub on
+# attacker-shaped tensors.
+features = ["npz", "pth", "gguf", "gptq", "awq", "bnb"]
 
 # Own workspace so it is not absorbed into the parent; the published
 # `anamnesis` crate excludes `/fuzz` entirely (see the root `Cargo.toml`).
@@ -152,6 +155,24 @@ bench = false
 [[bin]]
 name = "fuzz_detect_format"
 path = "fuzz_targets/fuzz_detect_format.rs"
+test = false
+doc = false
+bench = false
+
+# Safetensors header + owned-bytes parse + dequantisation, under input-derived
+# `ParseLimits`. The only target that runs the dequant kernels on hostile input.
+[[bin]]
+name = "fuzz_safetensors_limits"
+path = "fuzz_targets/fuzz_safetensors_limits.rs"
+test = false
+doc = false
+bench = false
+
+# The whole `convert_bytes` pipeline: detection, parse, dequant, hub, and one of
+# the three writers, under input-derived `ParseLimits`.
+[[bin]]
+name = "fuzz_convert_bytes"
+path = "fuzz_targets/fuzz_convert_bytes.rs"
 test = false
 doc = false
 bench = false
