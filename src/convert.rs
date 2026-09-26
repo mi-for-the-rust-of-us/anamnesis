@@ -852,6 +852,9 @@ fn read_hub_from_bytes(
 ) -> crate::Result<Hub> {
     let threads = crate::model::resolve_thread_budget(options.threads);
     let cancel = options.cancel.as_ref();
+    // Checked here for every format: the `.pth` and `NPZ` readers take no
+    // token, so without this a pre-cancelled run on them ran to completion.
+    crate::cancel::check(cancel)?;
     let out_dtype = resolve_output_dtype(options)?;
     match detect_format_from_bytes_with_limits(bytes, &options.limits)? {
         Format::Safetensors => {
@@ -1019,6 +1022,9 @@ fn read_hub(
 ) -> crate::Result<Hub> {
     let threads = crate::model::resolve_thread_budget(options.threads);
     let cancel = options.cancel.as_ref();
+    // Checked here for every format: the `.pth` and `NPZ` readers take no
+    // token, so without this a pre-cancelled run on them ran to completion.
+    crate::cancel::check(cancel)?;
     let out_dtype = resolve_output_dtype(options)?;
     match detect_format(input)? {
         Format::Safetensors => read_safetensors(
@@ -1063,6 +1069,10 @@ fn write_hub(
     sink: Sink<'_>,
     options: &ConvertOptions,
 ) -> crate::Result<ConvertStats> {
+    // The last point a cancellation can stop the run before anything is
+    // written. The `BnB-NF4` encode runs inside `lethe`'s writer, which takes no
+    // token, so a request made during that encode is seen only once it ends.
+    crate::cancel::check(options.cancel.as_ref())?;
     // Every target addresses tensors by name; refuse an ambiguous set before
     // any writer sees it.
     crate::parse::utils::reject_duplicate_names(hub.tensors.iter().map(|t| t.name.as_str()))?;
@@ -1252,7 +1262,7 @@ fn read_gguf(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if a tensor's element count overflows
-/// `usize` or a dequant worker thread panics, and
+/// `usize`, and
 /// [`AnamnesisError::Unsupported`] for a `GGUF` dtype with no safetensors
 /// equivalent.
 ///

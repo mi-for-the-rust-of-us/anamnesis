@@ -38,8 +38,8 @@
 //! [`resolve_thread_budget`](crate::model::resolve_thread_budget) — caller-owned
 //! and hardware-bounded, **never** derived from a file-declared quantity.
 
-// Only the parallel half raises errors of its own (a panicked worker); the
-// sequential path merely propagates whatever `f` returned.
+// Only the parallel half names the error type (to keep the lowest-indexed
+// failure across workers); the sequential path merely propagates `f`'s.
 #[cfg(feature = "parallel")]
 use crate::AnamnesisError;
 
@@ -95,10 +95,17 @@ pub(crate) const MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
 ///
 /// # Errors
 ///
-/// Propagates whatever `f` returns, and returns [`crate::AnamnesisError::Parse`]
-/// if a
-/// worker thread panics (which the crate's `panic`-denying lint floor makes
-/// unreachable in practice — it is a fail-closed backstop, not an expected path).
+/// Propagates whatever `f` returns.
+///
+/// # Panics
+///
+/// Re-raises a worker thread's panic on the calling thread, with its original
+/// payload, exactly as the sequential path would have panicked in place. The
+/// crate's lint floor makes a panic a bug rather than an expected path, and a
+/// bug must not be reported as `AnamnesisError::Parse` ("the file is at
+/// fault"): under the Python bindings' `unwind` profile it surfaces as
+/// `PanicException` whatever the thread budget, and under the release `abort`
+/// profile the process aborts, as it would sequentially.
 ///
 /// ## Error selection is deterministic
 ///
@@ -198,7 +205,8 @@ where
     // The lowest-indexed failure seen across all workers; see the "Error
     // selection is deterministic" section on `map_indexed`.
     let mut failure: Option<(usize, AnamnesisError)> = None;
-    let mut panicked = false;
+    // TRAIT_OBJECT: a panic payload is `Box<dyn Any + Send>` by `std`'s API.
+    let mut panic_payload: Option<Box<dyn std::any::Any + Send>> = None;
 
     // PARALLEL: `items` is claimed one entry at a time through a shared
     // `AtomicUsize` cursor — a self-balancing partition, since a worker that
@@ -257,8 +265,8 @@ where
             // The reordering is inert here in any case. The lint's own caveat is
             // to check the `impl Drop`s for side effects like releasing a lock or
             // sending a message; there are none on either path. No lock is
-            // released, no channel is written, and the panic payload is dropped
-            // unread whichever edition applies. The scoped-thread `Packet`
+            // released, no channel is written, and a panic payload is only
+            // moved out to be re-raised below, whichever edition applies. The scoped-thread `Packet`
             // destructor belongs to `handles`, which this does not touch.
             let joined = handle.join();
             match joined {
@@ -273,15 +281,18 @@ where
                         failure = Some((idx, err));
                     }
                 }
-                Err(_) => panicked = true,
+                // Keep the first payload; any later one is a second symptom.
+                Err(payload) => {
+                    panic_payload.get_or_insert(payload);
+                }
             }
         }
     });
 
-    if panicked {
-        return Err(AnamnesisError::Parse {
-            reason: "parallel dequant worker thread panicked".into(),
-        });
+    // Every handle has been joined, so `scope` has returned normally; re-raise
+    // on this thread so the panic reaches the caller as a panic, not an error.
+    if let Some(payload) = panic_payload {
+        std::panic::resume_unwind(payload);
     }
     if let Some((_, err)) = failure {
         return Err(err);

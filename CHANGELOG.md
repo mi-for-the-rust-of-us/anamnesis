@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cancelled `convert` on `.pth` or `NPZ` input no longer writes its output
+  file.** Only the safetensors and `GGUF` readers polled the `CancelToken`, so
+  a cancelled run on the other two formats completed and wrote the file,
+  against the documented guarantee. The token is now checked before reading
+  any format and again before writing.
+
+- **A panic in a parallel dequant worker is re-raised as a panic**, not
+  reported as `AnamnesisError::Parse`. A worker panic is a bug, not a malformed
+  file; converting it made the error type depend on the thread budget (the
+  sequential path panicked, the parallel one returned `Parse`), which the
+  Python bindings would have surfaced as `ParseError` instead of
+  `PanicException`.
+
 - **Two panics on hostile input, found by the v0.7.8 fuzz campaign.** Both
   would abort a release build and surface as a `PanicException` under the
   Python bindings, instead of a typed error:
