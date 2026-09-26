@@ -9,12 +9,11 @@ Every `.rs` file must start with `// SPDX-License-Identifier: MIT OR Apache-2.0`
 ## Pre-commit Checks
 
 Before every commit, run and fix any issues from:
-1. `cargo build --features cli` (ensures CLI binary is current before integration tests)
-2. `cargo fmt`
-3. `cargo clippy --all-targets --all-features -- -D warnings`
-4. `cargo test`
-5. **If the commit touches any `///` or `//!` comment**, run the rustdoc sweep — see [Documentation Checks](#documentation-checks). `--all-features` alone cannot see a link that breaks under an intermediate feature combination, and a public-items run cannot see a broken link on a `pub(crate)` item at all.
-6. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
+1. `cargo fmt`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
+3. `cargo test`, plus `cargo test --all-features` (what CI runs) when the change can reach the CLI. `tests/cli.rs` and `tests/cli_convert.rs` are gated on the `cli` feature, so a default-feature run skips them. No separate `cargo build` step is needed: Cargo builds the `anamnesis` / `amn` binaries for those tests and hands them over through `CARGO_BIN_EXE_*`, so they can never run against a stale binary.
+4. **If the commit touches any `///` or `//!` comment**, run the rustdoc sweep — see [Documentation Checks](#documentation-checks). `--all-features` alone cannot see a link that breaks under an intermediate feature combination, and a public-items run cannot see a broken link on a `pub(crate)` item at all.
+5. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
 
 ## Documentation Checks
 
