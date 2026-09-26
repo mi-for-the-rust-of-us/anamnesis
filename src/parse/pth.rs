@@ -742,6 +742,50 @@ enum PickleValue {
     },
 }
 
+/// Longest string preview an error message quotes from a pickle, in `char`s.
+const PICKLE_PREVIEW_CHARS: usize = 48;
+
+impl PickleValue {
+    /// A short, bounded description of this value for an error message: its
+    /// kind, its length where it has one, and at most
+    /// [`PICKLE_PREVIEW_CHARS`] of any string it carries.
+    ///
+    /// Error messages used `{:?}`, which renders the whole value. The value is
+    /// attacker-controlled: a 64 MiB `BINBYTES` payload, within every cap,
+    /// formatted to a ~320 MiB `String` outside `ParseLimits`, and would have
+    /// been copied into a Python exception and every log line that printed it.
+    fn describe(&self) -> String {
+        match self {
+            Self::None => "None".into(),
+            Self::Bool(b) => format!("bool {b}"),
+            Self::Int(i) => format!("int {i}"),
+            Self::String(text) => format!("string {:?}", preview(text)),
+            Self::Bytes(bytes) => format!("bytes of length {}", bytes.len()),
+            Self::Tuple(items) => format!("tuple of {} items", items.len()),
+            Self::List(items) => format!("list of {} items", items.len()),
+            Self::Dict(pairs) => format!("dict of {} entries", pairs.len()),
+            Self::Global { module, name } => {
+                format!("global `{}.{}`", preview(module), preview(name))
+            }
+            Self::PersistentId(_) => "persistent id".into(),
+            Self::Reduced { .. } => "reduce result".into(),
+            Self::Built { .. } => "build result".into(),
+        }
+    }
+}
+
+/// The first [`PICKLE_PREVIEW_CHARS`] characters of `text`, with a marker
+/// when anything was cut.
+fn preview(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(PICKLE_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Checks whether a `GLOBAL` reference is in the security allowlist.
 ///
 /// Only `PyTorch` tensor-reconstruction callables, storage classes, and
@@ -1684,7 +1728,7 @@ fn as_i64(val: &PickleValue) -> crate::Result<i64> {
         Ok(*v)
     } else {
         Err(AnamnesisError::Parse {
-            reason: format!("expected int, got {val:?}"),
+            reason: format!("expected int, got {}", val.describe()),
         })
     }
 }
@@ -1712,7 +1756,7 @@ fn as_str(val: &PickleValue) -> crate::Result<&str> {
         Ok(s.as_str())
     } else {
         Err(AnamnesisError::Parse {
-            reason: format!("expected string, got {val:?}"),
+            reason: format!("expected string, got {}", val.describe()),
         })
     }
 }
@@ -1728,7 +1772,7 @@ fn tuple_to_usize_vec(val: &PickleValue) -> crate::Result<Vec<usize>> {
         items.iter().map(as_usize).collect()
     } else {
         Err(AnamnesisError::Parse {
-            reason: format!("expected tuple, got {val:?}"),
+            reason: format!("expected tuple, got {}", val.describe()),
         })
     }
 }
@@ -1771,14 +1815,18 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
             other => {
                 return Err(AnamnesisError::Parse {
                     reason: format!(
-                        "tensor `{name}`: PersistentId payload is not a tuple: {other:?}"
+                        "tensor `{name}`: PersistentId payload is not a tuple: {}",
+                        other.describe()
                     ),
                 });
             }
         },
         other => {
             return Err(AnamnesisError::Parse {
-                reason: format!("tensor `{name}`: expected PersistentId, got {other:?}"),
+                reason: format!(
+                    "tensor `{name}`: expected PersistentId, got {}",
+                    other.describe()
+                ),
             });
         }
     };
@@ -1800,7 +1848,10 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
         PickleValue::Global { module, name: cls } => PthDtype::from_storage_class(module, cls)?,
         other => {
             return Err(AnamnesisError::Parse {
-                reason: format!("tensor `{name}`: expected storage Global, got {other:?}"),
+                reason: format!(
+                    "tensor `{name}`: expected storage Global, got {}",
+                    other.describe()
+                ),
             });
         }
     };
@@ -1941,7 +1992,7 @@ fn extract_dict_pairs(
                 });
             }
             Err(AnamnesisError::Parse {
-                reason: format!("top-level pickle value is not a dict: {root:?}"),
+                reason: format!("top-level pickle value is not a dict: {}", root.describe()),
             })
         }
         PickleValue::Built { obj, state: _ } => {
@@ -1951,7 +2002,10 @@ fn extract_dict_pairs(
             extract_dict_pairs(obj, depth + 1)
         }
         _ => Err(AnamnesisError::Parse {
-            reason: format!("top-level pickle value is not a dict or OrderedDict: {root:?}"),
+            reason: format!(
+                "top-level pickle value is not a dict or OrderedDict: {}",
+                root.describe()
+            ),
         }),
     }
 }
@@ -4305,6 +4359,30 @@ mod tests {
         // The same archive under the default budget parses.
         let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
         assert!(front.tensors.is_empty());
+    }
+
+    // An error message quoting an attacker's pickle value must stay short:
+    // `{:?}` rendered a large `BINBYTES` root at ~5 bytes per byte, outside
+    // every budget, straight into the error string.
+    #[test]
+    fn pickle_error_messages_are_bounded() {
+        let payload_len: u32 = 1 << 20;
+        let mut pkl = b"\x80\x03B".to_vec();
+        pkl.extend_from_slice(&payload_len.to_le_bytes());
+        pkl.extend(std::iter::repeat_n(0xFFu8, payload_len as usize));
+        pkl.push(b'.');
+        let bytes = zip_with_entries(&[("a/data.pkl", zip::CompressionMethod::Stored, &pkl)]);
+        let msg = parse_pth_bytes(bytes).unwrap_err().to_string();
+        assert!(msg.contains("bytes of length 1048576"), "{msg}");
+        assert!(msg.len() < 200, "error message is {} bytes", msg.len());
+    }
+
+    #[test]
+    fn pickle_describe_truncates_long_strings() {
+        let long = PickleValue::String("x".repeat(10_000));
+        let text = long.describe();
+        assert!(text.chars().count() < PICKLE_PREVIEW_CHARS + 16, "{text}");
+        assert!(text.contains('…'));
     }
 
     // A repeated tensor-storage suffix leaves it ambiguous which bytes a

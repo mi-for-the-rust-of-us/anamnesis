@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`.pth` error messages no longer render the offending pickle value in
+  full.** They formatted it with `{:?}`, so a 64 MiB `BINBYTES` payload within
+  every cap became a ~320 MiB error string, allocated outside `ParseLimits`.
+  Messages now name the value's kind and length, and quote at most 48
+  characters of any string.
+
 - **A cancelled `convert` on `.pth` or `NPZ` input no longer writes its output
   file.** Only the safetensors and `GGUF` readers polled the `CancelToken`, so
   a cancelled run on the other two formats completed and wrote the file,
