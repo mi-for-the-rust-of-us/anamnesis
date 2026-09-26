@@ -62,13 +62,21 @@ comment.
 
 ## Performance Changes
 
+anamnesis is meant to be fast: a change may make it faster or leave it as fast, never slower.
+
 If a commit claims a perf win (faster, less memory, fewer allocations, fewer branches), it must include a measurement, not just an analysis:
 
-1. **Best-of-5 release-mode median**, with `target-cpu=native`, on a real fixture the claim is about. Templates: `tests/bench_npz_adhoc.rs` and `tests/bench_pth_adhoc.rs` — each is gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
-2. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
-3. **If the measurement does not show a win in the expected direction, do not commit.** Estimates and asymptotic arguments are hypotheses, not data — see `5f2632b` ("Revert NPZ memset elimination") for the cautionary case where a confidently estimated `~30 %` saving turned out to be a measured `~33 %` regression.
+1. **Decide with the paired harness, on x86-64.** [`benches/ab.rs`](benches/ab.rs) (tango) loads the baseline and the candidate together and interleaves them sample by sample, so drift cancels; its floor is ~2 %. Export the baseline from the parent commit, then compare:
+   ```powershell
+   cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf   # on the baseline
+   cargo bench --bench=ab --features gptq,awq,bnb,gguf -- compare target/benchmarks/ab --filter 'gptq_*' --noise-threshold 2.5
+   ```
+   **Run it about 10 times per arm** (these arms take milliseconds) and judge the median, with min and max. Filter to one kernel family per run: on this desktop a full-suite run can be contended part-way through and swing untouched kernels by ±100 %. See `CONVENTIONS.md` § *Benchmark evidence* for which instrument may decide what, and each one's measured floor.
+2. **For an absolute magnitude on a real fixture** (a model file, not the synthetic layer), use a best-of-5 release-mode median with `target-cpu=native`. Templates: the `tests/bench_*_adhoc.rs` files, each gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
+3. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
+4. **If the measurement does not show a win in the expected direction, do not commit.** Estimates and asymptotic arguments are hypotheses, not data — see `5f2632b` ("Revert NPZ memset elimination") for the cautionary case where a confidently estimated `~30 %` saving turned out to be a measured `~33 %` regression.
 
-This rule applies to perf-claim commits only. Correctness fixes, refactors, doc changes, and feature additions do not need a measurement to ship.
+These rules apply to perf-claim commits. Correctness fixes, doc changes, and feature additions do not need a measurement to ship, **with one exception: any change inside a dequant kernel's module (`src/remember/*`, `src/lethe/*`) gets the paired no-regression check (step 1) even when it claims nothing.** Code that never runs per element can still change how the hot loop compiles: in the v0.7.8 close-out, moving `GPTQ`'s entry validation into a shared helper cost `gptq_int4_bf16` +69 %, and a `checked_add` in a per-block reader cost `NF4` ~5 % (`docs/perf-experiments.md` Experiment 19).
 
 Before proposing a perf-claim change, **read [`docs/perf-experiments.md`](docs/perf-experiments.md)** — it catalogs hypotheses already tested and their measured outcomes (some confirmed, some rejected, some contradicting their original CHANGELOG claims). This avoids re-litigating the same ideas. When an experiment is shipped or attempted, add a row to that file's index plus a section with method + numbers, even if the result is "no change" or a regression.
 

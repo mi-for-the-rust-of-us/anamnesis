@@ -850,10 +850,10 @@ Rules that follow, not suggestions:
 2. **Below roughly 15 % on this host, treat the result as no signal** — whatever
    the p-value says.
 3. **Any claim that reaches a commit message, `CHANGELOG.md`, or
-   `docs/perf-experiments.md` needs the interleaved best-of-N protocol in
-   [`CLAUDE.md`](CLAUDE.md) § *Performance Changes***: alternating binaries,
-   median or min of N, on an idle machine. That protocol controls for layout by
-   construction; criterion's baseline does not.
+   `docs/perf-experiments.md` needs the interleaved protocol in
+   [`CLAUDE.md`](CLAUDE.md) § *Performance Changes***: the paired harness (rule
+   4), about 10 runs per arm, judged on the median. Interleaving the two
+   binaries controls for drift by construction; criterion's baseline does not.
 4. **Prefer a paired instrument.** [`benches/ab.rs`](benches/ab.rs) loads both
    versions together and interleaves them sample by sample, so drift applies to
    both sides and cancels. It answers in ~30 s on x86-64. Note the converse trap
@@ -896,6 +896,12 @@ Rules that follow, not suggestions:
    Run untouched kernels alongside as **controls** — one Phase 7.7 run moved an
    untouched `AWQ` arm by +3.03 %, which is how that run was known to be noisy —
    and reproduce before acting.
+10. **"Cold" is a claim about how often code runs, not about codegen.** A change
+   to a kernel's entry function or its helpers can move the hot loop even when
+   no line of the loop changed: moving `GPTQ`'s input validation into a shared
+   helper cost `gptq_int4_bf16` +69 %, not rescued by `#[inline]`, and was
+   reverted (Experiment 19). Any change inside a kernel module gets the paired
+   check, whatever it claims.
 
 ### When auto-vectorization is not enough
 
