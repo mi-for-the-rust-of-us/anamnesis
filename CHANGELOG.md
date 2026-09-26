@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without error with its tail silently ignored. It now returns
   `AnamnesisError::Parse`, as `dequantize_bnb4` always did.
 
+- **The `ollama:` resolver no longer lets a manifest digest or a model spec
+  steer a path outside the model cache.** The digest was joined into
+  `blobs/sha256-<hash>` without checking it was hexadecimal, so a manifest
+  naming `sha256:../../x` resolved outside `blobs/`; spec components such as
+  `../evil` likewise reached the manifest path. Both are now rejected with
+  `AnamnesisError::Parse`. The manifest comes from the local `Ollama` cache,
+  so this is defence in depth rather than a remote exposure.
+
 - **A shape with a zero dimension after an overflowing one now counts as empty
   in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
   safetensors' `TensorEntry::num_elements` still stopped at the first overflow,
