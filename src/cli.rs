@@ -45,9 +45,7 @@ enum Commands {
         /// The estimate feeds the inspect-before-parse decision, so it has to
         /// be sized at the width you actually intend to `remember` or
         /// `convert` at: an `F32` request against a `BF16` estimate
-        /// under-reserves by exactly `2 ×`. `remember --to` fixed this same
-        /// bug for its own summary line in v0.7.4; `inspect` had no flag at
-        /// all until v0.7.6.
+        /// under-reserves by exactly `2 ×`.
         ///
         /// Vacuous on `.pth` and `NPZ`, whose tensors are already full
         /// precision and pass through in their source dtype. Accepted there
@@ -61,13 +59,14 @@ enum Commands {
         /// Path to the input model file.
         path: PathBuf,
         /// Output dtype for dequantised tensors: `bf16` (default), `f32`, or
-        /// `f16`. `safetensors` is accepted as an alias for `bf16` on
-        /// `.pth`/`.gguf` inputs, which always produce a safetensors file.
+        /// `f16`. On `.pth`, `NPZ` and `GGUF` inputs, which always produce a
+        /// safetensors file, `safetensors` is also accepted as an alias for
+        /// `bf16`.
         ///
         /// `f32` emits the reference implementation's own `f32` with no
         /// narrowing step of anamnesis's, at double the output bytes. `f16`
         /// buys 3 significand bits over `bf16` and pays a far narrower exponent
-        /// range (it saturates at 65504).
+        /// range (it overflows to infinity past 65504).
         ///
         /// Applies to **dequantised** tensors only; passthrough tensors keep
         /// their source dtype, so the output is legitimately mixed-dtype. On a
@@ -87,12 +86,13 @@ enum Commands {
     },
     /// Convert a model file to a different format.
     ///
-    /// Targets available in this build (Phase 6):
-    /// - `safetensors` (alias `bf16`) — dequantise any quantised input to a
-    ///   BF16 safetensors file (passes through unquantised inputs losslessly).
-    /// - `gguf` — write an unquantised GGUF file. Quantised GGUF emit
-    ///   (`gguf-q4km`, …) is deferred to Phase 8.5 via the same dispatch.
-    /// - `bnb-nf4` — encode the BF16 source into a BitsAndBytes-NF4
+    /// Targets:
+    /// - `safetensors` (alias `bf16`): dequantise any quantised input to a
+    ///   safetensors file at `--out-dtype` (BF16 by default), passing
+    ///   unquantised tensors through losslessly.
+    /// - `gguf`: write an unquantised GGUF file. Quantised GGUF emit
+    ///   (`gguf-q4km`, …) is Phase 8.5 work, through the same dispatch.
+    /// - `bnb-nf4`: encode the BF16 source into a BitsAndBytes-NF4
     ///   safetensors file (2-D tensors only; biases / norms / embeddings
     ///   pass through unchanged in BF16).
     Convert {
@@ -128,17 +128,15 @@ enum Commands {
         /// `f32` emits the reference implementation's own `f32` with no
         /// narrowing step of anamnesis's, at double the output bytes. `f16`
         /// buys 3 significand bits over `bf16` and pays a far narrower exponent
-        /// range, saturating to infinity above 65504.
+        /// range, overflowing to infinity past 65504.
         ///
         /// Applies to **dequantised tensors only**. Passthrough tensors (norms,
         /// biases, anything not block-quantised) keep their source dtype, so
         /// this is not "rewrite every tensor as f32".
         ///
-        /// Honoured for **every** input format that dequantises, since v0.7.4.
-        /// (v0.7.3 accepted non-`bf16` values for `GGUF` input only and
-        /// reported a clear error for quantised safetensors; that restriction
-        /// is gone.) `NPZ` and `.pth` dequantise nothing, so the value is
-        /// accepted and has no effect there.
+        /// Honoured for every input format that dequantises. `NPZ` and `.pth`
+        /// dequantise nothing, so the value is accepted and has no effect
+        /// there.
         #[arg(long, value_name = "DTYPE", default_value = "bf16")]
         out_dtype: String,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
@@ -554,7 +552,13 @@ fn run_remember_safetensors(
 
     let output_path = match output {
         Some(p) => p.to_owned(),
-        None => derive_output_path(path, target),
+        // The library derivation, so `remember` and `convert` name files the
+        // same way: `model-fp8.safetensors` → `model-bf16.safetensors`.
+        None => crate::convert::derive_output_path_for_dtype(
+            path,
+            ConvertTarget::Safetensors,
+            target.as_dtype(),
+        ),
     };
 
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
@@ -822,33 +826,25 @@ fn build_convert_options(
     Ok(ConvertOptions::new())
 }
 
-/// Runs the `convert` subcommand: parses the `--to` target, derives an output
-/// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
-/// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
 /// Parses `--out-dtype` into the element type the dequantised tensors get.
 ///
-/// Accepts exactly the three dequantisation output widths, case-insensitively.
+/// Goes through [`TargetDtype`]'s parser, the one `remember --to` uses, so the
+/// two flags accept exactly the same three widths with the same error.
 /// Deliberately **not** an `impl FromStr for Dtype`: `Dtype` names 15 element
 /// types, and a `FromStr` on it would advertise that `--out-dtype i64` is a
-/// meaningful request. The error string lists what is actually accepted, in the
-/// same wording `TargetDtype`'s parser uses on the `remember` side.
+/// meaningful request.
 ///
 /// # Errors
 ///
 /// Returns [`crate::AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32`
 /// or `f16`.
 fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
-    match s.to_ascii_lowercase().as_str() {
-        "bf16" => Ok(crate::Dtype::BF16),
-        "f32" => Ok(crate::Dtype::F32),
-        "f16" => Ok(crate::Dtype::F16),
-        other => Err(crate::AnamnesisError::Unsupported {
-            format: other.to_owned(),
-            detail: "supported output dtypes: bf16, f32, f16".to_owned(),
-        }),
-    }
+    Ok(s.parse::<TargetDtype>()?.as_dtype())
 }
 
+/// Runs the `convert` subcommand: parses the `--to` target, derives an output
+/// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
+/// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
 fn run_convert(
     path: &std::path::Path,
     to: &str,
@@ -905,31 +901,4 @@ fn run_convert(
         output_path.display()
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Output path derivation
-// ---------------------------------------------------------------------------
-
-/// Derive an output path from the input path and target dtype.
-///
-/// `model-fp8.safetensors`  → `model-bf16.safetensors`
-/// `model-GPTQ-Int4.safetensors` → `model-bf16.safetensors`
-/// `weights.safetensors`    → `weights-bf16.safetensors`
-///
-/// Shares the quantisation-suffix table with `convert` via
-/// [`crate::convert::strip_quant_suffix`], so the two derivations cannot drift.
-fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
-    let stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    let suffix = target.to_string().to_lowercase();
-    let new_name = format!(
-        "{}-{suffix}.safetensors",
-        crate::convert::strip_quant_suffix(stem)
-    );
-    input
-        .parent()
-        .map_or_else(|| PathBuf::from(&new_name), |p| p.join(&new_name))
 }

@@ -306,8 +306,9 @@ pub struct F32Out;
 ///
 /// **`F16` is not uniformly the better 2-byte choice.** Against [`Bf16Out`] it
 /// buys 3 significand bits (11 versus 8) and pays a far narrower exponent
-/// range. `BF16` shares `f32`'s range; `F16` saturates at 65504 and flushes to
-/// zero below about `2⁻²⁴`.
+/// range. `BF16` shares `f32`'s range; `F16`'s largest finite value is 65504,
+/// above which it overflows to infinity, and it flushes to zero below about
+/// `2⁻²⁴`.
 ///
 /// That range is reachable in real data, not just in theory: `MXFP4`'s `E8M0`
 /// scale spans `2⁻¹²⁸` to `2¹²⁷`, and a `Q8_0` block whose `f16` scale is large

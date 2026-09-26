@@ -11,8 +11,8 @@ stated. The third case earns a file for the same reason as the others, that a
 reply which decides something should be drafted and checked before it is sent,
 not typed into a comment box. Use the repo's own name (`anamnesis`) where the convention says
 `<upstream-repo>`. Currently
-[rust-lang/cargo](https://github.com/rust-lang/cargo/issues) and
-[rust-lang/rust](https://github.com/rust-lang/rust/issues); previously
+[rust-lang/cargo](https://github.com/rust-lang/cargo/issues) (`cargo-13146`)
+and anamnesis's own tracker (`anamnesis-11`, `anamnesis-12`); previously
 [huggingface/candle](https://github.com/huggingface/candle/issues), whose thread
 is archived in the sibling project (see below).
 

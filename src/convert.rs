@@ -15,9 +15,9 @@
 //!
 //! - **Quantised** tensors (`FP8` / `GPTQ` / `AWQ` / `BnB` safetensors, quantised
 //!   `GGUF` blocks) are dequantised to [`ConvertOptions::output_dtype`], which
-//!   defaults to `BF16`. Since v0.7.3 a `GGUF` input can be asked for `F32`
-//!   instead, which is the only width that adds no narrowing step of the
-//!   crate's own, or `F16`.
+//!   defaults to `BF16`. Any quantised input can be asked for `F32` instead,
+//!   the only width that adds no narrowing step of the crate's own, or `F16`
+//!   (`GGUF` since v0.7.3, the safetensors schemes since v0.7.4).
 //! - **Scalar** tensors keep their **original dtype** (`F64` / `F32` / `F16` /
 //!   `BF16` / `I8`–`I64` / `U8` / `Bool`), so `.pth` → safetensors and
 //!   `NPZ`-`F32` → `GGUF` stay bit-for-bit lossless.
@@ -177,15 +177,12 @@ pub struct ConvertOptions {
     /// doubling its bytes. Callers who want a uniform-dtype file want a cast
     /// pass, which is a different operation from dequantisation.
     ///
-    /// # v0.7.3 scope: `GGUF` input only
+    /// # Which inputs it applies to
     ///
-    /// Only the `GGUF` reader can honour a non-`BF16` request today. The
-    /// safetensors reader dequantises through the `FP8` / `GPTQ` / `AWQ` /
-    /// `BnB` kernels, which fuse the narrowing into their hot loops and are
-    /// generalised in v0.7.4; asking for `F32` with a quantised safetensors
-    /// input is therefore a clean `Unsupported` error rather than a silent
-    /// `BF16` fallback. `NPZ` and `.pth` inputs dequantise nothing at all, so
-    /// the option is vacuous there and is accepted rather than rejected.
+    /// Every input that dequantises: `GGUF` (since v0.7.3) and the `FP8` /
+    /// `GPTQ` / `AWQ` / `BnB` safetensors schemes (since v0.7.4). `NPZ` and
+    /// `.pth` inputs dequantise nothing at all, so the option is vacuous there
+    /// and is accepted rather than rejected.
     pub output_dtype: Option<Dtype>,
 }
 
@@ -233,7 +230,7 @@ impl ConvertOptions {
     /// is rejected by [`convert`], not here, so that the builder stays
     /// infallible like its siblings. See
     /// [`output_dtype`](ConvertOptions::output_dtype) for the passthrough
-    /// policy and the v0.7.3 `GGUF`-only scope.
+    /// policy and which inputs it applies to.
     #[must_use]
     pub fn with_output_dtype(mut self, dtype: Dtype) -> Self {
         self.output_dtype = Some(dtype);
@@ -741,8 +738,8 @@ pub fn derive_output_path_for_dtype(
 ///
 /// Every supported `(input format × target)` pair routes through the in-memory
 /// hub: the input is parsed and normalised (quantised tensors dequantised to
-/// `BF16`, scalar tensors kept in their original dtype), then written to the
-/// target. Format detection is automatic: by file extension, falling back to
+/// [`ConvertOptions::output_dtype`], `BF16` by default; scalar tensors kept in
+/// their original dtype), then written to the target. Format detection is automatic: by file extension, falling back to
 /// magic bytes for `.bin` and unrecognised extensions.
 ///
 /// # Errors
@@ -754,6 +751,8 @@ pub fn derive_output_path_for_dtype(
 /// `options.limits` or a permanent per-format cap.
 /// Returns [`AnamnesisError::Parse`] on a malformed input, and
 /// [`AnamnesisError::Io`] if the input cannot be read or the output written.
+/// Returns [`AnamnesisError::Cancelled`] if `options.cancel` is set before the
+/// run completes; no output file is written.
 ///
 /// # Memory
 ///
@@ -1010,10 +1009,9 @@ where
 
 /// Parses `input` into the hub, dispatching on the detected format.
 ///
-/// `out_dtype` reaches only the readers that actually dequantise. A reader that
-/// cannot honour a non-`BF16` request rejects it here rather than silently
-/// emitting `BF16`, so the caller never receives a file whose dtype differs
-/// from what they asked for.
+/// `out_dtype` reaches only the readers that actually dequantise, and every one
+/// of them honours all three output widths, so the caller never receives a file
+/// whose dequantised dtype differs from what they asked for.
 fn read_hub(
     input: &Path,
     options: &ConvertOptions,
@@ -1153,7 +1151,7 @@ fn hub_from_npz(
         tensors.push(HubTensor {
             name,
             shape: t.shape,
-            dtype: npz_dtype_to_hub(t.dtype),
+            dtype: t.dtype.to_dtype()?,
             data: t.data,
         });
     }
@@ -1186,7 +1184,7 @@ fn hub_from_pth(parsed: &crate::ParsedPth) -> crate::Result<Hub> {
         tensors.push(HubTensor {
             name: t.name,
             shape: t.shape,
-            dtype: pth_dtype_to_hub(t.dtype)?,
+            dtype: t.dtype.to_dtype()?,
             // BORROW: `into_owned()` copies the (possibly mmap-borrowed) bytes so
             // the hub outlives the `ParsedPth`.
             data: t.data.into_owned(),
@@ -1292,10 +1290,7 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
             shape.reverse();
 
             if tensor.dtype.is_quantized() {
-                let n_elements = tensor
-                    .shape
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                let n_elements = crate::parse::utils::checked_num_elements(tensor.shape)
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!(
                             "GGUF tensor `{}` shape {:?} element count overflows usize",
@@ -1388,15 +1383,17 @@ fn build_hub_views(hub: &Hub) -> crate::Result<Vec<(String, safetensors::tensor:
 /// Maps an upstream `safetensors` serialisation failure onto this crate's error
 /// type, keeping `IoError` distinguishable from a malformed-input `Parse`.
 ///
-/// Shared by the file and in-memory writers so a caller sees the same variant
-/// whichever destination it picked.
+/// The one mapping behind every safetensors writer in the crate: `convert`'s
+/// file and in-memory destinations, `ParsedModel::remember*`, and the `.pth` /
+/// `NPZ` writers in [`crate::remember`]. A caller sees the same variant and
+/// wording whichever path and destination it picked.
 // EXHAUSTIVE: `SafeTensorError` is a foreign type that may gain variants.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
+pub(crate) fn map_serialize_err(e: safetensors::SafeTensorError) -> AnamnesisError {
     match e {
         safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
         other => AnamnesisError::Parse {
-            reason: format!("failed to write safetensors file: {other}"),
+            reason: format!("failed to serialize safetensors: {other}"),
         },
     }
 }
@@ -1906,56 +1903,6 @@ fn json_to_metadata_value(
 // ---------------------------------------------------------------------------
 // Dtype mapping
 // ---------------------------------------------------------------------------
-
-/// Maps an [`NpzDtype`](crate::NpzDtype) to the hub dtype. Total — every `NPZ`
-/// dtype has a safetensors counterpart.
-#[cfg(feature = "npz")]
-const fn npz_dtype_to_hub(dtype: crate::NpzDtype) -> Dtype {
-    use crate::NpzDtype;
-    match dtype {
-        NpzDtype::Bool => Dtype::Bool,
-        NpzDtype::U8 => Dtype::U8,
-        NpzDtype::I8 => Dtype::I8,
-        NpzDtype::U16 => Dtype::U16,
-        NpzDtype::I16 => Dtype::I16,
-        NpzDtype::U32 => Dtype::U32,
-        NpzDtype::I32 => Dtype::I32,
-        NpzDtype::U64 => Dtype::U64,
-        NpzDtype::I64 => Dtype::I64,
-        NpzDtype::F16 => Dtype::F16,
-        NpzDtype::BF16 => Dtype::BF16,
-        NpzDtype::F32 => Dtype::F32,
-        NpzDtype::F64 => Dtype::F64,
-    }
-}
-
-/// Maps a [`PthDtype`](crate::PthDtype) to the hub dtype. Total — every `.pth`
-/// dtype the parser accepts has a safetensors counterpart.
-///
-/// # Errors
-///
-/// Currently infallible; returns `Result` so a future `PthDtype` without a
-/// counterpart can be rejected without a breaking change.
-#[cfg(feature = "pth")]
-// `clippy::unnecessary_wraps`: every arm is `Ok(_)` today; the `Result` is kept so
-// a future `PthDtype` without a safetensors counterpart can be rejected without a
-// breaking signature change.
-#[allow(clippy::unnecessary_wraps)]
-const fn pth_dtype_to_hub(dtype: crate::PthDtype) -> crate::Result<Dtype> {
-    use crate::PthDtype;
-    Ok(match dtype {
-        PthDtype::F16 => Dtype::F16,
-        PthDtype::BF16 => Dtype::BF16,
-        PthDtype::F32 => Dtype::F32,
-        PthDtype::F64 => Dtype::F64,
-        PthDtype::U8 => Dtype::U8,
-        PthDtype::I8 => Dtype::I8,
-        PthDtype::I16 => Dtype::I16,
-        PthDtype::I32 => Dtype::I32,
-        PthDtype::I64 => Dtype::I64,
-        PthDtype::Bool => Dtype::Bool,
-    })
-}
 
 /// Maps a **scalar** [`GgufType`](crate::GgufType) to the hub dtype.
 ///

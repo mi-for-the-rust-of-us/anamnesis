@@ -53,10 +53,14 @@
     clippy::doc_markdown
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anamnesis::{ConvertOptions, ConvertTarget, convert};
+
+use common::bench::fmt_stats;
 
 /// Best-of-N sample count. `CLAUDE.md` mandates best-of-5 for a perf-claim
 /// commit; this harness runs the same 5 so the reported median is the one the
@@ -92,15 +96,6 @@ fn model_path(file_name: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 // Timing helpers
 // ---------------------------------------------------------------------------
-
-/// Median + range of an ascending-sorted `&[f64]`, formatted for stderr. Same
-/// shape as the sibling `bench_pass2_adhoc` harness so the two are comparable.
-fn fmt_stats(samples: &[f64]) -> String {
-    let median = samples[samples.len() / 2];
-    let min = samples[0];
-    let max = samples[samples.len() - 1];
-    format!("median {median:.2} ms (min {min:.2}, max {max:.2})")
-}
 
 /// Best-of-N timing helper: one warm-up call, then `SAMPLES` timed calls,
 /// returning the ascending-sorted millisecond samples.

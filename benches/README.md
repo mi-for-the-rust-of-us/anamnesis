@@ -61,10 +61,21 @@ Two caveats worth knowing before reading the numbers:
 > sequential path — the benchmark then looks healthy while measuring
 > nothing. An early draft of the file did exactly that.
 
-**Phase 7.5 forecast** — when the encode-side kernels land (`FP8`,
+**Phase 8.5 forecast:** when the encode-side kernels land (`FP8`,
 `GGUF` legacy / K-quants / IQ / TQ / MXFP4), a new `encode.rs` will
 sit alongside `dequant.rs` rather than letting one file balloon past
-~600 LOC. See the [ROADMAP](../ROADMAP.md) Phase 7.5 entry.
+~600 LOC. It does not exist yet. See the [ROADMAP](../ROADMAP.md)
+Phase 8.5 entry (Lethe Encode Completion).
+
+### Shared fixture code: `benches/common/`
+
+`benches/common/mod.rs` holds the deterministic Knuth-hash filler
+(`fill_deterministic`, `synth_bytes`) that all four targets declare
+with `mod common;`. It is a directory module so Cargo does not
+auto-discover it as a fifth bench target. The filler is shared rather
+than copied because `ab.rs` and `dequant.rs` are quoted side by side
+and CodSpeed compares each id against its own history: a filler that
+drifted in one copy would change the quantised values under test.
 
 ---
 
@@ -131,10 +142,15 @@ while the paired deltas stay within ±2 %. It answers "is A faster than B", not
 cargo bench --features gptq,awq,bnb,gguf,npz,pth
 ```
 
-Runs **both** bench files (`dequant.rs` + `parsing.rs`) with
-`criterion`'s default settings: 100-sample groups, ~5 s measurement
-time per group, plus warm-up. Total wall-clock: **~10–15 minutes**
-on the reference machine below. Reports land in
+Runs **all four** bench targets (`ab.rs`, `convert.rs`, `dequant.rs`,
+`parsing.rs`); the three `criterion` ones use its default settings:
+100-sample groups, ~5 s measurement time per group, plus warm-up.
+`ab.rs` is the `tango-bench` harness, meant for the paired comparison
+under [A/B comparisons](#ab-comparisons) rather than this run. The
+two `bench-fileio` groups in `convert.rs` are skipped unless that
+feature is also enabled. The **~10–15 minutes** once quoted here was
+measured when only `dequant.rs` and `parsing.rs` existed; no
+wall-clock figure has been recorded for all four targets. Reports land in
 `target/criterion/`; open `target/criterion/report/index.html` for
 the HTML index.
 
@@ -180,11 +196,15 @@ machine-specific and should not be compared across machines.
 > **Note on `target-cpu=native`**: this project's CI builds *do not*
 > set `target-cpu=native` (CI builds run on Ubuntu without
 > CPU-specific code generation). The numbers below were taken with
-> the default release profile, so they reflect what CI would produce
-> if it ran the benches (it currently does not — `cargo bench` is
-> developer-driven, not CI-driven). To get the maximum-throughput
-> numbers the README claims for dequant kernels, set
-> `RUSTFLAGS='-C target-cpu=native'` before invoking `cargo bench`.
+> the default release profile, so they reflect what an untuned build
+> produces. The regular CI job does not run the benches; the separate
+> CodSpeed workflow (`.github/workflows/codspeed.yml`) does, on every
+> push to `main` that touches `src/**`, `benches/**`, `Cargo.toml`,
+> `Cargo.lock` or the workflow itself, but on `aarch64` runners, so its
+> numbers are a drift series and are not comparable with these. To get
+> the maximum-throughput numbers the README claims for dequant kernels, set
+> `$env:RUSTFLAGS="-C target-cpu=native"` (PowerShell; in bash,
+> `RUSTFLAGS='-C target-cpu=native'`) before invoking `cargo bench`.
 
 ### Dequant — synthetic `4096 × 11008` layer
 
@@ -206,10 +226,13 @@ write and essentially nothing else. `convert_gguf_to_safetensors` gains
 `threads_{1,4}_f32` on the same footing (1.54–1.61× end to end). Both
 were added as **sibling ids rather than renames**, because renaming the
 `BF16` ids would orphan their CodSpeed history, and that series is
-exactly the baseline the output-dtype work must not regress. There is
-no `F16` arm: same width as `BF16`, so no bandwidth story to tell, and
-its interesting properties are tests rather than benchmarks. Full
-numbers and method: `docs/perf-experiments.md` Experiment 13.
+exactly the baseline the output-dtype work must not regress. v0.7.3
+added no `F16` arm (same width as `BF16`, so no bandwidth story to
+tell); **v0.7.7 added `_f16` arms to every `dequant_*` family**, which
+is how the `F16` cost described under
+[Width arms](#width-arms-and-why-bf16-alone-was-not-enough) was found.
+No `_f16` median is recorded in the table above. Full numbers and
+method for the `_f32` arm: `docs/perf-experiments.md` Experiment 13.
 
 These are `--quick` numbers (`criterion --quick`, ~10 samples each).
 The full statistical run produces tighter confidence intervals but
@@ -236,6 +259,8 @@ throughput number is paired with a correctness guarantee on real
 | `inspect_npz` | Synthetic `.npz`, 128 F32 [4096] arrays | 1.56 ms | 5.02 GiB/s |
 | `inspect_pth` | `algzoo_rnn_small.pth` (~2 KB) | 167 µs | (small fixture; latency is the real metric) |
 | `inspect_gguf` | Synthetic `.gguf`, 128× F32 [4096] | 97.8 µs | 79.9 GiB/s* |
+| `parse_pth_front_matter` | `algzoo_rnn_small.pth` | no baseline recorded yet | |
+| `parse_gguf_front_matter` | Synthetic `.gguf`, 128× F32 [4096] | no baseline recorded yet | |
 
 \* Throughput numbers marked with an asterisk are misleading at face
 value: header-only parses do **not** read the full tensor-data

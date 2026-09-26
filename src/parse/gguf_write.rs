@@ -31,19 +31,14 @@ use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
-use crate::parse::gguf::{GgufMetadataArray, GgufMetadataValue, GgufType, align_up};
-
-/// `GGUF` magic bytes — spells `"GGUF"` in `ASCII`.
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+use crate::parse::gguf::{
+    DEFAULT_ALIGNMENT, GGUF_MAGIC, GgufMetadataArray, GgufMetadataValue, GgufType, MAX_TENSOR_DIMS,
+    align_up, value_type,
+};
 
 /// `GGUF` version emitted by this writer. Matches the latest version this
 /// crate's parser accepts and what `llama.cpp` writes by default.
 const GGUF_WRITE_VERSION: u32 = 3;
-
-/// Default tensor-data alignment when the caller does not supply
-/// `general.alignment`. Matches the parser's
-/// [`DEFAULT_ALIGNMENT`](super::gguf) constant.
-const DEFAULT_ALIGNMENT: u32 = 32;
 
 /// Metadata key that records the tensor-data alignment in the produced file.
 const ALIGNMENT_KEY: &str = "general.alignment";
@@ -251,7 +246,7 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
             let dim_u64 = dim as u64;
             write_u64_le(&mut tensor_info_block, dim_u64)?;
         }
-        write_u32_le(&mut tensor_info_block, gguf_type_to_u32(tensor.dtype))?;
+        write_u32_le(&mut tensor_info_block, tensor.dtype.to_u32())?;
         write_u64_le(&mut tensor_info_block, relative_offset)?;
         relative_offset =
             relative_offset
@@ -346,9 +341,12 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-/// Maximum number of tensor dimensions accepted by the writer. Matches the
-/// parser's `MAX_TENSOR_DIMS` cap so a written file always parses back.
-const MAX_TENSOR_DIMS_USZ: usize = 8;
+/// Maximum number of tensor dimensions accepted by the writer: the parser's
+/// `MAX_TENSOR_DIMS` cap itself, so a written file always parses back.
+// CAST: u32 → usize, lossless widening of the constant 8 on every supported
+// target (`usize::try_from` is not usable in a `const`).
+#[allow(clippy::as_conversions)]
+const MAX_TENSOR_DIMS_USZ: usize = MAX_TENSOR_DIMS as usize;
 
 fn validate_tensor(tensor: &GgufWriteTensor<'_>) -> crate::Result<()> {
     if tensor.dtype.is_quantized() {
@@ -537,55 +535,55 @@ fn write_zeros(w: &mut impl Write, n: u64) -> crate::Result<()> {
 fn write_metadata_value(w: &mut impl Write, value: &GgufMetadataValue) -> crate::Result<()> {
     match value {
         GgufMetadataValue::U8(v) => {
-            write_u32_le(w, 0)?;
+            write_u32_le(w, value_type::U8)?;
             write_u8(w, *v)
         }
         GgufMetadataValue::I8(v) => {
-            write_u32_le(w, 1)?;
+            write_u32_le(w, value_type::I8)?;
             write_i8(w, *v)
         }
         GgufMetadataValue::U16(v) => {
-            write_u32_le(w, 2)?;
+            write_u32_le(w, value_type::U16)?;
             write_u16_le(w, *v)
         }
         GgufMetadataValue::I16(v) => {
-            write_u32_le(w, 3)?;
+            write_u32_le(w, value_type::I16)?;
             write_i16_le(w, *v)
         }
         GgufMetadataValue::U32(v) => {
-            write_u32_le(w, 4)?;
+            write_u32_le(w, value_type::U32)?;
             write_u32_le(w, *v)
         }
         GgufMetadataValue::I32(v) => {
-            write_u32_le(w, 5)?;
+            write_u32_le(w, value_type::I32)?;
             write_i32_le(w, *v)
         }
         GgufMetadataValue::F32(v) => {
-            write_u32_le(w, 6)?;
+            write_u32_le(w, value_type::F32)?;
             write_f32_le(w, *v)
         }
         GgufMetadataValue::Bool(v) => {
-            write_u32_le(w, 7)?;
+            write_u32_le(w, value_type::BOOL)?;
             write_bool(w, *v)
         }
         GgufMetadataValue::String(s) => {
-            write_u32_le(w, 8)?;
+            write_u32_le(w, value_type::STRING)?;
             write_string(w, s)
         }
         GgufMetadataValue::Array(arr) => {
-            write_u32_le(w, 9)?;
+            write_u32_le(w, value_type::ARRAY)?;
             write_typed_array(w, arr.as_ref())
         }
         GgufMetadataValue::U64(v) => {
-            write_u32_le(w, 10)?;
+            write_u32_le(w, value_type::U64)?;
             write_u64_le(w, *v)
         }
         GgufMetadataValue::I64(v) => {
-            write_u32_le(w, 11)?;
+            write_u32_le(w, value_type::I64)?;
             write_i64_le(w, *v)
         }
         GgufMetadataValue::F64(v) => {
-            write_u32_le(w, 12)?;
+            write_u32_le(w, value_type::F64)?;
             write_f64_le(w, *v)
         }
     }
@@ -597,7 +595,7 @@ fn write_metadata_value(w: &mut impl Write, value: &GgufMetadataValue) -> crate:
 fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Result<()> {
     match arr {
         GgufMetadataArray::U8(v) => {
-            write_u32_le(w, 0)?;
+            write_u32_le(w, value_type::U8)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_u8(w, x)?;
@@ -605,7 +603,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::I8(v) => {
-            write_u32_le(w, 1)?;
+            write_u32_le(w, value_type::I8)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_i8(w, x)?;
@@ -613,7 +611,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::U16(v) => {
-            write_u32_le(w, 2)?;
+            write_u32_le(w, value_type::U16)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_u16_le(w, x)?;
@@ -621,7 +619,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::I16(v) => {
-            write_u32_le(w, 3)?;
+            write_u32_le(w, value_type::I16)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_i16_le(w, x)?;
@@ -629,7 +627,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::U32(v) => {
-            write_u32_le(w, 4)?;
+            write_u32_le(w, value_type::U32)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_u32_le(w, x)?;
@@ -637,7 +635,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::I32(v) => {
-            write_u32_le(w, 5)?;
+            write_u32_le(w, value_type::I32)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_i32_le(w, x)?;
@@ -645,7 +643,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::F32(v) => {
-            write_u32_le(w, 6)?;
+            write_u32_le(w, value_type::F32)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_f32_le(w, x)?;
@@ -653,7 +651,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::Bool(v) => {
-            write_u32_le(w, 7)?;
+            write_u32_le(w, value_type::BOOL)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_bool(w, x)?;
@@ -661,7 +659,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::String(v) => {
-            write_u32_le(w, 8)?;
+            write_u32_le(w, value_type::STRING)?;
             write_array_len(w, v.len())?;
             for s in v {
                 write_string(w, s)?;
@@ -669,7 +667,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::Array(v) => {
-            write_u32_le(w, 9)?;
+            write_u32_le(w, value_type::ARRAY)?;
             write_array_len(w, v.len())?;
             for inner in v {
                 write_typed_array(w, inner)?;
@@ -677,7 +675,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::U64(v) => {
-            write_u32_le(w, 10)?;
+            write_u32_le(w, value_type::U64)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_u64_le(w, x)?;
@@ -685,7 +683,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::I64(v) => {
-            write_u32_le(w, 11)?;
+            write_u32_le(w, value_type::I64)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_i64_le(w, x)?;
@@ -693,7 +691,7 @@ fn write_typed_array(w: &mut impl Write, arr: &GgufMetadataArray) -> crate::Resu
             Ok(())
         }
         GgufMetadataArray::F64(v) => {
-            write_u32_le(w, 12)?;
+            write_u32_le(w, value_type::F64)?;
             write_array_len(w, v.len())?;
             for &x in v {
                 write_f64_le(w, x)?;
@@ -713,49 +711,6 @@ fn write_array_len(w: &mut impl Write, len: usize) -> crate::Result<()> {
 // ---------------------------------------------------------------------------
 // GgufType → u32 discriminant
 // ---------------------------------------------------------------------------
-
-/// Maps a [`GgufType`] back to its on-disk `ggml_type` discriminant.
-///
-/// The inverse of [`GgufType::from_u32`](super::gguf). Quantised dtypes are
-/// rejected at the `validate_tensor` boundary above, so callers only ever
-/// reach this with a scalar dtype — but we provide the full mapping for
-/// future-proofing once Phase 8.5 lights up the quantised emitters.
-const fn gguf_type_to_u32(dtype: GgufType) -> u32 {
-    match dtype {
-        GgufType::F32 => 0,
-        GgufType::F16 => 1,
-        GgufType::Q4_0 => 2,
-        GgufType::Q4_1 => 3,
-        GgufType::Q5_0 => 6,
-        GgufType::Q5_1 => 7,
-        GgufType::Q8_0 => 8,
-        GgufType::Q8_1 => 9,
-        GgufType::Q2_K => 10,
-        GgufType::Q3_K => 11,
-        GgufType::Q4_K => 12,
-        GgufType::Q5_K => 13,
-        GgufType::Q6_K => 14,
-        GgufType::Q8_K => 15,
-        GgufType::IQ2_XXS => 16,
-        GgufType::IQ2_XS => 17,
-        GgufType::IQ3_XXS => 18,
-        GgufType::IQ1_S => 19,
-        GgufType::IQ4_NL => 20,
-        GgufType::IQ3_S => 21,
-        GgufType::IQ2_S => 22,
-        GgufType::IQ4_XS => 23,
-        GgufType::I8 => 24,
-        GgufType::I16 => 25,
-        GgufType::I32 => 26,
-        GgufType::I64 => 27,
-        GgufType::F64 => 28,
-        GgufType::IQ1_M => 29,
-        GgufType::BF16 => 30,
-        GgufType::TQ1_0 => 34,
-        GgufType::TQ2_0 => 35,
-        GgufType::MXFP4 => 39,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests

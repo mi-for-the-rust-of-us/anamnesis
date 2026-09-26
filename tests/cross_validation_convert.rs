@@ -47,6 +47,8 @@
     clippy::semicolon_if_nothing_returned
 )]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -58,29 +60,12 @@ use anamnesis::{
     write_bnb_nf4_safetensors_bytes, write_gguf,
 };
 
+use common::bf16::bf16_bytes_from_f32_iter;
+use common::builders::{build_safetensors_bf16, write_temp};
+
 // ===========================================================================
 // Fixture builders (deterministic; pure functions of their inputs)
 // ===========================================================================
-
-/// Builds an in-memory BF16 safetensors file from a tensor list. Inputs:
-/// (name, row-major shape, BF16 LE bytes). Tensors are emitted in the
-/// `safetensors` crate's iteration order — for round-trip tests, that
-/// ordering is what we compare against.
-fn build_safetensors_bf16(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
-    let views: Vec<(&str, safetensors::tensor::TensorView<'_>)> = tensors
-        .iter()
-        .map(|(name, shape, data)| {
-            let view = safetensors::tensor::TensorView::new(
-                safetensors::Dtype::BF16,
-                shape.to_vec(),
-                data,
-            )
-            .unwrap();
-            (*name, view)
-        })
-        .collect();
-    safetensors::tensor::serialize(views, None).unwrap()
-}
 
 /// Builds an in-memory mixed-dtype safetensors file. Each tuple is
 /// (name, dtype, shape, bytes).
@@ -93,22 +78,6 @@ fn build_safetensors_mixed(tensors: &[(&str, safetensors::Dtype, &[usize], &[u8]
         })
         .collect();
     safetensors::tensor::serialize(views, None).unwrap()
-}
-
-fn write_temp(bytes: &[u8], ext: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let path = dir.path().join(format!("fixture.{ext}"));
-    std::fs::write(&path, bytes).unwrap();
-    (dir, path)
-}
-
-fn bf16_bytes_from_f32_iter<I: IntoIterator<Item = f32>>(values: I) -> Vec<u8> {
-    let mut out = Vec::new();
-    for v in values {
-        let bits = (v.to_bits() >> 16) as u16;
-        out.extend_from_slice(&bits.to_le_bytes());
-    }
-    out
 }
 
 // ===========================================================================

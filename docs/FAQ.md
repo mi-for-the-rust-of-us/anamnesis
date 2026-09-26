@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
+<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ. Keep growth consistent.
@@ -197,7 +197,7 @@ model.remember_with_options(
 
 The run stops at the next tensor boundary and returns `AnamnesisError::Cancelled` — a variant of its own, so a host can tell a user-initiated abort from a bad file. **No output file is written**: every path builds its result in memory before serialising, so the check lands before any byte reaches the filesystem and there is nothing to clean up. Cancellation is cooperative, so a worker already inside a tensor finishes that tensor; the bound is one tensor, not the whole model. A token you never cancel costs nothing and changes no output byte.
 
-The CLI does not expose this yet — `Ctrl-C` on `amn` is the usual process signal. The token exists for embedders, and for the v0.8.0 Python bindings, where releasing the GIL around a long call would otherwise make `KeyboardInterrupt` undeliverable until the call returned.
+The CLI does not expose this yet: `Ctrl-C` on `amn` is the usual process signal. The token exists for embedders, and for the v0.8.0 Python bindings, where releasing the GIL around a long call would otherwise make `KeyboardInterrupt` undeliverable until the call returned. [Python interop](python-interop.md#cancellation-and-the-gil) has the details.
 
 ### Why is the output `BF16` and not `float32`?
 
@@ -205,7 +205,7 @@ It does not have to be. `amn convert model.gguf --to safetensors --out-dtype f32
 
 `BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8. Measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value, for which you need `float32`.
 
-`--out-dtype f32` is the option that removes anamnesis's own narrowing step entirely, so the value you get is the `f32` that `gguf-py` itself produces. Expect it to be *slower* than `bf16`, not faster: it doubles the output bytes on a path that is bandwidth-bound, which is the honest cost of the precision rather than a defect.
+`--out-dtype f32` is the option that removes anamnesis's own narrowing step entirely, so the value you get is the `f32` that `gguf-py` itself produces. On x86-64, expect it to be *slower* than `bf16`, not faster: it doubles the output bytes on a path that is bandwidth-bound, which is the honest cost of the precision rather than a defect. Apple Silicon is the exception: on an M3 Pro the kernels measured 0.51x to 1.07x the `bf16` time, faster in four of seven families.
 
 `f16` is not simply "the better 2-byte option". It buys 3 significand bits over `bf16` (11 versus 8) and pays a far narrower exponent range: `bf16` shares `f32`'s range, while `f16` overflows to infinity above 65504 and flushes to zero below about `2⁻²⁴`. anamnesis follows plain IEEE semantics there rather than saturating, so its output matches what NumPy and PyTorch produce for the same conversion.
 
@@ -221,7 +221,7 @@ Until then `remember` was `bf16`-only, because its four kernel families (`FP8`, 
 
 Stay on `bf16` unless you have a specific reason not to. It is what the safetensors and Hugging Face ecosystem serves weights in, it is what candle, burn, and tch expect, and at 2 bytes per element it keeps memory traffic down on a path that is bandwidth-bound.
 
-Ask for `f32` when you want the reference value itself rather than a rounded copy of it: cross-validating against PyTorch, debugging a numerical discrepancy, or feeding a downstream pipeline that computes in `float32` anyway. It costs double the output bytes and runs slower, which is the price of the precision.
+Ask for `f32` when you want the reference value itself rather than a rounded copy of it: cross-validating against PyTorch, debugging a numerical discrepancy, or feeding a downstream pipeline that computes in `float32` anyway. It costs double the output bytes and, on x86-64, runs slower, which is the price of the precision.
 
 Ask for `f16` only when a consumer specifically requires IEEE half and you know your values fit inside its range. It is not the better 2-byte option by default, for the reasons in the entry above.
 
@@ -233,7 +233,7 @@ Because `float32` is 4 bytes per element and `bfloat16` is 2. The doubling is th
 
 Only the tensors anamnesis **dequantizes** double. Passthrough tensors keep their source dtype and their exact bytes, so a real model grows by somewhat less than 2x overall, depending on how much of it was quantized in the first place.
 
-Expect it to be slower as well as bigger. These kernels are bandwidth-bound, so writing twice the bytes costs roughly what you would guess. If you want the size before you commit to the run, ask for it at the width you actually intend — `amn inspect --to f32` from the command line, or `InspectOptions` from the library:
+On x86-64, expect it to be slower as well as bigger. These kernels are bandwidth-bound there, so writing twice the bytes costs roughly what you would guess. (On an Apple M3 Pro it measured 0.51x to 1.07x the `bf16` time, because skipping the narrowing saved more than the extra bytes cost.) If you want the size before you commit to the run, ask for it at the width you actually intend: `amn inspect --to f32` from the command line, or `InspectOptions` from the library:
 
 ```rust
 use anamnesis::{InspectOptions, TargetDtype, parse};
@@ -249,11 +249,13 @@ println!("{}", info.dequantized_size);
 
 ### Why is `f16` slower than `bf16` when they are the same size?
 
-Because the cost is the **conversion**, not the bytes written. Both are 2 bytes per element and both produce identically sized files, but `f16` runs **2x to 3x slower** across every dequantisation kernel — measured 2.02x to 3.11x on x86-64 and 2.10x to 2.93x on `aarch64`.
+Because the cost is the **conversion**, not the bytes written. Both are 2 bytes per element and both produce identically sized files, but on x86-64 and server `aarch64` `f16` runs **2x to 3x slower** across every dequantisation kernel: measured 2.02x to 3.11x on x86-64 and 2.10x to 2.93x on server `aarch64`.
 
-It is slower than `f32`, which writes *twice* as many bytes. That is the surprising part, and it is the giveaway: if this were a bandwidth story, `f32` would be the expensive one. It is not.
+Apple Silicon is a different regime. On one Apple M3 Pro (an external measurement, issue #11) the ratios run 0.94x to 2.59x, and `bnb_int8` is *faster* at `f16` than at `bf16`. The M-series parts have hardware `FP16` arithmetic, which is the plausible reason. The rest of this answer describes x86-64 and server `aarch64`; on an M-series part, measure before assuming the 2x to 3x.
 
-`bf16` is the top 16 bits of an `f32` plus a rounding decision, so narrowing to it is a shift and an add, and the compiler runs 8 elements at a time. `f16` has a different exponent width, so it needs a real conversion: on x86-64 that is the `F16C` instruction, which takes a 128-bit source and so converts 4 elements per instruction rather than 8; on `aarch64` the narrowing is not inlined into the kernel at all. Two different mechanisms, the same 2x-3x.
+On those platforms it is slower than `f32`, which writes *twice* as many bytes. That is the surprising part, and it is the giveaway: if this were a bandwidth story, `f32` would be the expensive one. It is not.
+
+`bf16` is the top 16 bits of an `f32` plus a rounding decision, so narrowing to it is a shift and an add, and the compiler runs 8 elements at a time. `f16` has a different exponent width, so it needs a real conversion: on x86-64 that is the `F16C` instruction, which takes a 128-bit source and so converts 4 elements per instruction rather than 8; on server `aarch64` the narrowing is not inlined into the kernel at all. Two different mechanisms, the same 2x-3x.
 
 This is not an argument against `f16`. It is the right choice when a downstream consumer requires IEEE half and your values fit its range. It is an argument against picking it *because it looks free* next to `bf16`. The per-kernel numbers are in [Choosing an output dtype](tutorials/choosing-an-output-dtype.md), and the investigation is [`perf-experiments.md`](perf-experiments.md) Experiment 18.
 

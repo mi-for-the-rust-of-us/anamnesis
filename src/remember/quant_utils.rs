@@ -42,60 +42,27 @@ pub(crate) fn read_u32_le(data: &[u8], byte_offset: usize) -> crate::Result<u32>
 ///
 /// # Errors
 ///
-/// Returns [`AnamnesisError::Parse`] if the slice is too short or the dtype
-/// is unsupported for scale factors.
+/// Returns [`AnamnesisError::Parse`] if the slice is too short.
+/// Returns [`AnamnesisError::Unsupported`] if `dtype` is not a scale dtype.
 pub(crate) fn read_scale_f32(data: &[u8], byte_offset: usize, dtype: Dtype) -> crate::Result<f32> {
     match dtype {
+        // BITWISE: F16 → f32 via half crate's IEEE 754 conversion
         Dtype::F16 => {
-            let end = byte_offset
-                .checked_add(2)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "F16 scale byte offset overflow".into(),
-                })?;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("F16 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "F16 scale slice is not 2 bytes".into(),
-            })?;
-            // BITWISE: F16 → f32 via half crate's IEEE 754 conversion
-            Ok(half::f16::from_le_bytes(arr).to_f32())
+            Ok(half::f16::from_le_bytes(read_scale_bytes(data, byte_offset, dtype)?).to_f32())
         }
-        Dtype::BF16 => {
-            let end = byte_offset
-                .checked_add(2)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "BF16 scale byte offset overflow".into(),
-                })?;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("BF16 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 2] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "BF16 scale slice is not 2 bytes".into(),
-            })?;
-            // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
-            Ok(f32::from_bits(u32::from(u16::from_le_bytes(arr)) << 16))
-        }
-        Dtype::F32 => {
-            let end = byte_offset
-                .checked_add(4)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "F32 scale byte offset overflow".into(),
-                })?;
-            let slice = data
-                .get(byte_offset..end)
-                .ok_or_else(|| AnamnesisError::Parse {
-                    reason: format!("F32 scale read out of bounds at offset {byte_offset}"),
-                })?;
-            let arr: [u8; 4] = slice.try_into().map_err(|_| AnamnesisError::Parse {
-                reason: "F32 scale slice is not 4 bytes".into(),
-            })?;
-            Ok(f32::from_le_bytes(arr))
-        }
+        // BITWISE: BF16 → f32 by shifting into upper 16 bits of IEEE 754
+        Dtype::BF16 => Ok(f32::from_bits(
+            u32::from(u16::from_le_bytes(read_scale_bytes(
+                data,
+                byte_offset,
+                dtype,
+            )?)) << 16,
+        )),
+        Dtype::F32 => Ok(f32::from_le_bytes(read_scale_bytes(
+            data,
+            byte_offset,
+            dtype,
+        )?)),
         Dtype::F8E4M3
         | Dtype::F8E5M2
         | Dtype::F64
@@ -112,6 +79,69 @@ pub(crate) fn read_scale_f32(data: &[u8], byte_offset: usize, dtype: Dtype) -> c
             detail: "scale dtype must be F16, BF16, or F32".into(),
         }),
     }
+}
+
+/// Reads the `N` bytes of one `dtype` scale at `byte_offset`.
+///
+/// The bounds check [`read_scale_f32`] used to spell out once per dtype arm;
+/// `dtype` only labels the error.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `byte_offset + N` overflows or runs
+/// past the end of `data`.
+fn read_scale_bytes<const N: usize>(
+    data: &[u8],
+    byte_offset: usize,
+    dtype: Dtype,
+) -> crate::Result<[u8; N]> {
+    let end = byte_offset
+        .checked_add(N)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("{dtype} scale byte offset overflow"),
+        })?;
+    data.get(byte_offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("{dtype} scale read out of bounds at offset {byte_offset}"),
+        })
+}
+
+/// Unpacks scale factors for a single group into `buf`.
+///
+/// Fills `buf[0..out_features]` with the f32 scales for group `g`. Runs once
+/// per group, not per weight element.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short.
+/// Returns [`AnamnesisError::Unsupported`] if `scale_dtype` is not a scale
+/// dtype.
+pub(crate) fn unpack_scales_for_group(
+    buf: &mut [f32],
+    scales_data: &[u8],
+    g: usize,
+    out_features: usize,
+    scale_dtype: Dtype,
+) -> crate::Result<()> {
+    let bps = scale_dtype.byte_size();
+    let row_start = g
+        .checked_mul(out_features)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "scales group row offset overflow".into(),
+        })?;
+
+    for (j, buf_val) in buf.iter_mut().enumerate() {
+        let byte_offset = row_start
+            .checked_add(j)
+            .and_then(|idx| idx.checked_mul(bps))
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "scale byte offset overflow".into(),
+            })?;
+        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
+    }
+
+    Ok(())
 }
 
 /// Tile edge (in elements) for the cache-blocked transpose.

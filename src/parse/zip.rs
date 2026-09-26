@@ -123,9 +123,9 @@ const ZIP_MAX_NAME_LEN: usize = 4096;
 /// A positioned, read-only byte source the central-directory reader pulls
 /// fixed regions from.
 ///
-/// Implemented by [`SliceSource`] (the `.pth` mmap path — a borrowed `&[u8]`)
-/// and, from Phase 6.12 Step 2, by a `Read + Seek` adapter (the `.npz` and
-/// `.pth`-reader paths). Keeping the reader generic over this trait means the
+/// Implemented by [`SliceSource`] (a borrowed `&[u8]`: the `.pth` mmap and
+/// bytes paths, and `convert`'s format detection) and by [`ReaderSource`] (a
+/// `Read + Seek` adapter: the `.npz` paths and the `.pth` reader paths). Keeping the reader generic over this trait means the
 /// EOCD scan, `ZIP64` resolution, and central-directory parse are written once
 /// and shared by both substrates.
 pub(crate) trait ZipSource {
@@ -152,10 +152,9 @@ pub(crate) trait ZipSource {
 /// A [`ZipSource`] backed by an in-memory byte slice (the `.pth` memory-mapped
 /// file). `read_at` is a bounds-checked `copy_from_slice` from the mapping.
 ///
-/// Only the `.pth` reader constructs one — `.npz` drives the container through
-/// `ReaderSource` — so it is gated on `pth` to keep an `npz`-only build free of
-/// dead code. `test` keeps it available to this module's own unit tests in every
-/// feature combination.
+/// Constructed by the `.pth` mmap / bytes path and by `convert`'s archive
+/// format detection, which needs it under `npz` as well; `.npz` parsing itself
+/// drives the container through `ReaderSource`.
 #[cfg(any(feature = "pth", feature = "npz", test))]
 pub(crate) struct SliceSource<'a> {
     /// The whole archive bytes (the mmap).
@@ -264,6 +263,27 @@ impl<R: Read + Seek> ZipSource for ReaderSource<R> {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::Result<()> {
+        // Honour the trait's contract that an out-of-range read is `Parse`,
+        // exactly as `SliceSource` does: the offsets reaching here derive from
+        // the archive's own headers, so a range past the end is malformed
+        // input, not an I/O failure. Checked before seeking, as the `GGUF`
+        // reader's `ensure_remaining` does.
+        // CAST: usize → u64, lossless widening on all supported targets
+        #[allow(clippy::as_conversions)]
+        let len = buf.len() as u64;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "ZIP read range overflow".into(),
+            })?;
+        if end > self.len {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "ZIP read past end of source ([{offset}..{end}], source len = {})",
+                    self.len
+                ),
+            });
+        }
         self.reader
             .seek(std::io::SeekFrom::Start(offset))
             .map_err(AnamnesisError::Io)?;
@@ -425,10 +445,11 @@ pub(crate) enum Compression {
     /// most large `.npz` arrays).
     Stored,
     /// Raw `DEFLATE` (method 8) — inflated by `flate2` / `miniz_oxide` on the
-    /// `.npz` path.
+    /// `.npz` paths and the `.pth` reader paths.
     Deflate,
     /// Any other method tag — recognised but not interpreted; the caller
-    /// decides whether to skip (`.pth`) or reject (`.npz`).
+    /// decides whether to skip it (the `.pth` mmap / bytes index) or reject it
+    /// (`.npz`, and the `.pth` reader paths).
     Unsupported(u16),
 }
 
@@ -469,10 +490,9 @@ pub(crate) struct ZipEntry {
     /// Compressed (on-disk) size of the entry data, in bytes.
     pub(crate) compressed_size: u64,
     /// Uncompressed size of the entry data, in bytes (equal to
-    /// `compressed_size` for `STORED`). Consumed by the `.npz` path (the
-    /// `DEFLATE` inflate-size cross-check), wired in Phase 6.12 Step 2; the
-    /// `.pth` path is STORED-only and reads only `compressed_size`.
-    #[allow(dead_code)]
+    /// `compressed_size` for `STORED`). Bounds every `DEFLATE` inflation: the
+    /// `.npz` array-size cross-check and the `.pth` reader path's `data.pkl` /
+    /// `byteorder` caps.
     pub(crate) uncompressed_size: u64,
     /// Offset of the entry's local file header from the start of the archive.
     pub(crate) local_header_offset: u64,
@@ -503,12 +523,9 @@ struct CentralDirInfo {
 /// checked against `max_item_count` and the central-directory byte read against
 /// `max_single_alloc_bytes` — both **before** any allocation, fail-fast — so a
 /// tight-budget caller bounds the container metadata, not just the permanent
-/// [`ZIP_MAX_ENTRIES`] floor (CWE-770). The summary-only inspect paths
-/// (`inspect_npz_from_reader`, `inspect_pth_from_reader`) pass
-/// [`ParseLimits::unbounded`]; the full-detail `.pth` front-matter path
-/// (`parse_pth_front_matter_from_reader_with_limits`) is also inspect-style
-/// (no tensor-data read) but passes the caller's real budget through, so it
-/// is bounded here too.
+/// [`ZIP_MAX_ENTRIES`] floor (CWE-770). Every caller passes its caller's
+/// budget through, the inspect paths included (since v0.7.6, when
+/// `InspectOptions` gained `limits`).
 ///
 /// # Errors
 ///
@@ -960,9 +977,8 @@ pub(crate) fn data_start<S: ZipSource>(src: &mut S, entry: &ZipEntry) -> crate::
 /// `find('/')` matches every realistic `PyTorch` / `NumPy` archive; a name with
 /// no `/` is returned verbatim. Returns a borrow into `name` (no allocation).
 ///
-/// Only the `.pth` reader strips the prefix today (`.npz` keys on the full entry
-/// name), so it is gated on `pth` to keep an `npz`-only build free of dead code;
-/// `test` keeps it available to this module's unit tests.
+/// Used by the `.pth` parsers and by `convert`'s archive format detection
+/// (which also runs under `npz`); `.npz` parsing keys on the full entry name.
 #[cfg(any(feature = "pth", feature = "npz", test))]
 #[must_use]
 pub(crate) fn strip_archive_prefix(name: &str) -> Cow<'_, str> {
@@ -1290,6 +1306,35 @@ mod tests {
             matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected central-directory single-alloc rejection, got: {err}"
         );
+    }
+
+    // `ZipSource::read_at` promises `Parse` for an out-of-range read. The
+    // slice source always honoured it; the reader source surfaced
+    // `Io(UnexpectedEof)`, which Python would see as an `OSError`.
+    #[test]
+    fn reader_source_out_of_range_read_is_parse() {
+        let bytes = [0u8; 16];
+        let mut reader_src = ReaderSource::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let mut slice_src = SliceSource::new(&bytes);
+        let mut buf = [0u8; 8];
+        for offset in [9u64, 16, u64::MAX] {
+            assert!(
+                matches!(
+                    reader_src.read_at(offset, &mut buf),
+                    Err(AnamnesisError::Parse { .. })
+                ),
+                "reader source at offset {offset}"
+            );
+            assert!(
+                matches!(
+                    slice_src.read_at(offset, &mut buf),
+                    Err(AnamnesisError::Parse { .. })
+                ),
+                "slice source at offset {offset}"
+            );
+        }
+        // The in-range boundary still reads.
+        reader_src.read_at(8, &mut buf).unwrap();
     }
 
     #[test]

@@ -29,7 +29,10 @@ use std::path::Path;
 use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
+use crate::parse::utils::{
+    PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, classify_decode_error,
+    saturating_num_elements,
+};
 
 // ---------------------------------------------------------------------------
 // NPY magic
@@ -111,6 +114,60 @@ impl NpzDtype {
             Self::U32 | Self::I32 | Self::F32 => 4,
             Self::U64 | Self::I64 | Self::F64 => 8,
         }
+    }
+
+    /// Converts to the anamnesis [`Dtype`](crate::Dtype).
+    ///
+    /// The `NPZ` counterpart of `PthDtype::to_dtype`, with the same signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if no equivalent exists. Every
+    /// current variant maps; the `Result` keeps a future `NPZ` dtype with no
+    /// counterpart (a complex type, say) from being a breaking change.
+    pub const fn to_dtype(self) -> crate::Result<crate::Dtype> {
+        use crate::Dtype;
+        Ok(match self {
+            Self::Bool => Dtype::Bool,
+            Self::U8 => Dtype::U8,
+            Self::I8 => Dtype::I8,
+            Self::U16 => Dtype::U16,
+            Self::I16 => Dtype::I16,
+            Self::U32 => Dtype::U32,
+            Self::I32 => Dtype::I32,
+            Self::U64 => Dtype::U64,
+            Self::I64 => Dtype::I64,
+            Self::F16 => Dtype::F16,
+            Self::BF16 => Dtype::BF16,
+            Self::F32 => Dtype::F32,
+            Self::F64 => Dtype::F64,
+        })
+    }
+
+    /// Converts directly to `safetensors::Dtype`, skipping the intermediate
+    /// anamnesis `Dtype`. The `NPZ` counterpart of
+    /// `PthDtype::to_safetensors_dtype`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
+    /// exists (currently every variant maps).
+    pub const fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+        Ok(match self {
+            Self::Bool => safetensors::Dtype::BOOL,
+            Self::U8 => safetensors::Dtype::U8,
+            Self::I8 => safetensors::Dtype::I8,
+            Self::U16 => safetensors::Dtype::U16,
+            Self::I16 => safetensors::Dtype::I16,
+            Self::U32 => safetensors::Dtype::U32,
+            Self::I32 => safetensors::Dtype::I32,
+            Self::U64 => safetensors::Dtype::U64,
+            Self::I64 => safetensors::Dtype::I64,
+            Self::F16 => safetensors::Dtype::F16,
+            Self::BF16 => safetensors::Dtype::BF16,
+            Self::F32 => safetensors::Dtype::F32,
+            Self::F64 => safetensors::Dtype::F64,
+        })
     }
 }
 
@@ -213,16 +270,16 @@ struct NpyHeader {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the magic bytes, version, or header
-/// dict are malformed, or the declared header length exceeds the cap or the
-/// `budget`.
+/// dict are malformed, or the header bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header length
+/// exceeds the cap or the `budget`.
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Result<NpyHeader> {
     // Read magic (6 bytes) + major (1) + minor (1) = 8 bytes.
     let mut preamble = [0u8; 8];
     reader
         .read_exact(&mut preamble)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("NPY preamble read failed: {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, "NPY preamble"))?;
 
     // INDEX: preamble is exactly 8 bytes, slicing [..6] is safe
     #[allow(clippy::indexing_slicing)]
@@ -244,18 +301,14 @@ fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Resul
             let mut buf = [0u8; 2];
             reader
                 .read_exact(&mut buf)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("NPY v1 header length read failed: {e}"),
-                })?;
+                .map_err(|e| classify_decode_error(e, "NPY v1 header length"))?;
             usize::from(u16::from_le_bytes(buf))
         }
         2 | 3 => {
             let mut buf = [0u8; 4];
             reader
                 .read_exact(&mut buf)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("NPY v{major} header length read failed: {e}"),
-                })?;
+                .map_err(|e| classify_decode_error(e, &format!("NPY v{major} header length")))?;
             // CAST: u32 → usize, NPY headers are always small
             #[allow(clippy::as_conversions)]
             let len = u32::from_le_bytes(buf) as usize;
@@ -290,9 +343,7 @@ fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Resul
     let mut header_buf = vec![0u8; header_len];
     reader
         .read_exact(&mut header_buf)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("NPY header data read failed: {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, "NPY header data"))?;
 
     let header_str = std::str::from_utf8(&header_buf).map_err(|e| AnamnesisError::Parse {
         reason: format!("NPY header is not valid UTF-8: {e}"),
@@ -505,27 +556,6 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 // Bulk data extraction
 // ---------------------------------------------------------------------------
 
-/// Reads array data as raw little-endian bytes in one bulk `read_exact` call.
-///
-/// For little-endian data on a little-endian machine, the raw bytes are the
-/// correct in-memory representation — zero per-element processing. For
-/// big-endian data, a byte-swap pass is applied in-place after the bulk read.
-///
-/// `entry_size` is the ZIP entry's declared uncompressed size. The
-/// shape-derived `data_bytes` is rejected if it exceeds `entry_size`
-/// **before** any allocation: an entry cannot hold (or decompress to) more
-/// than it declares, so a small entry claiming an enormous shape — or a
-/// `DEFLATE` entry whose declared shape would balloon the allocation — fails
-/// fast instead of driving a multi-`GiB` `vec!`. This mirrors the
-/// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
-/// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the element count or byte count
-/// overflows `usize`, if `data_bytes` exceeds the entry's declared size, the
-/// `NPZ_MAX_ARRAY_BYTES` cap, or the caller's `budget` (per-item
-/// single-allocation cap + cumulative aggregate), or if the read fails.
 /// Rewrites Fortran-order (column-major) `data` into C-order (row-major),
 /// returning a fresh buffer.
 ///
@@ -639,19 +669,39 @@ fn to_c_order(
     Ok(out)
 }
 
+/// Reads array data as raw little-endian bytes in one bulk `read_exact` call.
+///
+/// For little-endian data on a little-endian machine, the raw bytes are the
+/// correct in-memory representation — zero per-element processing. For
+/// big-endian data, a byte-swap pass is applied in-place after the bulk read.
+///
+/// `entry_size` is the ZIP entry's declared uncompressed size. The
+/// shape-derived `data_bytes` is rejected if it exceeds `entry_size`
+/// **before** any allocation: an entry cannot hold (or decompress to) more
+/// than it declares, so a small entry claiming an enormous shape — or a
+/// `DEFLATE` entry whose declared shape would balloon the allocation — fails
+/// fast instead of driving a multi-`GiB` `vec!`. This mirrors the
+/// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
+/// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the element count or byte count
+/// overflows `usize`, if `data_bytes` exceeds the entry's declared size, or if
+/// the entry's bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::LimitExceeded`] if `data_bytes` exceeds the
+/// `NPZ_MAX_ARRAY_BYTES` cap or the caller's `budget` (per-item
+/// single-allocation cap + cumulative aggregate).
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_array_data(
     reader: &mut impl Read,
     header: &NpyHeader,
     entry_size: u64,
     budget: &mut Budget,
 ) -> crate::Result<Vec<u8>> {
-    let n_elements: usize = header
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "element count overflow".into(),
-        })?;
+    let n_elements = checked_num_elements(&header.shape).ok_or_else(|| AnamnesisError::Parse {
+        reason: "element count overflow".into(),
+    })?;
 
     let data_bytes = n_elements
         .checked_mul(header.dtype.byte_size())
@@ -690,9 +740,7 @@ fn read_array_data(
     let mut buf = vec![0u8; data_bytes];
     reader
         .read_exact(&mut buf)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("array data read failed ({data_bytes} bytes): {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, &format!("NPY array data ({data_bytes} bytes)")))?;
 
     // Byte-swap for big-endian data with multi-byte elements.
     if header.big_endian && header.dtype.byte_size() > 1 {
@@ -1045,11 +1093,7 @@ pub fn inspect_npz_from_reader_with_options<R: Read + Seek>(
         // count, so an inspect has nothing to reject here. Before v0.7.6 it
         // rejected anyway, which meant a host could not even *look* at an
         // archive holding a transposed array.
-        let n_elements: usize = header
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .unwrap_or(usize::MAX);
+        let n_elements = saturating_num_elements(&header.shape);
         let byte_len = n_elements.saturating_mul(header.dtype.byte_size());
 
         // CAST: usize → u64, byte lengths fit in u64
@@ -1202,10 +1246,7 @@ pub fn parse_npz_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<HashMap<String, NpzTensor>> {
-    // CAST: usize → u64, lossless widening on all supported targets.
-    #[allow(clippy::as_conversions)]
-    let len = bytes.len() as u64;
-    limits.check_alloc(len, "NPZ bytes")?;
+    limits.check_owned_input(&bytes, "NPZ bytes")?;
     parse_npz_from_zip_reader(std::io::Cursor::new(bytes), limits)
 }
 
@@ -1337,6 +1378,40 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    // -- NpzDtype::to_dtype / to_safetensors_dtype ---------------------------
+
+    /// Every variant maps, and both maps agree with `byte_size`, so the three
+    /// descriptions of one dtype cannot drift apart.
+    #[test]
+    fn dtype_maps_agree_with_byte_size() {
+        for dtype in [
+            NpzDtype::Bool,
+            NpzDtype::U8,
+            NpzDtype::I8,
+            NpzDtype::U16,
+            NpzDtype::I16,
+            NpzDtype::U32,
+            NpzDtype::I32,
+            NpzDtype::U64,
+            NpzDtype::I64,
+            NpzDtype::F16,
+            NpzDtype::BF16,
+            NpzDtype::F32,
+            NpzDtype::F64,
+        ] {
+            assert_eq!(
+                dtype.to_dtype().unwrap().byte_size(),
+                dtype.byte_size(),
+                "{dtype}"
+            );
+            assert_eq!(
+                dtype.to_safetensors_dtype().unwrap().bitsize(),
+                dtype.byte_size() * 8,
+                "{dtype}"
+            );
+        }
+    }
 
     // -- NpzDtype::byte_size -------------------------------------------------
 

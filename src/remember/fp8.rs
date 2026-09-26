@@ -97,7 +97,7 @@ const SUBNORMAL_TABLE: [u32; 8] = [
 /// - `NaN`: exp=15, mant=7 (byte `0x7F` or `0xFF`)
 #[must_use]
 #[inline]
-pub(crate) fn e4m3_to_f32_bits(byte: u8) -> u32 {
+fn e4m3_to_f32_bits(byte: u8) -> u32 {
     let b = u32::from(byte);
 
     // BITWISE: extract sign bit from E4M3 byte (bit [7])
@@ -430,12 +430,8 @@ pub fn dequantize_fp8<E: OutputElement>(
     scale_dtype: Dtype,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
+    // Every `Dtype` is at least one byte wide, so this is never zero.
     let bytes_per_scale = scale_dtype.byte_size();
-    if bytes_per_scale == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: format!("unsupported scale dtype: {scale_dtype}"),
-        });
-    }
 
     let expected_weight_len = rows
         .checked_mul(cols)

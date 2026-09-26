@@ -1,5 +1,7 @@
 # anamnesis
 
+> **HISTORICAL (archived at the v0.7.8 close-out).** The project brief from 2026-03-19, before the first release. `README.md` and `ROADMAP.md` describe the project as it is.
+
 *Make model weights usable in Rust — parse any tensor format, recover any precision.*
 
 **crates.io:** available — 0 results for "anamnesis" as of 2026-03-19.

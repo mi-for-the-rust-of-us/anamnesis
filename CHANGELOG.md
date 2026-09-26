@@ -7,7 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`NpzDtype::to_dtype` and `NpzDtype::to_safetensors_dtype`**, matching the
+  pair `PthDtype` already had, with the same `Result` signatures so a future
+  `NPZ` dtype without a counterpart is not a breaking change. The crate's two
+  private `NPZ` dtype maps now go through them. `PthDtype`'s pair is now
+  `const fn`.
+
+### Fixed
+
+- **A `.pth` archive that repeats `data.pkl` or `byteorder` is now rejected on
+  every path.** The parse paths kept the *last* copy and the reader-generic
+  inspect / front-matter paths the *first*, so a crafted archive could show
+  `inspect_pth_from_reader` one pickle and hand `parse_pth` another,
+  undermining the inspect-before-parse gate. Both now return
+  `AnamnesisError::Parse` naming the duplicate, whatever the entries'
+  compression methods. A repeated tensor-storage entry (`data/0` twice) is
+  likewise rejected by the parse paths instead of silently resolved last-wins.
+  Real `torch.save` archives never repeat an entry.
+
+- **`dequantize_bnb4_double_quant` now rejects a weight buffer of the wrong
+  length.** It was the only `NF4` / `FP4` entry point without that check: a
+  short buffer was still caught downstream, but an over-long one decoded
+  without error with its tail silently ignored. It now returns
+  `AnamnesisError::Parse`, as `dequantize_bnb4` always did.
+
+- **The `ollama:` resolver no longer lets a manifest digest or a model spec
+  steer a path outside the model cache.** The digest was joined into
+  `blobs/sha256-<hash>` without checking it was hexadecimal, so a manifest
+  naming `sha256:../../x` resolved outside `blobs/`; spec components such as
+  `../evil` likewise reached the manifest path. Both are now rejected with
+  `AnamnesisError::Parse`. The manifest comes from the local `Ollama` cache,
+  so this is defence in depth rather than a remote exposure.
+
+- **Malformed `.npz` / `.pth` bytes now report `AnamnesisError::Parse`, and
+  genuine read failures `AnamnesisError::Io`, on every path.** The two map to
+  different Python exceptions in v0.8.0 (`ParseError` vs `OSError`), so the
+  split is now a stated contract on `AnamnesisError`. Three sites did not
+  honour it:
+  - the vendored `ZIP` reader's `Read + Seek` source reported an
+    out-of-range read as `Io` where its slice source said `Parse`;
+  - a corrupt `DEFLATE` `data.pkl` on the reader-generic `.pth` paths
+    surfaced as `Io`;
+  - every `NPZ` entry read mapped *all* failures, disk errors included, to
+    `Parse`.
+
+  Unchanged, and now documented as deliberate: the reader-generic safetensors
+  header still returns `Io` when a stream of unknown length ends early, so an
+  `HTTP`-range adapter can tell a partial fetch from a malformed header. `NPZ`
+  read-failure messages change wording from `… read failed: …` to
+  `failed to decode …: …`.
+
+- **The `.pth` reader-generic paths now honour `ParseLimits::max_decompression_ratio`.**
+  They inflate `DEFLATE` `data.pkl` / `byteorder` entries, but only the `NPZ`
+  path checked the caller's expansion-ratio budget, so a caller who tightened it
+  was silently not protected there. The inflation was already bounded by the
+  permanent `MAX_PKL_SIZE` cap; this makes the caller's own budget apply too.
+
+- **`cargo install anamnesis` no longer installs the dev-only `tsan-harness`
+  binary.** It was gated on `parallel`, a default feature, so `cargo install
+  anamnesis --features cli` installed it beside `anamnesis` / `amn`, and a bare
+  `cargo install anamnesis` installed only it. It now requires a new,
+  non-default `tsan` feature, which only the ThreadSanitizer CI job enables.
+
+- **A shape with a zero dimension after an overflowing one now counts as empty
+  in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
+  safetensors' `TensorEntry::num_elements` still stopped at the first overflow,
+  so `[2^33, 2^33, 0]` read as `usize::MAX` elements, or was rejected, instead
+  of `0`. Every parser now shares one checked and one saturating element-count
+  helper.
+
 ### Changed
+
+- **Rustdoc corrections, several of them visible on docs.rs.** The crate
+  page's *Quick Start* heading was swallowed by a doubled `//!` prefix, and
+  `RememberOptions::with_threads` rendered with no documentation while
+  `with_cancel` showed the thread-budget doc and doctest. Both are fixed, along
+  with two other misplaced doc comments. `F16` output is now described as
+  overflowing to infinity past 65504, which is what it does, instead of
+  "saturating" (also in `amn --help`). `ConvertOptions::output_dtype` no longer
+  claims that only `GGUF` inputs honour it, true in v0.7.3 but not since v0.7.4.
+  Every `remember*_with_options` / `convert` `# Errors` section now lists
+  `AnamnesisError::Cancelled`, and the frozen Rust-to-Python exception table
+  gains its `Cancelled` row.
+
+- `dequantize_gguf` called with a scalar dtype now says the type "is not a
+  block-quantised type; there is nothing to dequantise" instead of
+  "dequantisation not yet supported". `amn convert --out-dtype` rejects a bad
+  value with `TargetDtype`'s wording ("supported target dtypes").
 
 - **The `BnB` `INT8` `F16` regression is confined to server-class ARM, and
   Apple Silicon is now measured.** v0.7.7 shipped that change disclosed, with a
@@ -16,6 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there, the migrated kernel being ~4.8 % *faster* at `F16`, matching x86-64.
   **The pin recommendation therefore applies only to `F16` output on ARM
   *servers* without hardware `FP16` (Graviton, Ampere), not to Apple Silicon.**
+  It is not a clean win there either: on the same M3 the migrated kernel is
+  about 5.2 % *slower* at `F32`, trading one width against the other. That is
+  not yet explained, nor reproduced on a second M-series tier.
 
 - **`F16Out` and `F32Out` cost figures are now platform-qualified**, because
   they were not, and were wrong outside x86-64. `F16` costs 2.0x to 3.1x `BF16`
@@ -84,7 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *Caveat recorded rather than buried:* `dequant_gguf_q4_k` improved 4.16 %
   consistently across both runs without being touched, so the conservative floor
   on the `GPTQ`-specific gain is nearer 5.7 %. Attributing that is Phase 7.7
-  item 6.
+  item 8.
 
 - **v0.7.6's `chunks_exact` suppression comments have been corrected, each
   against its own measurement.** They stated costs of +18 % to +74 % for

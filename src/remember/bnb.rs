@@ -114,13 +114,224 @@ const _: () = {
 
 /// Reads a little-endian `f32` from a byte slice at the given offset.
 ///
-/// # Errors
+/// Shared with the encode side ([`crate::lethe::bnb`]), as are the codebook,
+/// absmax, validation, and double-quant recovery helpers below. The two sides
+/// used to carry their own copies to stay "independently re-readable"; that
+/// let the decode-side double-quant entry lose a weight-length check the
+/// others kept, and the byte-exact round trip depends on the recovery
+/// arithmetic staying identical, so one copy is now the invariant.
 ///
 /// Returns `None` if the slice does not contain 4 bytes at `offset`.
-fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
+pub(crate) fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
+    // Unchecked `offset + 4` on purpose: every caller passes `i * 4` with `i`
+    // below a count whose `× 4` was already `checked_mul`'d, so it cannot
+    // overflow, and a `checked_add` here measurably slowed `NF4` decode
+    // (Experiment 19).
     let bytes: &[u8] = data.get(offset..offset + 4)?;
     let arr: [u8; 4] = bytes.try_into().ok()?;
     Some(f32::from_le_bytes(arr))
+}
+
+/// Validates the block geometry every `NF4` / `FP4` path shares, decode and
+/// encode, and returns the block count.
+///
+/// `context` prefixes each message (`"BnB4"`, `"BnB4 encode"`) so a caller
+/// can tell which side rejected its input.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `block_size` is zero or odd, or if
+/// `total_elements` is not a multiple of `block_size`.
+pub(crate) fn validate_bnb4_blocks(
+    context: &str,
+    total_elements: usize,
+    block_size: usize,
+) -> crate::Result<usize> {
+    if block_size == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: format!("{context} block_size must be > 0"),
+        });
+    }
+    // An odd block_size silently truncates `bytes_per_block = block_size / 2`,
+    // mis-aligning every block after the first and producing wrong (not
+    // out-of-bounds) output. Two nibbles pack into one byte, so a real BnB4
+    // block_size is always even (64 in practice).
+    if !block_size.is_multiple_of(2) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "{context} block_size must be even (two nibbles per byte), got {block_size}"
+            ),
+        });
+    }
+    // With an even block_size, divisibility also guarantees an even
+    // total_elements, so no separate parity check is needed.
+    if !total_elements.is_multiple_of(block_size) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "{context} total_elements ({total_elements}) not divisible by \
+                 block_size ({block_size})"
+            ),
+        });
+    }
+    Ok(total_elements / block_size)
+}
+
+/// Checks that packed `NF4` / `FP4` weight bytes hold exactly
+/// `total_elements / 2` bytes (two nibbles per byte).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `weight_data` has any other length.
+fn validate_bnb4_weight_len(weight_data: &[u8], total_elements: usize) -> crate::Result<()> {
+    let expected_weight_bytes = total_elements / 2;
+    if weight_data.len() != expected_weight_bytes {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 weight byte count mismatch: expected {expected_weight_bytes} for \
+                 {total_elements} elements, got {}",
+                weight_data.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Parses a 64-byte `F32` little-endian `NF4` / `FP4` codebook into
+/// `[f32; 16]`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `quant_map_data` is not 64 bytes.
+pub(crate) fn parse_codebook(quant_map_data: &[u8]) -> crate::Result<[f32; 16]> {
+    if quant_map_data.len() != 64 {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 quant_map must be 64 bytes (16×F32), got {}",
+                quant_map_data.len()
+            ),
+        });
+    }
+    let mut codebook = [0.0f32; 16];
+    for (i, slot) in codebook.iter_mut().enumerate() {
+        *slot = read_f32_le(quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: "BnB4 quant_map read out of bounds".into(),
+        })?;
+    }
+    Ok(codebook)
+}
+
+/// Parses `num_blocks` little-endian `F32` absmax values.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `absmax_data` is not exactly
+/// `num_blocks × 4` bytes, or if that count overflows `usize`.
+pub(crate) fn parse_absmax(absmax_data: &[u8], num_blocks: usize) -> crate::Result<Vec<f32>> {
+    let expected_bytes = num_blocks
+        .checked_mul(4)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "absmax byte count overflow".into(),
+        })?;
+    if absmax_data.len() != expected_bytes {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 absmax byte count mismatch: expected {expected_bytes}, got {}",
+                absmax_data.len()
+            ),
+        });
+    }
+    let mut absmax = vec![0.0f32; num_blocks];
+    for (i, slot) in absmax.iter_mut().enumerate() {
+        *slot = read_f32_le(absmax_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: format!("BnB4 absmax read out of bounds at block {i}"),
+        })?;
+    }
+    Ok(absmax)
+}
+
+/// Recovers per-block `f32` absmax values from `bitsandbytes` double-quant
+/// metadata: one `U8` index per block into a 256-entry nested codebook,
+/// scaled by the per-nested-block `nested_absmax` and shifted by
+/// `nested_offset`.
+///
+/// The single implementation of the recovery formula for both decode
+/// ([`dequantize_bnb4_double_quant`]) and encode
+/// (`lethe::bnb::encode_bnb4_double_quant`). Byte-exact round trips depend
+/// on the two sides recovering bit-identical absmax values, which one shared
+/// function makes structural rather than a matter of keeping two copies in
+/// step.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `nested_block_size` is zero, if
+/// `nested_quant_map_data` is not 1024 bytes, or if `nested_absmax_data` does
+/// not hold one `F32` per nested block.
+pub(crate) fn recover_double_quant_absmax(
+    absmax_data: &[u8],
+    nested_absmax_data: &[u8],
+    nested_quant_map_data: &[u8],
+    nested_offset: f32,
+    nested_block_size: usize,
+) -> crate::Result<Vec<f32>> {
+    if nested_block_size == 0 {
+        return Err(AnamnesisError::Parse {
+            reason: "BnB nested_block_size must be > 0".into(),
+        });
+    }
+    if nested_quant_map_data.len() != 1024 {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 nested_quant_map must be 1024 bytes (256×F32), got {}",
+                nested_quant_map_data.len()
+            ),
+        });
+    }
+    let mut nested_quant_map = [0.0f32; 256];
+    for (i, val) in nested_quant_map.iter_mut().enumerate() {
+        *val = read_f32_le(nested_quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
+            reason: "BnB4 nested_quant_map read out of bounds".into(),
+        })?;
+    }
+
+    let num_blocks = absmax_data.len();
+    // A partial last nested block still carries its own scale: round up.
+    let num_nested_blocks = num_blocks.div_ceil(nested_block_size);
+    let expected_nested_absmax_bytes =
+        num_nested_blocks
+            .checked_mul(4)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "nested absmax byte count overflow".into(),
+            })?;
+    if nested_absmax_data.len() != expected_nested_absmax_bytes {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "BnB4 nested_absmax byte count mismatch: expected \
+                 {expected_nested_absmax_bytes}, got {}",
+                nested_absmax_data.len()
+            ),
+        });
+    }
+
+    let mut recovered = vec![0.0f32; num_blocks];
+    for (i, (&absmax_byte, slot)) in absmax_data.iter().zip(recovered.iter_mut()).enumerate() {
+        let nested_block_idx = i / nested_block_size;
+        let nested_absmax_val =
+            read_f32_le(nested_absmax_data, nested_block_idx * 4).ok_or_else(|| {
+                AnamnesisError::Parse {
+                    reason: format!(
+                        "BnB4 nested_absmax read out of bounds at block {nested_block_idx}"
+                    ),
+                }
+            })?;
+        // CAST: u8 → usize, absmax_byte is 0-255 used as lookup index
+        #[allow(clippy::as_conversions)]
+        let idx = absmax_byte as usize;
+        // INDEX: idx is 0-255, nested_quant_map has 256 entries
+        #[allow(clippy::indexing_slicing)]
+        let entry = nested_quant_map[idx];
+        *slot = entry * nested_absmax_val + nested_offset;
+    }
+    Ok(recovered)
 }
 
 /// Applies the sign-magnitude zero-preservation rule to one looked-up
@@ -365,6 +576,17 @@ pub fn dequantize_bnb4<E: OutputElement>(
     block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
+    //
+    // KEPT INLINE ON MEASUREMENT. The v0.7.8 close-out routed this entry point
+    // through the shared `validate_bnb4_blocks` / `parse_absmax` /
+    // `parse_codebook` the double-quant and encode paths use. Paired harness
+    // (`benches/ab.rs`, tango, x86-64, 10 runs each, medians):
+    // `bnb_nf4_bf16` +4.50 % and `_f32` +5.34 % with the shared helpers, still
+    // +6.12 % / +6.54 % with only `read_f32_le`'s bounds reverted, still +7.32 %
+    // / +1.04 % with only this body restored; flat (+0.02 % / +0.37 %) only with
+    // both. A codegen-shape effect rather than cost that can be located, the same
+    // class `GPTQ` showed (see `remember/gptq.rs`), so it is not chased here.
+    // `docs/perf-experiments.md` Experiment 19.
     if block_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: "BnB block_size must be > 0".into(),
@@ -546,28 +768,10 @@ pub fn dequantize_bnb4_double_quant<E: OutputElement>(
     nested_block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
-    if block_size == 0 || nested_block_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: "BnB block_size and nested_block_size must be > 0".into(),
-        });
-    }
-    // Odd block_size truncates `bytes_per_block = block_size / 2` → mis-aligned
-    // blocks → wrong output (see the plain-decode guard above).
-    if !block_size.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 block_size must be even (two nibbles per byte), got {block_size}"
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(block_size) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 total_elements ({total_elements}) not divisible by block_size ({block_size})"
-            ),
-        });
-    }
-    let num_blocks = total_elements / block_size;
+    let num_blocks = validate_bnb4_blocks("BnB4", total_elements, block_size)?;
+    // Before v0.7.8 this entry point alone skipped the weight-length check,
+    // so an over-long buffer was accepted with its tail silently ignored.
+    validate_bnb4_weight_len(weight_data, total_elements)?;
     if absmax_data.len() != num_blocks {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -576,83 +780,14 @@ pub fn dequantize_bnb4_double_quant<E: OutputElement>(
             ),
         });
     }
-    // nested_quant_map must be exactly 256 F32 values = 1024 bytes
-    if nested_quant_map_data.len() != 1024 {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 nested_quant_map must be 1024 bytes (256×F32), got {}",
-                nested_quant_map_data.len()
-            ),
-        });
-    }
-
-    // --- Pre-load nested quant_map (256 entries) ---
-    let mut nested_quant_map = [0.0f32; 256];
-    for (i, val) in nested_quant_map.iter_mut().enumerate() {
-        *val = read_f32_le(nested_quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 nested_quant_map read out of bounds".into(),
-        })?;
-    }
-
-    // --- Dequantize nested absmax: U8 → F32 via nested lookup × nested_absmax ---
-    let num_nested_blocks = if num_blocks.is_multiple_of(nested_block_size) {
-        num_blocks / nested_block_size
-    } else {
-        // Partial last block: round up
-        num_blocks / nested_block_size + 1
-    };
-    let expected_nested_absmax_bytes =
-        num_nested_blocks
-            .checked_mul(4)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "nested absmax byte count overflow".into(),
-            })?;
-    if nested_absmax_data.len() != expected_nested_absmax_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 nested_absmax byte count mismatch: expected {expected_nested_absmax_bytes}, got {}",
-                nested_absmax_data.len()
-            ),
-        });
-    }
-
-    let mut dequantized_absmax = vec![0.0f32; num_blocks];
-    for (i, &absmax_byte) in absmax_data.iter().enumerate() {
-        let nested_block_idx = i / nested_block_size;
-        let nested_absmax_val =
-            read_f32_le(nested_absmax_data, nested_block_idx * 4).ok_or_else(|| {
-                AnamnesisError::Parse {
-                    reason: format!(
-                        "BnB4 nested_absmax read out of bounds at block {nested_block_idx}"
-                    ),
-                }
-            })?;
-        // CAST: u8 → usize, absmax_byte is 0-255 used as lookup index
-        #[allow(clippy::as_conversions)]
-        let idx = absmax_byte as usize;
-        // INDEX: idx is 0-255, nested_quant_map has 256 entries;
-        //        i < num_blocks, dequantized_absmax has num_blocks entries
-        #[allow(clippy::indexing_slicing)]
-        {
-            dequantized_absmax[i] = nested_quant_map[idx] * nested_absmax_val + nested_offset;
-        }
-    }
-
-    // --- Pre-load quant_map (16 entries) ---
-    if quant_map_data.len() != 64 {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 quant_map must be 64 bytes (16×F32), got {}",
-                quant_map_data.len()
-            ),
-        });
-    }
-    let mut quant_map = [0.0f32; 16];
-    for (i, val) in quant_map.iter_mut().enumerate() {
-        *val = read_f32_le(quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 quant_map read out of bounds".into(),
-        })?;
-    }
+    let dequantized_absmax = recover_double_quant_absmax(
+        absmax_data,
+        nested_absmax_data,
+        nested_quant_map_data,
+        nested_offset,
+        nested_block_size,
+    )?;
+    let quant_map = parse_codebook(quant_map_data)?;
 
     // --- Delegate to core dequant with recovered f32 absmax directly ---
     // No intermediate serialization: dequantized_absmax is passed as &[f32].
@@ -1117,6 +1252,30 @@ mod tests {
         assert_eq!(read_bf16(&out, 0), 2.0);
         // quant_map[0] * 2.0 = 0.0
         assert_eq!(read_bf16(&out, 1), 0.0);
+    }
+
+    // Before v0.7.8 the double-quant entry point alone skipped the weight
+    // length check: an over-long buffer decoded without error, its tail
+    // silently ignored. It must now be rejected like the plain path does.
+    #[test]
+    fn bnb4_double_quant_rejects_over_long_weight() {
+        let quant_map_bytes = f32_to_bytes(&[0.0f32; 16]);
+        let nested_quant_map_bytes = f32_to_bytes(&[0.0f32; 256]);
+        let nested_absmax_bytes = f32_to_bytes(&[1.0]);
+        let err = dequantize_bnb4_double_quant_to_bf16(
+            &[0x10, 0xFF], // one byte too many for 2 elements
+            &[0u8],
+            &quant_map_bytes,
+            &nested_absmax_bytes,
+            &nested_quant_map_bytes,
+            0.0,
+            2,
+            2,
+            256,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("weight byte count mismatch"), "{err}");
     }
 
     #[test]

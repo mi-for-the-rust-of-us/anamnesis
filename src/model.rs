@@ -93,10 +93,10 @@ pub enum TargetDtype {
     ///
     /// **Not uniformly the better 2-byte choice.** Against `BF16` it buys 3
     /// significand bits (11 versus 8) and pays a far narrower exponent range:
-    /// `BF16` shares `f32`'s range, while `F16` saturates at 65504 and flushes
-    /// to zero below about `2⁻²⁴`. Out-of-range values follow plain IEEE
-    /// semantics (infinity, flush-to-zero), never saturation — see
-    /// [`F16Out`] for why.
+    /// `BF16` shares `f32`'s range, while `F16`'s largest finite value is 65504
+    /// and it flushes to zero below about `2⁻²⁴`. Out-of-range values follow
+    /// plain IEEE semantics (overflow to infinity, flush to zero), never
+    /// saturation; see [`F16Out`] for why.
     F16,
 }
 
@@ -124,11 +124,13 @@ impl TargetDtype {
     /// duplication Phase 7.6 exists to remove.
     ///
     /// Total and infallible: every `TargetDtype` is an output width by
-    /// construction, which is the point of the type.
+    /// construction, which is the point of the type. Also how the CLI turns
+    /// `--out-dtype` / `--to` into the `Dtype` the library's path derivation
+    /// takes, so the CLI keeps no dtype vocabulary of its own.
     ///
-    /// Gated on `gguf` because that is where the two dispatch styles meet; a
-    /// build without it has only one and needs no bridge.
-    #[cfg(feature = "gguf")]
+    /// Gated on the two features that need the bridge: `gguf`, where the
+    /// `remember` and `convert` dispatch styles meet, and `cli`.
+    #[cfg(any(feature = "gguf", feature = "cli"))]
     #[must_use]
     pub(crate) const fn as_dtype(self) -> Dtype {
         match self {
@@ -141,10 +143,8 @@ impl TargetDtype {
 
 impl fmt::Display for TargetDtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Wildcard-free on purpose: `src/cli.rs`'s `derive_output_path` builds
-        // the output filename's dtype suffix from this string, so a new variant
-        // that fell through to a catch-all would silently produce a wrongly
-        // named file rather than failing to compile.
+        // Wildcard-free on purpose: a new variant that fell through to a
+        // catch-all would print a wrong name rather than failing to compile.
         match self {
             Self::BF16 => f.write_str("BF16"),
             Self::F32 => f.write_str("F32"),
@@ -317,10 +317,7 @@ pub fn parse_bytes(bytes: Vec<u8>) -> crate::Result<ParsedModel> {
 ///
 /// Takes ownership of `bytes` (no copy); peak heap is the input size.
 pub fn parse_bytes_with_limits(bytes: Vec<u8>, limits: &ParseLimits) -> crate::Result<ParsedModel> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "safetensors bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "safetensors bytes")?;
+    limits.check_owned_input(&bytes, "safetensors bytes")?;
     parsed_model_from_backing(Backing::Owned(bytes), limits)
 }
 
@@ -431,9 +428,9 @@ pub(crate) fn resolve_thread_budget(_threads: Option<usize>) -> usize {
 
 /// Caller-supplied options for the `remember` family of methods.
 ///
-/// Currently carries only the per-tensor dequantisation thread budget; the
-/// `#[non_exhaustive]` attribute lets future knobs be added without a breaking
-/// change. Construct with [`RememberOptions::new`] (or
+/// Carries the per-tensor dequantisation thread budget and an optional
+/// [`CancelToken`](crate::CancelToken); the `#[non_exhaustive]` attribute lets
+/// future knobs be added without a breaking change. Construct with [`RememberOptions::new`] (or
 /// [`RememberOptions::default`], which is identical) and chain the setters:
 ///
 /// ```rust
@@ -472,14 +469,24 @@ impl RememberOptions {
     /// Returns options with the built-in defaults (the
     /// `min(available_parallelism, 4)` thread budget).
     ///
-    /// `const`: the struct is a single `Option<usize>`, so there is nothing to
-    /// allocate.
+    /// `const`: both fields start as `None`, so there is nothing to allocate.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             threads: None,
             cancel: None,
         }
+    }
+
+    /// Attaches a cancellation handle, polled once per tensor.
+    ///
+    /// Keep a clone: the token is how another thread — a signal handler, a
+    /// watchdog, a request-timeout task — reaches an in-flight call. See
+    /// [`crate::cancel`] for the `PyO3` shape this exists for.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Sets the per-tensor dequantisation thread budget (clamped to at least 1).
@@ -497,17 +504,6 @@ impl RememberOptions {
     /// let opts = RememberOptions::new().with_threads(2);
     /// assert_eq!(opts.threads, Some(2));
     /// ```
-    /// Attaches a cancellation handle, polled once per tensor.
-    ///
-    /// Keep a clone: the token is how another thread — a signal handler, a
-    /// watchdog, a request-timeout task — reaches an in-flight call. See
-    /// [`crate::cancel`] for the `PyO3` shape this exists for.
-    #[must_use]
-    pub fn with_cancel(mut self, cancel: crate::CancelToken) -> Self {
-        self.cancel = Some(cancel);
-        self
-    }
-
     #[must_use]
     pub fn with_threads(mut self, n: usize) -> Self {
         self.threads = Some(n.max(1));
@@ -770,6 +766,8 @@ impl ParsedModel {
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_with_options(
         &self,
         output_path: impl AsRef<Path>,
@@ -827,6 +825,8 @@ impl ParsedModel {
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_with_progress_and_options<F>(
         &self,
         output_path: impl AsRef<Path>,
@@ -860,7 +860,7 @@ impl ParsedModel {
     /// bytes in memory, instead of writing a file.
     ///
     /// The in-memory twin of [`remember`](Self::remember): identical dequant and
-    /// companion-grouping, but returns the serialized `BF16` safetensors as a
+    /// companion-grouping, but returns the serialized safetensors, at the requested width, as a
     /// `Vec<u8>` so an embedder can load the dequantised model without a disk
     /// round-trip (e.g. candle-mi's quantized loader → `from_buffered_safetensors`).
     /// Completes the file/bytes pairing the crate's other serializers already
@@ -901,7 +901,7 @@ impl ParsedModel {
     ///
     /// The in-memory twin of [`remember_with_options`](Self::remember_with_options):
     /// identical dequant and companion-grouping, byte-identical output for any
-    /// thread count, but returns the serialized `BF16` safetensors as a `Vec<u8>`
+    /// thread count, but returns the serialized safetensors as a `Vec<u8>`
     /// instead of writing a file.
     ///
     /// # Errors
@@ -911,6 +911,8 @@ impl ParsedModel {
     /// serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     pub fn remember_to_bytes_with_options(
         &self,
         target: TargetDtype,
@@ -1576,19 +1578,8 @@ impl ParsedModel {
         // a time, so the file path's peak stays at the dequantised set — unlike
         // `remember_to_bytes`, which holds the whole serialized `Vec`.
         let metadata = self.header.metadata.clone();
-        safetensors::tensor::serialize_to_file(views, metadata, output_path).map_err(
-            // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
-            // we extract IoError and treat everything else as a parse/format error.
-            #[allow(clippy::wildcard_enum_match_arm)]
-            |e| match e {
-                safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
-                other => AnamnesisError::Parse {
-                    reason: format!("failed to write safetensors file: {other}"),
-                },
-            },
-        )?;
-
-        Ok(())
+        safetensors::tensor::serialize_to_file(views, metadata, output_path)
+            .map_err(crate::convert::map_serialize_err)
     }
 
     /// Internal: dequantize to `E` and return the serialized safetensors bytes.
@@ -1602,9 +1593,7 @@ impl ParsedModel {
         let views = self.build_views::<E>(&dequantized_data, &passthrough_refs)?;
 
         let metadata = self.header.metadata.clone();
-        safetensors::tensor::serialize(views, metadata).map_err(|e| AnamnesisError::Parse {
-            reason: format!("failed to serialize safetensors bytes: {e}"),
-        })
+        safetensors::tensor::serialize(views, metadata).map_err(crate::convert::map_serialize_err)
     }
 }
 
@@ -1658,12 +1647,9 @@ fn parse_bnb_quant_state_shape(
         .collect::<crate::Result<_>>()?;
 
     // Validate: product of recovered shape must equal total_elements.
-    let product: usize = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("quant_state shape overflow for `{weight_name}`"),
-        })?;
+    let product = checked_num_elements(&shape).ok_or_else(|| AnamnesisError::Parse {
+        reason: format!("quant_state shape overflow for `{weight_name}`"),
+    })?;
 
     if product != total_elements {
         return Err(AnamnesisError::Parse {

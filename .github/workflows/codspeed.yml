@@ -34,11 +34,8 @@
 # structural rather than a matter of remembering.
 #
 # WHAT IT STILL BUYS. Nobody runs a local benchmark on every merge. This job
-# does, and it holds the ARM time series that would otherwise not exist.
-#
-# *** TEMPORARILY OFF: see the dated note on the `on:` block below. The org's
-# *** August macro-runner allowance is spent; the trigger returns 2026-08-31.
-# *** Nothing else in this file changed, and none of the reasoning above did.
+# runs on every push to `main` that touches code (see the `paths:` filter), and
+# it holds the ARM time series that would otherwise not exist.
 #
 # Macro runners require a GitHub *organization* (not a personal account) and
 # draw from the org's monthly macro-runner minutes. The local best-of-N protocol
@@ -46,39 +43,27 @@
 name: CodSpeed (aarch64 drift watch)
 
 on:
-  # ==========================================================================
-  # DISABLED 2026-08-23. RE-ENABLE ON 2026-08-31 by uncommenting `push:` below.
-  # ==========================================================================
+  # QUOTA, AND WHY THE `paths:` FILTER EXISTS. The organisation's free plan is
+  # 600 macro-runner minutes a month, about 33 runs of this ~18-minute suite.
+  # Phase 7.7 spent 22 in three days, 16 of them on pushes to `main` that
+  # changed only documentation, and CodSpeed disabled the runners for the rest
+  # of August 2026. The trigger was commented out from 2026-08-23 until the
+  # v0.7.8 close-out re-enabled it. A benchmark suite has no business running
+  # on a commit that changes only comments; on Phase 7.7's own history this
+  # filter would have cut the `main` runs by roughly half.
   #
-  # The organisation exhausted its 600 free macro-runner minutes for August and
-  # CodSpeed disabled the runners until 2026-08-31, when the allowance resets.
-  # Left commented rather than deleted: a workflow that fails on every push to
-  # `main` for nine days trains readers to click past a red check, which is the
-  # exact failure Phase 7.7 item 11 was about.
-  #
-  # WHY THE QUOTA WENT. 600 minutes against an ~18-minute suite is about 33 runs
-  # a month. Phase 7.7 spent 22 in three days, and *16 of those were pushes to
-  # `main`* -- most of them documentation commits that could not possibly move a
-  # benchmark. Dropping the `pull_request` trigger earlier in the phase fixed the
-  # signal problem (verdicts rendered on the wrong architecture) but not the cost
-  # problem, because `main` pushes were always the majority.
-  #
-  # HENCE THE `paths:` FILTER BELOW, which should have been there from the start
-  # and is the durable half of this fix. A benchmark suite has no business
-  # running on a commit that changes only comments. On Phase 7.7's own history it
-  # would have cut the `main` runs by roughly half.
-  #
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'src/**'
-  #     - 'benches/**'
-  #     - 'Cargo.toml'
-  #     - 'Cargo.lock'
-  #     - '.github/workflows/codspeed.yml'
-  #
-  # `workflow_dispatch` stays live so a deliberate run can be triggered by hand
-  # once the allowance resets, without waiting for a qualifying push.
+  # If the allowance runs out again, comment `push:` out with a dated note
+  # rather than leaving the job failing: a red check on every push trains
+  # readers to click past it, which is the failure Phase 7.7 item 11 was about.
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/codspeed.yml'
+  # A deliberate run, e.g. to record a baseline at a release tag.
   workflow_dispatch:
 
 jobs:
@@ -98,7 +83,7 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      # Every feature the three bench targets require, listed explicitly rather
+      # Every feature the four bench targets require, listed explicitly rather
       # than via `--all-features`, because ONE feature must stay off here:
       # `bench-fileio`. It compiles the two file-writing groups in
       # `benches/convert.rs`, which on macro runners measure CI storage rather
@@ -106,7 +91,7 @@ jobs:
       # CodSpeed BASE disagrees with criterion's own median by ~2×. See the
       # `bench-fileio` entry in `Cargo.toml` for the numbers.
       #
-      # Required-features by target: dequant needs gptq/awq/bnb/gguf, parsing
+      # Required-features by target: ab and dequant need gptq/awq/bnb/gguf, parsing
       # needs npz/pth/gguf, convert needs gguf. `parallel` is on by default.
       - name: Build the benchmark targets
         run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth

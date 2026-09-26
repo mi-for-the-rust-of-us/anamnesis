@@ -1,16 +1,18 @@
 # PLAN — Upstreaming anamnesis's pickle-VM hardening to candle (#3617)
 
+> **HISTORICAL (archived at the v0.7.8 close-out).** A plan written on 2026-06-17, when anamnesis was at v0.6.8. It records the upstreaming proposal as it stood then; for the current status of candle#3617, see the issue itself.
+
 **Status:** Proposed (issue posted, no PR yet)
 **Date:** 2026-06-17
 **Upstream issue:** [huggingface/candle#3617](https://github.com/huggingface/candle/issues/3617) — *"Unbounded pickle-VM working set in `candle-core/src/pickle.rs` (DoS via crafted `.pth`)"* (opened by PCfVW, 2026-06-13)
-**Reference implementation:** `anamnesis ≥ 0.6.6` (current 0.6.8), [`src/parse/pth.rs`](../src/parse/pth.rs)
-**Relation to other docs:** continues the [`security-audit-brief.md`](security-audit-brief.md) / [`security-audit-findings.md`](security-audit-findings.md) theme; this one targets *upstream* (candle) rather than anamnesis itself.
+**Reference implementation:** `anamnesis ≥ 0.6.6` (current 0.6.8), [`src/parse/pth.rs`](../../src/parse/pth.rs)
+**Relation to other docs:** continues the the private `docs/security-audit-brief.md` / the private `docs/security-audit-findings.md` theme; this one targets *upstream* (candle) rather than anamnesis itself.
 
 ---
 
 ## Why this doc lives in anamnesis
 
-The fix being upstreamed is anamnesis's own pickle-VM hardening (Phase 6.11, shipped v0.6.6, `cargo-fuzz`-ed). candle's `pickle.rs` has the same structural vulnerability anamnesis already closed, so this is "port our hardening to the upstream that inspired the dogfooding." The issue was surfaced via the hf-fetch-model candle-engagement work ([`hf-fetch-model/docs/issues/`](../../hf-fetch-model/docs/issues/) archives the reply trail); a one-line cross-link from there back to this plan keeps the two projects' records consistent.
+The fix being upstreamed is anamnesis's own pickle-VM hardening (Phase 6.11, shipped v0.6.6, `cargo-fuzz`-ed). candle's `pickle.rs` has the same structural vulnerability anamnesis already closed, so this is "port our hardening to the upstream that inspired the dogfooding." The issue was surfaced via the hf-fetch-model candle-engagement work ([`hf-fetch-model/docs/issues/`](../../../hf-fetch-model/docs/issues/) archives the reply trail); a one-line cross-link from there back to this plan keeps the two projects' records consistent.
 
 ---
 
@@ -46,7 +48,7 @@ Open, **0 maintainer comments** as of 2026-06-17. Body includes 3 minimal PoCs a
 
 ## The design to port (anamnesis `pth.rs`, verified)
 
-anamnesis's `PickleVm` closes exactly these vectors. The working-set + depth governance below is **Phase 6.11 (anamnesis v0.6.6)**; the `MAX_PKL_SIZE` (100 MiB opcode-stream) and `MAX_PICKLE_PAYLOAD` (64 MiB per-item) caps predate it (v0.6.1–v0.6.3). candle's `pickle.rs` currently has **none** of these, so the PR adds the full stack. The mechanisms (all in [`src/parse/pth.rs`](../src/parse/pth.rs)):
+anamnesis's `PickleVm` closes exactly these vectors. The working-set + depth governance below is **Phase 6.11 (anamnesis v0.6.6)**; the `MAX_PKL_SIZE` (100 MiB opcode-stream) and `MAX_PICKLE_PAYLOAD` (64 MiB per-item) caps predate it (v0.6.1–v0.6.3). candle's `pickle.rs` currently has **none** of these, so the PR adds the full stack. The mechanisms (all in [`src/parse/pth.rs`](../../src/parse/pth.rs)):
 
 | Mechanism | anamnesis | Purpose |
 |---|---|---|
@@ -56,7 +58,7 @@ anamnesis's `PickleVm` closes exactly these vectors. The working-set + depth gov
 | `deep_size` charged **before** the clone | `memoize_top` / `memo_get_clone` | reject an over-budget memo without allocating the duplicate |
 | O(1) per opcode | depth tracked in `meta_stack`; deep walk only on memo-clone opcodes; memo stores `(value, SlotMeta)` | avoids an O(n²) CPU-DoS **in the guard itself** (a naive per-push deep walk would be the new bug) |
 
-`cargo-fuzz`-ed — per anamnesis [`fuzz/README.md`](../fuzz/README.md), the pickle/PTH targets ran clean: latest seeded campaign `fuzz_pth` **381k** runs, `fuzz_pth_limits` **193k** (earlier phases: 213k / 224k). The only crash any campaign surfaced was in the **NPZ** NPY-descriptor parser (`parse_descr`), unrelated to pickle and since fixed. **Accuracy note:** #3617 originally posted `fuzz_pth` 385k / `fuzz_pth_limits` 508k pointing at the CHANGELOG — both wrong (508k matched no PTH target; nearest is `fuzz_npz_parse` 503k). **Corrected in the live issue 2026-06-18** to the `fuzz/README.md` figures above.
+`cargo-fuzz`-ed — per anamnesis [`fuzz/README.md`](../../fuzz/README.md), the pickle/PTH targets ran clean: latest seeded campaign `fuzz_pth` **381k** runs, `fuzz_pth_limits` **193k** (earlier phases: 213k / 224k). The only crash any campaign surfaced was in the **NPZ** NPY-descriptor parser (`parse_descr`), unrelated to pickle and since fixed. **Accuracy note:** #3617 originally posted `fuzz_pth` 385k / `fuzz_pth_limits` 508k pointing at the CHANGELOG — both wrong (508k matched no PTH target; nearest is `fuzz_npz_parse` 503k). **Corrected in the live issue 2026-06-18** to the `fuzz/README.md` figures above.
 
 ---
 

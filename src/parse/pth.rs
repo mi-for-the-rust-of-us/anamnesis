@@ -38,7 +38,9 @@ use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::safetensors::Dtype;
-use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
+use crate::parse::utils::{
+    PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, saturating_num_elements_u64,
+};
 // `ZipSource` is in scope for the reader-path `total_len` / `read_at` calls on
 // the vendored `ReaderSource`; the trait methods are otherwise unreachable.
 use crate::ParseLimits;
@@ -176,7 +178,7 @@ impl PthDtype {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
     /// exists (currently all variants map successfully).
-    pub fn to_dtype(self) -> crate::Result<Dtype> {
+    pub const fn to_dtype(self) -> crate::Result<Dtype> {
         match self {
             Self::F16 => Ok(Dtype::F16),
             Self::BF16 => Ok(Dtype::BF16),
@@ -198,7 +200,7 @@ impl PthDtype {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if no `safetensors` equivalent
     /// exists (currently all variants map successfully).
-    pub fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
+    pub const fn to_safetensors_dtype(self) -> crate::Result<safetensors::Dtype> {
         match self {
             Self::F16 => Ok(safetensors::Dtype::F16),
             Self::BF16 => Ok(safetensors::Dtype::BF16),
@@ -421,76 +423,56 @@ impl ParsedPth {
                 .ok_or_else(|| AnamnesisError::Parse {
                     reason: format!("ZIP entry `{storage_suffix}` not found"),
                 })?;
-            let storage = self
-                .buffer
-                .get(storage_start..storage_start + storage_len)
-                .ok_or_else(|| AnamnesisError::Parse {
+            let storage_end =
+                storage_start
+                    .checked_add(storage_len)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("storage `{}`: end offset overflow", m.storage_key),
+                    })?;
+            let storage = self.buffer.get(storage_start..storage_end).ok_or_else(|| {
+                AnamnesisError::Parse {
                     reason: format!("storage `{}`: backing slice out of bounds", m.storage_key),
-                })?;
+                }
+            })?;
 
             let elem_size = m.dtype.byte_size();
-            let data: Cow<'_, [u8]> = if is_contiguous(&m.shape, &m.strides) && !self.big_endian {
-                // Zero-copy: borrow directly from the mmap.
-                let n_elements: usize = m
-                    .shape
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            let data: Cow<'_, [u8]> = if is_contiguous(&m.shape, &m.strides) {
+                let n_bytes = checked_num_elements(&m.shape)
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("tensor `{}`: element count overflow", m.name),
-                    })?;
-                let n_bytes =
-                    n_elements
-                        .checked_mul(elem_size)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("tensor `{}`: byte count overflow", m.name),
-                        })?;
-                let end =
-                    m.storage_offset
-                        .checked_add(n_bytes)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
-                        })?;
-                Cow::Borrowed(storage.get(m.storage_offset..end).ok_or_else(|| {
-                    AnamnesisError::Parse {
-                        reason: format!(
-                            "tensor `{}`: storage read out of bounds \
-                             ([{}..{}], storage len = {})",
-                            m.name,
-                            m.storage_offset,
-                            end,
-                            storage.len()
-                        ),
-                    }
-                })?)
-            } else if is_contiguous(&m.shape, &m.strides) {
-                // Contiguous but big-endian: copy + byte-swap.
-                let n_elements: usize = m
-                    .shape
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: element count overflow", m.name),
-                    })?;
-                let n_bytes =
-                    n_elements
-                        .checked_mul(elem_size)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("tensor `{}`: byte count overflow", m.name),
-                        })?;
-                let end =
-                    m.storage_offset
-                        .checked_add(n_bytes)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
-                        })?;
-                let mut buf = storage
-                    .get(m.storage_offset..end)
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: storage read out of bounds", m.name),
                     })?
-                    .to_vec();
-                byteswap_inplace(&mut buf, elem_size);
-                Cow::Owned(buf)
+                    .checked_mul(elem_size)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("tensor `{}`: byte count overflow", m.name),
+                    })?;
+                let end =
+                    m.storage_offset
+                        .checked_add(n_bytes)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
+                        })?;
+                let bytes =
+                    storage
+                        .get(m.storage_offset..end)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!(
+                                "tensor `{}`: storage read out of bounds \
+                             ([{}..{}], storage len = {})",
+                                m.name,
+                                m.storage_offset,
+                                end,
+                                storage.len()
+                            ),
+                        })?;
+                if self.big_endian {
+                    // Contiguous but big-endian: copy + byte-swap.
+                    let mut buf = bytes.to_vec();
+                    byteswap_inplace(&mut buf, elem_size);
+                    Cow::Owned(buf)
+                } else {
+                    // Zero-copy: borrow directly from the backing.
+                    Cow::Borrowed(bytes)
+                }
             } else {
                 // Non-contiguous: copy to contiguous layout.
                 let mut buf =
@@ -618,13 +600,7 @@ impl ParsedPth {
 fn build_pth_tensor_info(meta: &[TensorMeta]) -> Vec<PthTensorInfo> {
     meta.iter()
         .map(|m| {
-            // CAST: usize → u64, shape dims and dtype byte size fit in u64
-            #[allow(clippy::as_conversions)]
-            let n_elements: u64 = m
-                .shape
-                .iter()
-                .copied()
-                .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
+            let n_elements = saturating_num_elements_u64(&m.shape);
             // CAST: usize → u64, byte size of a single element is ≤ 8 → fits
             #[allow(clippy::as_conversions)]
             let byte_size = m.dtype.byte_size() as u64;
@@ -2045,12 +2021,9 @@ fn copy_to_contiguous(
         });
     }
 
-    let n_elements: usize = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "element count overflow".into(),
-        })?;
+    let n_elements = checked_num_elements(shape).ok_or_else(|| AnamnesisError::Parse {
+        reason: "element count overflow".into(),
+    })?;
     let out_bytes = n_elements
         .checked_mul(elem_size)
         .ok_or_else(|| AnamnesisError::Parse {
@@ -2266,22 +2239,13 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
     let raw: &[u8] = &buffer;
 
     // Legacy format detection: check ZIP magic before attempting to parse.
-    let magic = raw.get(..4).ok_or_else(|| AnamnesisError::Parse {
-        reason: "file too small to be a .pth archive".into(),
-    })?;
-    if magic.first() == Some(&0x80) && magic.get(1).is_some_and(|&b| b <= 0x05) {
-        return Err(AnamnesisError::Unsupported {
-            format: "pth".into(),
-            detail: "legacy .pth format (pre-PyTorch 1.6) is not supported; \
-                     re-save with torch.save()"
-                .into(),
-        });
-    }
-    if magic != b"PK\x03\x04" {
-        return Err(AnamnesisError::Parse {
-            reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
-        });
-    }
+    let magic: [u8; 4] = raw
+        .get(..4)
+        .and_then(|m| m.try_into().ok())
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: "file too small to be a .pth archive".into(),
+        })?;
+    check_pth_magic(magic)?;
 
     // 1. Pre-index all ZIP entry names → (data_start, size) for O(1) lookup,
     //    over the vendored central-directory reader (Phase 6.12). This replaces
@@ -2292,25 +2256,15 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
         Some((start, len)) => {
-            let bytes = raw
-                .get(start..start + len)
+            let end = start
+                .checked_add(len)
                 .ok_or_else(|| AnamnesisError::Parse {
-                    reason: "byteorder entry out of bounds".into(),
+                    reason: "byteorder entry end offset overflow".into(),
                 })?;
-            let text = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
-                reason: format!("byteorder entry is not UTF-8: {e}"),
+            let bytes = raw.get(start..end).ok_or_else(|| AnamnesisError::Parse {
+                reason: "byteorder entry out of bounds".into(),
             })?;
-            match text.trim() {
-                "little" => false,
-                "big" => true,
-                other => {
-                    return Err(AnamnesisError::Parse {
-                        reason: format!(
-                            "unknown byte order `{other}` (expected `little` or `big`)"
-                        ),
-                    });
-                }
-            }
+            parse_byteorder(bytes)?
         }
         None => false, // default: little-endian
     };
@@ -2400,10 +2354,7 @@ pub fn parse_pth_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<ParsedPth> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "pth bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "pth bytes")?;
+    limits.check_owned_input(&bytes, "pth bytes")?;
     parsed_pth_from_backing(Backing::Owned(bytes), limits)
 }
 
@@ -2521,13 +2472,7 @@ fn build_pth_inspect_info(
     let mut total_bytes: u64 = 0;
     let mut dtypes: Vec<PthDtype> = Vec::new();
     for m in meta {
-        // CAST: usize → u64, element counts and byte sizes fit in u64
-        #[allow(clippy::as_conversions)]
-        let n_elements: u64 = m
-            .shape
-            .iter()
-            .copied()
-            .fold(1u64, |acc, d| acc.saturating_mul(d as u64));
+        let n_elements = saturating_num_elements_u64(&m.shape);
         // CAST: usize → u64, byte size of a single element is ≤ 8 → fits
         #[allow(clippy::as_conversions)]
         let byte_size = m.dtype.byte_size() as u64;
@@ -2838,21 +2783,7 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
     // same precedent as the mmap-backed `parse_pth`.
     let mut magic = [0u8; 4];
     src.read_at(0, &mut magic)?;
-    // INDEX: `magic` is a fixed 4-byte array; [0]/[1] are always in bounds.
-    #[allow(clippy::indexing_slicing)]
-    if magic[0] == 0x80 && magic[1] <= 0x05 {
-        return Err(AnamnesisError::Unsupported {
-            format: "pth".into(),
-            detail: "legacy .pth format (pre-PyTorch 1.6) is not supported; \
-                     re-save with torch.save()"
-                .into(),
-        });
-    }
-    if magic != *b"PK\x03\x04" {
-        return Err(AnamnesisError::Parse {
-            reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
-        });
-    }
+    check_pth_magic(magic)?;
 
     // Walk the central directory once over the vendored reader to locate
     // `data.pkl` and (optional) `byteorder` by suffix — same suffix-stripping
@@ -2861,19 +2792,11 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
     // by the caller's `limits` (the permanent ZIP_MAX_ENTRIES floor always
     // applies inside the reader regardless).
     let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
-    let mut pkl_entry: Option<&crate::parse::zip::ZipEntry> = None;
-    let mut byteorder_entry: Option<&crate::parse::zip::ZipEntry> = None;
-    for entry in &entries {
-        let suffix = crate::parse::zip::strip_archive_prefix(&entry.name);
-        if suffix == "data.pkl" && pkl_entry.is_none() {
-            pkl_entry = Some(entry);
-        } else if suffix == "byteorder" && byteorder_entry.is_none() {
-            byteorder_entry = Some(entry);
-        }
-    }
-    let pkl_entry = pkl_entry.ok_or_else(|| AnamnesisError::Parse {
-        reason: "ZIP entry `data.pkl` not found".into(),
-    })?;
+    let byteorder_entry = find_unique_entry(&entries, "byteorder")?;
+    let pkl_entry =
+        find_unique_entry(&entries, "data.pkl")?.ok_or_else(|| AnamnesisError::Parse {
+            reason: "ZIP entry `data.pkl` not found".into(),
+        })?;
 
     // Bounded by the caller's `limits`, layered on top of the permanent
     // MAX_PKL_SIZE cap enforced inside `enforce_pkl_size_cap` itself.
@@ -2891,26 +2814,12 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
                     ),
                 });
             }
-            let buf = read_pth_entry_bytes(&mut src, entry)?;
-            let text = std::str::from_utf8(&buf).map_err(|e| AnamnesisError::Parse {
-                reason: format!("byteorder entry is not UTF-8: {e}"),
-            })?;
-            match text.trim() {
-                "little" => false,
-                "big" => true,
-                other => {
-                    return Err(AnamnesisError::Parse {
-                        reason: format!(
-                            "unknown byte order `{other}` (expected `little` or `big`)"
-                        ),
-                    });
-                }
-            }
+            parse_byteorder(&read_pth_entry_bytes(&mut src, entry, limits)?)?
         }
         None => false, // default: little-endian
     };
 
-    let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry)?;
+    let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry, limits)?;
     Ok((big_endian, pkl_bytes))
 }
 
@@ -3069,12 +2978,25 @@ fn build_front_matter_inspect_info(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
-/// method other than `STORED` or `DEFLATE`, [`AnamnesisError::Parse`] if the
-/// local header is malformed, or [`AnamnesisError::Io`] if a read fails.
+/// method other than `STORED` or `DEFLATE`.
+/// Returns [`AnamnesisError::LimitExceeded`] if the entry's declared expansion
+/// ratio exceeds `limits`' `max_decompression_ratio`.
+/// Returns [`AnamnesisError::Parse`] if the local header is malformed or the
+/// entry's bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_pth_entry_bytes<R: Read + Seek>(
     src: &mut crate::parse::zip::ReaderSource<R>,
     entry: &crate::parse::zip::ZipEntry,
+    limits: &ParseLimits,
 ) -> crate::Result<Vec<u8>> {
+    // Zip-bomb guard from archive metadata, before reading: the caller's
+    // expansion-ratio budget, exactly as the `.npz` path applies it. `STORED`
+    // entries have ratio 1 and pass.
+    limits.check_decompression_ratio(
+        entry.uncompressed_size,
+        entry.compressed_size,
+        &entry.name,
+    )?;
     // Already capped by the caller (`enforce_pkl_size_cap` / the byteorder cap).
     let limit = entry.uncompressed_size;
     let raw = src.entry_data_reader(entry)?;
@@ -3096,11 +3018,101 @@ fn read_pth_entry_bytes<R: Read + Seek>(
     // Grows as bytes arrive, bounded by `take` — never an eager declared-size
     // allocation, never an unbounded inflation.
     let mut buf = Vec::new();
-    reader
-        .take(limit)
-        .read_to_end(&mut buf)
-        .map_err(AnamnesisError::Io)?;
+    reader.take(limit).read_to_end(&mut buf).map_err(|e| {
+        crate::parse::utils::classify_decode_error(e, &format!("ZIP entry `{}`", entry.name))
+    })?;
     Ok(buf)
+}
+
+/// Checks a `.pth` file's first four bytes: a legacy (pre-1.6) raw pickle is
+/// reported as [`AnamnesisError::Unsupported`], anything else that is not a
+/// `ZIP` local-file header as [`AnamnesisError::Parse`].
+///
+/// Shared by the mmap / bytes path and the reader path so the two diagnostics
+/// cannot drift apart.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if `magic` starts a legacy pickle.
+/// Returns [`AnamnesisError::Parse`] if `magic` is not `PK\x03\x04`.
+fn check_pth_magic(magic: [u8; 4]) -> crate::Result<()> {
+    let [first, second, ..] = magic;
+    if first == 0x80 && second <= 0x05 {
+        return Err(AnamnesisError::Unsupported {
+            format: "pth".into(),
+            detail: "legacy .pth format (pre-PyTorch 1.6) is not supported; \
+                     re-save with torch.save()"
+                .into(),
+        });
+    }
+    if magic != *b"PK\x03\x04" {
+        return Err(AnamnesisError::Parse {
+            reason: "file is not a ZIP archive (missing PK\\x03\\x04 magic)".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Parses a `.pth` `byteorder` entry, returning `true` for big-endian.
+///
+/// Shared by the mmap / bytes path and the reader path.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `bytes` is not UTF-8 or names a byte
+/// order other than `little` or `big`.
+fn parse_byteorder(bytes: &[u8]) -> crate::Result<bool> {
+    let text = std::str::from_utf8(bytes).map_err(|e| AnamnesisError::Parse {
+        reason: format!("byteorder entry is not UTF-8: {e}"),
+    })?;
+    match text.trim() {
+        "little" => Ok(false),
+        "big" => Ok(true),
+        other => Err(AnamnesisError::Parse {
+            reason: format!("unknown byte order `{other}` (expected `little` or `big`)"),
+        }),
+    }
+}
+
+/// Finds the single central-directory entry whose archive-stripped suffix is
+/// `suffix`, rejecting an archive that names it more than once.
+///
+/// Both `.pth` entry paths resolve `data.pkl` and `byteorder` through this one
+/// helper: the mmap / bytes path ([`build_entry_index`]) and the reader path
+/// ([`read_pth_archive_for_inspect`]). They used to disagree on a duplicate,
+/// the first keeping the last copy and the second the first, so a crafted
+/// archive could show inspect one pickle and hand parse another. Real
+/// `torch.save` archives never repeat an entry, so rejecting is invisible to
+/// honest input.
+///
+/// Every entry is considered regardless of compression method, because the
+/// reader path inflates `DEFLATE` entries that the mmap path skips.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if two entries share `suffix`.
+fn find_unique_entry<'a>(
+    entries: &'a [crate::parse::zip::ZipEntry],
+    suffix: &str,
+) -> crate::Result<Option<&'a crate::parse::zip::ZipEntry>> {
+    let mut found: Option<&crate::parse::zip::ZipEntry> = None;
+    // EXPLICIT: a stateful scan that must see the second match to reject it;
+    // `.find()` would stop at the first and hide the duplicate.
+    for entry in entries {
+        if crate::parse::zip::strip_archive_prefix(&entry.name) != suffix {
+            continue;
+        }
+        if let Some(first) = found {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "duplicate ZIP entry `{suffix}` in .pth archive (`{}` and `{}`)",
+                    first.name, entry.name
+                ),
+            });
+        }
+        found = Some(entry);
+    }
+    Ok(found)
 }
 
 /// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`,
@@ -3120,9 +3132,17 @@ fn read_pth_entry_bytes<R: Read + Seek>(
 /// Returns [`AnamnesisError::Parse`] if the central directory is malformed, a
 /// local-header data offset cannot be resolved, `data_start` or `size`
 /// overflows `usize`, or an entry's byte range exceeds the file size.
+/// Returns [`AnamnesisError::Parse`] if two entries share a suffix.
 fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryIndex> {
     let mut src = crate::parse::zip::SliceSource::new(raw);
     let entries = crate::parse::zip::read_central_directory(&mut src, limits)?;
+
+    // Resolve the two control entries through the same duplicate-rejecting
+    // lookup the reader path uses, over *every* entry: the index below keeps
+    // `STORED` entries only, so a `STORED` + `DEFLATE` pair of `data.pkl` would
+    // otherwise pass here and still disagree with the reader path.
+    find_unique_entry(&entries, "data.pkl")?;
+    find_unique_entry(&entries, "byteorder")?;
 
     // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
     // an eager `with_capacity` ~proportional to the file size. The Vec grows as
@@ -3163,15 +3183,19 @@ fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryInd
         }
     }
 
-    // Sort for binary-search lookup. On a duplicate suffix (pathological —
-    // real `.pth` entry names are unique) keep the last-pushed, matching the
-    // prior `HashMap` insert semantics: a stable sort leaves equal keys in push
-    // order, so reversing puts the last-pushed first, `dedup_by` keeps that
-    // first-of-run, and reversing again restores ascending order.
+    // Sort for binary-search lookup, then reject a repeated suffix. Real `.pth`
+    // entry names are unique; an archive that repeats one is ambiguous about
+    // which bytes a tensor owns, so it is refused rather than resolved by a
+    // first-wins or last-wins rule a reader of the file could not predict.
     index.sort_by(|a, b| a.0.cmp(&b.0));
-    index.reverse();
-    index.dedup_by(|a, b| a.0 == b.0);
-    index.reverse();
+    if let Some(suffix) = index.windows(2).find_map(|pair| match pair {
+        [a, b] if a.0 == b.0 => Some(&a.0),
+        _ => None,
+    }) {
+        return Err(AnamnesisError::Parse {
+            reason: format!("duplicate ZIP entry `{suffix}` in .pth archive"),
+        });
+    }
     // Reclaim the `push`-growth capacity slack (a `Vec` over-allocates up to ~2×
     // while growing): the index is now immutable, so trim it to exact length —
     // this is what keeps resident bytes/entry near the theoretical floor.
@@ -4154,6 +4178,142 @@ mod tests {
             msg.contains("data.pkl") && msg.contains("not found"),
             "expected 'data.pkl not found' (compressed entries are skipped), got: {msg}"
         );
+    }
+
+    /// Builds an in-memory `.pth`-shaped ZIP from `(name, method, data)`
+    /// entries. Duplicate *suffixes* are expressed through distinct archive
+    /// prefixes (`a/data.pkl`, `b/data.pkl`), because the `zip` writer refuses
+    /// two identical names while the parser keys on the prefix-stripped suffix.
+    fn zip_with_entries(entries: &[(&str, zip::CompressionMethod, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            for &(name, method, data) in entries {
+                let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// Asserts that every `.pth` entry path (owned-bytes parse, reader
+    /// inspect, reader front matter) rejects `bytes` naming `suffix` twice.
+    fn assert_duplicate_rejected_everywhere(bytes: &[u8], suffix: &str) {
+        let needle = format!("duplicate ZIP entry `{suffix}`");
+        let parse = parse_pth_bytes(bytes.to_vec()).unwrap_err().to_string();
+        assert!(parse.contains(&needle), "parse: {parse}");
+        let inspect = inspect_pth_from_reader(std::io::Cursor::new(bytes))
+            .unwrap_err()
+            .to_string();
+        assert!(inspect.contains(&needle), "inspect: {inspect}");
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(bytes))
+            .unwrap_err()
+            .to_string();
+        assert!(front.contains(&needle), "front matter: {front}");
+    }
+
+    const EMPTY_DICT_PICKLE: &[u8] = b"\x80\x02}.";
+
+    // Duplicate `data.pkl`: parse used to keep the last copy and inspect the
+    // first, so the two paths could interpret different pickles.
+    #[test]
+    fn duplicate_data_pkl_rejected_on_every_path() {
+        let stored = zip::CompressionMethod::Stored;
+        let bytes = zip_with_entries(&[
+            ("a/data.pkl", stored, EMPTY_DICT_PICKLE),
+            ("b/data.pkl", stored, EMPTY_DICT_PICKLE),
+        ]);
+        assert_duplicate_rejected_everywhere(&bytes, "data.pkl");
+    }
+
+    // A `STORED` + `DEFLATE` pair: the mmap/bytes index skips the `DEFLATE`
+    // copy, so only a check over every entry catches this one.
+    #[test]
+    fn duplicate_data_pkl_across_compression_methods_rejected() {
+        let bytes = zip_with_entries(&[
+            (
+                "a/data.pkl",
+                zip::CompressionMethod::Deflated,
+                EMPTY_DICT_PICKLE,
+            ),
+            (
+                "b/data.pkl",
+                zip::CompressionMethod::Stored,
+                EMPTY_DICT_PICKLE,
+            ),
+        ]);
+        assert_duplicate_rejected_everywhere(&bytes, "data.pkl");
+    }
+
+    #[test]
+    fn duplicate_byteorder_rejected_on_every_path() {
+        let stored = zip::CompressionMethod::Stored;
+        let bytes = zip_with_entries(&[
+            ("a/data.pkl", stored, EMPTY_DICT_PICKLE),
+            ("a/byteorder", stored, b"little"),
+            ("b/byteorder", stored, b"big"),
+        ]);
+        assert_duplicate_rejected_everywhere(&bytes, "byteorder");
+    }
+
+    // A corrupt `DEFLATE` `data.pkl` is malformed input, not an I/O fault:
+    // the bytes are all present and fail to inflate. It used to surface as
+    // `Io`, which Python maps to `OSError`.
+    #[test]
+    fn corrupt_deflate_data_pkl_is_parse_on_reader_path() {
+        let mut bytes = zip_with_entries(&[(
+            "a/data.pkl",
+            zip::CompressionMethod::Deflated,
+            &[0x42u8; 256],
+        )]);
+        // Overwrite the compressed stream (which starts after the 30-byte
+        // local header and the 10-byte name) with an invalid DEFLATE block
+        // type (0b11 in bits 1-2 of the first byte).
+        let start = 30 + "a/data.pkl".len();
+        bytes[start] = 0b0000_0111;
+        let err = inspect_pth_from_reader(std::io::Cursor::new(&bytes)).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }), "{err:?}");
+    }
+
+    // The reader paths inflate `DEFLATE` entries, so they honour the caller's
+    // expansion-ratio budget exactly as the `.npz` path does.
+    #[test]
+    fn deflate_data_pkl_respects_decompression_ratio() {
+        // A valid pickle that compresses well, from allowlisted opcodes only:
+        // PROTO 2, MARK, 4096 x NONE, TUPLE (a long tuple left on the stack),
+        // EMPTY_DICT, STOP. `STOP` returns the empty dict on top.
+        let mut pkl = b"\x80\x02(".to_vec();
+        pkl.extend(std::iter::repeat_n(b'N', 4096));
+        pkl.extend_from_slice(b"t}.");
+        let bytes = zip_with_entries(&[("a/data.pkl", zip::CompressionMethod::Deflated, &pkl)]);
+
+        let tight = ParseLimits::default().with_max_decompression_ratio(2);
+        let err =
+            parse_pth_front_matter_from_reader_with_limits(std::io::Cursor::new(&bytes), &tight)
+                .unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_decompression_ratio"),
+            "{err:?}"
+        );
+        // The same archive under the default budget parses.
+        let front = parse_pth_front_matter_from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        assert!(front.tensors.is_empty());
+    }
+
+    // A repeated tensor-storage suffix leaves it ambiguous which bytes a
+    // tensor owns; the parse path refuses it rather than picking one.
+    #[test]
+    fn duplicate_storage_entry_rejected_by_parse() {
+        let stored = zip::CompressionMethod::Stored;
+        let bytes = zip_with_entries(&[
+            ("a/data.pkl", stored, EMPTY_DICT_PICKLE),
+            ("a/data/0", stored, &[0u8; 4]),
+            ("b/data/0", stored, &[1u8; 4]),
+        ]);
+        let err = parse_pth_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("duplicate ZIP entry `data/0`"), "{err}");
     }
 
     // G31: ZIP entry with zero data length (valid edge case)

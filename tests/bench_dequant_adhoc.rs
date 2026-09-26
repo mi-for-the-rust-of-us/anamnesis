@@ -5,18 +5,23 @@
 //! Not part of CI — gated `#[ignore]`. Run with:
 //!
 //! ```text
-//! cargo test --release --features gguf --test bench_dequant_adhoc \
+//! cargo test --release --features gguf,bnb,gptq,awq --test bench_dequant_adhoc \
 //!     -- --nocapture --ignored
 //! ```
+//!
+//! All four format features are needed: `bench_bf16_all_families` compiles
+//! its `BnB`, `GPTQ` and `AWQ` arms only under `bnb` / `gptq` / `awq`, and
+//! `bench_gguf_size_sweep` only exists under `gguf`. A narrower list still
+//! builds and runs, silently without those arms.
 //!
 //! The synthetic fixtures use byte patterns that exercise the dequant
 //! pipelines at realistic layer sizes; actual byte values do not affect
 //! timing because the kernels have no data-dependent branches.
 //!
-//! ## What the GGUF benches measure
+//! ## What the GGUF bench measures
 //!
-//! `bench_gguf_q8_0` and `bench_gguf_q4_0` run the same kernel logic two
-//! ways and compare:
+//! `bench_gguf_size_sweep` runs the same kernel logic two ways, on both
+//! `Q8_0` and `Q4_0` across four output sizes, and compares:
 //!
 //! - **NEW** (current `dequantize_gguf_to_bf16`) — `Vec::with_capacity` +
 //!   per-block `extend_from_slice`, the v0.4.0 refactor pattern.
@@ -41,19 +46,17 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::time::Instant;
 
 use anamnesis::dequantize_per_tensor_fp8_to_bf16;
 #[cfg(feature = "gguf")]
 use anamnesis::{GgufType, dequantize_gguf_blocks_to_bf16, dequantize_gguf_to_bf16};
 
-/// Median + range of an ascending-sorted `&[f64]`, formatted for stderr.
-fn fmt_stats(samples: &[f64]) -> String {
-    let median = samples[samples.len() / 2];
-    let min = samples[0];
-    let max = samples[samples.len() - 1];
-    format!("median {median:.2} ms (min {min:.2}, max {max:.2})")
-}
+use common::bench::fmt_stats;
+#[cfg(feature = "gguf")]
+use common::bench::{build_q4_0_buffer, build_q8_0_buffer};
 
 /// Best-of-5 timing helper. Calls `f()` 5 times after a 2-iteration
 /// warmup, returning the sorted millisecond samples. The closure
@@ -642,37 +645,6 @@ fn dequantize_via_indexed_sink(
         Ok(())
     })?;
     Ok(out)
-}
-
-/// Synthesizes `n_blocks` of `Q8_0`-formatted bytes (34 bytes per
-/// 32-element block: `f16 d` + `i8 qs[32]`). Byte values are arbitrary
-/// — the kernel has no data-dependent branches, so timing is identical
-/// to a real model's bytes. Using a non-zero `d` ensures the runtime
-/// `d × qs[j]` multiplications are not optimised away.
-#[cfg(feature = "gguf")]
-fn build_q8_0_buffer(n_blocks: usize) -> Vec<u8> {
-    const BLOCK_BYTES: usize = 34;
-    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
-    // Set d = f16(1.0) = 0x3C00 in every block (stored LE in bytes 0..2).
-    // Keep qs[32] = 0..0 (irrelevant for timing).
-    for block in buf.as_chunks_mut::<BLOCK_BYTES>().0 {
-        block[0] = 0x00;
-        block[1] = 0x3C;
-    }
-    buf
-}
-
-/// Synthesizes `n_blocks` of `Q4_0`-formatted bytes (18 bytes per
-/// 32-element block: `f16 d` + 16 bytes of packed nibbles).
-#[cfg(feature = "gguf")]
-fn build_q4_0_buffer(n_blocks: usize) -> Vec<u8> {
-    const BLOCK_BYTES: usize = 18;
-    let mut buf = vec![0u8; n_blocks * BLOCK_BYTES];
-    for block in buf.as_chunks_mut::<BLOCK_BYTES>().0 {
-        block[0] = 0x00;
-        block[1] = 0x3C;
-    }
-    buf
 }
 
 /// Runs the NEW vs OLD comparison for a single `(dtype, n_elements)`

@@ -48,14 +48,14 @@ use crate::ParseLimits;
 use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::PREALLOC_SOFT_CAP;
+use crate::parse::utils::{PREALLOC_SOFT_CAP, checked_num_elements, saturating_num_elements_u64};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// `GGUF` magic bytes — spells `"GGUF"` in ASCII.
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+pub(crate) const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 
 /// `GGUF` magic read as a little-endian `u32`. Useful for detecting
 /// byte-swapped (big-endian) files without a full magic-byte comparison.
@@ -66,7 +66,7 @@ const GGUF_MAGIC_LE_U32: u32 = u32::from_le_bytes(*GGUF_MAGIC);
 const GGUF_MAGIC_BE_U32: u32 = u32::from_be_bytes(*GGUF_MAGIC);
 
 /// Default tensor-data alignment when `general.alignment` metadata is absent.
-const DEFAULT_ALIGNMENT: u32 = 32;
+pub(crate) const DEFAULT_ALIGNMENT: u32 = 32;
 
 /// Upper bound on `tensor_count` (soft `DoS` guard).
 const MAX_TENSOR_COUNT: u64 = 1_000_000;
@@ -94,7 +94,7 @@ const MAX_ARRAY_DEPTH: u32 = 4;
 ///
 /// `ggml` itself caps this at `GGML_MAX_DIMS = 4`; we accept up to 8 for
 /// future-proofing.
-const MAX_TENSOR_DIMS: u32 = 8;
+pub(crate) const MAX_TENSOR_DIMS: u32 = 8;
 
 /// Upper bound on a single tensor's name length, in bytes.
 ///
@@ -210,6 +210,47 @@ pub enum GgufType {
 }
 
 impl GgufType {
+    /// The `ggml_type` discriminant written for this type: the inverse of
+    /// [`from_u32`](Self::from_u32). Kept beside it, and pinned by a round-trip
+    /// test over every variant, so the reader's and writer's tables cannot
+    /// drift apart.
+    pub(crate) const fn to_u32(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2_K => 10,
+            Self::Q3_K => 11,
+            Self::Q4_K => 12,
+            Self::Q5_K => 13,
+            Self::Q6_K => 14,
+            Self::Q8_K => 15,
+            Self::IQ2_XXS => 16,
+            Self::IQ2_XS => 17,
+            Self::IQ3_XXS => 18,
+            Self::IQ1_S => 19,
+            Self::IQ4_NL => 20,
+            Self::IQ3_S => 21,
+            Self::IQ2_S => 22,
+            Self::IQ4_XS => 23,
+            Self::I8 => 24,
+            Self::I16 => 25,
+            Self::I32 => 26,
+            Self::I64 => 27,
+            Self::F64 => 28,
+            Self::IQ1_M => 29,
+            Self::BF16 => 30,
+            Self::TQ1_0 => 34,
+            Self::TQ2_0 => 35,
+            Self::MXFP4 => 39,
+        }
+    }
+
     /// Parses a `u32` `ggml_type` discriminant into a [`GgufType`].
     ///
     /// # Errors
@@ -1312,11 +1353,8 @@ impl ParsedGguf {
                     self.buffer.len()
                 ),
             })?;
-        let n_elements: usize = info
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .ok_or_else(|| AnamnesisError::Parse {
+        let n_elements =
+            checked_num_elements(&info.shape).ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("tensor `{}`: element count overflows usize", info.name),
             })?;
         crate::remember::gguf::dequantize_gguf::<E>(data, info.dtype, n_elements)
@@ -1379,9 +1417,8 @@ impl<R: Read + Seek> GgufReader<R> {
     /// Pulled out of [`read_into`](Self::read_into) so it can also gate
     /// [`read_bytes`](Self::read_bytes) **before** it allocates — an
     /// adversarial declared length is rejected without committing any heap,
-    /// producing a deterministic `AnamnesisError::Parse` (matching the
-    /// slice-based cursor's behaviour) rather than relying on the underlying
-    /// reader's `UnexpectedEof` kind-mapping.
+    /// producing a deterministic `AnamnesisError::Parse` rather than an
+    /// `AnamnesisError::Io` wrapping the underlying reader's `UnexpectedEof`.
     ///
     /// # Errors
     ///
@@ -1559,6 +1596,26 @@ impl<R: Read + Seek> GgufReader<R> {
 // Metadata value reader
 // ---------------------------------------------------------------------------
 
+/// `GGUF` metadata value-type tags (`gguf_metadata_value_type` in the spec).
+///
+/// Named once so the reader ([`read_metadata_value`], [`read_typed_array`]) and
+/// the writer (`gguf_write`) cannot disagree about a wire code.
+pub(crate) mod value_type {
+    pub(crate) const U8: u32 = 0;
+    pub(crate) const I8: u32 = 1;
+    pub(crate) const U16: u32 = 2;
+    pub(crate) const I16: u32 = 3;
+    pub(crate) const U32: u32 = 4;
+    pub(crate) const I32: u32 = 5;
+    pub(crate) const F32: u32 = 6;
+    pub(crate) const BOOL: u32 = 7;
+    pub(crate) const STRING: u32 = 8;
+    pub(crate) const ARRAY: u32 = 9;
+    pub(crate) const U64: u32 = 10;
+    pub(crate) const I64: u32 = 11;
+    pub(crate) const F64: u32 = 12;
+}
+
 /// Reads a single metadata value of the given `value_type` discriminant.
 ///
 /// For `ARRAY` (`value_type` 9), dispatches into [`read_typed_array`]
@@ -1569,18 +1626,18 @@ fn read_metadata_value<R: Read + Seek>(
     value_type: u32,
 ) -> crate::Result<GgufMetadataValue> {
     match value_type {
-        0 => Ok(GgufMetadataValue::U8(cursor.read_u8()?)),
-        1 => Ok(GgufMetadataValue::I8(cursor.read_i8()?)),
-        2 => Ok(GgufMetadataValue::U16(cursor.read_u16_le()?)),
-        3 => Ok(GgufMetadataValue::I16(cursor.read_i16_le()?)),
-        4 => Ok(GgufMetadataValue::U32(cursor.read_u32_le()?)),
-        5 => Ok(GgufMetadataValue::I32(cursor.read_i32_le()?)),
-        6 => Ok(GgufMetadataValue::F32(cursor.read_f32_le()?)),
-        7 => Ok(GgufMetadataValue::Bool(cursor.read_bool()?)),
-        8 => Ok(GgufMetadataValue::String(
+        value_type::U8 => Ok(GgufMetadataValue::U8(cursor.read_u8()?)),
+        value_type::I8 => Ok(GgufMetadataValue::I8(cursor.read_i8()?)),
+        value_type::U16 => Ok(GgufMetadataValue::U16(cursor.read_u16_le()?)),
+        value_type::I16 => Ok(GgufMetadataValue::I16(cursor.read_i16_le()?)),
+        value_type::U32 => Ok(GgufMetadataValue::U32(cursor.read_u32_le()?)),
+        value_type::I32 => Ok(GgufMetadataValue::I32(cursor.read_i32_le()?)),
+        value_type::F32 => Ok(GgufMetadataValue::F32(cursor.read_f32_le()?)),
+        value_type::BOOL => Ok(GgufMetadataValue::Bool(cursor.read_bool()?)),
+        value_type::STRING => Ok(GgufMetadataValue::String(
             cursor.read_string(MAX_STRING_LEN, "MAX_STRING_LEN")?,
         )),
-        9 => {
+        value_type::ARRAY => {
             let inner_type = cursor.read_u32_le()?;
             let len = read_array_len(cursor)?;
             // Initial depth is 0: this call builds the outer array (nesting
@@ -1591,9 +1648,9 @@ fn read_metadata_value<R: Read + Seek>(
             let array = read_typed_array(cursor, inner_type, len, 0)?;
             Ok(GgufMetadataValue::Array(Box::new(array)))
         }
-        10 => Ok(GgufMetadataValue::U64(cursor.read_u64_le()?)),
-        11 => Ok(GgufMetadataValue::I64(cursor.read_i64_le()?)),
-        12 => Ok(GgufMetadataValue::F64(cursor.read_f64_le()?)),
+        value_type::U64 => Ok(GgufMetadataValue::U64(cursor.read_u64_le()?)),
+        value_type::I64 => Ok(GgufMetadataValue::I64(cursor.read_i64_le()?)),
+        value_type::F64 => Ok(GgufMetadataValue::F64(cursor.read_f64_le()?)),
         other => Err(AnamnesisError::Parse {
             reason: format!("GGUF metadata: unknown value type {other}"),
         }),
@@ -1676,70 +1733,70 @@ fn read_typed_array<R: Read + Seek>(
 
     let cap = len.min(PREALLOC_SOFT_CAP);
     match inner_type {
-        0 => {
+        value_type::U8 => {
             let mut v: Vec<u8> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_u8()?);
             }
             Ok(GgufMetadataArray::U8(v))
         }
-        1 => {
+        value_type::I8 => {
             let mut v: Vec<i8> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_i8()?);
             }
             Ok(GgufMetadataArray::I8(v))
         }
-        2 => {
+        value_type::U16 => {
             let mut v: Vec<u16> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_u16_le()?);
             }
             Ok(GgufMetadataArray::U16(v))
         }
-        3 => {
+        value_type::I16 => {
             let mut v: Vec<i16> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_i16_le()?);
             }
             Ok(GgufMetadataArray::I16(v))
         }
-        4 => {
+        value_type::U32 => {
             let mut v: Vec<u32> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_u32_le()?);
             }
             Ok(GgufMetadataArray::U32(v))
         }
-        5 => {
+        value_type::I32 => {
             let mut v: Vec<i32> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_i32_le()?);
             }
             Ok(GgufMetadataArray::I32(v))
         }
-        6 => {
+        value_type::F32 => {
             let mut v: Vec<f32> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_f32_le()?);
             }
             Ok(GgufMetadataArray::F32(v))
         }
-        7 => {
+        value_type::BOOL => {
             let mut v: Vec<bool> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_bool()?);
             }
             Ok(GgufMetadataArray::Bool(v))
         }
-        8 => {
+        value_type::STRING => {
             let mut v: Vec<String> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_string(MAX_STRING_LEN, "MAX_STRING_LEN")?);
             }
             Ok(GgufMetadataArray::String(v))
         }
-        9 => {
+        value_type::ARRAY => {
             // Nested array: each element is itself a typed array. Check
             // the recursion depth before reading anything so we fail fast
             // on adversarial nesting.
@@ -1759,21 +1816,21 @@ fn read_typed_array<R: Read + Seek>(
             }
             Ok(GgufMetadataArray::Array(v))
         }
-        10 => {
+        value_type::U64 => {
             let mut v: Vec<u64> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_u64_le()?);
             }
             Ok(GgufMetadataArray::U64(v))
         }
-        11 => {
+        value_type::I64 => {
             let mut v: Vec<i64> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_i64_le()?);
             }
             Ok(GgufMetadataArray::I64(v))
         }
-        12 => {
+        value_type::F64 => {
             let mut v: Vec<f64> = Vec::with_capacity(cap);
             for _ in 0..len {
                 v.push(cursor.read_f64_le()?);
@@ -1936,10 +1993,7 @@ pub fn parse_gguf_bytes_with_limits(
     bytes: Vec<u8>,
     limits: &ParseLimits,
 ) -> crate::Result<ParsedGguf> {
-    let len = u64::try_from(bytes.len()).map_err(|_| AnamnesisError::Parse {
-        reason: "GGUF bytes: length overflows u64".into(),
-    })?;
-    limits.check_alloc(len, "GGUF bytes")?;
+    limits.check_owned_input(&bytes, "GGUF bytes")?;
     parsed_gguf_from_backing(Backing::Owned(bytes), limits)
 }
 
@@ -2580,13 +2634,7 @@ fn build_inspect_info(
         // report `u64::MAX` for a mathematically-empty tensor — the bug
         // `build_pth_tensor_info` had until v0.7.5).
         if info.dtype.is_quantized() || info.byte_len.is_none() {
-            // CAST: usize → u64, lossless widening of a header-declared
-            // dimension on every supported target.
-            #[allow(clippy::as_conversions)]
-            let n_elements = info
-                .shape
-                .iter()
-                .fold(1u64, |acc, &d| acc.saturating_mul(d as u64));
+            let n_elements = saturating_num_elements_u64(&info.shape);
             dequantized_size =
                 dequantized_size.saturating_add(n_elements.saturating_mul(out_bytes));
         } else if let Some(byte_len) = info.byte_len {
@@ -2774,6 +2822,22 @@ pub(crate) fn align_up(offset: u64, alignment: u64) -> crate::Result<u64> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The reader's (`from_u32`) and writer's (`to_u32`) `ggml_type` tables
+    /// are inverse: every accepted discriminant round-trips, and every variant
+    /// has one. `to_u32`'s match is exhaustive, so a new variant cannot be
+    /// added without a code there; this count catches a missing `from_u32` arm.
+    #[test]
+    fn ggml_type_tables_round_trip() {
+        let mut accepted = 0;
+        for disc in 0..64 {
+            if let Ok(ty) = GgufType::from_u32(disc) {
+                assert_eq!(ty.to_u32(), disc, "{ty:?}");
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 32, "one discriminant per `GgufType` variant");
+    }
 
     // -----------------------------------------------------------------
     // Fixture builder

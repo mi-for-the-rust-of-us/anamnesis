@@ -45,6 +45,8 @@
     clippy::cast_precision_loss
 )]
 
+mod common;
+
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{
@@ -53,6 +55,8 @@ use anamnesis::{
     dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16, dequantize_gptq,
     dequantize_gptq_to_bf16, dequantize_per_tensor_fp8, dequantize_per_tensor_fp8_to_bf16,
 };
+
+use common::synth_bytes;
 
 // ---------------------------------------------------------------------------
 // Synthetic layer dimensions
@@ -94,26 +98,6 @@ const LAYER_ELEMENTS: usize = LAYER_ROWS * LAYER_COLS;
 // the primary regression guard, because it is the width the crate emits by
 // default and the one every historical number is quoted at. The two new ids
 // exist so a per-width divergence cannot hide behind it again.
-
-// ---------------------------------------------------------------------------
-// Deterministic synthesis helpers
-// ---------------------------------------------------------------------------
-
-/// Fills a buffer with deterministic non-zero bytes via a Knuth
-/// multiplicative hash on the index. Avoids the all-zero pathology
-/// that some quantisation kernels short-circuit through their
-/// fast-path branches.
-fn fill_deterministic(buf: &mut [u8]) {
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i.wrapping_mul(2_654_435_761) & 0xFF) as u8;
-    }
-}
-
-fn synth_bytes(n: usize) -> Vec<u8> {
-    let mut v = vec![0u8; n];
-    fill_deterministic(&mut v);
-    v
-}
 
 // ---------------------------------------------------------------------------
 // FP8 — per-tensor (single scale, full layer)

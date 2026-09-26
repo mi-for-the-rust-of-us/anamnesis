@@ -1,5 +1,7 @@
 # anamnesis — Flagship Example (V2)
 
+> **HISTORICAL (archived at the v0.7.8 close-out).** The flagship example the Phase 1 API was designed against. The shipped API and CLI are documented in `README.md` and `docs/cli-reference.md`.
+
 **The problem in one sentence:** Mistral ships Ministral 3B Instruct as FP8 safetensors. No Rust ML framework can load it.
 
 *Note: Tensor counts and sizes in CLI output examples below are illustrative.

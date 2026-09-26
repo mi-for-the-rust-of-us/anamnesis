@@ -18,7 +18,7 @@ if (-not (Test-Path "tests/fixtures")) {
 tests/fixtures/ is missing.
 
 You are probably in a crate unpacked from crates.io, which excludes tests/
-to keep the published artefact at 0.60 MiB instead of 4.8 MiB.
+to keep the published artefact under 1 MiB instead of 4.8 MiB.
 
 Get the corpus from the matching GitHub Release (the "Source code (tar.gz)"
 asset carries tests/ verbatim), or clone the repository:
@@ -38,17 +38,17 @@ Write-Host "=================================="
 Write-Host ""
 
 $suites = @(
-    @{ Target = "cross_validation_safetensors"; What = "FP8 E4M3 (fine-grained / per-channel / per-tensor), BF16 + F32"; Oracle = "PyTorch's own fp8 cast" }
+    @{ Target = "cross_validation";             What = "FP8 E4M3 (fine-grained / per-channel / per-tensor), BF16 + F32"; Oracle = "PyTorch's own fp8 cast" }
     @{ Target = "cross_validation_gptq";        What = "GPTQ INT4 + INT8, group-wise, g_idx, BF16 + F32";              Oracle = "GPTQModel dequantize_weight" }
     @{ Target = "cross_validation_awq";         What = "AWQ INT4, per-group, BF16 + F32";                              Oracle = "AutoAWQ unpack_awq + reverse_awq_order" }
     @{ Target = "cross_validation_bnb";         What = "BitsAndBytes NF4 / FP4 / INT8, BF16 + F32";                    Oracle = "bitsandbytes dequantize_4bit" }
-    @{ Target = "cross_validation_bnb_encode";  What = "BitsAndBytes NF4 encode (byte-exact on disk)";     Oracle = "bitsandbytes on-disk bytes" }
+    @{ Target = "cross_validation_bnb_encode";  What = "BitsAndBytes NF4 + INT8 encode (byte-exact on disk)"; Oracle = "bitsandbytes on-disk bytes" }
     @{ Target = "cross_validation_gguf";        What = "all 22 GGUF block-quant kernels, BF16 + F32"; Oracle = "gguf-py (mirrors ggml-quants.c)" }
     @{ Target = "cross_validation_ollama";      What = "GGUF Q8_0 from a real Ollama blob";                Oracle = "gguf-py" }
     @{ Target = "cross_validation_npz";         What = "NPZ / NPY parsing";                                Oracle = "NumPy" }
     @{ Target = "cross_validation_pth";         What = "PyTorch .pth (pickle + tensor recovery)";          Oracle = "torch.load" }
     @{ Target = "cross_validation_convert";     What = "format-conversion pipeline";                       Oracle = "per-format references" }
-    @{ Target = "cross_validation";             What = "end-to-end dequantisation";                        Oracle = "per-format references" }
+    @{ Target = "cross_validation_safetensors"; What = "safetensors header parsing (FP8 / GPTQ / AWQ / BnB layouts)"; Oracle = "the safetensors Python library" }
 )
 
 $failed = 0

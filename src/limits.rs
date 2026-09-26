@@ -47,13 +47,14 @@
 /// memory.
 // Deliberately not `Copy`: `ParseLimits` is a configuration/budget value passed
 // by `&ParseLimits` everywhere (and borrowed by the `.pth` pickle VM), so a
-// `Copy` derive would trip clippy's `trivially_copy_pass_by_ref` on the 16-byte
+// `Copy` derive would trip clippy's `trivially_copy_pass_by_ref` on the 32-byte
 // struct. `Clone` covers the rare by-value need.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The shared `max_` prefix is intentional — every field is a caller-set maximum
-// (`max_single_alloc_bytes`, `max_total_bytes`, `max_item_count`); the prefix is
-// what makes the budget axes read uniformly.
+// (`max_single_alloc_bytes`, `max_total_bytes`, `max_item_count`,
+// `max_decompression_ratio`); the prefix is what makes the budget axes read
+// uniformly.
 #[allow(clippy::struct_field_names)]
 pub struct ParseLimits {
     /// Upper bound, in bytes, on any single header-declared buffer a parser
@@ -89,13 +90,15 @@ pub struct ParseLimits {
     max_item_count: u64,
 
     /// Upper bound on a compressed archive entry's uncompressed-to-compressed
-    /// expansion ratio — the zip-bomb cap for `DEFLATE` `NPZ` entries. A few-KB
+    /// expansion ratio — the zip-bomb cap for `DEFLATE` archive entries. A few-KB
     /// entry that *honestly* declares a gigabyte-scale uncompressed size passes
     /// every byte-size check yet is a `1 000 000:1` amplification no real file
     /// produces; this rejects it from the archive metadata before allocating.
     /// `STORED` entries report equal sizes (ratio `1`) and always pass.
-    /// [`u64::MAX`] means unbounded. Applies to `NPZ` only (the sole `DEFLATE`
-    /// path; `.pth` is `STORED`-only, `GGUF` / safetensors are not zipped).
+    /// [`u64::MAX`] means unbounded. Applies to every `DEFLATE` entry anamnesis
+    /// inflates: `NPZ` arrays, and `data.pkl` / `byteorder` on the `.pth` reader
+    /// paths (the `.pth` mmap / bytes paths read `STORED` entries only; `GGUF` and
+    /// safetensors are not zipped).
     max_decompression_ratio: u64,
 }
 
@@ -200,6 +203,21 @@ impl ParseLimits {
         Ok(())
     }
 
+    /// Charges a caller-supplied, already-owned input buffer against
+    /// [`ParseLimits::max_single_alloc_bytes`], the first step of every
+    /// `*_bytes_with_limits` entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `bytes` is larger than the configured maximum single allocation.
+    pub(crate) fn check_owned_input(&self, bytes: &[u8], context: &str) -> crate::Result<()> {
+        // CAST: usize → u64, lossless widening on all supported targets.
+        #[allow(clippy::as_conversions)]
+        let len = bytes.len() as u64;
+        self.check_alloc(len, context)
+    }
+
     /// Rejects a declared item count if it exceeds the caller's
     /// [`ParseLimits::max_item_count`] budget. Called at every site that reads
     /// a file-declared count of tensors / arrays / KV entries, immediately
@@ -254,9 +272,9 @@ impl ParseLimits {
     ///
     /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
     /// if the declared expansion ratio exceeds the configured maximum.
-    // Only the `npz` parse path reads `DEFLATE` (compressed) archive entries;
-    // with that feature disabled this helper has no caller.
-    #[cfg_attr(not(feature = "npz"), allow(dead_code))]
+    // Only the `npz` paths and the `.pth` reader paths read `DEFLATE`
+    // (compressed) archive entries; with neither feature this has no caller.
+    #[cfg_attr(not(any(feature = "npz", feature = "pth")), allow(dead_code))]
     pub(crate) fn check_decompression_ratio(
         &self,
         uncompressed: u64,
@@ -313,7 +331,8 @@ impl ParseLimits {
     /// bound is `u64::MAX`, i.e. effectively the file size — matching the mmap
     /// path's no-inherent-limit behaviour.
     // Used by the copy-based `parse_*_from_reader` entry points (always-on
-    // safetensors + the `gguf`/`pth` features); never dead in the public sense.
+    // safetensors + the `gguf` / `npz` / `pth` features); never dead in the
+    // public sense.
     pub(crate) fn read_to_vec_bounded<R: std::io::Read>(
         &self,
         reader: R,

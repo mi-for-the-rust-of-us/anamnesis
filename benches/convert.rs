@@ -78,16 +78,21 @@
     clippy::doc_markdown
 )]
 
+mod common;
+
 use std::path::PathBuf;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use anamnesis::{ConvertOptions, ConvertTarget, RememberOptions, TargetDtype};
+
 // Only `bench_convert_gguf_to_safetensors` calls the path-to-path `convert()`;
 // its in-memory sibling uses `anamnesis::convert_bytes` fully qualified. Gated
 // with the group so the CI build (feature off) has no unused import.
 #[cfg(feature = "bench-fileio")]
 use anamnesis::convert;
+
+use common::fill_deterministic;
 
 /// The two budgets every group is measured at: the sequential baseline and the
 /// library's default `min(cores, 4)`.
@@ -95,19 +100,6 @@ const BUDGETS: [usize; 2] = [1, 4];
 
 /// `GGUF` default tensor-data alignment.
 const ALIGNMENT: usize = 32;
-
-// ---------------------------------------------------------------------------
-// Deterministic synthesis
-// ---------------------------------------------------------------------------
-
-/// Knuth multiplicative hash on the index — the same filler `dequant.rs` uses,
-/// so bit patterns are stable across runs and CodSpeed's comparison is not
-/// perturbed by fixture churn.
-fn fill_deterministic(buf: &mut [u8]) {
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i.wrapping_mul(2_654_435_761) & 0xFF) as u8;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Quantised GGUF fixture (hand-rolled; write_gguf rejects quantised dtypes)

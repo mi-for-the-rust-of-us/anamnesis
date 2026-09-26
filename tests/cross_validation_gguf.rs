@@ -33,12 +33,14 @@
     clippy::wildcard_enum_match_arm
 )]
 
+mod common;
+
 use std::time::Instant;
 
-use anamnesis::{
-    F32Out, GgufType, dequantize_gguf, dequantize_gguf_to_bf16, inspect_gguf_from_reader,
-    parse_gguf,
-};
+use anamnesis::{F32Out, GgufType, dequantize_gguf, inspect_gguf_from_reader, parse_gguf};
+
+use common::fixture::read_u32_le;
+use common::gguf::{check_bf16_against_golden, gguf_type_from_disc};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
@@ -80,46 +82,6 @@ struct GgufFixture {
     raw_data: Vec<u8>,
     expected_bf16: Vec<u8>,
     expected_f32: Vec<u8>,
-}
-
-fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-    u32::from_le_bytes(bytes)
-}
-
-/// Maps a `ggml_type` discriminant to a [`GgufType`].
-///
-/// Covers all 22 dequantizable block types — Phase 4.5 step 6 closed
-/// the GGUF coverage gap, so every block-quantised `GgufType` variant
-/// is exercised here.
-fn gguf_type_from_disc(disc: u32) -> GgufType {
-    match disc {
-        2 => GgufType::Q4_0,
-        3 => GgufType::Q4_1,
-        6 => GgufType::Q5_0,
-        7 => GgufType::Q5_1,
-        8 => GgufType::Q8_0,
-        9 => GgufType::Q8_1,
-        10 => GgufType::Q2_K,
-        11 => GgufType::Q3_K,
-        12 => GgufType::Q4_K,
-        13 => GgufType::Q5_K,
-        14 => GgufType::Q6_K,
-        15 => GgufType::Q8_K,
-        20 => GgufType::IQ4_NL,
-        23 => GgufType::IQ4_XS,
-        16 => GgufType::IQ2_XXS,
-        17 => GgufType::IQ2_XS,
-        22 => GgufType::IQ2_S,
-        18 => GgufType::IQ3_XXS,
-        21 => GgufType::IQ3_S,
-        19 => GgufType::IQ1_S,
-        29 => GgufType::IQ1_M,
-        34 => GgufType::TQ1_0,
-        35 => GgufType::TQ2_0,
-        39 => GgufType::MXFP4,
-        other => panic!("unknown ggml_type discriminant: {other}"),
-    }
 }
 
 fn parse_gguf_fixture(data: &[u8], expected_dtype: GgufType) -> GgufFixture {
@@ -166,84 +128,19 @@ fn parse_gguf_fixture(data: &[u8], expected_dtype: GgufType) -> GgufFixture {
 }
 
 // ---------------------------------------------------------------------------
-// BF16 comparison
-// ---------------------------------------------------------------------------
-
-/// Compare two `BF16` byte slices, allowing up to `max_ulp_diff` ULP
-/// (unit in the last place) difference per element.
-///
-/// Returns the number of mismatched elements and the maximum ULP diff found.
-fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u16) {
-    assert_eq!(actual.len(), expected.len(), "output length mismatch");
-    let mut mismatches = 0;
-    let mut max_diff: u16 = 0;
-
-    for (i, (a_pair, e_pair)) in actual
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(expected.as_chunks::<2>().0)
-        .enumerate()
-    {
-        let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);
-        let e_bits = u16::from_le_bytes([e_pair[0], e_pair[1]]);
-
-        // Handle NaN: both NaN is a match.
-        let a_is_nan = (a_bits & 0x7F80 == 0x7F80) && (a_bits & 0x007F != 0);
-        let e_is_nan = (e_bits & 0x7F80 == 0x7F80) && (e_bits & 0x007F != 0);
-        if a_is_nan && e_is_nan {
-            continue;
-        }
-        if a_is_nan != e_is_nan {
-            mismatches += 1;
-            continue;
-        }
-
-        let diff = a_bits.abs_diff(e_bits);
-        if diff > max_ulp_diff {
-            mismatches += 1;
-            if i < 5 {
-                eprintln!(
-                    "  element {i}: actual=0x{a_bits:04X}, expected=0x{e_bits:04X}, diff={diff} ULP"
-                );
-            }
-        }
-        if diff > max_diff {
-            max_diff = diff;
-        }
-    }
-    (mismatches, max_diff)
-}
-
-// ---------------------------------------------------------------------------
 // Unified test runner
 // ---------------------------------------------------------------------------
 
 fn run_cross_validation(name: &str, data: &[u8], dtype: GgufType, max_ulp: u16) {
     let fixture = parse_gguf_fixture(data, dtype);
-    let total = fixture.n_elements;
 
-    // Dequantize with anamnesis and measure time.
-    let start = Instant::now();
-    let actual = dequantize_gguf_to_bf16(&fixture.raw_data, dtype, fixture.n_elements)
-        .expect("dequantization failed");
-    let elapsed = start.elapsed();
-
-    assert_eq!(
-        actual.len(),
-        fixture.expected_bf16.len(),
-        "{name}: output length mismatch"
-    );
-
-    let (mismatches, max_diff) = compare_bf16(&actual, &fixture.expected_bf16, max_ulp);
-    eprintln!(
-        "{name}: {total} elements, {mismatches} mismatches, \
-         max ULP diff = {max_diff}, anamnesis = {:.1} \u{b5}s",
-        elapsed.as_secs_f64() * 1e6
-    );
-    assert_eq!(
-        mismatches, 0,
-        "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
+    check_bf16_against_golden(
+        name,
+        &fixture.raw_data,
+        dtype,
+        fixture.n_elements,
+        &fixture.expected_bf16,
+        max_ulp,
     );
 
     compare_f32_exact(name, &fixture, dtype);

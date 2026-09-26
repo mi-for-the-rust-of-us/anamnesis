@@ -221,9 +221,37 @@ fn parse_spec(spec: &str) -> crate::Result<(&str, &str)> {
         Some((_, "")) => Err(AnamnesisError::Parse {
             reason: format!("Ollama model spec {spec:?} has an empty tag"),
         }),
-        Some((name, tag)) => Ok((name, tag)),
-        None => Ok((cleaned, DEFAULT_TAG)),
+        Some((name, tag)) => {
+            reject_path_escape(spec, "model name", name)?;
+            reject_path_escape(spec, "tag", tag)?;
+            Ok((name, tag))
+        }
+        None => {
+            reject_path_escape(spec, "model name", cleaned)?;
+            Ok((cleaned, DEFAULT_TAG))
+        }
     }
+}
+
+/// Rejects a spec component that would steer the manifest path outside
+/// `manifests/`: a `.` or `..` segment, an empty segment, a backslash, or a
+/// leading `/`. Legitimate names (`llama3.2`, a namespaced `user/model`)
+/// contain none of these.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `component` contains any of them.
+fn reject_path_escape(spec: &str, what: &str, component: &str) -> crate::Result<()> {
+    let escapes = component.contains('\\')
+        || component
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    if escapes {
+        return Err(AnamnesisError::Parse {
+            reason: format!("Ollama model spec {spec:?} has an invalid {what} {component:?}"),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +301,18 @@ fn parse_model_digest(manifest_bytes: &[u8]) -> crate::Result<String> {
             reason: "Ollama manifest model layer digest is empty after `sha256:` prefix".into(),
         });
     }
+    // The hash is joined into a filesystem path (`blobs/sha256-<hash>`), so
+    // anything but hex digits could steer it: `sha256:../../x` would escape
+    // `blobs/`. The manifest is read from the local cache, but the check is
+    // what the documented `sha256:<hex>` form promises.
+    if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "Ollama manifest model layer digest {digest:?} is not hexadecimal after                  the `sha256:` prefix"
+            ),
+        });
+    }
+    // BORROW: the hash outlives the parsed manifest it borrows from
     Ok(hash.to_owned())
 }
 
@@ -421,6 +461,43 @@ mod tests {
             AnamnesisError::Parse { reason } => assert!(reason.contains("empty after")),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    // A non-hex digest is joined into `blobs/sha256-<hash>` and could escape
+    // the blob directory.
+    #[test]
+    fn parse_model_digest_rejects_path_traversal_digest() {
+        let manifest = br#"{"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:../../x","size":1}]}"#;
+        let err = parse_model_digest(manifest).unwrap_err();
+        match err {
+            AnamnesisError::Parse { reason } => assert!(reason.contains("not hexadecimal")),
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spec_rejects_path_escapes() {
+        for spec in [
+            "../evil:1b",
+            "llama3.2:..",
+            "a/../b:1b",
+            "a//b:1b",
+            "/abs:1b",
+            "a\\b:1b",
+            "..",
+        ] {
+            assert!(
+                matches!(parse_spec(spec), Err(AnamnesisError::Parse { .. })),
+                "{spec:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_spec_accepts_dotted_and_namespaced_names() {
+        assert_eq!(parse_spec("llama3.2:1b").unwrap(), ("llama3.2", "1b"));
+        assert_eq!(parse_spec("user/model:q4").unwrap(), ("user/model", "q4"));
+        assert_eq!(parse_spec("qwen2.5").unwrap(), ("qwen2.5", "latest"));
     }
 
     #[test]

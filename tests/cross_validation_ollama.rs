@@ -46,41 +46,25 @@
     clippy::wildcard_enum_match_arm
 )]
 
-use std::time::Instant;
+mod common;
 
-use anamnesis::{GgufType, dequantize_gguf_to_bf16};
+use anamnesis::GgufType;
+
+use common::fixture::read_u32_le;
+use common::gguf::{check_bf16_against_golden, gguf_type_from_disc};
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed fixture payload — same layout as `cross_validation_gguf`'s
-/// `GgufFixture`. Kept local rather than shared via a `tests/common/`
-/// module so the two cross-validation suites stay independently
-/// readable; the duplication is intentional and minimal.
+/// Parsed fixture payload: the `BF16`-only subset of `cross_validation_gguf`'s
+/// `GgufFixture`. The container differs (this one predates the v2 `AMNG`
+/// header), so the struct and its parser stay local; the type mapping and the
+/// `BF16` check are shared through `tests/common/gguf.rs`.
 struct OllamaFixture {
     n_elements: usize,
     raw_data: Vec<u8>,
     expected_bf16: Vec<u8>,
-}
-
-fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    // INDEX: caller passes offsets that are bounded by the 16-byte fixture
-    // header; per-test fixture data is checked-in, so this is a test-side
-    // assertion, not an attacker-controllable surface.
-    let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-    u32::from_le_bytes(bytes)
-}
-
-/// Maps a `ggml_type` discriminant to a [`GgufType`]. Currently only
-/// `Q8_0` is exercised — extending coverage to other kernels (e.g.,
-/// `Q4_K_M` from a future `ollama pull`) means adding one match arm
-/// per new fixture.
-fn gguf_type_from_disc(disc: u32) -> GgufType {
-    match disc {
-        8 => GgufType::Q8_0,
-        other => panic!("unsupported Ollama fixture ggml_type discriminant: {other}"),
-    }
 }
 
 fn parse_ollama_fixture(data: &[u8], expected_dtype: GgufType) -> OllamaFixture {
@@ -107,85 +91,19 @@ fn parse_ollama_fixture(data: &[u8], expected_dtype: GgufType) -> OllamaFixture 
 }
 
 // ---------------------------------------------------------------------------
-// BF16 comparison
-// ---------------------------------------------------------------------------
-
-/// Compare two `BF16` byte slices, allowing up to `max_ulp_diff` `ULP`
-/// (unit in the last place) difference per element. Same shape as
-/// `cross_validation_gguf::compare_bf16` — `NaN` counts as a match if
-/// both sides are `NaN`, otherwise sub-`ULP` differences are tolerated
-/// up to the supplied cap.
-fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u16) {
-    assert_eq!(actual.len(), expected.len(), "output length mismatch");
-    let mut mismatches = 0;
-    let mut max_diff: u16 = 0;
-
-    for (i, (a_pair, e_pair)) in actual
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(expected.as_chunks::<2>().0)
-        .enumerate()
-    {
-        // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
-        let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);
-        let e_bits = u16::from_le_bytes([e_pair[0], e_pair[1]]);
-
-        // NaN equivalence — both NaN is a match.
-        let a_is_nan = (a_bits & 0x7F80 == 0x7F80) && (a_bits & 0x007F != 0);
-        let e_is_nan = (e_bits & 0x7F80 == 0x7F80) && (e_bits & 0x007F != 0);
-        if a_is_nan && e_is_nan {
-            continue;
-        }
-        if a_is_nan != e_is_nan {
-            mismatches += 1;
-            continue;
-        }
-
-        let diff = a_bits.abs_diff(e_bits);
-        if diff > max_ulp_diff {
-            mismatches += 1;
-            if i < 5 {
-                eprintln!(
-                    "  element {i}: actual=0x{a_bits:04X}, expected=0x{e_bits:04X}, diff={diff} ULP"
-                );
-            }
-        }
-        if diff > max_diff {
-            max_diff = diff;
-        }
-    }
-    (mismatches, max_diff)
-}
-
-// ---------------------------------------------------------------------------
 // Unified test runner
 // ---------------------------------------------------------------------------
 
 fn run_cross_validation(name: &str, data: &[u8], dtype: GgufType, max_ulp: u16) {
     let fixture = parse_ollama_fixture(data, dtype);
-    let total = fixture.n_elements;
 
-    let start = Instant::now();
-    let actual = dequantize_gguf_to_bf16(&fixture.raw_data, dtype, fixture.n_elements)
-        .expect("dequantization failed");
-    let elapsed = start.elapsed();
-
-    assert_eq!(
-        actual.len(),
-        fixture.expected_bf16.len(),
-        "{name}: output length mismatch"
-    );
-
-    let (mismatches, max_diff) = compare_bf16(&actual, &fixture.expected_bf16, max_ulp);
-    eprintln!(
-        "{name}: {total} elements, {mismatches} mismatches, \
-         max ULP diff = {max_diff}, anamnesis = {:.1} \u{b5}s",
-        elapsed.as_secs_f64() * 1e6
-    );
-    assert_eq!(
-        mismatches, 0,
-        "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
+    check_bf16_against_golden(
+        name,
+        &fixture.raw_data,
+        dtype,
+        fixture.n_elements,
+        &fixture.expected_bf16,
+        max_ulp,
     );
 }
 

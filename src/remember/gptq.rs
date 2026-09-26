@@ -53,7 +53,7 @@
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
-use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
+use crate::remember::quant_utils::{read_u32_le, unpack_scales_for_group};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -105,12 +105,9 @@ fn unpack_zeros_for_group(
     // CAST: u8 → usize, bits is 4 or 8
     #[allow(clippy::as_conversions)]
     let pack_factor = 32 / bits as usize;
-    let packed_cols =
-        out_features
-            .checked_div(pack_factor)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "pack_factor is zero".into(),
-            })?;
+    // `bits` is validated to 4 or 8 before this runs, so `pack_factor` is 8 or
+    // 4 and the division cannot be by zero.
+    let packed_cols = out_features / pack_factor;
 
     for (j, buf_val) in buf.iter_mut().enumerate() {
         let packed_col = j / pack_factor;
@@ -133,41 +130,6 @@ fn unpack_zeros_for_group(
         {
             *buf_val = (qz + 1) as f32;
         }
-    }
-
-    Ok(())
-}
-
-/// Unpacks scale factors for a single group into `buf`.
-///
-/// Fills `buf[0..out_features]` with the f32 scales for group `g`.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short or the
-/// dtype is unsupported.
-fn unpack_scales_for_group(
-    buf: &mut [f32],
-    scales_data: &[u8],
-    g: usize,
-    out_features: usize,
-    scale_dtype: Dtype,
-) -> crate::Result<()> {
-    let bps = scale_dtype.byte_size();
-    let row_start = g
-        .checked_mul(out_features)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "scales group row offset overflow".into(),
-        })?;
-
-    for (j, buf_val) in buf.iter_mut().enumerate() {
-        let byte_offset = row_start
-            .checked_add(j)
-            .and_then(|idx| idx.checked_mul(bps))
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale byte offset overflow".into(),
-            })?;
-        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
     }
 
     Ok(())
@@ -327,6 +289,18 @@ pub fn dequantize_gptq<E: OutputElement>(
     let pack_factor = 32 / bits as usize;
 
     // --- Validate dimensions ---
+    //
+    // KEPT INLINE ON MEASUREMENT, not by oversight. This block and `AWQ`'s are
+    // near-identical, and the v0.7.8 close-out moved both into a shared
+    // `quant_utils::validate_group_tensors`. That cost `gptq_int4_bf16`
+    // +69.4 / +68.8 / +75.2 / +73.8 / +71.1 % across five runs of the paired
+    // harness (`benches/ab.rs`, tango, x86-64, ~2 % floor), with `F32` and
+    // `F16` flat. Shapes measured: the whole block moved out, with and without
+    // `#[inline]` on the helpers, and with the per-group scale unpack local or
+    // shared; only restoring this block in place recovered the number (+1.5 %).
+    // The mechanism is unexplained, and per `CONVENTIONS.md` rule 9 it is not
+    // chased here. `AWQ` keeps its copy inline too, so neither kernel carries a
+    // single-caller helper. See `docs/perf-experiments.md` Experiment 19.
     if in_features == 0 || out_features == 0 || group_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: format!(

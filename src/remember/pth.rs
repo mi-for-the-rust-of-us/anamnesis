@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use crate::convert::map_serialize_err;
 use crate::error::AnamnesisError;
 use crate::parse::pth::PthTensor;
 
@@ -40,33 +41,8 @@ pub fn pth_to_safetensors(
     tensors: &[PthTensor<'_>],
     output: impl AsRef<Path>,
 ) -> crate::Result<()> {
-    let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        Vec::with_capacity(tensors.len());
-
-    for tensor in tensors {
-        let st_dtype = tensor.dtype.to_safetensors_dtype()?;
-        // Cow<[u8]> derefs to &[u8] — zero-copy when Borrowed (from mmap).
-        let view =
-            safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("failed to create TensorView for `{}`: {e}", tensor.name),
-                })?;
-        views.push((tensor.name.clone(), view));
-    }
-
-    safetensors::tensor::serialize_to_file(views, None, output.as_ref()).map_err(
-        // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
-        // we extract IoError and treat everything else as a parse/format error.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
-            other => AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
-        },
-    )?;
-
-    Ok(())
+    safetensors::tensor::serialize_to_file(pth_views(tensors)?, None, output.as_ref())
+        .map_err(map_serialize_err)
 }
 
 /// Converts parsed `.pth` tensors to an in-memory safetensors byte buffer.
@@ -92,9 +68,23 @@ pub fn pth_to_safetensors(
 /// safetensors size. When tensors are `Cow::Borrowed` (zero-copy from an
 /// mmap), input data is not duplicated.
 pub fn pth_to_safetensors_bytes(tensors: &[PthTensor<'_>]) -> crate::Result<Vec<u8>> {
-    let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        Vec::with_capacity(tensors.len());
+    safetensors::tensor::serialize(pth_views(tensors)?, None).map_err(map_serialize_err)
+}
 
+/// Builds the safetensors views for [`pth_to_safetensors`] and
+/// [`pth_to_safetensors_bytes`], so the file and in-memory destinations cannot
+/// drift on dtype mapping, shape, or order.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Unsupported`] if a dtype has no safetensors
+/// equivalent, and [`AnamnesisError::Parse`] if the upstream crate rejects a
+/// shape/length pairing.
+fn pth_views<'a>(
+    tensors: &'a [PthTensor<'_>],
+) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'a>)>> {
+    let mut views: Vec<(String, safetensors::tensor::TensorView<'a>)> =
+        Vec::with_capacity(tensors.len());
     for tensor in tensors {
         let st_dtype = tensor.dtype.to_safetensors_dtype()?;
         // Cow<[u8]> derefs to &[u8] — zero-copy when Borrowed (from mmap).
@@ -105,12 +95,7 @@ pub fn pth_to_safetensors_bytes(tensors: &[PthTensor<'_>]) -> crate::Result<Vec<
                 })?;
         views.push((tensor.name.clone(), view));
     }
-
-    // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
-    #[allow(clippy::wildcard_enum_match_arm)]
-    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
-        reason: format!("failed to serialize safetensors: {e}"),
-    })
+    Ok(views)
 }
 
 #[cfg(test)]

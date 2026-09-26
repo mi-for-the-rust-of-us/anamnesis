@@ -36,8 +36,12 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::Instant;
+
+use common::bench::fmt_stats;
 
 /// Relative path under the `HuggingFace` cache to a large safetensors
 /// model file (~11 GiB). Chosen because (a) it is a single-file shard
@@ -52,13 +56,6 @@ fn fixture_path() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let path = PathBuf::from(home).join(STARCODER2_3B_RELATIVE);
     path.exists().then_some(path)
-}
-
-fn fmt_stats(samples: &[f64]) -> String {
-    let median = samples[samples.len() / 2];
-    let min = samples[0];
-    let max = samples[samples.len() - 1];
-    format!("median {median:.2} ms (min {min:.2}, max {max:.2})")
 }
 
 #[test]

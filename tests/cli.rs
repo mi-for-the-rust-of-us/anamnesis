@@ -5,7 +5,12 @@
 //! These tests build and invoke the binary via `std::process::Command` to
 //! verify argument parsing, subcommand routing, and output format. They
 //! complement the library-level tests in `cross_validation.rs`.
+//!
+//! Gated on `cli` because the binaries declare `required-features = ["cli"]`:
+//! without it Cargo builds no binary and sets no `CARGO_BIN_EXE_*` variable.
+//! Run with `cargo test --features cli` (or `--all-features`).
 
+#![cfg(feature = "cli")]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -15,48 +20,11 @@
 
 use std::process::Command;
 
-/// Path to the built binary (cargo sets this via the test harness).
-///
-/// Panics with a diagnostic message if the binary is missing or stale
-/// (version mismatch with `Cargo.toml`). Fix: run `cargo build` before
-/// `cargo test`.
-fn binary_path() -> std::path::PathBuf {
-    // `cargo test` builds binaries into target/debug/
-    let mut path = std::env::current_exe()
-        .expect("cannot determine test executable path")
-        .parent()
-        .expect("no parent directory")
-        .parent()
-        .expect("no grandparent directory")
-        .to_path_buf();
-    path.push(if cfg!(windows) {
-        "anamnesis.exe"
-    } else {
-        "anamnesis"
-    });
-
-    // Guard: binary must exist
-    assert!(
-        path.exists(),
-        "CLI binary not found at {}. Run `cargo build --features cli` before `cargo test`.",
-        path.display()
-    );
-
-    // Guard: binary version must match Cargo.toml
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|e| panic!("cannot run {}: {e}", path.display()));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = env!("CARGO_PKG_VERSION");
-    assert!(
-        stdout.contains(expected),
-        "STALE BINARY: {} reports `{stdout}` \
-         but Cargo.toml has v{expected}. Run `cargo build --features cli` before `cargo test`.",
-        path.display()
-    );
-
-    path
+/// The `anamnesis` binary. Cargo builds it for this test crate (with this
+/// crate's feature set) and points `CARGO_BIN_EXE_anamnesis` at it, so it can
+/// never be stale or missing.
+fn binary_path() -> &'static str {
+    env!("CARGO_BIN_EXE_anamnesis")
 }
 
 /// Build a minimal safetensors file in a temp directory for testing.

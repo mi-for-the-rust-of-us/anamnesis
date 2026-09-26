@@ -1,6 +1,6 @@
 # Python interop — design notes for the PyO3 bindings
 
-<!-- Last updated: 2026-06-25, anamnesis v0.6.8 (Phase 6.13) -->
+<!-- Last updated: 2026-09-26, anamnesis v0.7.8 (Phase 6.13, 7.6, 7.8) -->
 
 This is the contract the [Phase 8](../ROADMAP.md#phase-8-python-bindings-pyo3)
 PyO3 bindings (`pip install anamnesis-quant`) implement. It is written **before** the
@@ -147,6 +147,60 @@ Two things the binding must therefore expose, and one it must not:
 surface it as such rather than flattening it, because flattening would either
 invent precision or discard it. See the
 [FAQ](FAQ.md#does-asking-for-f32-rewrite-every-tensor-as-float32).
+
+## Cancellation and the GIL
+
+*The Rust side landed in v0.7.6; the Python wiring is Phase 8.*
+
+**The problem.** The binding releases the `GIL` around a large `parse` /
+`remember` / `convert`. While the `GIL` is released, `KeyboardInterrupt` is not
+delivered until Rust returns, so without cooperation from the core a notebook
+user could not `Ctrl-C` a multi-minute conversion and a web worker could not
+honour a request timeout.
+
+**The core's answer is a `CancelToken`** (`src/cancel.rs`), attached through
+`RememberOptions::with_cancel` or `ConvertOptions::with_cancel`. It is
+`Clone + Send + Sync`, one-way (no `reset`), and costs one relaxed atomic load
+to poll. The intended binding shape: run the work on a spawned thread, poll
+`Python::check_signals()` on the main thread, and call `cancel()` when a signal
+arrives.
+
+What a cancelled run guarantees:
+
+- **It is polled once per tensor**, by the workers themselves, at the point the
+  scheduling cursor hands one out; never inside a kernel. Cancellation is
+  cooperative, so a worker already inside a tensor finishes it. The bound is
+  one tensor's dequantisation, not the whole model.
+- **It returns `AnamnesisError::Cancelled`**, a variant of its own rather than a
+  `Parse`, because the input may be perfectly valid and a retry may succeed.
+  The binding maps it to the builtin `KeyboardInterrupt`, which is what the user
+  asked for, rather than to a `ParseError` that would misreport what happened.
+- **No output file is written.** Every path builds its complete result in memory
+  before serialising, so the check lands strictly before any byte reaches the
+  filesystem. There is no partial file to delete because none is created.
+
+A token the caller never cancels changes no output byte.
+
+## `Parse` versus `Io` on a short or corrupt input
+
+`Parse` maps to `ParseError` and `Io` to the builtin `OSError`, so which one a bad
+input produces is part of the contract. The rule, frozen on `AnamnesisError` in
+`src/error.rs`:
+
+- **A declared range past a known source length is `Parse`.** Every path that
+  knows the length (the slice-backed parsers, the `GGUF` reader, the `ZIP`
+  reader under `.npz` / `.pth` on both its slice and its `Read + Seek` source)
+  checks header-derived offsets against it before reading.
+- **A codec rejecting bytes inside a validated range is `Parse`**, for example a
+  corrupt or truncated `DEFLATE` `.pth` entry: the bytes are all present, and
+  malformed.
+- **A streaming `Read` of unknown length that ends early is `Io`.** The
+  reader-generic safetensors header takes a plain `Read`, which an `HTTP`-range
+  adapter may back, and a partial fetch must stay distinguishable from a
+  malformed header. Any genuine transport failure on any path is `Io` too.
+
+So a Python host can answer *400* on `ParseError` knowing the file itself is at
+fault, and retry or report a transport problem on `OSError`.
 
 See also the *Panic safety* section above and the README "Parsing untrusted
 input" error taxonomy — together they are the safety contract the bindings ship

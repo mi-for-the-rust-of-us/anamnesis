@@ -9,12 +9,11 @@ Every `.rs` file must start with `// SPDX-License-Identifier: MIT OR Apache-2.0`
 ## Pre-commit Checks
 
 Before every commit, run and fix any issues from:
-1. `cargo build --features cli` (ensures CLI binary is current before integration tests)
-2. `cargo fmt`
-3. `cargo clippy --all-targets --all-features -- -D warnings`
-4. `cargo test`
-5. **If the commit touches any `///` or `//!` comment**, run the rustdoc sweep — see [Documentation Checks](#documentation-checks). `--all-features` alone cannot see a link that breaks under an intermediate feature combination, and a public-items run cannot see a broken link on a `pub(crate)` item at all.
-6. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
+1. `cargo fmt`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
+3. `cargo test`, plus `cargo test --all-features` (what CI runs) when the change can reach the CLI. `tests/cli.rs` and `tests/cli_convert.rs` are gated on the `cli` feature, so a default-feature run skips them. No separate `cargo build` step is needed: Cargo builds the `anamnesis` / `amn` binaries for those tests and hands them over through `CARGO_BIN_EXE_*`, so they can never run against a stale binary.
+4. **If the commit touches any `///` or `//!` comment**, run the rustdoc sweep — see [Documentation Checks](#documentation-checks). `--all-features` alone cannot see a link that breaks under an intermediate feature combination, and a public-items run cannot see a broken link on a `pub(crate)` item at all.
+5. Update `CHANGELOG.md` — add a bullet under the `[Unreleased]` section for any user-visible change (new feature, fix, breaking change). Follow [Keep a Changelog](https://keepachangelog.com/) categories: Added, Changed, Fixed, Removed.
 
 ## Documentation Checks
 
@@ -63,13 +62,21 @@ comment.
 
 ## Performance Changes
 
+anamnesis is meant to be fast: a change may make it faster or leave it as fast, never slower.
+
 If a commit claims a perf win (faster, less memory, fewer allocations, fewer branches), it must include a measurement, not just an analysis:
 
-1. **Best-of-5 release-mode median**, with `target-cpu=native`, on a real fixture the claim is about. Templates: `tests/bench_npz_adhoc.rs` and `tests/bench_pth_adhoc.rs` — each is gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
-2. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
-3. **If the measurement does not show a win in the expected direction, do not commit.** Estimates and asymptotic arguments are hypotheses, not data — see `5f2632b` ("Revert NPZ memset elimination") for the cautionary case where a confidently estimated `~30 %` saving turned out to be a measured `~33 %` regression.
+1. **Decide with the paired harness, on x86-64.** [`benches/ab.rs`](benches/ab.rs) (tango) loads the baseline and the candidate together and interleaves them sample by sample, so drift cancels; its floor is ~2 %. Export the baseline from the parent commit, then compare:
+   ```powershell
+   cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf   # on the baseline
+   cargo bench --bench=ab --features gptq,awq,bnb,gguf -- compare target/benchmarks/ab --filter 'gptq_*' --noise-threshold 2.5
+   ```
+   **Run it about 10 times per arm** (these arms take milliseconds) and judge the median, with min and max. Filter to one kernel family per run: on this desktop a full-suite run can be contended part-way through and swing untouched kernels by ±100 %. See `CONVENTIONS.md` § *Benchmark evidence* for which instrument may decide what, and each one's measured floor.
+2. **For an absolute magnitude on a real fixture** (a model file, not the synthetic layer), use a best-of-5 release-mode median with `target-cpu=native`. Templates: the `tests/bench_*_adhoc.rs` files, each gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
+3. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
+4. **If the measurement does not show a win in the expected direction, do not commit.** Estimates and asymptotic arguments are hypotheses, not data — see `5f2632b` ("Revert NPZ memset elimination") for the cautionary case where a confidently estimated `~30 %` saving turned out to be a measured `~33 %` regression.
 
-This rule applies to perf-claim commits only. Correctness fixes, refactors, doc changes, and feature additions do not need a measurement to ship.
+These rules apply to perf-claim commits. Correctness fixes, doc changes, and feature additions do not need a measurement to ship, **with one exception: any change inside a dequant kernel's module (`src/remember/*`, `src/lethe/*`) gets the paired no-regression check (step 1) even when it claims nothing.** Code that never runs per element can still change how the hot loop compiles: in the v0.7.8 close-out, moving `GPTQ`'s entry validation into a shared helper cost `gptq_int4_bf16` +69 %, and a `checked_add` in a per-block reader cost `NF4` ~5 % (`docs/perf-experiments.md` Experiment 19).
 
 Before proposing a perf-claim change, **read [`docs/perf-experiments.md`](docs/perf-experiments.md)** — it catalogs hypotheses already tested and their measured outcomes (some confirmed, some rejected, some contradicting their original CHANGELOG claims). This avoids re-litigating the same ideas. When an experiment is shipped or attempted, add a row to that file's index plus a section with method + numbers, even if the result is "no change" or a regression.
 
@@ -106,7 +113,7 @@ Before tagging a release (`v*`), complete these steps in order:
 8. Wait for the publish workflow to go GREEN. Since v0.7.3 it does **two**
    things: `cargo publish`, then `gh release create` for the tag. The Release
    is what carries the test corpus, because `Cargo.toml`'s `exclude` keeps
-   `tests/` out of the published crate (0.60 MiB instead of 4.8 MiB), and
+   `tests/` out of the published crate (under 1 MiB instead of 4.8 MiB), and
    GitHub's per-tag source tarball ships it verbatim.
 9. Check the Release actually appeared and its notes are the right section.
    If the job failed *after* `cargo publish` succeeded, **do not re-run the

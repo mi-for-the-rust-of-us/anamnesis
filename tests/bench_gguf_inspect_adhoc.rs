@@ -37,10 +37,13 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use anamnesis::{inspect_gguf_from_reader, parse_gguf};
+
+use common::bench::{min_median_max, time_loop};
 
 /// Number of timed iterations per file per substrate.
 ///
@@ -51,29 +54,6 @@ const ITERATIONS: usize = 5;
 /// One additional warm-up iteration before timing begins, to amortise
 /// the cold-cache cost of the first read on a freshly-opened file.
 const WARMUP_ITERATIONS: usize = 1;
-
-/// Returns `(min, median, max)` of a slice of `Duration`s. Sorts the input.
-fn min_median_max(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
-    samples.sort_unstable();
-    let lo = samples[0];
-    let hi = samples[samples.len() - 1];
-    let mid = samples[samples.len() / 2];
-    (lo, mid, hi)
-}
-
-/// Times one closure `ITERATIONS` times after warming the file cache.
-fn time_loop<T, F: FnMut() -> T>(mut f: F) -> Vec<Duration> {
-    for _ in 0..WARMUP_ITERATIONS {
-        let _ = f();
-    }
-    let mut samples = Vec::with_capacity(ITERATIONS);
-    for _ in 0..ITERATIONS {
-        let t = Instant::now();
-        let _ = f();
-        samples.push(t.elapsed());
-    }
-    samples
-}
 
 #[test]
 #[ignore = "needs locally-downloaded GGUF models under tests/fixtures/gguf_reference/models/"]
@@ -124,11 +104,13 @@ fn bench_gguf_inspect_paths() {
         let file_size = std::fs::metadata(path).ok().map_or(0, |m| m.len());
 
         // mmap-backed path: parse_gguf(path).inspect()
-        let mut mmap_samples = time_loop(|| parse_gguf(path).expect("parse_gguf").inspect());
+        let mut mmap_samples = time_loop(WARMUP_ITERATIONS, ITERATIONS, || {
+            parse_gguf(path).expect("parse_gguf").inspect()
+        });
         let (mmap_lo, mmap_mid, mmap_hi) = min_median_max(&mut mmap_samples);
 
         // Reader-generic path: inspect_gguf_from_reader(File::open(path)?)
-        let mut reader_samples = time_loop(|| {
+        let mut reader_samples = time_loop(WARMUP_ITERATIONS, ITERATIONS, || {
             let f = std::fs::File::open(path).expect("open");
             inspect_gguf_from_reader(f).expect("inspect_gguf_from_reader")
         });

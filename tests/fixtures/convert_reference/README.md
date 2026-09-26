@@ -23,8 +23,8 @@ The Rust test looks up the sidecar by `path_label` and reports
 
 ## Generating / refreshing sidecars
 
-Run `generate_convert_timings.py` (placeholder; not shipped in this
-commit) against a Python environment with `numpy`, `safetensors`,
+Run `generate_convert_timings.py` (in this directory) against a Python
+environment with `numpy`, `safetensors`,
 `gguf`, and `bitsandbytes` installed. The script writes one JSON per
 path label listed in `tests/cross_validation_convert.rs::report_vs_python`.
 

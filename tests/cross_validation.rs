@@ -16,6 +16,8 @@
     clippy::wildcard_enum_match_arm
 )]
 
+mod common;
+
 use std::time::Instant;
 
 use anamnesis::{
@@ -23,6 +25,9 @@ use anamnesis::{
     dequantize_per_channel_fp8_to_bf16, dequantize_per_tensor_fp8,
     dequantize_per_tensor_fp8_to_bf16,
 };
+
+use common::bf16::compare_bf16;
+use common::fixture::read_u32_le;
 
 // ---------------------------------------------------------------------------
 // Fixture parsing
@@ -67,11 +72,6 @@ struct Fixture {
     scale_data: Vec<u8>,
     expected_bf16: Vec<u8>,
     expected_f32: Vec<u8>,
-}
-
-fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    let bytes: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-    u32::from_le_bytes(bytes)
 }
 
 fn parse_fixture(data: &[u8]) -> Fixture {
@@ -123,56 +123,6 @@ fn parse_fixture(data: &[u8]) -> Fixture {
         expected_bf16: data[bf16_start..bf16_start + bf16_len].to_vec(),
         expected_f32: data[f32_start..f32_start + f32_len].to_vec(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// BF16 comparison
-// ---------------------------------------------------------------------------
-
-/// Compare two `BF16` byte slices, allowing up to `max_ulp_diff` ULP
-/// (unit in the last place) difference per element.
-///
-/// Returns the number of mismatched elements and the maximum ULP diff found.
-fn compare_bf16(actual: &[u8], expected: &[u8], max_ulp_diff: u16) -> (usize, u16) {
-    assert_eq!(actual.len(), expected.len(), "output length mismatch");
-    let mut mismatches = 0;
-    let mut max_diff: u16 = 0;
-
-    for (i, (a_pair, e_pair)) in actual
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .zip(expected.as_chunks::<2>().0)
-        .enumerate()
-    {
-        let a_bits = u16::from_le_bytes([a_pair[0], a_pair[1]]);
-        let e_bits = u16::from_le_bytes([e_pair[0], e_pair[1]]);
-
-        // Handle NaN: both NaN is a match.
-        let a_is_nan = (a_bits & 0x7F80 == 0x7F80) && (a_bits & 0x007F != 0);
-        let e_is_nan = (e_bits & 0x7F80 == 0x7F80) && (e_bits & 0x007F != 0);
-        if a_is_nan && e_is_nan {
-            continue;
-        }
-        if a_is_nan != e_is_nan {
-            mismatches += 1;
-            continue;
-        }
-
-        let diff = a_bits.abs_diff(e_bits);
-        if diff > max_ulp_diff {
-            mismatches += 1;
-            if i < 5 {
-                eprintln!(
-                    "  element {i}: actual=0x{a_bits:04X}, expected=0x{e_bits:04X}, diff={diff} ULP"
-                );
-            }
-        }
-        if diff > max_diff {
-            max_diff = diff;
-        }
-    }
-    (mismatches, max_diff)
 }
 
 // ---------------------------------------------------------------------------

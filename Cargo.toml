@@ -21,7 +21,9 @@ default-run = "anamnesis"
 # binary goldens, which took the published `.crate` to 4.8 MiB gzipped against
 # the registry's 10 MiB cap. Measured with `cargo package`, excluding it leaves
 # a 2.2 MiB payload that is almost entirely text and gzips to **628 687 bytes
-# (0.60 MiB)**, an 8.0x reduction. The cap was also starting to constrain how wide
+# (0.60 MiB)** at v0.7.3, an 8.0x reduction. The crate has grown with its docs
+# since (803 KiB at the v0.7.8 close-out); "under 1 MiB" is the figure the
+# README and the Release notes quote. The cap was also starting to constrain how wide
 # those goldens could be, which is backwards: the test corpus should be sized by
 # the correctness claim it has to support, and the artefact by what consumers
 # actually need.
@@ -41,8 +43,13 @@ default-run = "anamnesis"
 # targets below are declared explicitly and would dangle without their sources.
 # `/__reports__` holds contributed measurement studies (charts + raw data).
 # Useful in the repository, dead weight in the published crate: the issue #11
-# Apple-Silicon study alone is 252 KiB against a ~788 KiB crate.
-exclude = ["/fuzz", "/tests", "/__reports__"]
+# Apple-Silicon study alone is 252 KiB against a ~0.8 MiB crate.
+# `/docs/archive` holds planning documents for work that has shipped: kept for
+# the record in the repository, not needed by anyone building the crate.
+# `/docs/investigations` is gitignored and holds ~435 MB of format-spelunking
+# binaries; `cargo package` is git-aware and would skip it anyway, but listing
+# it keeps a non-git packaging run from ever picking it up.
+exclude = ["/fuzz", "/tests", "/__reports__", "/docs/archive", "/docs/investigations"]
 
 # `[package.metadata.docs.rs]` accepts only docs.rs-specific build keys
 # (features, targets, all-features, no-default-features). Other Cargo
@@ -121,6 +128,9 @@ gguf = []
 # runtime dep). Implies `gguf` because every Ollama blob is a GGUF.
 ollama = ["gguf"]
 indicatif = ["dep:indicatif"]
+# Builds the dev-only `tsan-harness` binary (see its `[[bin]]` entry below and
+# `.github/workflows/tsan.yml`). Never needed by a library or CLI user.
+tsan = ["parallel"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
@@ -162,14 +172,21 @@ required-features = ["cli"]
 # dev-dependencies, so this target can be built the way the Unstable Book's own
 # sanitizer example is.
 #
-# `required-features = ["parallel"]` keeps it out of a sequential build, where
-# it would have nothing to check.
+# `required-features = ["tsan"]`: a dedicated, non-default feature. It used to be
+# `["parallel"]`, which is a *default* feature, so `cargo install anamnesis
+# --features cli` also installed this dev-only binary into `~/.cargo/bin`, and a
+# bare `cargo install anamnesis` installed nothing else. `tsan` implies
+# `parallel`, still keeping the harness out of a sequential build, where it would
+# have nothing to check.
 [[bin]]
 name = "tsan-harness"
 path = "src/bin/tsan_harness.rs"
-required-features = ["parallel"]
+required-features = ["tsan"]
 
 [dev-dependencies]
+# Phase 7.7 paired A/B harness behind `benches/ab.rs`: loads two builds and
+# interleaves them sample by sample, so drift cancels. The instrument that
+# decides whether a change is faster (~2 % floor on x86-64).
 tango-bench = "0.8"
 # Phase 6.5 dev-only benchmark harness. Provides statistical-rigour
 # throughput measurement (Welch t-tests, bootstrap CIs), HTML report
@@ -179,7 +196,7 @@ tango-bench = "0.8"
 #
 # Aliased to `codspeed-criterion-compat` (a drop-in for criterion 0.5): a plain
 # `cargo bench` behaves exactly like upstream criterion, while under
-# `cargo codspeed` it emits CodSpeed measurements for CI regression tracking.
+# `cargo codspeed` it emits CodSpeed measurements for the `aarch64` drift watch.
 # The bench `.rs` sources keep their `use criterion::…` imports unchanged. See
 # `.github/workflows/codspeed.yml`.
 #

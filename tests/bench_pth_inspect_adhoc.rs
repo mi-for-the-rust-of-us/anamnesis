@@ -64,10 +64,14 @@
 /// reader/mmap ratios), one record per `.pth` file in that family.
 type FamilyBuckets = std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)>;
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anamnesis::{inspect_pth_from_reader, parse_pth};
+
+use common::bench::{min_median_max, time_loop};
 
 /// Number of timed iterations per file per substrate.
 ///
@@ -85,29 +89,6 @@ const WARMUP_ITERATIONS: usize = 1;
 /// `.pth` files) before invoking `bench_pth_inspect_algzoo_sweep`. When
 /// unset or invalid, the sweep test prints a SKIP message and returns.
 const ALGZOO_DIR_ENV: &str = "ANAMNESIS_ALGZOO_DIR";
-
-/// Returns `(min, median, max)` of a slice of `Duration`s. Sorts the input.
-fn min_median_max(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
-    samples.sort_unstable();
-    let lo = samples[0];
-    let hi = samples[samples.len() - 1];
-    let mid = samples[samples.len() / 2];
-    (lo, mid, hi)
-}
-
-/// Times one closure `ITERATIONS` times after warming the file cache.
-fn time_loop<T, F: FnMut() -> T>(mut f: F) -> Vec<Duration> {
-    for _ in 0..WARMUP_ITERATIONS {
-        let _ = f();
-    }
-    let mut samples = Vec::with_capacity(ITERATIONS);
-    for _ in 0..ITERATIONS {
-        let t = Instant::now();
-        let _ = f();
-        samples.push(t.elapsed());
-    }
-    samples
-}
 
 /// Per-file timing record produced by [`measure_file`].
 struct FileTiming {
@@ -130,10 +111,12 @@ impl FileTiming {
 fn measure_file(path: &Path) -> FileTiming {
     let file_size = std::fs::metadata(path).ok().map_or(0, |m| m.len());
 
-    let mut mmap_samples = time_loop(|| parse_pth(path).expect("parse_pth").inspect());
+    let mut mmap_samples = time_loop(WARMUP_ITERATIONS, ITERATIONS, || {
+        parse_pth(path).expect("parse_pth").inspect()
+    });
     let (mmap_min, mmap_med, mmap_max) = min_median_max(&mut mmap_samples);
 
-    let mut reader_samples = time_loop(|| {
+    let mut reader_samples = time_loop(WARMUP_ITERATIONS, ITERATIONS, || {
         let f = std::fs::File::open(path).expect("open");
         inspect_pth_from_reader(f).expect("inspect_pth_from_reader")
     });

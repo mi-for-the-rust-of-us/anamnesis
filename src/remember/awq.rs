@@ -73,7 +73,7 @@
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
-use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
+use crate::remember::quant_utils::{read_u32_le, unpack_scales_for_group};
 
 /// `AWQ` 4-bit pack factor: 8 nibbles per packed `I32`.
 const AWQ_PACK_FACTOR: usize = 8;
@@ -136,41 +136,6 @@ fn unpack_zeros_for_group(
         {
             *buf_val = qz as f32;
         }
-    }
-
-    Ok(())
-}
-
-/// Unpacks scale factors for a single group into `buf`.
-///
-/// Fills `buf[0..out_features]` with the f32 scales for group `g`.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short or the
-/// dtype is unsupported.
-fn unpack_scales_for_group(
-    buf: &mut [f32],
-    scales_data: &[u8],
-    g: usize,
-    out_features: usize,
-    scale_dtype: Dtype,
-) -> crate::Result<()> {
-    let bps = scale_dtype.byte_size();
-    let row_start = g
-        .checked_mul(out_features)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "scales group row offset overflow".into(),
-        })?;
-
-    for (j, buf_val) in buf.iter_mut().enumerate() {
-        let byte_offset = row_start
-            .checked_add(j)
-            .and_then(|idx| idx.checked_mul(bps))
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale byte offset overflow".into(),
-            })?;
-        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
     }
 
     Ok(())
@@ -294,6 +259,9 @@ pub fn dequantize_awq<E: OutputElement>(
     let pack_factor = AWQ_PACK_FACTOR;
 
     // --- Validate dimensions ---
+    //
+    // Deliberately a near-copy of `GPTQ`'s block: sharing it measurably
+    // slowed `GPTQ` (see the note in `remember/gptq.rs`), so both stay inline.
     if in_features == 0 || out_features == 0 || group_size == 0 {
         return Err(AnamnesisError::Parse {
             reason: format!(

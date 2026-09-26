@@ -168,7 +168,8 @@ host branches without string-matching: a budget/cap breach (a `ParseLimits` axis
 (→ *413*); a malformed/truncated file is `Parse` (→ *400*); a `.pth` pickle
 referencing a `GLOBAL` outside the `torch.*` allowlist is `DisallowedGlobal { module, name }`
 (a security signal); a recognised-but-unimplemented format/dtype is `Unsupported`;
-I/O failures are `Io`. The v0.8.0 Python bindings map these one-to-one:
+a caller-requested stop through a `CancelToken` is `Cancelled`; I/O failures
+are `Io`. The v0.8.0 Python bindings map these one-to-one:
 
 | `AnamnesisError` | Python exception |
 |---|---|
@@ -176,6 +177,7 @@ I/O failures are `Io`. The v0.8.0 Python bindings map these one-to-one:
 | `Unsupported` | `UnsupportedError` |
 | `LimitExceeded` | `LimitExceededError` |
 | `DisallowedGlobal` | `SecurityError` |
+| `Cancelled` | builtin `KeyboardInterrupt` |
 | `Io` | builtin `OSError` |
 
 **No panic, no abort.** No public parse/inspect entry point panics or aborts on
@@ -220,7 +222,7 @@ Representative measured results (release build, `target-cpu=native`, best-of-5):
 - **vs the Python `GGUF` stack:** whole-model `GGUF` dequantisation is **17–28×** faster than [`gguf-py`](https://pypi.org/project/gguf/) single-threaded and **34–53×** at the default thread budget. **Not a like-for-like output:** `gguf-py` returns `float32`, anamnesis returns `BF16`, which is half the bytes and the narrower type. What is verified is that anamnesis's `BF16` is **bit-identical to `gguf-py`'s `float32` correctly rounded to `BF16`** (0 ULP, all 22 kernels), so the two agree on the numbers and differ only in the delivered width. Since that width difference is itself worth ~2× of memory traffic on a bandwidth-bound workload, halving `gguf-py`'s time as a generous correction still leaves ~9–14× and ~17–26×.
 
 These are guarded against regression by [CodSpeed](https://codspeed.io/) continuous
-benchmarking on every merge to `main` — note that its bare-metal runners are
+benchmarking on each push to `main` that touches code. Its bare-metal runners are
 `aarch64`, while the numbers above are x86-64, so it watches a *different*
 architecture rather than the same one twice. Deciding whether a change is faster
 is done locally on x86-64 with a paired harness that resolves ~2 %. Alongside
@@ -234,7 +236,7 @@ and [`docs/perf-experiments.md`](docs/perf-experiments.md).
 
 ### Verifying the correctness claims yourself
 
-The crate published to crates.io is 0.60 MiB and **excludes `tests/`**, because
+The crate published to crates.io is under 1 MiB and **excludes `tests/`**, because
 the cross-validation corpus is 6.3 MiB of binary goldens that no consumer's
 build can reach. The corpus ships with every
 [GitHub Release](https://github.com/mi-for-the-rust-of-us/anamnesis/releases)

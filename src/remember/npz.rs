@@ -16,33 +16,9 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::Path;
 
+use crate::convert::map_serialize_err;
 use crate::error::AnamnesisError;
-use crate::parse::npz::{NpzDtype, NpzTensor};
-
-/// Maps an [`NpzDtype`] to its `safetensors::Dtype` counterpart.
-///
-/// Every variant maps successfully — `safetensors` covers the full `NPZ`
-/// dtype range (`Bool`, `U8`/`I8`/…/`U64`/`I64`, `F16`, `BF16`, `F32`,
-/// `F64`). The function exists as an exhaustive match rather than a `From`
-/// impl so the wildcard arm reads as a compile-time error if `NpzDtype`
-/// ever gains a variant `safetensors` cannot represent.
-fn npz_dtype_to_safetensors(dtype: NpzDtype) -> safetensors::Dtype {
-    match dtype {
-        NpzDtype::Bool => safetensors::Dtype::BOOL,
-        NpzDtype::U8 => safetensors::Dtype::U8,
-        NpzDtype::I8 => safetensors::Dtype::I8,
-        NpzDtype::U16 => safetensors::Dtype::U16,
-        NpzDtype::I16 => safetensors::Dtype::I16,
-        NpzDtype::U32 => safetensors::Dtype::U32,
-        NpzDtype::I32 => safetensors::Dtype::I32,
-        NpzDtype::U64 => safetensors::Dtype::U64,
-        NpzDtype::I64 => safetensors::Dtype::I64,
-        NpzDtype::F16 => safetensors::Dtype::F16,
-        NpzDtype::BF16 => safetensors::Dtype::BF16,
-        NpzDtype::F32 => safetensors::Dtype::F32,
-        NpzDtype::F64 => safetensors::Dtype::F64,
-    }
-}
+use crate::parse::npz::NpzTensor;
 
 /// Converts the tensors parsed from an `NPZ` archive to a safetensors file
 /// on disk.
@@ -75,39 +51,8 @@ pub fn npz_to_safetensors<S: BuildHasher>(
     tensors: &HashMap<String, NpzTensor, S>,
     output: impl AsRef<Path>,
 ) -> crate::Result<()> {
-    // Sort by name so the produced safetensors header has a deterministic
-    // tensor order regardless of the source HashMap's iteration order.
-    let mut names: Vec<&str> = tensors.keys().map(String::as_str).collect();
-    names.sort_unstable();
-
-    let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        Vec::with_capacity(names.len());
-    for name in &names {
-        let tensor = tensors.get(*name).ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("NPZ→safetensors: tensor `{name}` vanished mid-iteration"),
-        })?;
-        let st_dtype = npz_dtype_to_safetensors(tensor.dtype);
-        let view =
-            safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("failed to create TensorView for `{name}`: {e}"),
-                })?;
-        views.push(((*name).to_owned(), view));
-    }
-
-    safetensors::tensor::serialize_to_file(views, None, output.as_ref()).map_err(
-        // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants;
-        // we extract IoError and treat everything else as a parse/format error.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        |e| match e {
-            safetensors::SafeTensorError::IoError(io_err) => AnamnesisError::Io(io_err),
-            other => AnamnesisError::Parse {
-                reason: format!("failed to write safetensors file: {other}"),
-            },
-        },
-    )?;
-
-    Ok(())
+    safetensors::tensor::serialize_to_file(npz_views(tensors)?, None, output.as_ref())
+        .map_err(map_serialize_err)
 }
 
 /// Converts the tensors parsed from an `NPZ` archive to an in-memory
@@ -133,29 +78,35 @@ pub fn npz_to_safetensors<S: BuildHasher>(
 pub fn npz_to_safetensors_bytes<S: BuildHasher>(
     tensors: &HashMap<String, NpzTensor, S>,
 ) -> crate::Result<Vec<u8>> {
-    let mut names: Vec<&str> = tensors.keys().map(String::as_str).collect();
-    names.sort_unstable();
+    safetensors::tensor::serialize(npz_views(tensors)?, None).map_err(map_serialize_err)
+}
+
+/// Builds the safetensors views for [`npz_to_safetensors`] and
+/// [`npz_to_safetensors_bytes`], sorted by tensor name so the output header
+/// has a deterministic order whatever the source `HashMap`'s iteration order.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the upstream crate rejects a
+/// shape/length pairing.
+fn npz_views<S: BuildHasher>(
+    tensors: &HashMap<String, NpzTensor, S>,
+) -> crate::Result<Vec<(String, safetensors::tensor::TensorView<'_>)>> {
+    let mut sorted: Vec<(&String, &NpzTensor)> = tensors.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
     let mut views: Vec<(String, safetensors::tensor::TensorView<'_>)> =
-        Vec::with_capacity(names.len());
-    for name in &names {
-        let tensor = tensors.get(*name).ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("NPZ→safetensors: tensor `{name}` vanished mid-iteration"),
-        })?;
-        let st_dtype = npz_dtype_to_safetensors(tensor.dtype);
+        Vec::with_capacity(sorted.len());
+    for (name, tensor) in sorted {
+        let st_dtype = tensor.dtype.to_safetensors_dtype()?;
         let view =
             safetensors::tensor::TensorView::new(st_dtype, tensor.shape.clone(), &tensor.data)
                 .map_err(|e| AnamnesisError::Parse {
                     reason: format!("failed to create TensorView for `{name}`: {e}"),
                 })?;
-        views.push(((*name).to_owned(), view));
+        views.push((name.clone(), view));
     }
-
-    // EXHAUSTIVE: SafeTensorError is a foreign type that may gain variants
-    #[allow(clippy::wildcard_enum_match_arm)]
-    safetensors::tensor::serialize(views, None).map_err(|e| AnamnesisError::Parse {
-        reason: format!("failed to serialize safetensors: {e}"),
-    })
+    Ok(views)
 }
 
 #[cfg(test)]
@@ -168,6 +119,7 @@ pub fn npz_to_safetensors_bytes<S: BuildHasher>(
 )]
 mod tests {
     use super::*;
+    use crate::parse::npz::NpzDtype;
 
     fn make_tensor(name: &str, dtype: NpzDtype, shape: Vec<usize>, data: Vec<u8>) -> NpzTensor {
         NpzTensor {

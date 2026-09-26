@@ -63,8 +63,8 @@
 //! their signatures thread `E` through to the shared runner.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
-//! `dequantize_row_*` reference implementations. Bit-for-bit
-//! cross-validation against `llama.cpp` output is Phase 4 step 4.
+//! `dequantize_row_*` reference implementations, and cross-validated against
+//! `gguf-py`, which mirrors them (see *Output format* below).
 //!
 //! # Output format
 //!
@@ -87,10 +87,11 @@ use iq_grids::{
 // Block-size constants
 // ---------------------------------------------------------------------------
 
-/// Element count per legacy block quant (`Q4_0`..`Q8_1`, `IQ4_NL`).
+/// Element count per legacy block quant (`Q4_0`..`Q8_1`, `IQ4_NL`, `MXFP4`).
 const QK_SMALL: usize = 32;
 
-/// Element count per K-quant super-block (`Q2_K`..`Q8_K`, `IQ4_XS`).
+/// Element count per K-quant super-block (`Q2_K`..`Q8_K`, `IQ4_XS`, and every
+/// `IQ2_*` / `IQ3_*` / `IQ1_*` / `TQ*` type).
 const QK_K: usize = 256;
 
 /// Powers of 3 used for the base-3 packing trick in `TQ1_0`.
@@ -286,7 +287,9 @@ fn validate_dequant_input(
         .type_size()
         .ok_or_else(|| AnamnesisError::Unsupported {
             format: "GGUF".into(),
-            detail: format!("dequantisation not yet supported for {dtype}"),
+            detail: format!(
+                "{dtype} is not a block-quantised type; there is nothing to dequantise"
+            ),
         })?;
     let expected_bytes = n_blocks
         .checked_mul(type_size)
@@ -420,7 +423,9 @@ where
         GgufType::MXFP4 => dequant_mxfp4::<E, _>(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
-            detail: format!("dequantisation not yet supported for {dtype}"),
+            detail: format!(
+                "{dtype} is not a block-quantised type; there is nothing to dequantise"
+            ),
         }),
     }
 }
@@ -437,10 +442,12 @@ where
 /// anamnesis's own; see `remember::output` for what that does and does not
 /// guarantee. [`dequantize_gguf_to_bf16`] is the `E = Bf16Out` spelling.
 ///
-/// Convenience wrapper around [`dequantize_gguf_blocks`] that pushes each
-/// block's output into a pre-allocated `Vec::with_capacity`. For very large
-/// tensors, prefer the streaming variant — this variant's peak heap is
-/// O(`n_elements × E::BYTES`).
+/// The collecting counterpart of [`dequantize_gguf_blocks`]: the same
+/// validation and the same kernel dispatch, with a sink that appends each
+/// block to a pre-allocated `Vec::with_capacity`. It does not call the
+/// streaming entry point, because it needs the validated byte length for that
+/// capacity. For very large tensors, prefer the streaming variant: this one's
+/// peak heap is O(`n_elements × E::BYTES`).
 ///
 /// # Errors
 ///
@@ -530,8 +537,8 @@ pub fn dequantize_gguf_to_bf16(
 /// or the sink will silently misread `F32` output as twice as many `BF16`
 /// values. Sink errors abort the stream and are propagated unchanged.
 ///
-/// This is the canonical form. [`dequantize_gguf`] is a thin wrapper that
-/// sinks into a `Vec::with_capacity`.
+/// This is the canonical form. [`dequantize_gguf`] shares its validation and
+/// dispatch, with a sink that appends into a `Vec::with_capacity`.
 ///
 /// # Errors
 ///
@@ -2034,6 +2041,8 @@ impl crate::ParsedGguf {
     /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
     /// safetensors equivalent.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes; no output is written.
     ///
     /// # Memory
     ///
@@ -2080,6 +2089,8 @@ impl crate::ParsedGguf {
     /// # Errors
     ///
     /// As [`remember_to_bytes`](Self::remember_to_bytes).
+    /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
+    /// triggered before the run completes.
     ///
     /// # Memory
     ///
@@ -3502,8 +3513,7 @@ mod tests {
 ///
 /// Each `IQ2*_GRID` entry packs an 8-element `u8` codebook vector as a
 /// little-endian `u64`; `.to_le_bytes()` at the use site recovers the 8
-/// codebook values. Subsequent Phase 4.5 commits (`IQ3_*`, `IQ1_*`) will
-/// deposit their own grids into this submodule.
+/// codebook values. The `IQ3_*` and `IQ1_*` grids live here too.
 #[allow(clippy::unreadable_literal, clippy::large_stack_arrays)]
 mod iq_grids {
     /// Per-element sign-selection bit-mask (`j`-th bit).

@@ -40,9 +40,8 @@ use crate::error::AnamnesisError;
 /// The input is a 16-byte synthetic weight buffer where byte `i` packs
 /// nibble `i` in both the low and high positions; both nibbles are
 /// covered by a single block. One `block_size`-element block is used per
-/// scale, with all 16 nibble values represented exactly twice per block
-/// at minimum (`block_size >= 32` recommended; the harness asserts
-/// `block_size >= 32` to guarantee coverage).
+/// scale, with all 16 nibble values represented exactly twice. The harness
+/// requires `block_size == 32`, the synthetic input's length.
 ///
 /// The harness accepts both the `decode` and `encode` functions as
 /// closures so it can be invoked from unit tests inside the `bnb`
@@ -57,9 +56,8 @@ use crate::error::AnamnesisError;
 /// - `scales` — set of per-block absmax values to test. Each scale
 ///   produces a fresh decode-then-encode round-trip on the same
 ///   synthetic 32-element block.
-/// - `block_size` — elements per absmax block. Must be a multiple of 32
-///   and at most the harness's synthetic input length (`16 * 2 =
-///   32` elements default — pass `block_size = 32`).
+/// - `block_size` — elements per absmax block. Must be exactly 32, the
+///   harness's synthetic input length (`16 × 2` elements).
 /// - `decode` — closure invoking the kernel-under-test's decode entry
 ///   point with the standard `(weight_bytes, absmax_bytes,
 ///   quant_map_bytes, total_elements, block_size)` signature.
@@ -70,8 +68,8 @@ use crate::error::AnamnesisError;
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the harness's own bounds are
-/// violated (`block_size` not a multiple of 32, `block_size > 32`,
-/// `scales` empty). Decode / encode errors propagate.
+/// violated (`block_size != 32`, or `scales` empty). Decode / encode errors
+/// propagate.
 ///
 /// # Panics
 ///
