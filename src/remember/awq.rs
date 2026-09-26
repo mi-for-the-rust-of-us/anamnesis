@@ -73,7 +73,9 @@
 use crate::error::AnamnesisError;
 use crate::parse::safetensors::Dtype;
 use crate::remember::output::{Bf16Out, OutputElement, VECTOR_TILE};
-use crate::remember::quant_utils::{read_scale_f32, read_u32_le};
+use crate::remember::quant_utils::{
+    alloc_output, read_u32_le, unpack_scales_for_group, validate_group_tensors,
+};
 
 /// `AWQ` 4-bit pack factor: 8 nibbles per packed `I32`.
 const AWQ_PACK_FACTOR: usize = 8;
@@ -136,41 +138,6 @@ fn unpack_zeros_for_group(
         {
             *buf_val = qz as f32;
         }
-    }
-
-    Ok(())
-}
-
-/// Unpacks scale factors for a single group into `buf`.
-///
-/// Fills `buf[0..out_features]` with the f32 scales for group `g`.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if `scales_data` is too short or the
-/// dtype is unsupported.
-fn unpack_scales_for_group(
-    buf: &mut [f32],
-    scales_data: &[u8],
-    g: usize,
-    out_features: usize,
-    scale_dtype: Dtype,
-) -> crate::Result<()> {
-    let bps = scale_dtype.byte_size();
-    let row_start = g
-        .checked_mul(out_features)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "scales group row offset overflow".into(),
-        })?;
-
-    for (j, buf_val) in buf.iter_mut().enumerate() {
-        let byte_offset = row_start
-            .checked_add(j)
-            .and_then(|idx| idx.checked_mul(bps))
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "scale byte offset overflow".into(),
-            })?;
-        *buf_val = read_scale_f32(scales_data, byte_offset, scale_dtype)?;
     }
 
     Ok(())
@@ -293,87 +260,20 @@ pub fn dequantize_awq<E: OutputElement>(
 
     let pack_factor = AWQ_PACK_FACTOR;
 
-    // --- Validate dimensions ---
-    if in_features == 0 || out_features == 0 || group_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "zero dimension: in_features={in_features}, out_features={out_features}, \
-                 group_size={group_size}"
-            ),
-        });
-    }
-    if !out_features.is_multiple_of(pack_factor) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "out_features {out_features} is not a multiple of pack_factor {pack_factor}"
-            ),
-        });
-    }
-    if !in_features.is_multiple_of(group_size) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "in_features {in_features} is not a multiple of group_size {group_size}"
-            ),
-        });
-    }
-
-    let packed_cols = out_features / pack_factor;
-    let num_groups = in_features / group_size;
-
-    // --- Validate tensor sizes ---
-    let expected_qw_len = in_features
-        .checked_mul(packed_cols)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "qweight byte length overflow".into(),
-        })?;
-    if qweight_data.len() != expected_qw_len {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "qweight data length {} != expected {expected_qw_len}",
-                qweight_data.len()
-            ),
-        });
-    }
-
-    let expected_scales_len = num_groups
-        .checked_mul(out_features)
-        .and_then(|n| n.checked_mul(scale_dtype.byte_size()))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "scales byte length overflow".into(),
-        })?;
-    if scales_data.len() != expected_scales_len {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "scales data length {} != expected {expected_scales_len}",
-                scales_data.len()
-            ),
-        });
-    }
-
-    let expected_qzeros_len = num_groups
-        .checked_mul(packed_cols)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "qzeros byte length overflow".into(),
-        })?;
-    if qzeros_data.len() != expected_qzeros_len {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "qzeros data length {} != expected {expected_qzeros_len}",
-                qzeros_data.len()
-            ),
-        });
-    }
+    // --- Validate dimensions and tensor sizes ---
+    let (packed_cols, _) = validate_group_tensors(
+        qweight_data.len(),
+        scales_data.len(),
+        qzeros_data.len(),
+        in_features,
+        out_features,
+        group_size,
+        pack_factor,
+        scale_dtype,
+    )?;
 
     // --- Allocate output + scratch buffers ---
-    let out_byte_len = in_features
-        .checked_mul(out_features)
-        .and_then(|n| n.checked_mul(E::BYTES))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "output size overflow".into(),
-        })?;
-    let mut output = vec![0u8; out_byte_len];
+    let mut output = alloc_output::<E>(in_features, out_features)?;
 
     // Pre-allocate scratch buffers for one row each (reused across iterations).
     // Lazy per-group: only `out_features` f32 values are live at a time,
