@@ -124,11 +124,13 @@ impl TargetDtype {
     /// duplication Phase 7.6 exists to remove.
     ///
     /// Total and infallible: every `TargetDtype` is an output width by
-    /// construction, which is the point of the type.
+    /// construction, which is the point of the type. Also how the CLI turns
+    /// `--out-dtype` / `--to` into the `Dtype` the library's path derivation
+    /// takes, so the CLI keeps no dtype vocabulary of its own.
     ///
-    /// Gated on `gguf` because that is where the two dispatch styles meet; a
-    /// build without it has only one and needs no bridge.
-    #[cfg(feature = "gguf")]
+    /// Gated on the two features that need the bridge: `gguf`, where the
+    /// `remember` and `convert` dispatch styles meet, and `cli`.
+    #[cfg(any(feature = "gguf", feature = "cli"))]
     #[must_use]
     pub(crate) const fn as_dtype(self) -> Dtype {
         match self {
@@ -141,10 +143,8 @@ impl TargetDtype {
 
 impl fmt::Display for TargetDtype {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Wildcard-free on purpose: `src/cli.rs`'s `derive_output_path` builds
-        // the output filename's dtype suffix from this string, so a new variant
-        // that fell through to a catch-all would silently produce a wrongly
-        // named file rather than failing to compile.
+        // Wildcard-free on purpose: a new variant that fell through to a
+        // catch-all would print a wrong name rather than failing to compile.
         match self {
             Self::BF16 => f.write_str("BF16"),
             Self::F32 => f.write_str("F32"),

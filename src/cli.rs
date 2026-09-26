@@ -554,7 +554,13 @@ fn run_remember_safetensors(
 
     let output_path = match output {
         Some(p) => p.to_owned(),
-        None => derive_output_path(path, target),
+        // The library derivation, so `remember` and `convert` name files the
+        // same way: `model-fp8.safetensors` → `model-bf16.safetensors`.
+        None => crate::convert::derive_output_path_for_dtype(
+            path,
+            ConvertTarget::Safetensors,
+            target.as_dtype(),
+        ),
     };
 
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
@@ -822,33 +828,25 @@ fn build_convert_options(
     Ok(ConvertOptions::new())
 }
 
-/// Runs the `convert` subcommand: parses the `--to` target, derives an output
-/// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
-/// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
 /// Parses `--out-dtype` into the element type the dequantised tensors get.
 ///
-/// Accepts exactly the three dequantisation output widths, case-insensitively.
+/// Goes through [`TargetDtype`]'s parser, the one `remember --to` uses, so the
+/// two flags accept exactly the same three widths with the same error.
 /// Deliberately **not** an `impl FromStr for Dtype`: `Dtype` names 15 element
 /// types, and a `FromStr` on it would advertise that `--out-dtype i64` is a
-/// meaningful request. The error string lists what is actually accepted, in the
-/// same wording `TargetDtype`'s parser uses on the `remember` side.
+/// meaningful request.
 ///
 /// # Errors
 ///
 /// Returns [`crate::AnamnesisError::Unsupported`] if `s` is not `bf16`, `f32`
 /// or `f16`.
 fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
-    match s.to_ascii_lowercase().as_str() {
-        "bf16" => Ok(crate::Dtype::BF16),
-        "f32" => Ok(crate::Dtype::F32),
-        "f16" => Ok(crate::Dtype::F16),
-        other => Err(crate::AnamnesisError::Unsupported {
-            format: other.to_owned(),
-            detail: "supported output dtypes: bf16, f32, f16".to_owned(),
-        }),
-    }
+    Ok(s.parse::<TargetDtype>()?.as_dtype())
 }
 
+/// Runs the `convert` subcommand: parses the `--to` target, derives an output
+/// path when `-o` is omitted, collects any caller-supplied `GGUF` metadata, and
+/// delegates the whole `(input × target)` dispatch to [`crate::convert::convert`].
 fn run_convert(
     path: &std::path::Path,
     to: &str,
@@ -905,31 +903,4 @@ fn run_convert(
         output_path.display()
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Output path derivation
-// ---------------------------------------------------------------------------
-
-/// Derive an output path from the input path and target dtype.
-///
-/// `model-fp8.safetensors`  → `model-bf16.safetensors`
-/// `model-GPTQ-Int4.safetensors` → `model-bf16.safetensors`
-/// `weights.safetensors`    → `weights-bf16.safetensors`
-///
-/// Shares the quantisation-suffix table with `convert` via
-/// [`crate::convert::strip_quant_suffix`], so the two derivations cannot drift.
-fn derive_output_path(input: &std::path::Path, target: TargetDtype) -> PathBuf {
-    let stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    let suffix = target.to_string().to_lowercase();
-    let new_name = format!(
-        "{}-{suffix}.safetensors",
-        crate::convert::strip_quant_suffix(stem)
-    );
-    input
-        .parent()
-        .map_or_else(|| PathBuf::from(&new_name), |p| p.join(&new_name))
 }
