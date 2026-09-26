@@ -32,9 +32,10 @@ harnesses, run explicitly with `--ignored --nocapture`, never by plain
 
 | File | Feature gate | What it tests |
 |------|-------------|---------------|
-| `no_panic.rs` | none | No public parse/inspect entry point panics on malformed input (owned-bytes, reader and path/mmap variants); per-format tests gated on `gguf` / `pth` / `npz` |
+| `no_panic.rs` | none | No public parse/inspect/`convert_bytes` entry point panics on malformed input (owned-bytes, reader and path/mmap variants), nor any method a binding calls on a successful result (inspect, tensors, dequantise, serialise); the battery includes a generated `GGUF`; per-format tests gated on `gguf` / `pth` / `npz` |
+| `fuzz_regressions.rs` | per test: `pth` / `gptq` | Inputs that fuzzing or review found crashing (duplicate `.pth` tensor name, `"gptq_bits": "0"`, a `.qweight` rename colliding with a `.weight`), each asserting a clean error |
 | `panic_profile.rs` | none | `[profile.release]` builds with `panic = "abort"`, `[profile.python]` with unwind |
-| `parallel_contract.rs` | none | Compile-time `Send`/`Sync` guards for the parsed-model types the parallel dispatch shares across threads |
+| `parallel_contract.rs` | none | Compile-time `Send`/`Sync` guards for the parsed-model types the parallel dispatch shares across threads, and for every type a Phase 8 binding will hold or move across a released `GIL` |
 | `parse_owned_path.rs` | none | Path/mmap, `parse_*_bytes` and `parse_*_from_reader` parse identically; malformed bytes and tight `ParseLimits` yield a clean `Err` |
 | `python_ownership_contract.rs` | none | Owned extraction outlives a dropped `Parsed*` (the Phase 8 `PyO3` data-ownership contract) |
 
@@ -97,12 +98,13 @@ The fixture format is scheme-specific (documented in each generator script). All
 | `awq_reference/` | 2 models (Llama-3.2, Falcon3) | 256x256 | `generate_awq.py` |
 | `bnb_reference/` | 7 fixtures from 4 models (Llama-3.2-1B NF4/FP4/NF4-double-quant/INT8, Qwen3 FP4, Qwen2.5-1.5B and Phi-3.5-mini double-quant NF4), each with a `.timing.json` Python-timing sidecar | 4096 elements (NF4/FP4), 256x256 (INT8) | `generate_bnb.py` |
 | `npz_reference/` | Gemma Scope 2B SAE (small slice) | 5 F32 arrays | `generate_npz.py` |
-| `gguf_reference/` | 23 fixtures: 20 from 4 models (SmolLM2-135M, TinyLlama-1.1B, Mistral-7B-v0.3, Qwen2.5-0.5B) plus 3 synthetic (`TQ1_0`, `TQ2_0`, `MXFP4`) | 65 536 elements (2 048 / 256 blocks) | `generate_gguf.py`; `generate_gguf_dequant_timings.py` writes the `*.dequant.timing.json` Python baselines. The source `.gguf` files go in `models/` (gitignored) |
+| `gguf_reference/` | 22 fixtures: 19 from 4 models (SmolLM2-135M, TinyLlama-1.1B, Mistral-7B-v0.3, Qwen2.5-0.5B) plus 3 synthetic (`TQ1_0`, `TQ2_0`, `MXFP4`) | 65 536 elements (2 048 / 256 blocks) | `generate_gguf.py`; `generate_gguf_dequant_timings.py` writes the `*.dequant.timing.json` Python baselines. The source `.gguf` files go in `models/` (gitignored) |
 | `ollama_reference/` | 1 model (`llama3.2:1b`, `Q8_0`, from the local Ollama cache) | 65 536 elements | `generate_ollama_fixture.py` |
 | `pth_reference/` | 3 AlgZoo models (see below) | Full model (10–432 params) | `generate_pth_reference.py`; `bench_python_inspect.py` is the Python-side timing baseline |
 | `safetensors_reference/` | 4 synthetic `.safetensors` files (FP8, GPTQ, AWQ, BnB NF4), each with a `<scheme>.expected.json` reference from the `safetensors` Python library | Tiny tensors (header-level test) | `generate.py` |
 | `convert_reference/` | No fixtures: optional `*.timing.json` Python-timing sidecars for `cross_validation_convert.rs` (see its `README.md`) | n/a | `generate_convert_timings.py` |
 | `pth_benchmark/` | 3 torchvision checkpoints (`resnet18`, `resnet50`, `vit_b_16`); **gitignored**, fetched once for `bench_pth_adhoc.rs` (recipe in that file's module doc) | Full model | none (one-line `torch.save` recipe) |
+| `fuzz_regressions/` | 2 crash bodies from the v0.7.8 fuzz campaign (limits prefix stripped) | whole files | none: captured, not generated |
 
 ### AlgZoo `.pth` Fixtures
 
