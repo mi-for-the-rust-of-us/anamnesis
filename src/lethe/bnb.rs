@@ -202,7 +202,7 @@ fn nearest_codebook_index(value: f32, codebook: &[f32; 16]) -> u8 {
 
 /// Validates a `BF16` source for `NF4` / `FP4` encode and returns the block
 /// count: the shared block geometry (see
-/// [`validate_bnb4_blocks`](crate::remember::bnb)) plus a `BF16` byte length of
+/// [`validate_bnb4_blocks`]) plus a `BF16` byte length of
 /// exactly `total_elements × 2`.
 ///
 /// # Errors
@@ -257,7 +257,7 @@ fn validate_bf16_len(context: &str, bf16_data: &[u8], total_elements: usize) -> 
     if bf16_data.len() != expected_bf16_bytes {
         return Err(AnamnesisError::Parse {
             reason: format!(
-                "{context} bf16 byte count mismatch: expected {expected_bf16_bytes} for                  {total_elements} elements, got {}",
+                "{context} bf16 byte count mismatch: expected {expected_bf16_bytes} for {total_elements} elements, got {}",
                 bf16_data.len()
             ),
         });
