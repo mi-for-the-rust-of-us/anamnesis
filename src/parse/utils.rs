@@ -39,6 +39,38 @@ pub(crate) fn byteswap_inplace(data: &mut [u8], element_size: usize) {
     }
 }
 
+/// Classifies an `io::Error` raised while **decoding** an artefact's bytes
+/// whose range has already been validated against a known source length.
+///
+/// Inside a validated range the bytes are all present, so a codec that
+/// rejects them (`InvalidData` / `InvalidInput`) or runs out before its own
+/// end marker (`UnexpectedEof`, e.g. a truncated `DEFLATE` stream) is a
+/// property of the input: [`AnamnesisError::Parse`](crate::AnamnesisError::Parse),
+/// matching what the slice-backed paths report for the same bytes. Every other
+/// kind is a transport failure and stays
+/// [`AnamnesisError::Io`](crate::AnamnesisError::Io).
+///
+/// **Not for raw streaming reads.** Where the source length is unknown (the
+/// reader-generic safetensors header, which an `HTTP`-range adapter may back),
+/// a stream that ends early stays `Io` by documented contract: a partial fetch
+/// must be distinguishable from a malformed header. The rule, in full, is
+/// stated on [`AnamnesisError`](crate::AnamnesisError).
+#[cfg(any(feature = "npz", feature = "pth"))]
+#[must_use]
+pub(crate) fn classify_decode_error(e: std::io::Error, what: &str) -> crate::AnamnesisError {
+    // EXHAUSTIVE: `io::ErrorKind` is a foreign `#[non_exhaustive]` enum; only
+    // the three input-fault kinds are reclassified, every other kind is I/O.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match e.kind() {
+        std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::InvalidInput => crate::AnamnesisError::Parse {
+            reason: format!("failed to decode {what}: {e}"),
+        },
+        _ => crate::AnamnesisError::Io(e),
+    }
+}
+
 /// Computes the product of a tensor's shape dimensions with overflow checking.
 ///
 /// Returns `None` if the product overflows `usize` — an adversarial or

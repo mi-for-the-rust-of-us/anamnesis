@@ -15,11 +15,31 @@
 /// | `Unsupported` | `UnsupportedError` |
 /// | `LimitExceeded` | `LimitExceededError` |
 /// | `DisallowedGlobal` | `SecurityError` |
+/// | `Cancelled` | builtin `KeyboardInterrupt` |
 /// | `Io` | builtin `OSError` |
 ///
 /// `ParseError` / `UnsupportedError` / `LimitExceededError` / `SecurityError`
 /// all subclass a base `AnamnesisError(Exception)`. The wiring lands in Phase 8;
 /// this table is the contract it implements.
+///
+/// # `Parse` versus `Io` on a short or corrupt input
+///
+/// The two map to different Python exceptions, so which one a bad input
+/// produces is part of the contract, not an implementation detail:
+///
+/// - **A declared range past a known source length is `Parse`.** Every path
+///   that knows the length checks header-derived offsets against it before
+///   reading: the slice-backed parsers, the `GGUF` reader, and the `ZIP`
+///   reader under `.npz` / `.pth` (on both its slice and its `Read + Seek`
+///   source).
+/// - **A codec rejecting bytes inside a validated range is `Parse`**, e.g. a
+///   corrupt or truncated `DEFLATE` `.pth` entry: the bytes are all present
+///   and malformed.
+/// - **A streaming `Read` of unknown length that ends early is `Io`.** The
+///   reader-generic safetensors header takes a plain `Read`, which an
+///   `HTTP`-range adapter may back, and a partial fetch must stay
+///   distinguishable from a malformed header. The same holds for any genuine
+///   transport failure on any path.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AnamnesisError {

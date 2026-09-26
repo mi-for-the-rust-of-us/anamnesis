@@ -30,7 +30,8 @@ use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
 use crate::parse::utils::{
-    PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, saturating_num_elements,
+    PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, classify_decode_error,
+    saturating_num_elements,
 };
 
 // ---------------------------------------------------------------------------
@@ -215,16 +216,16 @@ struct NpyHeader {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the magic bytes, version, or header
-/// dict are malformed, or the declared header length exceeds the cap or the
-/// `budget`.
+/// dict are malformed, or the header bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::LimitExceeded`] if the declared header length
+/// exceeds the cap or the `budget`.
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Result<NpyHeader> {
     // Read magic (6 bytes) + major (1) + minor (1) = 8 bytes.
     let mut preamble = [0u8; 8];
     reader
         .read_exact(&mut preamble)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("NPY preamble read failed: {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, "NPY preamble"))?;
 
     // INDEX: preamble is exactly 8 bytes, slicing [..6] is safe
     #[allow(clippy::indexing_slicing)]
@@ -246,18 +247,14 @@ fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Resul
             let mut buf = [0u8; 2];
             reader
                 .read_exact(&mut buf)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("NPY v1 header length read failed: {e}"),
-                })?;
+                .map_err(|e| classify_decode_error(e, "NPY v1 header length"))?;
             usize::from(u16::from_le_bytes(buf))
         }
         2 | 3 => {
             let mut buf = [0u8; 4];
             reader
                 .read_exact(&mut buf)
-                .map_err(|e| AnamnesisError::Parse {
-                    reason: format!("NPY v{major} header length read failed: {e}"),
-                })?;
+                .map_err(|e| classify_decode_error(e, &format!("NPY v{major} header length")))?;
             // CAST: u32 → usize, NPY headers are always small
             #[allow(clippy::as_conversions)]
             let len = u32::from_le_bytes(buf) as usize;
@@ -292,9 +289,7 @@ fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Resul
     let mut header_buf = vec![0u8; header_len];
     reader
         .read_exact(&mut header_buf)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("NPY header data read failed: {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, "NPY header data"))?;
 
     let header_str = std::str::from_utf8(&header_buf).map_err(|e| AnamnesisError::Parse {
         reason: format!("NPY header is not valid UTF-8: {e}"),
@@ -507,27 +502,6 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 // Bulk data extraction
 // ---------------------------------------------------------------------------
 
-/// Reads array data as raw little-endian bytes in one bulk `read_exact` call.
-///
-/// For little-endian data on a little-endian machine, the raw bytes are the
-/// correct in-memory representation — zero per-element processing. For
-/// big-endian data, a byte-swap pass is applied in-place after the bulk read.
-///
-/// `entry_size` is the ZIP entry's declared uncompressed size. The
-/// shape-derived `data_bytes` is rejected if it exceeds `entry_size`
-/// **before** any allocation: an entry cannot hold (or decompress to) more
-/// than it declares, so a small entry claiming an enormous shape — or a
-/// `DEFLATE` entry whose declared shape would balloon the allocation — fails
-/// fast instead of driving a multi-`GiB` `vec!`. This mirrors the
-/// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
-/// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
-///
-/// # Errors
-///
-/// Returns [`AnamnesisError::Parse`] if the element count or byte count
-/// overflows `usize`, if `data_bytes` exceeds the entry's declared size, the
-/// `NPZ_MAX_ARRAY_BYTES` cap, or the caller's `budget` (per-item
-/// single-allocation cap + cumulative aggregate), or if the read fails.
 /// Rewrites Fortran-order (column-major) `data` into C-order (row-major),
 /// returning a fresh buffer.
 ///
@@ -641,6 +615,30 @@ fn to_c_order(
     Ok(out)
 }
 
+/// Reads array data as raw little-endian bytes in one bulk `read_exact` call.
+///
+/// For little-endian data on a little-endian machine, the raw bytes are the
+/// correct in-memory representation — zero per-element processing. For
+/// big-endian data, a byte-swap pass is applied in-place after the bulk read.
+///
+/// `entry_size` is the ZIP entry's declared uncompressed size. The
+/// shape-derived `data_bytes` is rejected if it exceeds `entry_size`
+/// **before** any allocation: an entry cannot hold (or decompress to) more
+/// than it declares, so a small entry claiming an enormous shape — or a
+/// `DEFLATE` entry whose declared shape would balloon the allocation — fails
+/// fast instead of driving a multi-`GiB` `vec!`. This mirrors the
+/// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
+/// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the element count or byte count
+/// overflows `usize`, if `data_bytes` exceeds the entry's declared size, or if
+/// the entry's bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::LimitExceeded`] if `data_bytes` exceeds the
+/// `NPZ_MAX_ARRAY_BYTES` cap or the caller's `budget` (per-item
+/// single-allocation cap + cumulative aggregate).
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_array_data(
     reader: &mut impl Read,
     header: &NpyHeader,
@@ -688,9 +686,7 @@ fn read_array_data(
     let mut buf = vec![0u8; data_bytes];
     reader
         .read_exact(&mut buf)
-        .map_err(|e| AnamnesisError::Parse {
-            reason: format!("array data read failed ({data_bytes} bytes): {e}"),
-        })?;
+        .map_err(|e| classify_decode_error(e, &format!("NPY array data ({data_bytes} bytes)")))?;
 
     // Byte-swap for big-endian data with multi-byte elements.
     if header.big_endian && header.dtype.byte_size() > 1 {

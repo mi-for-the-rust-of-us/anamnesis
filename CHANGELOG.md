@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AnamnesisError::Parse`. The manifest comes from the local `Ollama` cache,
   so this is defence in depth rather than a remote exposure.
 
+- **Malformed `.npz` / `.pth` bytes now report `AnamnesisError::Parse`, and
+  genuine read failures `AnamnesisError::Io`, on every path.** The two map to
+  different Python exceptions in v0.8.0 (`ParseError` vs `OSError`), so the
+  split is now a stated contract on `AnamnesisError`. Three sites did not
+  honour it:
+  - the vendored `ZIP` reader's `Read + Seek` source reported an
+    out-of-range read as `Io` where its slice source said `Parse`;
+  - a corrupt `DEFLATE` `data.pkl` on the reader-generic `.pth` paths
+    surfaced as `Io`;
+  - every `NPZ` entry read mapped *all* failures, disk errors included, to
+    `Parse`.
+
+  Unchanged, and now documented as deliberate: the reader-generic safetensors
+  header still returns `Io` when a stream of unknown length ends early, so an
+  `HTTP`-range adapter can tell a partial fetch from a malformed header. `NPZ`
+  read-failure messages change wording from `… read failed: …` to
+  `failed to decode …: …`.
+
 - **A shape with a zero dimension after an overflowing one now counts as empty
   in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
   safetensors' `TensorEntry::num_elements` still stopped at the first overflow,

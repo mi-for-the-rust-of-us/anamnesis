@@ -264,6 +264,27 @@ impl<R: Read + Seek> ZipSource for ReaderSource<R> {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::Result<()> {
+        // Honour the trait's contract that an out-of-range read is `Parse`,
+        // exactly as `SliceSource` does: the offsets reaching here derive from
+        // the archive's own headers, so a range past the end is malformed
+        // input, not an I/O failure. Checked before seeking, as the `GGUF`
+        // reader's `ensure_remaining` does.
+        // CAST: usize → u64, lossless widening on all supported targets
+        #[allow(clippy::as_conversions)]
+        let len = buf.len() as u64;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "ZIP read range overflow".into(),
+            })?;
+        if end > self.len {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "ZIP read past end of source ([{offset}..{end}], source len = {})",
+                    self.len
+                ),
+            });
+        }
         self.reader
             .seek(std::io::SeekFrom::Start(offset))
             .map_err(AnamnesisError::Io)?;
@@ -1290,6 +1311,35 @@ mod tests {
             matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_single_alloc_bytes"),
             "expected central-directory single-alloc rejection, got: {err}"
         );
+    }
+
+    // `ZipSource::read_at` promises `Parse` for an out-of-range read. The
+    // slice source always honoured it; the reader source surfaced
+    // `Io(UnexpectedEof)`, which Python would see as an `OSError`.
+    #[test]
+    fn reader_source_out_of_range_read_is_parse() {
+        let bytes = [0u8; 16];
+        let mut reader_src = ReaderSource::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let mut slice_src = SliceSource::new(&bytes);
+        let mut buf = [0u8; 8];
+        for offset in [9u64, 16, u64::MAX] {
+            assert!(
+                matches!(
+                    reader_src.read_at(offset, &mut buf),
+                    Err(AnamnesisError::Parse { .. })
+                ),
+                "reader source at offset {offset}"
+            );
+            assert!(
+                matches!(
+                    slice_src.read_at(offset, &mut buf),
+                    Err(AnamnesisError::Parse { .. })
+                ),
+                "slice source at offset {offset}"
+            );
+        }
+        // The in-range boundary still reads.
+        reader_src.read_at(8, &mut buf).unwrap();
     }
 
     #[test]

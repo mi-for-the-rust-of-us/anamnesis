@@ -1376,9 +1376,8 @@ impl<R: Read + Seek> GgufReader<R> {
     /// Pulled out of [`read_into`](Self::read_into) so it can also gate
     /// [`read_bytes`](Self::read_bytes) **before** it allocates — an
     /// adversarial declared length is rejected without committing any heap,
-    /// producing a deterministic `AnamnesisError::Parse` (matching the
-    /// slice-based cursor's behaviour) rather than relying on the underlying
-    /// reader's `UnexpectedEof` kind-mapping.
+    /// producing a deterministic `AnamnesisError::Parse` rather than an
+    /// `AnamnesisError::Io` wrapping the underlying reader's `UnexpectedEof`.
     ///
     /// # Errors
     ///

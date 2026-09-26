@@ -2981,8 +2981,10 @@ fn build_front_matter_inspect_info(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] if the entry uses a compression
-/// method other than `STORED` or `DEFLATE`, [`AnamnesisError::Parse`] if the
-/// local header is malformed, or [`AnamnesisError::Io`] if a read fails.
+/// method other than `STORED` or `DEFLATE`.
+/// Returns [`AnamnesisError::Parse`] if the local header is malformed or the
+/// entry's bytes are truncated or fail to inflate.
+/// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_pth_entry_bytes<R: Read + Seek>(
     src: &mut crate::parse::zip::ReaderSource<R>,
     entry: &crate::parse::zip::ZipEntry,
@@ -3008,10 +3010,9 @@ fn read_pth_entry_bytes<R: Read + Seek>(
     // Grows as bytes arrive, bounded by `take` — never an eager declared-size
     // allocation, never an unbounded inflation.
     let mut buf = Vec::new();
-    reader
-        .take(limit)
-        .read_to_end(&mut buf)
-        .map_err(AnamnesisError::Io)?;
+    reader.take(limit).read_to_end(&mut buf).map_err(|e| {
+        crate::parse::utils::classify_decode_error(e, &format!("ZIP entry `{}`", entry.name))
+    })?;
     Ok(buf)
 }
 
@@ -4247,6 +4248,25 @@ mod tests {
             ("b/byteorder", stored, b"big"),
         ]);
         assert_duplicate_rejected_everywhere(&bytes, "byteorder");
+    }
+
+    // A corrupt `DEFLATE` `data.pkl` is malformed input, not an I/O fault:
+    // the bytes are all present and fail to inflate. It used to surface as
+    // `Io`, which Python maps to `OSError`.
+    #[test]
+    fn corrupt_deflate_data_pkl_is_parse_on_reader_path() {
+        let mut bytes = zip_with_entries(&[(
+            "a/data.pkl",
+            zip::CompressionMethod::Deflated,
+            &[0x42u8; 256],
+        )]);
+        // Overwrite the compressed stream (which starts after the 30-byte
+        // local header and the 10-byte name) with an invalid DEFLATE block
+        // type (0b11 in bits 1-2 of the first byte).
+        let start = 30 + "a/data.pkl".len();
+        bytes[start] = 0b0000_0111;
+        let err = inspect_pth_from_reader(std::io::Cursor::new(&bytes)).unwrap_err();
+        assert!(matches!(err, AnamnesisError::Parse { .. }), "{err:?}");
     }
 
     // A repeated tensor-storage suffix leaves it ambiguous which bytes a
