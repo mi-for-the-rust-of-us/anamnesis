@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `.pth` archive that repeats `data.pkl` or `byteorder` is now rejected on
+  every path.** The parse paths kept the *last* copy and the reader-generic
+  inspect / front-matter paths the *first*, so a crafted archive could show
+  `inspect_pth_from_reader` one pickle and hand `parse_pth` another,
+  undermining the inspect-before-parse gate. Both now return
+  `AnamnesisError::Parse` naming the duplicate, whatever the entries'
+  compression methods. A repeated tensor-storage entry (`data/0` twice) is
+  likewise rejected by the parse paths instead of silently resolved last-wins.
+  Real `torch.save` archives never repeat an entry.
+
+- **A shape with a zero dimension after an overflowing one now counts as empty
+  in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
+  safetensors' `TensorEntry::num_elements` still stopped at the first overflow,
+  so `[2^33, 2^33, 0]` read as `usize::MAX` elements, or was rejected, instead
+  of `0`. Every parser now shares one checked and one saturating element-count
+  helper.
+
 ### Changed
 
 - **The `BnB` `INT8` `F16` regression is confined to server-class ARM, and

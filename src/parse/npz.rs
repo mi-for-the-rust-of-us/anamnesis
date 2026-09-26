@@ -29,7 +29,9 @@ use std::path::Path;
 use crate::ParseLimits;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::{PREALLOC_SOFT_CAP, byteswap_inplace};
+use crate::parse::utils::{
+    PREALLOC_SOFT_CAP, byteswap_inplace, checked_num_elements, saturating_num_elements,
+};
 
 // ---------------------------------------------------------------------------
 // NPY magic
@@ -645,13 +647,9 @@ fn read_array_data(
     entry_size: u64,
     budget: &mut Budget,
 ) -> crate::Result<Vec<u8>> {
-    let n_elements: usize = header
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "element count overflow".into(),
-        })?;
+    let n_elements = checked_num_elements(&header.shape).ok_or_else(|| AnamnesisError::Parse {
+        reason: "element count overflow".into(),
+    })?;
 
     let data_bytes = n_elements
         .checked_mul(header.dtype.byte_size())
@@ -1045,11 +1043,7 @@ pub fn inspect_npz_from_reader_with_options<R: Read + Seek>(
         // count, so an inspect has nothing to reject here. Before v0.7.6 it
         // rejected anyway, which meant a host could not even *look* at an
         // archive holding a transposed array.
-        let n_elements: usize = header
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .unwrap_or(usize::MAX);
+        let n_elements = saturating_num_elements(&header.shape);
         let byte_len = n_elements.saturating_mul(header.dtype.byte_size());
 
         // CAST: usize → u64, byte lengths fit in u64

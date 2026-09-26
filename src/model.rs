@@ -1658,12 +1658,9 @@ fn parse_bnb_quant_state_shape(
         .collect::<crate::Result<_>>()?;
 
     // Validate: product of recovered shape must equal total_elements.
-    let product: usize = shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("quant_state shape overflow for `{weight_name}`"),
-        })?;
+    let product = checked_num_elements(&shape).ok_or_else(|| AnamnesisError::Parse {
+        reason: format!("quant_state shape overflow for `{weight_name}`"),
+    })?;
 
     if product != total_elements {
         return Err(AnamnesisError::Parse {

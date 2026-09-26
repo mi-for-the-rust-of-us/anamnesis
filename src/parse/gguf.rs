@@ -48,7 +48,7 @@ use crate::ParseLimits;
 use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::limits::Budget;
-use crate::parse::utils::PREALLOC_SOFT_CAP;
+use crate::parse::utils::{PREALLOC_SOFT_CAP, checked_num_elements, saturating_num_elements_u64};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1312,11 +1312,8 @@ impl ParsedGguf {
                     self.buffer.len()
                 ),
             })?;
-        let n_elements: usize = info
-            .shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .ok_or_else(|| AnamnesisError::Parse {
+        let n_elements =
+            checked_num_elements(&info.shape).ok_or_else(|| AnamnesisError::Parse {
                 reason: format!("tensor `{}`: element count overflows usize", info.name),
             })?;
         crate::remember::gguf::dequantize_gguf::<E>(data, info.dtype, n_elements)
@@ -2580,13 +2577,7 @@ fn build_inspect_info(
         // report `u64::MAX` for a mathematically-empty tensor — the bug
         // `build_pth_tensor_info` had until v0.7.5).
         if info.dtype.is_quantized() || info.byte_len.is_none() {
-            // CAST: usize → u64, lossless widening of a header-declared
-            // dimension on every supported target.
-            #[allow(clippy::as_conversions)]
-            let n_elements = info
-                .shape
-                .iter()
-                .fold(1u64, |acc, &d| acc.saturating_mul(d as u64));
+            let n_elements = saturating_num_elements_u64(&info.shape);
             dequantized_size =
                 dequantized_size.saturating_add(n_elements.saturating_mul(out_bytes));
         } else if let Some(byte_len) = info.byte_len {

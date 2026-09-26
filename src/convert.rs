@@ -1292,10 +1292,7 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
             shape.reverse();
 
             if tensor.dtype.is_quantized() {
-                let n_elements = tensor
-                    .shape
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                let n_elements = crate::parse::utils::checked_num_elements(tensor.shape)
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!(
                             "GGUF tensor `{}` shape {:?} element count overflows usize",

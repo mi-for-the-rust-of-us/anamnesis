@@ -575,15 +575,14 @@ impl TensorEntry {
     ///
     /// Saturates to `usize::MAX` if the shape's element count overflows
     /// `usize` (e.g., a malformed or adversarial header that declares
-    /// `[u32::MAX, 2]` on a 32-bit target). Matches the saturating
-    /// behaviour of `inspect_npz` and prevents the silent wraparound
-    /// that an unguarded `shape.iter().product()` would produce.
+    /// `[u32::MAX, 2]` on a 32-bit target), and is `0` for any shape with a
+    /// zero dimension, even one that follows an overflowing dimension.
+    /// Shares one helper with the `NPZ` and `.pth` inspect paths, so the
+    /// formats cannot disagree, and never wraps the way an unguarded
+    /// `shape.iter().product()` would.
     #[must_use]
     pub fn num_elements(&self) -> usize {
-        self.shape
-            .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-            .unwrap_or(usize::MAX)
+        crate::parse::utils::saturating_num_elements(&self.shape)
     }
 
     /// Returns the byte length of the tensor's data (`end - start` offset).
