@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--features gguf` now builds on 32-bit targets.** Two compile-time
+  layout assertions hard-coded 64-bit sizes, so i686 and armv7 builds failed
+  outright. They now apply on 64-bit only, and the whole test suite passes on
+  i686. CI checks a 32-bit build from now on.
+
 - **`.pth` error messages no longer render the offending pickle value in
   full.** They formatted it with `{:?}`, so a 64 MiB `BINBYTES` payload within
   every cap became a ~320 MiB error string, allocated outside `ParseLimits`.

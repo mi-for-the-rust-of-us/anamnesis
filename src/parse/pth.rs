@@ -4818,7 +4818,9 @@ mod tests {
     fn front_matter_total_bytes_matches_inspect_on_overflowing_shape() {
         let meta = vec![TensorMeta {
             name: "huge".to_owned(),
-            shape: vec![1usize << 33, 1usize << 33, 0],
+            // `usize::MAX` rather than `1 << 33` so the shape overflows before
+            // the trailing zero on 32-bit targets too.
+            shape: vec![usize::MAX, usize::MAX, 0],
             dtype: PthDtype::F32,
             storage_key: "0".to_owned(),
             storage_offset: 0,
