@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   likewise rejected by the parse paths instead of silently resolved last-wins.
   Real `torch.save` archives never repeat an entry.
 
+- **`dequantize_bnb4_double_quant` now rejects a weight buffer of the wrong
+  length.** It was the only `NF4` / `FP4` entry point without that check: a
+  short buffer was still caught downstream, but an over-long one decoded
+  without error with its tail silently ignored. It now returns
+  `AnamnesisError::Parse`, as `dequantize_bnb4` always did.
+
 - **A shape with a zero dimension after an overflowing one now counts as empty
   in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
   safetensors' `TensorEntry::num_elements` still stopped at the first overflow,

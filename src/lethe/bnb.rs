@@ -28,6 +28,9 @@
 //! [`dequantize_bnb4_to_bf16`]: crate::remember::bnb::dequantize_bnb4_to_bf16
 
 use crate::error::AnamnesisError;
+use crate::remember::bnb::{
+    parse_absmax, parse_codebook, read_f32_le, recover_double_quant_absmax, validate_bnb4_blocks,
+};
 
 // ---------------------------------------------------------------------------
 // Canonical codebooks (bitsandbytes reference values)
@@ -102,19 +105,6 @@ pub const FP4_CODEBOOK: [f32; 16] = [
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Reads a little-endian `f32` from a byte slice at the given offset.
-///
-/// Mirrors `read_f32_le` in [`remember::bnb`](mod@crate::remember::bnb).
-/// Duplicated locally rather than shared to keep the two modules
-/// independently re-readable as decode / encode mirrors.
-///
-/// Returns `None` if the slice does not contain 4 bytes at `offset`.
-fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
-    let bytes: &[u8] = data.get(offset..offset + 4)?;
-    let arr: [u8; 4] = bytes.try_into().ok()?;
-    Some(f32::from_le_bytes(arr))
-}
 
 /// Converts a `BF16` bit pattern to an `f32` value. Lossless — `BF16` is
 /// exactly the upper 16 bits of an `f32` for finite values.
@@ -210,50 +200,69 @@ fn nearest_codebook_index(value: f32, codebook: &[f32; 16]) -> u8 {
     best_idx
 }
 
-/// Parses 64 bytes of `F32` little-endian codebook into `[f32; 16]`.
-fn parse_codebook(quant_map_data: &[u8]) -> crate::Result<[f32; 16]> {
-    if quant_map_data.len() != 64 {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 quant_map must be 64 bytes (16xF32), got {}",
-                quant_map_data.len()
-            ),
-        });
-    }
-    let mut codebook = [0.0f32; 16];
-    for (i, slot) in codebook.iter_mut().enumerate() {
-        *slot = read_f32_le(quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 quant_map read out of bounds".into(),
-        })?;
-    }
-    Ok(codebook)
+/// Validates a `BF16` source for `NF4` / `FP4` encode and returns the block
+/// count: the shared block geometry (see
+/// [`validate_bnb4_blocks`](crate::remember::bnb)) plus a `BF16` byte length of
+/// exactly `total_elements × 2`.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the block geometry is invalid or
+/// `bf16_data` has the wrong length.
+fn validate_bnb4_encode(
+    bf16_data: &[u8],
+    total_elements: usize,
+    block_size: usize,
+) -> crate::Result<usize> {
+    let num_blocks = validate_bnb4_blocks("BnB4 encode", total_elements, block_size)?;
+    validate_bf16_len("BnB4 encode", bf16_data, total_elements)?;
+    Ok(num_blocks)
 }
 
-/// Parses an absmax byte slice into a freshly allocated `Vec<f32>`.
+/// Validates a `BF16` source for `INT8` encode and returns
+/// `out_features × in_features`.
 ///
-/// The on-disk absmax tensor is `F32` little-endian; this is the same
-/// byte layout the decode side reads. `num_blocks * 4` bytes expected.
-fn parse_absmax(absmax_data: &[u8], num_blocks: usize) -> crate::Result<Vec<f32>> {
-    let expected_bytes = num_blocks
-        .checked_mul(4)
-        .ok_or_else(|| AnamnesisError::Parse {
-            reason: "absmax byte count overflow".into(),
-        })?;
-    if absmax_data.len() != expected_bytes {
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the element count overflows or
+/// `bf16_data` has the wrong length.
+fn validate_int8_encode(
+    bf16_data: &[u8],
+    out_features: usize,
+    in_features: usize,
+) -> crate::Result<usize> {
+    let total_elements =
+        out_features
+            .checked_mul(in_features)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "BnB INT8 encode element count overflow".into(),
+            })?;
+    validate_bf16_len("BnB INT8 encode", bf16_data, total_elements)?;
+    Ok(total_elements)
+}
+
+/// Checks that `bf16_data` holds exactly `total_elements` `BF16` values.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if `total_elements × 2` overflows or
+/// differs from `bf16_data.len()`.
+fn validate_bf16_len(context: &str, bf16_data: &[u8], total_elements: usize) -> crate::Result<()> {
+    let expected_bf16_bytes =
+        total_elements
+            .checked_mul(2)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("{context} bf16 byte count overflow"),
+            })?;
+    if bf16_data.len() != expected_bf16_bytes {
         return Err(AnamnesisError::Parse {
             reason: format!(
-                "BnB4 absmax byte count mismatch: expected {expected_bytes}, got {}",
-                absmax_data.len()
+                "{context} bf16 byte count mismatch: expected {expected_bf16_bytes} for                  {total_elements} elements, got {}",
+                bf16_data.len()
             ),
         });
     }
-    let mut absmax = vec![0.0f32; num_blocks];
-    for (i, slot) in absmax.iter_mut().enumerate() {
-        *slot = read_f32_le(absmax_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
-            reason: format!("BnB4 absmax read out of bounds at block {i}"),
-        })?;
-    }
-    Ok(absmax)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +337,8 @@ fn encode_bnb4_core(
             .iter()
             .zip(scratch_block.iter_mut())
         {
-            // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
+            // INDEX: `as_chunks::<2>` yields `[u8; 2]` arrays, so indices 0 and 1
+            // are always in bounds
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([bf16_pair[0], bf16_pair[1]]);
             *slot = bf16_bits_to_f32(bits);
@@ -363,7 +373,8 @@ fn encode_bnb4_core(
             .iter()
             .zip(out_block.iter_mut())
         {
-            // INDEX: chunks_exact(2) guarantees exactly 2 f32 per pair
+            // INDEX: `as_chunks::<2>` yields `[f32; 2]` arrays, so indices 0 and 1
+            // are always in bounds
             #[allow(clippy::indexing_slicing)]
             let (val_first, val_second) = (pair[0], pair[1]);
             // If absmax is zero, every value collapses to zero;
@@ -451,53 +462,7 @@ pub fn encode_bnb4(
     block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
-    if block_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: "BnB encode block_size must be > 0".into(),
-        });
-    }
-    // Odd block_size truncates `bytes_per_block = block_size / 2` in
-    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
-    // the decode-side guard in `remember::bnb`.
-    if !block_size.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode total_elements ({total_elements}) must be even \
-                 (two nibbles per byte)"
-            ),
-        });
-    }
-    let expected_bf16_bytes =
-        total_elements
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB4 encode bf16 byte count overflow".into(),
-            })?;
-    if bf16_data.len() != expected_bf16_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode bf16 byte count mismatch: expected {expected_bf16_bytes} for \
-                 {total_elements} elements, got {}",
-                bf16_data.len()
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(block_size) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode total_elements ({total_elements}) not divisible by \
-                 block_size ({block_size})"
-            ),
-        });
-    }
-    let num_blocks = total_elements / block_size;
+    let num_blocks = validate_bnb4_encode(bf16_data, total_elements, block_size)?;
     let codebook = parse_codebook(quant_map_data)?;
     let absmax = parse_absmax(absmax_data, num_blocks)?;
     encode_bnb4_core(bf16_data, &absmax, &codebook, total_elements, block_size)
@@ -532,45 +497,7 @@ pub fn encode_bnb4_compute_absmax(
     total_elements: usize,
     block_size: usize,
 ) -> crate::Result<(Vec<u8>, Vec<u8>)> {
-    if block_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: "BnB encode block_size must be > 0".into(),
-        });
-    }
-    // Odd block_size truncates `bytes_per_block = block_size / 2` in
-    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
-    // the decode-side guard in `remember::bnb`.
-    if !block_size.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(block_size) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode total_elements ({total_elements}) not divisible by \
-                 block_size ({block_size})"
-            ),
-        });
-    }
-    let expected_bf16_bytes =
-        total_elements
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB4 encode bf16 byte count overflow".into(),
-            })?;
-    if bf16_data.len() != expected_bf16_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode bf16 byte count mismatch: expected {expected_bf16_bytes} for \
-                 {total_elements} elements, got {}",
-                bf16_data.len()
-            ),
-        });
-    }
-    let num_blocks = total_elements / block_size;
+    let num_blocks = validate_bnb4_encode(bf16_data, total_elements, block_size)?;
     let mut absmax = vec![0.0f32; num_blocks];
     for (block_idx, slot) in absmax.iter_mut().enumerate() {
         let bf16_byte_start = block_idx * block_size * 2;
@@ -582,7 +509,8 @@ pub fn encode_bnb4_compute_absmax(
             })?;
         let mut max_abs = 0.0_f32;
         for pair in bf16_block.as_chunks::<2>().0 {
-            // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
+            // INDEX: `as_chunks::<2>` yields `[u8; 2]` arrays, so indices 0 and 1
+            // are always in bounds
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
             let v = bf16_bits_to_f32(bits).abs();
@@ -602,91 +530,6 @@ pub fn encode_bnb4_compute_absmax(
 // NF4/FP4 double-quant encode (4-bit, lookup-table based, nested absmax)
 // ---------------------------------------------------------------------------
 
-/// Recovers the per-block `f32` absmax values from `bitsandbytes` double-quant
-/// metadata.
-///
-/// Mirrors the recovery step inside
-/// [`dequantize_bnb4_double_quant_to_bf16`](crate::remember::bnb::dequantize_bnb4_double_quant_to_bf16):
-/// for each block `i`, reads the `U8` quantised absmax byte, looks up the
-/// corresponding entry in the 256-entry nested codebook, multiplies by
-/// the per-nested-block `nested_absmax` scale, and adds the
-/// `nested_offset` (the `bitsandbytes` absmax-mean compression bias).
-/// The recovered `Vec<f32>` is the same value the decoder uses, so
-/// encoding `BF16` produced by decode through `encode_bnb4_core` with
-/// this recovered absmax round-trips byte-exactly.
-fn recover_double_quant_absmax(
-    absmax_data: &[u8],
-    nested_absmax_data: &[u8],
-    nested_quant_map_data: &[u8],
-    nested_offset: f32,
-    nested_block_size: usize,
-) -> crate::Result<Vec<f32>> {
-    if nested_block_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: "BnB nested_block_size must be > 0".into(),
-        });
-    }
-    if nested_quant_map_data.len() != 1024 {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 nested_quant_map must be 1024 bytes (256xF32), got {}",
-                nested_quant_map_data.len()
-            ),
-        });
-    }
-    let num_blocks = absmax_data.len();
-    let num_nested_blocks = if num_blocks.is_multiple_of(nested_block_size) {
-        num_blocks / nested_block_size
-    } else {
-        num_blocks / nested_block_size + 1
-    };
-    let expected_nested_absmax_bytes =
-        num_nested_blocks
-            .checked_mul(4)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB4 encode nested absmax byte count overflow".into(),
-            })?;
-    if nested_absmax_data.len() != expected_nested_absmax_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode nested_absmax byte count mismatch: expected \
-                 {expected_nested_absmax_bytes}, got {}",
-                nested_absmax_data.len()
-            ),
-        });
-    }
-
-    // Pre-load nested codebook (256 entries).
-    let mut nested_codebook = [0.0_f32; 256];
-    for (i, slot) in nested_codebook.iter_mut().enumerate() {
-        *slot = read_f32_le(nested_quant_map_data, i * 4).ok_or_else(|| AnamnesisError::Parse {
-            reason: "BnB4 encode nested_quant_map read out of bounds".into(),
-        })?;
-    }
-
-    // Recover per-block absmax: nested_codebook[absmax_byte] * nested_absmax[nested_block_idx].
-    let mut recovered = vec![0.0_f32; num_blocks];
-    for (i, (&absmax_byte, slot)) in absmax_data.iter().zip(recovered.iter_mut()).enumerate() {
-        let nested_block_idx = i / nested_block_size;
-        let nested_absmax_val =
-            read_f32_le(nested_absmax_data, nested_block_idx * 4).ok_or_else(|| {
-                AnamnesisError::Parse {
-                    reason: format!(
-                        "BnB4 encode nested_absmax read out of bounds at block {nested_block_idx}"
-                    ),
-                }
-            })?;
-        // CAST: u8 -> usize, byte value 0-255 used as lookup index
-        #[allow(clippy::as_conversions)]
-        let idx = absmax_byte as usize;
-        // INDEX: idx is 0-255, nested_codebook has 256 entries
-        #[allow(clippy::indexing_slicing)]
-        let entry = nested_codebook[idx];
-        *slot = entry * nested_absmax_val + nested_offset;
-    }
-    Ok(recovered)
-}
-
 /// Encodes `BF16` weights to `BitsAndBytes` `NF4` / `FP4` packed nibbles
 /// using the **double-quant** absmax layout.
 ///
@@ -701,11 +544,11 @@ fn recover_double_quant_absmax(
 /// decoder originally read: `encode_bnb4_double_quant(decode(weight,
 /// absmax, qm, n_absmax, n_qm)) == weight`.
 ///
-/// This strict mirror is the round-trip API. A future
+/// This strict mirror is the round-trip API. There is no
 /// `encode_bnb4_double_quant_compute_*` convenience that derives `absmax`,
-/// `nested_absmax`, and the nested codebook from a fresh `BF16` source —
-/// needed by the Phase 6 "any input -> BnB-NF4 safetensors" conversion
-/// path — is intentionally out of scope for Phase 5 step 1c.
+/// `nested_absmax`, and the nested codebook from a fresh `BF16` source: the
+/// `convert` path to `BnB-NF4` writes single-quant absmax and does not need
+/// one. Deriving nested metadata is encode-completion work (Phase 8.5).
 ///
 /// # Arguments
 ///
@@ -755,53 +598,7 @@ pub fn encode_bnb4_double_quant(
     nested_block_size: usize,
 ) -> crate::Result<Vec<u8>> {
     // --- Validation ---
-    if block_size == 0 {
-        return Err(AnamnesisError::Parse {
-            reason: "BnB encode block_size must be > 0".into(),
-        });
-    }
-    // Odd block_size truncates `bytes_per_block = block_size / 2` in
-    // `encode_bnb4_core` → mis-aligned blocks → wrong packed output. Mirror of
-    // the decode-side guard in `remember::bnb`.
-    if !block_size.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode block_size must be even (two nibbles per byte), got {block_size}"
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(2) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode total_elements ({total_elements}) must be even \
-                 (two nibbles per byte)"
-            ),
-        });
-    }
-    let expected_bf16_bytes =
-        total_elements
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB4 encode bf16 byte count overflow".into(),
-            })?;
-    if bf16_data.len() != expected_bf16_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode bf16 byte count mismatch: expected {expected_bf16_bytes} for \
-                 {total_elements} elements, got {}",
-                bf16_data.len()
-            ),
-        });
-    }
-    if !total_elements.is_multiple_of(block_size) {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB4 encode total_elements ({total_elements}) not divisible by \
-                 block_size ({block_size})"
-            ),
-        });
-    }
-    let num_blocks = total_elements / block_size;
+    let num_blocks = validate_bnb4_encode(bf16_data, total_elements, block_size)?;
     if absmax_data.len() != num_blocks {
         return Err(AnamnesisError::Parse {
             reason: format!(
@@ -876,26 +673,7 @@ pub fn encode_bnb_int8(
     out_features: usize,
     in_features: usize,
 ) -> crate::Result<Vec<u8>> {
-    let total_elements =
-        out_features
-            .checked_mul(in_features)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB INT8 encode element count overflow".into(),
-            })?;
-    let expected_bf16_bytes =
-        total_elements
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB INT8 encode bf16 byte count overflow".into(),
-            })?;
-    if bf16_data.len() != expected_bf16_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB INT8 encode bf16 byte count mismatch: expected {expected_bf16_bytes}, got {}",
-                bf16_data.len()
-            ),
-        });
-    }
+    let total_elements = validate_int8_encode(bf16_data, out_features, in_features)?;
     let expected_scb_bytes = out_features
         .checked_mul(4)
         .ok_or_else(|| AnamnesisError::Parse {
@@ -916,7 +694,9 @@ pub fn encode_bnb_int8(
         let scb_val = read_f32_le(scb_data, row * 4).ok_or_else(|| AnamnesisError::Parse {
             reason: format!("BnB INT8 encode SCB read out of bounds at row {row}"),
         })?;
-        // Per-row scale: SCB / 127.0 (identical to the decode side).
+        // Per-row scale: SCB / 127.0, the inverse of the decode side's
+        // `(w × SCB) × INV_127` (which multiplies by a precomputed 1/127 since
+        // v0.7.4 rather than dividing).
         let scale = scb_val / 127.0;
 
         // Pre-slice for branch-free inner loop (two-level bounds checking)
@@ -958,7 +738,8 @@ pub fn encode_bnb_int8(
         // resolved here rather than at v0.8.0 so the Python bindings do not
         // inherit an open one.
         for (bf16_pair, out_byte) in bf16_row.as_chunks::<2>().0.iter().zip(out_row.iter_mut()) {
-            // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
+            // INDEX: `as_chunks::<2>` yields `[u8; 2]` arrays, so indices 0 and 1
+            // are always in bounds
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([bf16_pair[0], bf16_pair[1]]);
             let v = bf16_bits_to_f32(bits);
@@ -978,11 +759,10 @@ pub fn encode_bnb_int8(
             let rounded = scaled.round();
             // Clamp to i8 range.
             let clamped = rounded.clamp(-128.0, 127.0);
-            // CAST: f32 → i8, value is in [-128, 127] after clamp,
-            // never NaN (caller guards against NaN BF16 input via the
-            // dimensional checks above; if a NaN slipped in, clamp
-            // preserves NaN, but `as i8` on NaN is implementation-defined
-            // → defensive cast via i32 first).
+            // CAST: f32 → i32 → i8, value is in [-128, 127] after clamp. A NaN
+            // input is not excluded by any check above and survives `round`
+            // and `clamp`, but Rust's float-to-int `as` saturates and maps NaN
+            // to 0, so the cast is well-defined for every input.
             #[allow(
                 clippy::as_conversions,
                 clippy::cast_possible_truncation,
@@ -1023,26 +803,7 @@ pub fn encode_bnb_int8_compute_scb(
     out_features: usize,
     in_features: usize,
 ) -> crate::Result<(Vec<u8>, Vec<u8>)> {
-    let total_elements =
-        out_features
-            .checked_mul(in_features)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB INT8 encode element count overflow".into(),
-            })?;
-    let expected_bf16_bytes =
-        total_elements
-            .checked_mul(2)
-            .ok_or_else(|| AnamnesisError::Parse {
-                reason: "BnB INT8 encode bf16 byte count overflow".into(),
-            })?;
-    if bf16_data.len() != expected_bf16_bytes {
-        return Err(AnamnesisError::Parse {
-            reason: format!(
-                "BnB INT8 encode bf16 byte count mismatch: expected {expected_bf16_bytes}, got {}",
-                bf16_data.len()
-            ),
-        });
-    }
+    validate_int8_encode(bf16_data, out_features, in_features)?;
     let mut scb = vec![0.0f32; out_features];
     for (row, slot) in scb.iter_mut().enumerate() {
         let bf16_byte_start = row * in_features * 2;
@@ -1054,7 +815,8 @@ pub fn encode_bnb_int8_compute_scb(
             })?;
         let mut max_abs = 0.0_f32;
         for pair in bf16_row.as_chunks::<2>().0 {
-            // INDEX: chunks_exact(2) guarantees exactly 2 bytes per pair
+            // INDEX: `as_chunks::<2>` yields `[u8; 2]` arrays, so indices 0 and 1
+            // are always in bounds
             #[allow(clippy::indexing_slicing)]
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
             let v = bf16_bits_to_f32(bits).abs();
