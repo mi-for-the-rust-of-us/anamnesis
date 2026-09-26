@@ -132,8 +132,10 @@ pub(crate) fn read_f32_le(data: &[u8], offset: usize) -> Option<f32> {
     Some(f32::from_le_bytes(arr))
 }
 
-/// Validates the block geometry every `NF4` / `FP4` path shares, decode and
-/// encode, and returns the block count.
+/// Validates the `NF4` / `FP4` block geometry and returns the block count.
+///
+/// Shared by the double-quant decode and every encode path. The plain
+/// [`dequantize_bnb4`] keeps an inline copy on measurement (Experiment 19).
 ///
 /// `context` prefixes each message (`"BnB4"`, `"BnB4 encode"`) so a caller
 /// can tell which side rejected its input.
@@ -579,7 +581,7 @@ pub fn dequantize_bnb4<E: OutputElement>(
     //
     // KEPT INLINE ON MEASUREMENT. The v0.7.8 close-out routed this entry point
     // through the shared `validate_bnb4_blocks` / `parse_absmax` /
-    // `parse_codebook` the double-quant and encode paths use. Paired harness
+    // `parse_codebook` (shared by the double-quant and encode paths). Paired harness
     // (`benches/ab.rs`, tango, x86-64, 10 runs each, medians):
     // `bnb_nf4_bf16` +4.50 % and `_f32` +5.34 % with the shared helpers, still
     // +6.12 % / +6.54 % with only `read_f32_le`'s bounds reverted, still +7.32 %

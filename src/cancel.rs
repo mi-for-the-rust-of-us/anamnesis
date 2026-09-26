@@ -50,8 +50,8 @@
 //! safetensors and `GGUF` readers), and, on the `convert` path, also before
 //! reading any format and again before writing. The `.pth` and `NPZ` readers
 //! dequantise nothing and are not polled inside; a `BnB-NF4` encode runs to
-//! its end once started, so a request made during it is honoured after the
-//! encode and before the write. In every case a cancelled run writes nothing.
+//! its end once started, and the token is checked again after the encode and
+//! before the file is written. In every case a cancelled run writes nothing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

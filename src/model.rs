@@ -709,7 +709,8 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent.
+    /// shapes are inconsistent, or if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -762,7 +763,8 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent.
+    /// shapes are inconsistent, or if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -788,7 +790,8 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent.
+    /// shapes are inconsistent, or if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -821,7 +824,8 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent.
+    /// shapes are inconsistent, or if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
@@ -870,7 +874,9 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent, or if serialization fails.
+    /// shapes are inconsistent, if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide), or
+    /// if serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     ///
@@ -907,7 +913,9 @@ impl ParsedModel {
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor data is malformed or
-    /// shapes are inconsistent, or if serialization fails.
+    /// shapes are inconsistent, if two output tensors share a name (a
+    /// `<layer>.qweight` is written as `<layer>.weight`, which can collide), or
+    /// if serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
@@ -1566,6 +1574,10 @@ impl ParsedModel {
             views.push((name.to_owned(), view));
         }
 
+        // `remember` renames `a.qweight` to `a.weight`; a file that also
+        // carries a plain `a.weight` would otherwise hand the upstream
+        // serializer two tensors with one name, which it panics on.
+        crate::parse::utils::reject_duplicate_names(views.iter().map(|(n, _)| n.as_str()))?;
         Ok(views)
     }
 

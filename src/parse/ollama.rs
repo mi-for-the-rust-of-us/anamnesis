@@ -234,15 +234,19 @@ fn parse_spec(spec: &str) -> crate::Result<(&str, &str)> {
 }
 
 /// Rejects a spec component that would steer the manifest path outside
-/// `manifests/`: a `.` or `..` segment, an empty segment, a backslash, or a
-/// leading `/`. Legitimate names (`llama3.2`, a namespaced `user/model`)
-/// contain none of these.
+/// `manifests/`: a `.` or `..` segment, an empty segment, a backslash, a
+/// colon (a Windows drive prefix), or a leading `/`. Legitimate names
+/// (`llama3.2`, a namespaced `user/model`) contain none of these.
 ///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if `component` contains any of them.
 fn reject_path_escape(spec: &str, what: &str, component: &str) -> crate::Result<()> {
+    // `:` too: it is the tag separator, so it never appears in a real name or
+    // tag, and on Windows a component such as `C:evil` is a drive-relative
+    // path that `PathBuf::join` would put in place of the whole base.
     let escapes = component.contains('\\')
+        || component.contains(':')
         || component
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..");
@@ -308,7 +312,7 @@ fn parse_model_digest(manifest_bytes: &[u8]) -> crate::Result<String> {
     if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AnamnesisError::Parse {
             reason: format!(
-                "Ollama manifest model layer digest {digest:?} is not hexadecimal after                  the `sha256:` prefix"
+                "Ollama manifest model layer digest {digest:?} is not hexadecimal after the `sha256:` prefix"
             ),
         });
     }
@@ -485,6 +489,7 @@ mod tests {
             "/abs:1b",
             "a\\b:1b",
             "..",
+            "C:evil:1b",
         ] {
             assert!(
                 matches!(parse_spec(spec), Err(AnamnesisError::Parse { .. })),

@@ -13,12 +13,11 @@
 //! Each fixture is a 65 536-element slice extracted by
 //! `tests/fixtures/ollama_reference/generate_ollama_fixture.py` from a
 //! specific tensor in a specific `Ollama`-cached model, paired with the
-//! `gguf` Python package's reference `BF16` dequant. Fixture file format
-//! is byte-identical to `tests/fixtures/gguf_reference/*.bin` so the
-//! parser below intentionally mirrors `cross_validation_gguf`'s
-//! `parse_gguf_fixture` — same 16-byte header (discriminant, element
-//! count, raw byte count, golden byte count) followed by raw quantised
-//! block data and the golden `BF16` output.
+//! `gguf` Python package's reference `BF16` dequant. The fixture keeps the
+//! original 16-byte header (discriminant, element count, raw byte count,
+//! golden byte count) followed by raw quantised block data and the golden
+//! `BF16` output; the `gguf_reference` fixtures have since moved to the v2
+//! `AMNG` container, so the parser below is this suite's own.
 //!
 //! # Coverage
 //!

@@ -160,7 +160,8 @@ doc = false
 bench = false
 
 # Safetensors header + owned-bytes parse + dequantisation, under input-derived
-# `ParseLimits`. The only target that runs the dequant kernels on hostile input.
+# `ParseLimits`. Runs the dequant kernels directly on a parsed model (the
+# `convert_bytes` target below reaches them through the hub).
 [[bin]]
 name = "fuzz_safetensors_limits"
 path = "fuzz_targets/fuzz_safetensors_limits.rs"

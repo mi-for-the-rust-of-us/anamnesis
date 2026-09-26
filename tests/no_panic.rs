@@ -161,7 +161,49 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
         }
     }
 
+    // No `.gguf` file is committed, so without this nothing in the battery
+    // parses as `GGUF` and every method called on a parsed `GGUF` result goes
+    // unexercised. Generate one from the FP8 fixture, with its near-misses.
+    #[cfg(feature = "gguf")]
+    if let Ok(st) = std::fs::read(FIXTURES[0]) {
+        let options = anamnesis::ConvertOptions::new();
+        if let Ok((gguf, _)) =
+            anamnesis::convert_bytes(&st, anamnesis::ConvertTarget::Gguf, &options)
+        {
+            let len = gguf.len();
+            for cut in [16usize, len / 2, len.saturating_sub(1)] {
+                inputs.push((
+                    format!("{GGUF_FROM_FP8}@trunc{cut}"),
+                    gguf[..cut.min(len)].to_vec(),
+                ));
+            }
+            let mut flipped = gguf.clone();
+            flipped[len / 2] ^= 0xFF;
+            inputs.push((format!("{GGUF_FROM_FP8}@flip"), flipped));
+            inputs.push((format!("{GGUF_FROM_FP8}@whole"), gguf));
+        }
+    }
+
     inputs
+}
+
+/// Label prefix of the generated `GGUF` inputs.
+#[cfg(feature = "gguf")]
+const GGUF_FROM_FP8: &str = "fp8-converted.gguf";
+
+/// Guards the generated `GGUF` inputs the same way `battery_includes_every_fixture`
+/// guards the committed ones: if the conversion ever stops producing a file that
+/// parses, the `GGUF` half of `methods_on_parsed_results_never_panic` would go
+/// silent again.
+#[cfg(feature = "gguf")]
+#[test]
+fn battery_includes_a_parseable_gguf() {
+    let parsed = adversarial_inputs()
+        .into_iter()
+        .filter(|(label, _)| label.starts_with(GGUF_FROM_FP8))
+        .filter(|(_, bytes)| anamnesis::parse_gguf_bytes(bytes.clone()).is_ok())
+        .count();
+    assert!(parsed >= 1, "no generated GGUF input parses");
 }
 
 /// The label prefix used for inputs derived from a fixture path.

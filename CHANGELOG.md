@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file.** Only the safetensors and `GGUF` readers polled the `CancelToken`, so
   a cancelled run on the other two formats completed and wrote the file,
   against the documented guarantee. The token is now checked before reading
-  any format and again before writing.
+  any format, again before writing, and after a `BnB-NF4` encode (which runs
+  to its end once started), so a cancelled run writes nothing on any path.
 
 - **A panic in a parallel dequant worker is re-raised as a panic**, not
   reported as `AnamnesisError::Parse`. A worker panic is a bug, not a malformed
@@ -41,18 +42,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python bindings would have surfaced as `ParseError` instead of
   `PanicException`.
 
-- **Two panics on hostile input, found by the v0.7.8 fuzz campaign.** Both
-  would abort a release build and surface as a `PanicException` under the
-  Python bindings, instead of a typed error:
-  - a `.pth` whose pickled state dict names one tensor twice reached the
-    upstream `safetensors` serializer, which panicked on the duplicate
-    (`convert_bytes`, `pth_to_safetensors`). Duplicate tensor names are now
-    rejected with `AnamnesisError::Parse` where they enter, and before every
-    safetensors / `GGUF` / `BnB-NF4` write, including caller-built inputs to
-    `write_bnb_nf4_safetensors`;
+- **Three panics on hostile input, two found by the v0.7.8 fuzz campaign and
+  one by the review after it.** Each would abort a release build and surface
+  as a `PanicException` under the Python bindings, instead of a typed error:
+  - duplicate tensor names reached the upstream `safetensors` serializer, which
+    panicked on them: from a `.pth` state dict that names one tensor twice
+    (`convert_bytes`, `pth_to_safetensors`), and from `remember` renaming a
+    `GPTQ` / `AWQ` `<layer>.qweight` to `<layer>.weight` in a file that also
+    carries a plain `<layer>.weight`. Duplicate tensor names are now rejected
+    with `AnamnesisError::Parse` where they enter and before every write:
+    `convert` (all targets), `remember`, `pth_to_safetensors`,
+    `write_bnb_nf4_safetensors` (on its output names) and `write_gguf`;
   - a safetensors header declaring `"gptq_bits": "0"` in `__metadata__` made
     `remember` divide by zero. Unsupported widths are now ignored by the header
     parser (falling back to shape inference) and rejected at the division.
+
+- **An `NPZ` archive that repeats an array name is now rejected on every
+  path.** `parse_npz*` kept the last copy while `inspect_npz*` listed both, so
+  the two could describe different archives. Both now return
+  `AnamnesisError::Parse`, as for a repeated `.pth` entry below.
 
 - **A `.pth` archive that repeats `data.pkl` or `byteorder` is now rejected on
   every path.** The parse paths kept the *last* copy and the reader-generic
@@ -75,8 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `blobs/sha256-<hash>` without checking it was hexadecimal, so a manifest
   naming `sha256:../../x` resolved outside `blobs/`; spec components such as
   `../evil` likewise reached the manifest path. Both are now rejected with
-  `AnamnesisError::Parse`. The manifest comes from the local `Ollama` cache,
-  so this is defence in depth rather than a remote exposure.
+  `AnamnesisError::Parse`, as is a `:` in a spec component (on Windows,
+  `C:evil` is a drive-relative path that replaces the whole base). The
+  manifest comes from the local `Ollama` cache, so this is defence in depth
+  rather than a remote exposure.
 
 - **Malformed `.npz` / `.pth` bytes now report `AnamnesisError::Parse`, and
   genuine read failures `AnamnesisError::Io`, on every path.** The two map to
@@ -93,8 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unchanged, and now documented as deliberate: the reader-generic safetensors
   header still returns `Io` when a stream of unknown length ends early, so an
   `HTTP`-range adapter can tell a partial fetch from a malformed header. `NPZ`
-  read-failure messages change wording from `… read failed: …` to
-  `failed to decode …: …`.
+  failures classified as `Parse` change wording from `… read failed: …` to
+  `failed to decode …: …`; genuine read failures are now `Io` and carry the
+  OS message.
 
 - **The `.pth` reader-generic paths now honour `ParseLimits::max_decompression_ratio`.**
   They inflate `DEFLATE` `data.pkl` / `byteorder` entries, but only the `NPZ`
