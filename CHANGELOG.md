@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-failure messages change wording from `… read failed: …` to
   `failed to decode …: …`.
 
+- **`cargo install anamnesis` no longer installs the dev-only `tsan-harness`
+  binary.** It was gated on `parallel`, a default feature, so `cargo install
+  anamnesis --features cli` installed it beside `anamnesis` / `amn`, and a bare
+  `cargo install anamnesis` installed only it. It now requires a new,
+  non-default `tsan` feature, which only the ThreadSanitizer CI job enables.
+
 - **A shape with a zero dimension after an overflowing one now counts as empty
   in every format.** `.pth` fixed this in v0.7.5; `NPZ` (parse and inspect) and
   safetensors' `TensorEntry::num_elements` still stopped at the first overflow,

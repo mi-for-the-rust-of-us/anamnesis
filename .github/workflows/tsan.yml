@@ -136,4 +136,5 @@ jobs:
           cargo +nightly run --release \
             -Zbuild-std=std,panic_abort,panic_unwind \
             --target x86_64-unknown-linux-gnu \
+            --features tsan \
             --bin tsan-harness

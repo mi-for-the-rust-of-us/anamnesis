@@ -41,7 +41,7 @@
 //! it finds a race.
 //!
 //! ```text
-//! cargo +nightly run -Zbuild-std --target x86_64-unknown-linux-gnu --bin tsan-harness
+//! cargo +nightly run -Zbuild-std --target x86_64-unknown-linux-gnu --features tsan --bin tsan-harness
 //! ```
 
 // A dev-only harness: it asserts and reports rather than returning Results into
