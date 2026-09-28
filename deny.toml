@@ -1,6 +1,7 @@
 # cargo-deny policy (https://embarkstudios.github.io/cargo-deny/), run by the
-# `deny` job in `.github/workflows/ci.yml` and locally with `cargo deny check`
-# (`[graph] all-features` below makes both cover every feature).
+# `deny` job in `.github/workflows/deny.yml` (weekly, and on every push and PR)
+# and locally with `cargo deny check` (`[graph] all-features` below makes both
+# cover every feature).
 #
 # Why this exists: a dependency's build script or proc-macro runs arbitrary code
 # on every machine that builds anamnesis, the same "runs just by being

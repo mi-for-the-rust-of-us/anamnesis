@@ -1,0 +1,37 @@
+name: Dependencies
+
+# `cargo-deny` against `deny.toml`: RustSec advisories (a yanked or compromised
+# release of a dependency shows up here), licences, and sources (crates.io only,
+# no git dependencies). Build scripts and proc-macros run arbitrary code at build
+# time, which makes this the Rust counterpart of the `site-packages/*.pth`
+# start-up hook the LiteLLM 1.82.8 payload used.
+#
+# Its own workflow, rather than a job in `ci.yml`, because it needs a schedule
+# and the rest of CI does not. An advisory is published against a dependency
+# whether or not this repository changes, and the `Cargo.lock` shipped in the
+# crate is what `cargo install anamnesis --locked` users build, so a check that
+# only ran on push would miss exactly the case it exists for (Phase 7.9, audit
+# finding L-6).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: "Dependencies (cargo-deny)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check

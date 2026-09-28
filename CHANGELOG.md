@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job that holds `id-token: write`; it now runs
   `cargo install cargo-codspeed --locked --version 5.0.1` and keeps no git
   credentials after checkout.
+- **Dependency advisories are checked weekly, not only on push.** The
+  `cargo-deny` job moved from `ci.yml` to its own `deny.yml`, which also runs on
+  a Monday schedule, so an advisory published against an unchanged `main` (or
+  the `Cargo.lock` that `cargo install --locked` users build) is reported.
 
 ## [0.7.8] - 2026-09-26
 

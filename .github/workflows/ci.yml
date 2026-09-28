@@ -117,20 +117,3 @@ jobs:
             cargo doc --locked --no-deps --document-private-items $combo
             echo "::endgroup::"
           done
-
-  # Dependency supply chain, per `deny.toml`: RustSec advisories (a yanked or
-  # compromised release of a dependency shows up here), licences, and sources
-  # (crates.io only, no git dependencies). Build scripts and proc-macros run
-  # arbitrary code at build time, which makes this the Rust counterpart of the
-  # `site-packages/*.pth` start-up hook the LiteLLM 1.82.8 payload used.
-  deny:
-    name: "Dependencies (cargo-deny)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check
