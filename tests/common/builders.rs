@@ -116,6 +116,33 @@ pub fn build_npz_f32(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
+/// Builds an `NPZ` archive from raw `NPY` v2 entries, each `(array name, header
+/// dict, data)`, all `STORED`. The header dict is written verbatim (padded and
+/// newline-terminated as `NumPy` does), so a test can declare shapes, orders and
+/// dtypes `build_npz_f32` would never produce.
+pub fn build_npz_raw(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
+    let options: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, dict, data) in entries {
+        let mut header = dict.as_bytes().to_vec();
+        // v2: magic (6) + version (2) + u32 length (4), then the dict, padded
+        // with spaces to a 16-byte boundary and ended by a newline.
+        while (12 + header.len() + 1) % 16 != 0 {
+            header.push(b' ');
+        }
+        header.push(b'\n');
+        let mut npy = b"\x93NUMPY\x02\x00".to_vec();
+        npy.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+        npy.extend_from_slice(&header);
+        npy.extend_from_slice(data);
+        zip.start_file(format!("{name}.npy"), options).unwrap();
+        zip.write_all(&npy).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
 /// Writes `bytes` to `fixture.<ext>` in a fresh temp directory. The returned
 /// `TempDir` must outlive every use of the path.
 pub fn write_temp(bytes: &[u8], ext: &str) -> (tempfile::TempDir, PathBuf) {

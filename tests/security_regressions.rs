@@ -605,3 +605,53 @@ mod h2_gguf_aliasing_and_alignment {
         assert_eq!(anamnesis::parse_gguf_bytes(out).unwrap().alignment(), 64);
     }
 }
+
+// ---------------------------------------------------------------------------
+// H-3: the `Fortran`-order transposition walked every declared dimension for
+// every element, and the rank was bounded only by the 1 MiB header cap. A 240 KB
+// archive with 80000 size-1 dimensions took 4.2 s under tight limits while
+// `inspect` saw a small array.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "npz")]
+mod h3_npy_rank {
+    use std::io::Cursor;
+
+    use anamnesis::AnamnesisError;
+
+    use crate::common::builders::build_npz_raw;
+
+    fn fortran_u8(shape: &str, data: &[u8]) -> Vec<u8> {
+        let dict = format!("{{'descr': '|u1', 'fortran_order': True, 'shape': {shape}, }}");
+        build_npz_raw(&[("w", &dict, data)])
+    }
+
+    fn is_rank_cap(r: &Result<impl std::fmt::Debug, AnamnesisError>) -> bool {
+        matches!(r, Err(AnamnesisError::LimitExceeded { limit, .. }) if *limit == "NPY_MAX_DIMS")
+    }
+
+    #[test]
+    fn the_audit_archive_is_refused_before_any_work() {
+        // The audit's PoC at its smallest size: 40000 elements, rank 40001.
+        let n = 40_000;
+        let shape = format!("({n},{})", "1,".repeat(n));
+        let bytes = fortran_u8(&shape, &vec![7u8; n]);
+        let started = std::time::Instant::now();
+        assert!(is_rank_cap(&anamnesis::parse_npz_bytes(bytes.clone())));
+        assert!(is_rank_cap(&anamnesis::inspect_npz_from_reader(
+            Cursor::new(&bytes)
+        )));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_maximum_rank_with_size_one_dimensions_is_fast_and_correct() {
+        // Shape (2, 1 x 62, 3) in Fortran order: the 2x3 matrix [[0, 1, 2],
+        // [3, 4, 5]] is stored column by column as 0 3 1 4 2 5.
+        let shape = format!("(2,{}3)", "1,".repeat(62));
+        let bytes = fortran_u8(&shape, &[0, 3, 1, 4, 2, 5]);
+        let arrays = anamnesis::parse_npz_bytes(bytes).unwrap();
+        assert_eq!(arrays["w"].data, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(arrays["w"].shape.len(), 64);
+    }
+}

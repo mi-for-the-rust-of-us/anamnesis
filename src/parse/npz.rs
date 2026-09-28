@@ -50,6 +50,17 @@ const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 /// the 4 GiB declared-header window before allocating.
 const NPY_MAX_HEADER_BYTES: usize = 1 << 20;
 
+/// Maximum number of dimensions of an `NPY` array: `NumPy`'s own limit
+/// (`NPY_MAXDIMS`, 64 since `NumPy` 2.0; 32 before).
+///
+/// Without it the shape tuple was bounded only by the 1 MiB header cap, so a
+/// header could declare hundreds of thousands of size-1 dimensions, and the
+/// `Fortran`-order transposition in [`to_c_order`] walked every one of them
+/// for every element: a 240 KB archive cost 4.2 s, a few MB would cost hours,
+/// and `inspect` saw an ordinary small array (Phase 7.9, audit finding H-3).
+/// Always-on, independent of [`ParseLimits`].
+const NPY_MAX_DIMS: usize = 64;
+
 /// Upper bound on a single `NPY`/`NPZ` array's raw byte length (8 GiB).
 ///
 /// The element-count and byte-count `checked_mul`s in [`read_array_data`]
@@ -274,7 +285,8 @@ struct NpyHeader {
 /// Returns [`AnamnesisError::Unsupported`] if the `NPY` version is not 1, 2 or
 /// 3, or the dtype descriptor names an unsupported type.
 /// Returns [`AnamnesisError::LimitExceeded`] if the declared header length
-/// exceeds the cap or the `budget`.
+/// exceeds the cap or the `budget`, or the shape has more than `NPY_MAX_DIMS`
+/// (64) dimensions.
 /// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn parse_npy_header(reader: &mut impl Read, budget: &mut Budget) -> crate::Result<NpyHeader> {
     // Read magic (6 bytes) + major (1) + minor (1) = 8 bytes.
@@ -511,7 +523,8 @@ fn extract_fortran_order(header: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the shape field is missing or
-/// contains invalid dimension values.
+/// contains invalid dimension values, and [`AnamnesisError::LimitExceeded`] if
+/// it has more than `NPY_MAX_DIMS` (64) dimensions.
 fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
     let shape_start = header.find("'shape'").or_else(|| header.find("\"shape\""));
     let shape_start = shape_start.ok_or_else(|| AnamnesisError::Parse {
@@ -541,17 +554,27 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
             reason: "NPY header 'shape' extraction failed".into(),
         })?;
 
-    inner
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            s.trim()
+    // Counted while splitting, so an over-long shape is refused before its
+    // dimensions are collected.
+    let mut shape = Vec::new();
+    for dim in inner.split(',').filter(|s| !s.trim().is_empty()) {
+        if shape.len() == NPY_MAX_DIMS {
+            return Err(AnamnesisError::LimitExceeded {
+                limit: "NPY_MAX_DIMS",
+                message: format!(
+                    "NPY shape has more than {NPY_MAX_DIMS} dimensions, NumPy's own limit"
+                ),
+            });
+        }
+        shape.push(
+            dim.trim()
                 .parse::<usize>()
                 .map_err(|e| AnamnesisError::Parse {
                     reason: format!("NPY shape dimension parse error: {e}"),
-                })
-        })
-        .collect()
+                })?,
+        );
+    }
+    Ok(shape)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,8 +599,12 @@ fn extract_shape(header: &str) -> crate::Result<Vec<usize>> {
 /// already had to fix once for `AWQ`/`GPTQ`, and a wrong orientation is not a
 /// crash — it is plausible numbers in the wrong places.
 ///
-/// Rank 0 and rank 1 return `data` untouched (the two orders coincide), as does
-/// any shape with a zero dimension. Higher ranks are one code path: `F`-order is
+/// Size-1 dimensions are dropped first: they change neither order, and keeping
+/// them made the odometer below carry through every one of them for every
+/// element (Phase 7.9, audit finding H-3). With them gone, the cost is linear in
+/// the array's size whatever the declared rank. Rank 0 and rank 1 (after that
+/// squeeze) return `data` untouched, since the two orders coincide, as does any
+/// shape with a zero dimension. Higher ranks are one code path: `F`-order is
 /// `C`-order with the dimensions reversed, so reversed strides handle rank 2 and
 /// rank *n* alike.
 ///
@@ -600,6 +627,8 @@ fn to_c_order(
     elem_size: usize,
     budget: &mut Budget,
 ) -> crate::Result<Vec<u8>> {
+    let squeezed: Vec<usize> = shape.iter().copied().filter(|&dim| dim != 1).collect();
+    let shape = squeezed.as_slice();
     let rank = shape.len();
     let n_elements: usize = shape.iter().copied().fold(1usize, usize::saturating_mul);
     if rank < 2 || n_elements == 0 || elem_size == 0 {
@@ -2252,6 +2281,42 @@ mod tests {
         let mut budget = Budget::unbounded();
         let out = to_c_order(f_order, &shape, 1, &mut budget).unwrap();
         assert_eq!(out, c_order, "rank-3 reversed-strides transposition");
+    }
+
+    /// Size-1 dimensions change neither order, so interleaving them anywhere in
+    /// a rank-3 shape must give the rank-3 answer (Phase 7.9, audit finding
+    /// H-3: they used to make the transposition cost `n_elements x rank`).
+    #[test]
+    fn fortran_order_ignores_size_one_dimensions() {
+        let n = 24usize;
+        let f_order: Vec<u8> = (0..n).map(|i| u8::try_from(i).unwrap()).collect();
+        let reference =
+            to_c_order(f_order.clone(), &[2, 3, 4], 1, &mut Budget::unbounded()).unwrap();
+        for shape in [
+            vec![1, 2, 3, 4],
+            vec![2, 1, 3, 1, 4],
+            vec![2, 3, 4, 1, 1, 1],
+        ] {
+            let out = to_c_order(f_order.clone(), &shape, 1, &mut Budget::unbounded()).unwrap();
+            assert_eq!(out, reference, "shape {shape:?}");
+        }
+        // One non-unit dimension: the orders coincide and the data is untouched.
+        let out = to_c_order(f_order.clone(), &[1, 24, 1], 1, &mut Budget::unbounded()).unwrap();
+        assert_eq!(out, f_order);
+    }
+
+    #[test]
+    fn shape_rank_is_capped_at_numpys_limit() {
+        let tuple = |rank: usize| format!("{{'shape': ({}), }}", "1,".repeat(rank));
+        assert_eq!(
+            extract_shape(&tuple(NPY_MAX_DIMS)).unwrap().len(),
+            NPY_MAX_DIMS
+        );
+        let err = extract_shape(&tuple(NPY_MAX_DIMS + 1)).unwrap_err();
+        assert!(
+            matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "NPY_MAX_DIMS"),
+            "{err}"
+        );
     }
 
     /// The transposition's second buffer is charged to the caller's budget, like

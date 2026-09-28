@@ -116,6 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this), the reader and the writer share one rule requiring a power-of-two
   alignment (as llama.cpp does), and `convert` no longer inherits the source
   alignment: the output uses the default of 32 unless the caller sets one.
+- **`NPY` arrays are capped at 64 dimensions, and the `Fortran`-order
+  transposition no longer scales with rank** (Phase 7.9, audit finding H-3).
+  The shape tuple was bounded only by the 1 MiB header cap, and the
+  transposition added in v0.7.6 walked every dimension for every element, so
+  a 240 KB archive declaring 80000 size-1 dimensions cost 4.2 s under tight
+  `ParseLimits` (hours at a few MB) while `inspect` saw an ordinary small array.
+  A shape with more than `NumPy`'s own limit of 64 dimensions is now
+  `LimitExceeded` (`NPY_MAX_DIMS`) on every entry point, and size-1 dimensions,
+  which change neither order, are dropped before transposing. Output bytes are
+  unchanged.
 
 ### Changed
 
