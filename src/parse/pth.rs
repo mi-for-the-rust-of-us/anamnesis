@@ -2100,8 +2100,9 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
 ///
 /// Returns [`AnamnesisError::Parse`] if shape and strides have different
 /// lengths, element count or byte count overflows `usize`, if the maximum
-/// stride offset overflows, or if the source data range exceeds the
-/// storage slice.
+/// stride offset overflows, if the source data range exceeds the storage
+/// slice, or if the view would materialise more bytes than the storage holds
+/// from `offset` (an expanded view). An empty tensor is `Ok(vec![])`.
 fn copy_to_contiguous(
     storage: &[u8],
     offset: usize,
@@ -2122,6 +2123,11 @@ fn copy_to_contiguous(
     let n_elements = checked_num_elements(shape).ok_or_else(|| AnamnesisError::Parse {
         reason: "element count overflow".into(),
     })?;
+    // An empty tensor reads nothing, whatever its strides. Returning here also
+    // keeps a zero dimension out of the `dim - 1` in the offset bound below.
+    if n_elements == 0 {
+        return Ok(Vec::new());
+    }
     let out_bytes = n_elements
         .checked_mul(elem_size)
         .ok_or_else(|| AnamnesisError::Parse {
@@ -4338,19 +4344,21 @@ mod tests {
         );
     }
 
-    // G21: Zero-element tensor (shape [0, 4])
-    // This test exercises copy_to_contiguous directly with a zero-sized
-    // dimension. In the non-contiguous path, dim=0 triggers the checked_sub(1)
-    // error in the max_elem_offset calculation. (In the contiguous path,
-    // n_elements=0 produces a zero-byte slice before copy_to_contiguous
-    // is ever called.)
+    // G21: Zero-element tensor (shape [0, 4]). An empty tensor is legitimate
+    // however it was strided; until v0.7.9 the non-contiguous path rejected it,
+    // because `dim - 1` underflows for a zero dimension in the max-offset
+    // computation (audit finding I-9).
     #[test]
-    fn copy_to_contiguous_zero_elements_errors() {
+    fn copy_to_contiguous_zero_elements_is_empty() {
         let storage = vec![0u8; 16];
-        let result = copy_to_contiguous(&storage, 0, &[0, 4], &[4, 1], 4);
-        assert!(
-            result.is_err(),
-            "zero-dim in shape should error in max_elem_offset"
+        assert_eq!(
+            copy_to_contiguous(&storage, 0, &[0, 4], &[1, 7], 4).unwrap(),
+            Vec::<u8>::new()
+        );
+        // Even from an empty storage, and at an offset equal to its length.
+        assert_eq!(
+            copy_to_contiguous(&[], 0, &[4, 0], &[1, 4], 4).unwrap(),
+            Vec::<u8>::new()
         );
     }
 

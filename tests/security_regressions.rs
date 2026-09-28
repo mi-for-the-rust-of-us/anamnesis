@@ -206,3 +206,18 @@ mod n1_pth_rank {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }
+
+// ---------------------------------------------------------------------------
+// I-9: an empty non-contiguous `.pth` tensor was an error, because the offset
+// bound computed `dim - 1` for a zero dimension.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pth")]
+#[test]
+fn i9_an_empty_non_contiguous_tensor_is_empty() {
+    let bytes = common::pth::single_u8_view(&[0, 3], &[1, 5], &[1, 2, 3]);
+    let parsed = anamnesis::parse_pth_bytes(bytes).unwrap();
+    let tensors = parsed.tensors().unwrap();
+    assert_eq!(tensors[0].shape, vec![0, 3]);
+    assert!(tensors[0].data.is_empty());
+}

@@ -77,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run failed with "Permission denied" on Linux and macOS; and it logged to the
   fixed path `/tmp/amn-verify.log`, which another user of a shared host could
   pre-plant as a symlink. It now uses `mktemp`, removed on exit.
+- **An empty non-contiguous `.pth` tensor parses** (Phase 7.9, audit
+  finding I-9). A tensor with a zero dimension and non-row-major strides was
+  rejected with "max stride offset overflow", because the offset bound computed
+  `dim - 1` for the zero dimension. It now materialises as an empty buffer.
 
 ## [0.7.8] - 2026-09-26
 
