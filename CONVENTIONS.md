@@ -1013,7 +1013,18 @@ must **never** change an output byte:
   a **default, not a ceiling** — because the limiting resource is DRAM bandwidth,
   a memory-rich host (many-channel DDR5 server) can profitably raise it through
   the caller parameter; hard-coding the core count would be wrong in both
-  directions.
+  directions. The hardware *is* the ceiling: an explicit request is clamped to
+  `available_parallelism`, since threads past the core count only add spawn
+  cost and memory (Phase 7.9, audit finding L-4).
+- **A refused thread costs parallelism, never the process.** Spawn workers with
+  `std::thread::Builder::spawn_scoped`, which reports a refusal as an error,
+  never `Scope::spawn`, which panics (an abort under `panic = "abort"`). Carry
+  on with the workers already started; with none, run on the calling thread.
+- **Stop at the first failure without changing which failure is reported.**
+  Workers share the lowest failing index seen (`AtomicUsize::fetch_min`) and
+  stop claiming once the next index is above it: the true minimum failing index
+  is never skipped, and a hostile file is not dequantised in full just to be
+  discarded.
 - **Bounded by hardware, never by the input.** Thread/task count derives from
   hardware parallelism, **never** from any file-declared quantity (tensor count,
   shape, block count). A malicious archive declaring 10⁹ tensors must not spawn

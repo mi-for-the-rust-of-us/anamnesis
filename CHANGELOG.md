@@ -186,6 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place only once complete (the `safetensors` writers already did, upstream),
   and `convert` / `amn` refuse an output that is the input, including through
   a symbolic link, another spelling, or (on Unix) a hard link.
+- **The thread pool degrades instead of aborting, and stops at the first
+  failure** (Phase 7.9, audit finding L-4). A worker thread the OS refused to
+  start made `Scope::spawn` panic, an abort under `panic = "abort"`; workers now
+  start through `Builder::spawn_scoped`, and a refusal leaves the work to the
+  threads already running, or to the calling thread. After a failure the other
+  workers used to dequantise the rest of the file anyway; they now stop, while
+  still reporting the lowest-indexed failure at every thread count. An
+  explicit thread budget is clamped to `available_parallelism` (it was passed
+  to the spawner as given, `--threads 1000000` included).
 
 ### Changed
 

@@ -410,16 +410,18 @@ enum TensorDequant {
 /// `None` → `min(available_parallelism, 4)` — the measured scaling knee for
 /// bandwidth-bound dequant (`docs/perf-experiments.md` Experiment 11), leaving
 /// the rest of the host's cores free for the embedding process. `Some(n)` pins
-/// the budget to `n.max(1)`. The budget is derived only from hardware and the
-/// caller's request — **never** from any file-declared quantity — per the
+/// the budget to `n`, at least 1 and at most `available_parallelism`: threads
+/// beyond the hardware only add spawn cost and memory, and until v0.7.9 an
+/// absurd request (`--threads 1000000`) was passed straight to the spawner
+/// (Phase 7.9, audit finding L-4). The budget is derived only from hardware and
+/// the caller's request — **never** from any file-declared quantity — per the
 /// `CONVENTIONS.md` "caller owns the thread budget" rule.
 #[cfg(feature = "parallel")]
 pub(crate) fn resolve_thread_budget(threads: Option<usize>) -> usize {
+    let hardware = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     match threads {
-        None => std::thread::available_parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-            .min(4),
-        Some(n) => n.max(1),
+        None => hardware.min(4),
+        Some(n) => n.clamp(1, hardware),
     }
 }
 
@@ -457,9 +459,10 @@ pub struct RememberOptions {
     ///
     /// `None` (the default) resolves to `min(available_parallelism, 4)` — the
     /// measured scaling knee for bandwidth-bound dequant, leaving the host's
-    /// remaining cores free. `Some(n)` pins the budget to `n.max(1)`. With the
-    /// `parallel` Cargo feature disabled the budget is always 1 (fully
-    /// sequential) regardless of this field.
+    /// remaining cores free. `Some(n)` pins the budget to `n`, clamped to
+    /// `1..=available_parallelism` when the run starts. With the `parallel`
+    /// Cargo feature disabled the budget is always 1 (fully sequential)
+    /// regardless of this field.
     pub threads: Option<usize>,
     /// Cooperative cancellation handle, polled once per tensor.
     ///

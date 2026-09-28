@@ -200,6 +200,14 @@ where
 
     let n_workers = threads.min(items.len());
     let cursor = AtomicUsize::new(0);
+    // The lowest failing index any worker has seen so far, `usize::MAX` until a
+    // failure. A worker stops as soon as the next index it claims is above it:
+    // that index, and every later one (the cursor only moves forward), cannot
+    // change which failure is reported, so computing them is wasted work, and
+    // on a hostile file that work could be most of the file (Phase 7.9, audit
+    // finding L-4). The rule never skips the true minimum failing index `m`:
+    // skipping `m` would need a failure below `m`.
+    let min_failed = AtomicUsize::new(usize::MAX);
 
     let mut collected: Vec<(usize, R)> = Vec::with_capacity(items.len());
     // The lowest-indexed failure seen across all workers; see the "Error
@@ -219,36 +227,67 @@ where
     // identical for any thread count and any steal order. `on_result` runs only
     // on this thread.
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n_workers)
-            .map(|_| {
-                let cursor = &cursor;
-                scope.spawn(move || {
-                    let mut local: Vec<(usize, R)> = Vec::new();
-                    loop {
-                        let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(item) = items.get(idx) else { break };
-                        // One relaxed load per *item*, at the same point the
-                        // cursor hands one out and never inside a kernel — the
-                        // shape CONVENTIONS.md sanctions for the cursor itself.
-                        // Reported as a failure at `idx` so the lowest-index
-                        // rule below picks a deterministic one: whatever the
-                        // steal order, a cancelled run reports `Cancelled`.
-                        if let Err(err) = crate::cancel::check(cancel) {
-                            return Err((idx, err));
-                        }
-                        match f(idx, item) {
-                            Ok(result) => local.push((idx, result)),
-                            // Stop claiming after this worker's own first
-                            // failure; the remaining entries fall to the other
-                            // workers, which keeps the minimum-index argument
-                            // above valid.
-                            Err(err) => return Err((idx, err)),
-                        }
+        // Captures shared references only, so it is `Copy`: the same worker
+        // body is handed to each spawned thread, and run on this one if none
+        // can be spawned.
+        let worker = || -> Result<Vec<(usize, R)>, (usize, AnamnesisError)> {
+            let mut local: Vec<(usize, R)> = Vec::new();
+            loop {
+                let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(idx) else { break };
+                // A failure at a lower index already decides the outcome; see
+                // `min_failed` above. One relaxed load per *item*, like the
+                // cursor itself, and never inside a kernel.
+                if idx > min_failed.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Reported as a failure at `idx` so the lowest-index rule below
+                // picks a deterministic one: whatever the steal order, a
+                // cancelled run reports `Cancelled`.
+                let outcome = crate::cancel::check(cancel).and_then(|()| f(idx, item));
+                match outcome {
+                    Ok(result) => local.push((idx, result)),
+                    // Stop claiming after this worker's own first failure, and
+                    // tell the others; the minimum-index argument above holds.
+                    Err(err) => {
+                        min_failed.fetch_min(idx, Ordering::Relaxed);
+                        return Err((idx, err));
                     }
-                    Ok(local)
-                })
-            })
-            .collect();
+                }
+            }
+            Ok(local)
+        };
+
+        // `Builder::spawn_scoped` reports a refused thread as an error where
+        // `Scope::spawn` panics (an abort under `panic = "abort"`). A thread
+        // limit or memory pressure then costs parallelism, not the process:
+        // the workers already started share all the items through the cursor.
+        let mut handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            match spawn_worker(scope, worker) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        // Not one thread could be started: this thread does all the work.
+        let inline = handles.is_empty().then(worker);
+
+        let mut absorb = |outcome: Result<Vec<(usize, R)>, (usize, AnamnesisError)>| match outcome {
+            Ok(local) => {
+                for (idx, result) in local {
+                    on_result(&result);
+                    collected.push((idx, result));
+                }
+            }
+            Err((idx, err)) => {
+                if failure.as_ref().is_none_or(|&(seen, _)| idx < seen) {
+                    failure = Some((idx, err));
+                }
+            }
+        };
+        if let Some(outcome) = inline {
+            absorb(outcome);
+        }
 
         // Join in spawn order on the calling thread. Every handle is joined even
         // once a failure is known: the deterministic-error rule needs the
@@ -271,17 +310,7 @@ where
             // does not touch.
             let joined = handle.join();
             match joined {
-                Ok(Ok(local)) => {
-                    for (idx, result) in local {
-                        on_result(&result);
-                        collected.push((idx, result));
-                    }
-                }
-                Ok(Err((idx, err))) => {
-                    if failure.as_ref().is_none_or(|&(seen, _)| idx < seen) {
-                        failure = Some((idx, err));
-                    }
-                }
+                Ok(outcome) => absorb(outcome),
                 // Keep the first payload; any later one is a second symptom.
                 Err(payload) => {
                     panic_payload.get_or_insert(payload);
@@ -303,6 +332,39 @@ where
     // happened to distribute the work.
     collected.sort_by_key(|&(idx, _)| idx);
     Ok(collected.into_iter().map(|(_, result)| result).collect())
+}
+
+/// Starts one scoped worker thread, reporting a refusal as an error.
+///
+/// Test builds can make it refuse after a set number of threads (see
+/// `SPAWN_BUDGET`), which is how the degraded paths are exercised without
+/// exhausting the machine.
+#[cfg(feature = "parallel")]
+fn spawn_worker<'scope, 'env, W, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    worker: W,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    W: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if SPAWN_BUDGET.with(|budget| {
+        let left = budget.get();
+        budget.set(left.saturating_sub(1));
+        left == 0
+    }) {
+        return Err(std::io::Error::other("test: thread spawn refused"));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, worker)
+}
+
+#[cfg(all(test, feature = "parallel"))]
+thread_local! {
+    /// How many more worker threads [`spawn_worker`] may start on this thread
+    /// before it refuses; unlimited unless a test lowers it. Thread-local, so
+    /// concurrently running tests do not see each other's setting.
+    static SPAWN_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 #[cfg(test)]
@@ -353,6 +415,127 @@ mod tests {
         )
         .expect("an uncancelled empty run succeeds");
         assert!(out.is_empty());
+    }
+
+    fn fail_at(idx: usize) -> AnamnesisError {
+        AnamnesisError::Parse {
+            reason: format!("failed at {idx}"),
+        }
+    }
+
+    /// After a failure, workers stop claiming items instead of computing the
+    /// rest of a (possibly hostile) file only to discard it (Phase 7.9, audit
+    /// finding L-4).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn workers_stop_after_a_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<usize> = (0..1000).collect();
+        let calls = AtomicUsize::new(0);
+        let err = map_indexed(
+            &items,
+            4,
+            BIG,
+            None,
+            |idx, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if idx == 10 {
+                    Err(fail_at(idx))
+                } else {
+                    Ok(idx)
+                }
+            },
+            |_| {},
+        )
+        .expect_err("item 10 fails");
+        assert!(matches!(&err, AnamnesisError::Parse { reason } if reason == "failed at 10"));
+        let calls = calls.load(Ordering::Relaxed);
+        assert!(
+            calls < 200,
+            "{calls} of 1000 items computed after an early failure"
+        );
+    }
+
+    /// The early stop must not change *which* failure is reported: a failure at
+    /// a later index that happens first must lose to a slower one at a lower
+    /// index, at every budget.
+    #[test]
+    fn the_lowest_failing_index_wins_even_when_it_fails_last() {
+        let items: Vec<usize> = (0..200).collect();
+        for threads in [1usize, 2, 4, 8] {
+            let err = map_indexed(
+                &items,
+                threads,
+                BIG,
+                None,
+                |idx, _| match idx {
+                    5 => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Err(fail_at(idx))
+                    }
+                    50 => Err(fail_at(idx)),
+                    _ => Ok(idx),
+                },
+                |_| {},
+            )
+            .expect_err("items 5 and 50 fail");
+            assert!(
+                matches!(&err, AnamnesisError::Parse { reason } if reason == "failed at 5"),
+                "at {threads} threads: {err:?}"
+            );
+        }
+    }
+
+    /// A refused thread spawn degrades the run instead of panicking: with no
+    /// worker thread at all the calling thread does the work, and with some,
+    /// they share it. Results and error selection are unchanged.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_refused_spawn_degrades_instead_of_panicking() {
+        use super::SPAWN_BUDGET;
+        let items: Vec<usize> = (0..97).collect();
+        let expected: Vec<usize> = items.iter().map(|v| v * 3).collect();
+        for budget in [0usize, 1, 2] {
+            SPAWN_BUDGET.with(|b| b.set(budget));
+            let out = map_indexed(&items, 8, BIG, None, |_, &v| Ok(v * 3), |_| {});
+            SPAWN_BUDGET.with(|b| b.set(budget));
+            let err = map_indexed(
+                &items,
+                8,
+                BIG,
+                None,
+                |idx, _| {
+                    if idx >= 40 {
+                        Err(fail_at(idx))
+                    } else {
+                        Ok(idx)
+                    }
+                },
+                |_| {},
+            );
+            SPAWN_BUDGET.with(|b| b.set(usize::MAX));
+            assert_eq!(out.expect("map"), expected, "spawn budget {budget}");
+            assert!(
+                matches!(&err, Err(AnamnesisError::Parse { reason }) if reason == "failed at 40"),
+                "spawn budget {budget}: {err:?}"
+            );
+        }
+    }
+
+    /// An explicit budget is clamped to the hardware: at least one thread, at
+    /// most `available_parallelism`.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn an_explicit_thread_budget_is_clamped_to_the_hardware() {
+        let hardware = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert_eq!(crate::model::resolve_thread_budget(Some(0)), 1);
+        assert_eq!(
+            crate::model::resolve_thread_budget(Some(1_000_000)),
+            hardware
+        );
+        assert_eq!(crate::model::resolve_thread_budget(Some(1)), 1);
+        assert_eq!(crate::model::resolve_thread_budget(None), hardware.min(4));
     }
 
     /// Order is an input-order property, not a completion-order one: the same

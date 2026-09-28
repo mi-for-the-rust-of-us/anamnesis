@@ -94,7 +94,8 @@ enum Commands {
         force: bool,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
         /// measured scaling knee — so the rest of the machine stays free.
-        /// Values below 1 are clamped to 1 (fully sequential). Output is
+        /// Values below 1 are clamped to 1 (fully sequential), values above the
+        /// number of CPU cores to that number. Output is
         /// byte-identical whatever you pass.
         #[arg(long, value_name = "N")]
         threads: Option<usize>,
@@ -162,7 +163,8 @@ enum Commands {
         out_dtype: String,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
         /// measured scaling knee — so the rest of the machine stays free.
-        /// Values below 1 are clamped to 1 (fully sequential). Output is
+        /// Values below 1 are clamped to 1 (fully sequential), values above the
+        /// number of CPU cores to that number. Output is
         /// byte-identical whatever you pass.
         #[arg(long, value_name = "N")]
         threads: Option<usize>,

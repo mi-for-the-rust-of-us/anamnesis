@@ -126,8 +126,9 @@ pub struct ConvertOptions {
     pub limits: ParseLimits,
     /// Per-tensor dequantisation thread budget, with the same semantics as
     /// [`RememberOptions::threads`](crate::RememberOptions): `None` (the default)
-    /// resolves to `min(available_parallelism, 4)`, `Some(n)` pins it to
-    /// `n.max(1)`, and it is always 1 when the `parallel` feature is off.
+    /// resolves to `min(available_parallelism, 4)`, `Some(n)` pins it to `n`
+    /// clamped to `1..=available_parallelism`, and it is always 1 when the
+    /// `parallel` feature is off.
     ///
     /// Applies to the **safetensors** input path (which reuses the model
     /// dequant) and, since v0.7.2, to the **`GGUF`** input path. The `NPZ` and
