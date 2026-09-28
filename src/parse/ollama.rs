@@ -55,6 +55,7 @@
 //! Only the `application/vnd.ollama.image.model` layer's `digest`
 //! matters for the path resolver; the rest is ignored.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::AnamnesisError;
@@ -87,6 +88,71 @@ const DEFAULT_TAG: &str = "latest";
 /// library API directly.
 const URL_SCHEME_PREFIX: &str = "ollama:";
 
+/// Largest manifest [`resolve_ollama_model`] reads, in bytes.
+///
+/// A real manifest is a single line of a few hundred bytes. The cache directory
+/// can come from `OLLAMA_MODELS`, which may point at a shared or writable
+/// location, and the manifest was read whole with `std::fs::read`: a
+/// multi-gigabyte file there was read into memory before its `JSON` was looked
+/// at (Phase 7.9, audit finding I-4).
+const OLLAMA_MAX_MANIFEST_BYTES: u64 = 1 << 20;
+
+/// Reads an `Ollama` manifest: a regular file of at most
+/// `OLLAMA_MAX_MANIFEST_BYTES`, read through a bounded reader so a file that
+/// grows after its size was checked cannot be read past the cap either.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Io`] if the manifest is missing (with a hint to
+/// `ollama pull` the model) or cannot be read, [`AnamnesisError::Parse`] if it
+/// is not a regular file, and [`AnamnesisError::LimitExceeded`] if it is
+/// larger than the cap.
+fn read_manifest(path: &Path, model_name: &str, tag: &str) -> crate::Result<Vec<u8>> {
+    // EXHAUSTIVE: `io::ErrorKind` is foreign `#[non_exhaustive]` — we
+    // only customise the `NotFound` message (the most common case
+    // when the model has not been pulled) and pass every other kind
+    // through unchanged.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let io_error = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => AnamnesisError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Ollama manifest not found at {} (run `ollama pull {model_name}:{tag}` first)",
+                path.display()
+            ),
+        )),
+        _ => AnamnesisError::Io(e),
+    };
+    let too_large = |size: u64| AnamnesisError::LimitExceeded {
+        limit: "OLLAMA_MAX_MANIFEST_BYTES",
+        message: format!(
+            "Ollama manifest {} is {size} bytes, over the {OLLAMA_MAX_MANIFEST_BYTES}-byte cap",
+            path.display()
+        ),
+    };
+
+    let metadata = std::fs::metadata(path).map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(AnamnesisError::Parse {
+            reason: format!("Ollama manifest {} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > OLLAMA_MAX_MANIFEST_BYTES {
+        return Err(too_large(metadata.len()));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(io_error)?
+        .take(OLLAMA_MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(AnamnesisError::Io)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > OLLAMA_MAX_MANIFEST_BYTES {
+        return Err(too_large(read));
+    }
+    Ok(bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -115,25 +181,14 @@ const URL_SCHEME_PREFIX: &str = "ollama:";
 /// Returns [`AnamnesisError::Io`] when the manifest file or the
 /// resolved blob file does not exist on disk (typically because the
 /// model has not been `ollama pull`-ed yet) or cannot be read.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] when the manifest is larger than
+/// 1 MiB, and [`AnamnesisError::Parse`] when it is not a regular file.
 pub fn resolve_ollama_model(spec: &str) -> crate::Result<PathBuf> {
     let (model_name, tag) = parse_spec(spec)?;
     let root = ollama_models_root();
     let manifest_path = manifest_path_for(&root, model_name, tag);
-    // EXHAUSTIVE: `io::ErrorKind` is foreign `#[non_exhaustive]` — we
-    // only customise the `NotFound` message (the most common case
-    // when the model has not been pulled) and pass every other kind
-    // through unchanged.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AnamnesisError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "Ollama manifest not found at {} (run `ollama pull {model_name}:{tag}` first)",
-                manifest_path.display()
-            ),
-        )),
-        _ => AnamnesisError::Io(e),
-    })?;
+    let manifest_bytes = read_manifest(&manifest_path, model_name, tag)?;
     let blob_hash = parse_model_digest(&manifest_bytes)?;
     let blob_path = blob_path_for(&root, &blob_hash);
     if !blob_path.exists() {
@@ -334,6 +389,33 @@ fn parse_model_digest(manifest_bytes: &[u8]) -> crate::Result<String> {
 )]
 mod tests {
     use super::*;
+
+    /// The manifest read is bounded, and refuses what is not a regular file
+    /// (Phase 7.9, audit finding I-4).
+    #[test]
+    fn read_manifest_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok");
+        std::fs::write(&ok, br#"{"layers":[]}"#).unwrap();
+        assert_eq!(read_manifest(&ok, "m", "t").unwrap(), br#"{"layers":[]}"#);
+
+        let big = dir.path().join("big");
+        let cap = usize::try_from(OLLAMA_MAX_MANIFEST_BYTES).unwrap();
+        std::fs::write(&big, vec![b' '; cap + 1]).unwrap();
+        assert!(matches!(
+            read_manifest(&big, "m", "t"),
+            Err(AnamnesisError::LimitExceeded { limit, .. }) if limit == "OLLAMA_MAX_MANIFEST_BYTES"
+        ));
+
+        assert!(matches!(
+            read_manifest(dir.path(), "m", "t"),
+            Err(AnamnesisError::Parse { reason }) if reason.contains("not a regular file")
+        ));
+        assert!(matches!(
+            read_manifest(&dir.path().join("missing"), "m", "t"),
+            Err(AnamnesisError::Io(e)) if e.to_string().contains("ollama pull m:t")
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // parse_spec — pure, no filesystem touch

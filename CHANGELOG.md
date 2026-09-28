@@ -195,6 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still reporting the lowest-indexed failure at every thread count. An
   explicit thread budget is clamped to `available_parallelism` (it was passed
   to the spawner as given, `--threads 1000000` included).
+- **The `ollama:` manifest read is bounded** (Phase 7.9, audit finding I-4).
+  The manifest was read whole with `std::fs::read`; `OLLAMA_MODELS` can point
+  at a shared or writable directory, so a huge file there was read into memory
+  first. It must now be a regular file of at most 1 MiB (a real one is a few
+  hundred bytes), or the resolver returns `LimitExceeded` / `Parse`.
 
 ### Changed
 
