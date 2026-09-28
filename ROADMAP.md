@@ -1398,27 +1398,27 @@ Three arms earned a significance star while nothing had changed, so **a `*` mean
 
 **Items** (one commit per ID on `phase-7.9-security`, merged `--no-ff`):
 
-- [ ] **M-4.** `SECURITY.md` and private vulnerability reporting.
-- [ ] **M-5, L-7.** `publish.yml` split into `verify` / `publish` / `release` jobs, so no third-party build code runs while the job holds `id-token: write`; `--locked` throughout.
-- [ ] **L-5.** CodSpeed installs a pinned `cargo-codspeed` and keeps no git credentials.
-- [ ] **L-6.** Scheduled `cargo-deny`; `fuzz/Cargo.lock` refreshed.
-- [ ] **I-6.** `verify-claims.sh` logs to a `mktemp` file.
-- [ ] **H-1.** `.pth` views may not expand beyond their storage (a 380-byte file aborted the process).
-- [ ] **N-1.** `.pth` rank capped at 64; size-1 dimensions no longer drive the strided copy.
-- [ ] **I-9.** An empty non-contiguous `.pth` tensor is no longer an error.
-- [ ] **M-1.** `inspect` counts GPTQ/AWQ packed weights (it under-reported 4-bit models 8×).
-- [ ] **L-3, M-2.** Materialisation charged to `max_total_bytes`; permanent `.pth` materialisation ratio.
-- [ ] **H-2.** GGUF: overlapping tensor ranges rejected, power-of-two alignment, the writer no longer inherits the source alignment.
-- [ ] **H-3.** `NPY` rank capped at 64; the Fortran-order transposition no longer scales with rank.
-- [ ] **M-6.** A STORED ZIP entry must declare equal sizes; DEFLATE arrays are read incrementally.
-- [ ] **L-2.** One `byteorder` cap on every `.pth` path.
-- [ ] **L-1.** The pickle `MARK` stack is capped.
-- [ ] **M-7.** safetensors: `max_item_count` applies; companion lookups are no longer quadratic.
-- [ ] **M-3.** Error messages and CLI output escape control and bidi characters, and bound attacker text.
-- [ ] **M-8.** Atomic writes; `-o` equal to the input refused; the CLI no longer overwrites without `--force`.
-- [ ] **L-4.** Thread spawn failure degrades instead of panicking; the budget is clamped to the hardware; workers stop after the first failure.
-- [ ] **I-4.** The `ollama:` manifest read is bounded.
-- [ ] **Docs.** README, tutorial, FAQ, validation timeline, Python interop, CLI reference, `CONVENTIONS.md`, fuzz status.
+- [x] **M-4.** `SECURITY.md` and private vulnerability reporting: **`b4e105f`**
+- [x] **M-5, L-7.** `publish.yml` split into `verify` / `publish` / `release` jobs, so no third-party build code runs while the job holds `id-token: write`; `--locked` throughout: **`9ad7d11`**
+- [x] **L-5.** CodSpeed installs a pinned `cargo-codspeed` and keeps no git credentials: **`d71fb22`**
+- [x] **L-6.** Scheduled `cargo-deny` in its own workflow (`fuzz/Cargo.lock` turned out to be gitignored, so there was nothing tracked to refresh): **`4e9c718`**
+- [x] **I-6.** `verify-claims.sh` logs to a `mktemp` file: **`ec90fc6`**
+- [x] **H-1.** `.pth` views may not expand beyond their storage (a 380-byte file aborted the process): **`cd1ef0e`**
+- [x] **N-1.** `.pth` rank capped at 64; size-1 dimensions no longer drive the strided copy: **`176a844`**
+- [x] **I-9.** An empty non-contiguous `.pth` tensor is no longer an error: **`1f6c395`**
+- [x] **M-1.** `inspect` counts GPTQ/AWQ packed weights (it under-reported 4-bit models 8×): **`52cc84d`**
+- [x] **L-3, M-2.** Materialisation charged to `max_total_bytes`; permanent `.pth` materialisation ratio: **`81863c0`**
+- [x] **H-2.** GGUF: overlapping tensor ranges rejected, power-of-two alignment, the writer no longer inherits the source alignment: **`45c8003`**
+- [x] **H-3.** `NPY` rank capped at 64; the Fortran-order transposition no longer scales with rank: **`510277d`**
+- [x] **M-6.** A STORED ZIP entry must declare equal sizes; DEFLATE arrays are read incrementally: **`b94682a`**
+- [x] **L-2.** One `byteorder` cap on every `.pth` path: **`9d844ad`**
+- [x] **L-1.** The pickle `MARK` stack is capped: **`7cde16a`**
+- [x] **M-7.** safetensors: `max_item_count` applies; companion lookups are no longer quadratic: **`dbcdcfd`**
+- [x] **M-3.** Error messages and CLI output escape control and bidi characters, and bound attacker text: **`e12d0d1`**
+- [x] **M-8.** Atomic writes; `-o` equal to the input refused; the CLI no longer overwrites without `--force`: **`f66d052`**
+- [x] **L-4.** Thread spawn failure degrades instead of panicking; the budget is clamped to the hardware; workers stop after the first failure: **`a045c24`**
+- [x] **I-4.** The `ollama:` manifest read is bounded: **`d015aa4`**
+- [x] **Docs.** README, tutorial, FAQ, validation timeline, Python interop, CLI reference, `CONVENTIONS.md`, fuzz status: **`f8b6b14`**
 
 **Outside the crate, same phase:** the `verify` / `publish` / `release` split applied to candle-mi, hf-fetch-model and hypomnesis; GitHub settings (private vulnerability reporting, secret scanning with push protection, Dependabot alerts, `main` and `refs/tags/v*` rulesets) on all four repositories.
 
