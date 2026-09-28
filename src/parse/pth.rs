@@ -370,8 +370,8 @@ pub struct ParsedPth {
 /// `O(log n)` — negligible.
 #[derive(Debug)]
 struct EntryIndex {
-    /// `(suffix, data_start, data_len)` triples, sorted ascending by `suffix`.
-    entries: Vec<(Box<str>, usize, usize)>,
+    /// `(suffix, (data_start, data_len))` pairs, sorted ascending by `suffix`.
+    entries: Vec<(Box<str>, (usize, usize))>,
 }
 
 impl EntryIndex {
@@ -380,14 +380,11 @@ impl EntryIndex {
     fn get(&self, name: &str) -> Option<(usize, usize)> {
         match self
             .entries
-            .binary_search_by(|(key, _, _)| key.as_ref().cmp(name))
+            .binary_search_by(|(key, _)| key.as_ref().cmp(name))
         {
             // INDEX: `binary_search_by` returns an in-bounds index on `Ok`.
             #[allow(clippy::indexing_slicing)]
-            Ok(idx) => {
-                let (_, start, len) = self.entries[idx];
-                Some((start, len))
-            }
+            Ok(idx) => Some(self.entries[idx].1),
             Err(_) => None,
         }
     }
@@ -2120,6 +2117,28 @@ fn copy_to_contiguous(
             ),
         });
     }
+    // An expanded view (a zero stride on a dimension larger than 1) passes the
+    // source-span check above with a tiny storage, yet asks for an arbitrarily
+    // large output. `validate_tensor_views` refuses such views at parse time;
+    // this repeats the rule where the buffer is sized, so the allocation below
+    // is bounded by the storage however this function is reached.
+    let available = storage
+        .len()
+        .checked_sub(offset)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "non-contiguous tensor: offset {offset} exceeds storage len {}",
+                storage.len()
+            ),
+        })?;
+    if out_bytes > available {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "non-contiguous tensor: view materialises {out_bytes} bytes from \
+                 {available} storage bytes (expanded views are not supported)"
+            ),
+        });
+    }
 
     // -- Inner loop: plain arithmetic, no per-element bounds checks ----------
     let mut out = vec![0u8; out_bytes];
@@ -2182,7 +2201,14 @@ fn copy_to_contiguous(
 ///
 /// The pickle interpreter uses an explicit `GLOBAL` allowlist. Non-`PyTorch`
 /// callables (e.g., `os.system`, `subprocess.Popen`) are rejected with
-/// [`AnamnesisError::Parse`], preventing arbitrary code execution.
+/// [`AnamnesisError::DisallowedGlobal`], preventing arbitrary code execution.
+///
+/// Every tensor view is checked against its storage before this returns: a view
+/// that names a storage the archive does not hold, or would materialise more
+/// bytes than its storage holds from its offset (an *expanded* view, such as
+/// `x.expand(4, n)` saves), is rejected with [`AnamnesisError::Parse`]. Without
+/// that rule a few hundred bytes could make [`ParsedPth::tensors`] allocate
+/// without bound.
 ///
 /// Against unguarded-allocation denial of service, the declared `data.pkl`
 /// size is capped at `MAX_PKL_SIZE` before the entry is sliced from the mmap
@@ -2194,7 +2220,9 @@ fn copy_to_contiguous(
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch`
-/// ZIP archive or uses unsupported pickle opcodes.
+/// ZIP archive, uses unsupported pickle opcodes, or holds a tensor view that
+/// names a missing storage or would materialise more bytes than its storage
+/// holds.
 ///
 /// Returns [`AnamnesisError::DisallowedGlobal`] for a pickle `GLOBAL` outside
 /// the `torch.*` allowlist, and [`AnamnesisError::LimitExceeded`] for a
@@ -2252,7 +2280,8 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch` ZIP
-/// archive or uses unsupported pickle opcodes.
+/// archive, uses unsupported pickle opcodes, or holds a tensor view that names
+/// a missing storage or would materialise more bytes than its storage holds.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
 /// files that are raw pickle without ZIP wrapping.
@@ -2350,6 +2379,11 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
             reason: "data.pkl slice out of bounds".into(),
         })?;
     let meta = interpret_pickle_to_meta(pkl_data, limits)?;
+    validate_tensor_views(&meta, |key| {
+        entry_index
+            .get(&format!("data/{key}"))
+            .and_then(|(_, len)| u64::try_from(len).ok())
+    })?;
 
     Ok(ParsedPth {
         buffer,
@@ -2370,7 +2404,8 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
 /// # Errors
 ///
 /// Returns the same errors as [`parse_pth_with_limits`]:
-/// [`AnamnesisError::Parse`] (invalid ZIP / unsupported pickle opcodes),
+/// [`AnamnesisError::Parse`] (invalid ZIP / unsupported pickle opcodes / a
+/// tensor view larger than its storage),
 /// [`AnamnesisError::DisallowedGlobal`] (a `GLOBAL` outside the `torch.*`
 /// allowlist), [`AnamnesisError::LimitExceeded`] (a `data.pkl` size or pickle
 /// payload / working-set / nesting depth exceeding a permanent cap — always-on,
@@ -2514,6 +2549,89 @@ fn interpret_pickle_to_meta(
     // as duplicate ZIP entries are.
     crate::parse::utils::reject_duplicate_names(meta.iter().map(|m| m.name.as_str()))?;
     Ok(meta)
+}
+
+/// Byte length of a tensor view of `shape` over `elem_size`-byte elements, in
+/// `u64` so the reader path can size a view it never materialises, even on a
+/// 32-bit target.
+///
+/// Zero-correct: any zero dimension gives `Some(0)`, even when the product of
+/// the other dimensions would overflow, matching
+/// [`checked_num_elements`]. `None`
+/// means the byte count overflows `u64`.
+fn view_byte_len(shape: &[usize], elem_size: usize) -> Option<u64> {
+    if shape.contains(&0) {
+        return Some(0);
+    }
+    let elem_size = u64::try_from(elem_size).ok()?;
+    shape.iter().try_fold(elem_size, |acc, &dim| {
+        u64::try_from(dim).ok().and_then(|d| acc.checked_mul(d))
+    })
+}
+
+/// Rejects a tensor whose view would materialise more bytes than its storage
+/// holds from the view's offset.
+///
+/// A `state_dict` tensor is a view over a storage file (`data/<key>`): an
+/// offset, a shape and strides. Normal views, contiguous or transposed, read
+/// each storage element at most once, so their byte length never exceeds the
+/// storage bytes after the offset. An *expanded* view (a zero stride on a
+/// dimension larger than 1, as `x.expand(4, n)` produces) repeats elements, and
+/// materialising it could turn a one-byte storage into an arbitrarily large
+/// buffer: a 380-byte file once aborted the process with a 4 EiB allocation
+/// (Phase 7.9, audit finding H-1). Such views are refused here, at parse time,
+/// for every entry point. Zero strides on size-1 dimensions (Hugging Face's
+/// `position_ids = arange(n).expand(1, -1)`) expand nothing and are accepted.
+///
+/// `storage_len` returns the byte length of the `STORED` entry for a storage
+/// key (without the `data/` prefix), or `None` if the archive has none. The mmap
+/// and bytes paths answer it from their [`EntryIndex`]; the reader path from the
+/// central directory. Sharing this one check keeps `inspect` and `parse` from
+/// disagreeing about which files are acceptable.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if a tensor names a storage the archive
+/// does not hold, if its offset lies beyond the end of that storage, if its
+/// byte length overflows `u64`, or if it would materialise more bytes than the
+/// storage holds from its offset.
+fn validate_tensor_views(
+    meta: &[TensorMeta],
+    storage_len: impl Fn(&str) -> Option<u64>,
+) -> crate::Result<()> {
+    for m in meta {
+        let len = storage_len(&m.storage_key).ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "tensor `{}`: storage `data/{}` not found in the archive",
+                m.name, m.storage_key
+            ),
+        })?;
+        let offset = u64::try_from(m.storage_offset).map_err(|_| AnamnesisError::Parse {
+            reason: format!("tensor `{}`: storage offset overflows u64", m.name),
+        })?;
+        let available = len
+            .checked_sub(offset)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: format!(
+                    "tensor `{}`: storage offset {offset} exceeds the {len}-byte storage `data/{}`",
+                    m.name, m.storage_key
+                ),
+            })?;
+        let n_bytes =
+            view_byte_len(&m.shape, m.dtype.byte_size()).ok_or_else(|| AnamnesisError::Parse {
+                reason: format!("tensor `{}`: byte count overflows u64", m.name),
+            })?;
+        if n_bytes > available {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "tensor `{}`: view materialises {n_bytes} bytes but storage `data/{}` holds \
+                     {available} bytes from offset {offset} (expanded views are not supported)",
+                    m.name, m.storage_key
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Builds a [`PthInspectInfo`] from the parsed per-tensor metadata.
@@ -2719,7 +2837,10 @@ impl crate::InspectSummary for PthInspectInfo {
 /// `byteorder` entry appears twice or its bytes are not UTF-8 or not
 /// `"little"`/`"big"`, a `DEFLATE` entry is truncated or fails to inflate, the
 /// pickle VM rejects the opcode stream, any `_rebuild_tensor_v2` call has
-/// malformed arguments, or the state dict names one tensor twice.
+/// malformed arguments, the state dict names one tensor twice, two `STORED`
+/// entries share a name, or a tensor view names a storage the archive does not
+/// hold or would materialise more bytes than its storage holds (the same view
+/// rule [`parse_pth`] applies, so the two agree on which files are acceptable).
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-`PyTorch` 1.6)
 /// `.pth` files that begin with a raw pickle byte (`0x80` followed by a
@@ -2804,10 +2925,23 @@ fn read_pth_meta<R: Read + Seek>(
     reader: R,
     limits: &ParseLimits,
 ) -> crate::Result<(bool, Vec<TensorMeta>)> {
-    let (big_endian, pkl_bytes) = read_pth_archive_for_inspect(reader, limits)?;
+    let (big_endian, pkl_bytes, stored) = read_pth_archive_for_inspect(reader, limits)?;
     let meta = interpret_pickle_to_meta(&pkl_bytes, limits)?;
+    validate_tensor_views(&meta, |key| {
+        let suffix = format!("data/{key}");
+        stored
+            .binary_search_by(|(name, _)| name.as_ref().cmp(suffix.as_str()))
+            .ok()
+            .and_then(|idx| stored.get(idx))
+            .map(|&(_, len)| len)
+    })?;
     Ok((big_endian, meta))
 }
+
+/// An archive's `STORED` entries as `(suffix, byte length)` pairs, sorted by
+/// suffix: the reader path's counterpart of [`EntryIndex`], which holds no data
+/// offsets because the reader path never slices tensor data.
+type StoredSizes = Vec<(Box<str>, u64)>;
 
 /// I/O step of [`inspect_pth_from_reader`] and
 /// [`parse_pth_front_matter_from_reader_with_limits`] (via [`read_pth_meta`]):
@@ -2819,7 +2953,10 @@ fn read_pth_meta<R: Read + Seek>(
 /// cap (on top of the permanent `MAX_PKL_SIZE` / `ZIP_MAX_ENTRIES` floors,
 /// which always apply regardless of `limits`).
 ///
-/// Returns `(big_endian, pkl_bytes)`. Splitting the I/O step keeps
+/// Returns `(big_endian, pkl_bytes, stored)`, where `stored` lists the
+/// archive's `STORED` entries as `(suffix, byte length)` pairs sorted by suffix:
+/// the storage sizes [`validate_tensor_views`] checks each tensor against, the
+/// same set the mmap path's [`EntryIndex`] holds. Splitting the I/O step keeps
 /// [`inspect_pth_from_reader`] readable as three short calls (read bytes,
 /// interpret, summarise).
 ///
@@ -2833,7 +2970,7 @@ fn read_pth_meta<R: Read + Seek>(
 fn read_pth_archive_for_inspect<R: Read + Seek>(
     reader: R,
     limits: &ParseLimits,
-) -> crate::Result<(bool, Vec<u8>)> {
+) -> crate::Result<(bool, Vec<u8>, StoredSizes)> {
     let mut src = crate::parse::zip::ReaderSource::new(reader)?;
     let total_len = src.total_len();
     if total_len < 4 {
@@ -2883,7 +3020,23 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
     };
 
     let pkl_bytes = read_pth_entry_bytes(&mut src, pkl_entry, limits)?;
-    Ok((big_endian, pkl_bytes))
+
+    // Storage sizes for `validate_tensor_views`, over the same `STORED`-only set
+    // the mmap path indexes, with the same duplicate rule.
+    let mut stored: StoredSizes = entries
+        .iter()
+        .filter(|entry| entry.method.is_stored())
+        .map(|entry| {
+            // BORROW: `Box::from(&str)` copies the borrowed suffix into an
+            // exact-sized owned key that outlives `entries`.
+            let suffix: Box<str> =
+                Box::from(crate::parse::zip::strip_archive_prefix(&entry.name).as_ref());
+            (suffix, entry.compressed_size)
+        })
+        .filter(|(suffix, _)| !suffix.is_empty())
+        .collect();
+    sort_rejecting_duplicate_suffixes(&mut stored)?;
+    Ok((big_endian, pkl_bytes, stored))
 }
 
 /// Full front matter of a parsed `.pth` file — every tensor's name, shape,
@@ -3178,6 +3331,31 @@ fn find_unique_entry<'a>(
     Ok(found)
 }
 
+/// Sorts `(suffix, value)` pairs by suffix for binary search, then rejects a
+/// repeated suffix.
+///
+/// Real `.pth` entry names are unique; an archive that repeats one is ambiguous
+/// about which bytes a tensor owns, so it is refused rather than resolved by a
+/// first-wins or last-wins rule a reader of the file could not predict. Shared
+/// by the mmap path's [`build_entry_index`] and the reader path's storage-size
+/// table, so the two cannot disagree about which archives are acceptable.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if two pairs share a suffix.
+fn sort_rejecting_duplicate_suffixes<T>(pairs: &mut [(Box<str>, T)]) -> crate::Result<()> {
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(suffix) = pairs.windows(2).find_map(|pair| match pair {
+        [a, b] if a.0 == b.0 => Some(&a.0),
+        _ => None,
+    }) {
+        return Err(AnamnesisError::Parse {
+            reason: format!("duplicate ZIP entry `{suffix}` in .pth archive"),
+        });
+    }
+    Ok(())
+}
+
 /// Builds an O(1) index of ZIP entry suffix → `(data_start, data_len)` in `raw`,
 /// over the vendored central-directory reader ([`crate::parse::zip`]).
 ///
@@ -3212,7 +3390,7 @@ fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryInd
     // Clamp the pre-allocation hint: a many-entries zip would otherwise drive
     // an eager `with_capacity` ~proportional to the file size. The Vec grows as
     // entries are pushed. Mirrors the `GGUF` parser's `PREALLOC_SOFT_CAP`.
-    let mut index: Vec<(Box<str>, usize, usize)> =
+    let mut index: Vec<(Box<str>, (usize, usize))> =
         Vec::with_capacity(entries.len().min(PREALLOC_SOFT_CAP));
 
     for entry in &entries {
@@ -3244,23 +3422,11 @@ fn build_entry_index(raw: &[u8], limits: &ParseLimits) -> crate::Result<EntryInd
             // BORROW: `Box::from(&str)` copies the borrowed suffix into an
             // exact-sized owned key (no `String` capacity slack), which must
             // outlive the `entries` vector.
-            index.push((Box::from(suffix.as_ref()), data_start, data_len));
+            index.push((Box::from(suffix.as_ref()), (data_start, data_len)));
         }
     }
 
-    // Sort for binary-search lookup, then reject a repeated suffix. Real `.pth`
-    // entry names are unique; an archive that repeats one is ambiguous about
-    // which bytes a tensor owns, so it is refused rather than resolved by a
-    // first-wins or last-wins rule a reader of the file could not predict.
-    index.sort_by(|a, b| a.0.cmp(&b.0));
-    if let Some(suffix) = index.windows(2).find_map(|pair| match pair {
-        [a, b] if a.0 == b.0 => Some(&a.0),
-        _ => None,
-    }) {
-        return Err(AnamnesisError::Parse {
-            reason: format!("duplicate ZIP entry `{suffix}` in .pth archive"),
-        });
-    }
+    sort_rejecting_duplicate_suffixes(&mut index)?;
     // Reclaim the `push`-growth capacity slack (a `Vec` over-allocates up to ~2×
     // while growing): the index is now immutable, so trim it to exact length —
     // this is what keeps resident bytes/entry near the theoretical floor.
@@ -4192,13 +4358,75 @@ mod tests {
 
     // G27: Zero-stride dimension (broadcast)
     #[test]
-    fn copy_to_contiguous_zero_stride_broadcast() {
-        // shape [2, 3], strides [0, 1], elem_size=1
-        // Row 0 and Row 1 both read from the same 3 bytes (broadcast)
+    fn copy_to_contiguous_rejects_expanded_view() {
+        // shape [2, 3], strides [0, 1], elem_size=1: both rows read the same
+        // 3 bytes, so the view would materialise 6 bytes from a 3-byte storage.
+        // Expanded views are refused (Phase 7.9, H-1): this is the shape that,
+        // at 2^62 rows, once aborted the process.
         let storage: Vec<u8> = vec![10, 20, 30];
-        let result = copy_to_contiguous(&storage, 0, &[2, 3], &[0, 1], 1).unwrap();
-        // Both rows should be [10, 20, 30]
-        assert_eq!(result, vec![10, 20, 30, 10, 20, 30]);
+        let err = copy_to_contiguous(&storage, 0, &[2, 3], &[0, 1], 1).unwrap_err();
+        assert!(
+            matches!(&err, AnamnesisError::Parse { reason } if reason.contains("expanded views")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn copy_to_contiguous_accepts_zero_stride_on_a_size_one_dimension() {
+        // shape [1, 3], strides [0, 1]: Hugging Face's
+        // `position_ids = arange(n).expand(1, -1)`. The zero stride sits on a
+        // size-1 dimension, so nothing is repeated and the view stays valid.
+        let storage: Vec<u8> = vec![10, 20, 30];
+        let result = copy_to_contiguous(&storage, 0, &[1, 3], &[0, 1], 1).unwrap();
+        assert_eq!(result, vec![10, 20, 30]);
+    }
+
+    fn view_meta(shape: &[usize], strides: &[usize], offset: usize) -> TensorMeta {
+        TensorMeta {
+            name: "t".into(),
+            shape: shape.to_vec(),
+            dtype: PthDtype::U8,
+            storage_key: "0".into(),
+            storage_offset: offset,
+            strides: strides.to_vec(),
+        }
+    }
+
+    #[test]
+    fn view_byte_len_is_zero_correct_and_checked() {
+        assert_eq!(view_byte_len(&[2, 3], 4), Some(24));
+        assert_eq!(view_byte_len(&[], 4), Some(4));
+        assert_eq!(view_byte_len(&[usize::MAX, 0], 4), Some(0));
+        assert_eq!(view_byte_len(&[usize::MAX, usize::MAX], 1), None);
+    }
+
+    #[test]
+    fn validate_tensor_views_bounds_every_view_by_its_storage() {
+        let three = |key: &str| (key == "0").then_some(3u64);
+        // Fits exactly, from offset 0 and from an offset.
+        validate_tensor_views(&[view_meta(&[3], &[1], 0)], three).unwrap();
+        validate_tensor_views(&[view_meta(&[2], &[1], 1)], three).unwrap();
+        // Non-expanding zero stride on a size-1 dimension.
+        validate_tensor_views(&[view_meta(&[1, 3], &[0, 1], 0)], three).unwrap();
+        // Empty tensor over any storage.
+        validate_tensor_views(&[view_meta(&[0, 5], &[5, 1], 3)], three).unwrap();
+
+        let reason = |meta: TensorMeta| match validate_tensor_views(&[meta], three) {
+            Err(AnamnesisError::Parse { reason }) => reason,
+            other => panic!("expected Parse, got {other:?}"),
+        };
+        // Expanded: 2 rows of 3 bytes from a 3-byte storage.
+        assert!(reason(view_meta(&[2, 3], &[0, 1], 0)).contains("expanded views"));
+        // The 380-byte PoC's shape: 2^62 elements over a 1-byte storage.
+        assert!(reason(view_meta(&[1 << 62], &[0], 0)).contains("expanded views"));
+        // Byte count overflowing u64.
+        assert!(reason(view_meta(&[usize::MAX, usize::MAX], &[0, 0], 0)).contains("overflows"));
+        // Offset past the end of the storage.
+        assert!(reason(view_meta(&[1], &[1], 4)).contains("exceeds the 3-byte storage"));
+        // Storage missing from the archive.
+        let mut missing = view_meta(&[1], &[1], 0);
+        missing.storage_key = "7".into();
+        assert!(reason(missing).contains("not found"));
     }
 
     // G29: ZIP archive with no data.pkl entry

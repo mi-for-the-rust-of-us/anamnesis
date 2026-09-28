@@ -43,6 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo-deny` job moved from `ci.yml` to its own `deny.yml`, which also runs on
   a Monday schedule, so an advisory published against an unchanged `main` (or
   the `Cargo.lock` that `cargo install --locked` users build) is reported.
+- **A `.pth` tensor view may not materialise more bytes than its storage
+  holds** (Phase 7.9, audit finding H-1;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). A view with a
+  zero stride on a dimension larger than 1 passed every existing check with a
+  one-byte storage, and `ParsedPth::tensors()` then sized its output from the
+  declared shape alone: a 380-byte file aborted the process with a 4 EiB
+  allocation (uncatchable, even under the `python` unwind profile), a 394-byte
+  one panicked, and a 374-byte one produced 1 GiB. No `ParseLimits` setting
+  helped, because the output of `tensors()` was charged to nothing. Every
+  parse, inspect and front-matter entry point now rejects such a view with
+  `Parse`, and `copy_to_contiguous` repeats the rule where it sizes its buffer.
+  Zero strides that expand nothing, such as Hugging Face's
+  `position_ids = arange(n).expand(1, -1)`, still parse. A view that reads
+  past the end of its storage, or names a storage the archive lacks, is now
+  refused at parse time too, instead of on the first `tensors()` call. Present
+  since `.pth` support landed.
 
 ### Fixed
 

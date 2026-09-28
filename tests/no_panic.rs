@@ -40,6 +40,8 @@
     clippy::wildcard_enum_match_arm
 )]
 
+mod common;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
@@ -159,6 +161,34 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
                 inputs.push((format!("{name}@flip{pos}"), flipped));
             }
         }
+    }
+
+    // Crafted hostile `.pth` files from the Phase 7.9 audit, with their
+    // near-misses: before the fix, the first one aborted the process on any call
+    // that materialised it, which `catch_unwind` cannot observe.
+    #[cfg(feature = "pth")]
+    for (label, bytes) in [
+        (
+            "pth-expanded-2^62",
+            common::pth::single_u8_view(&[1 << 62, 3], &[0, 0], &[7]),
+        ),
+        (
+            "pth-expanded-2^30",
+            common::pth::single_u8_view(&[1 << 30], &[0], &[7]),
+        ),
+        (
+            "pth-position-ids",
+            common::pth::single_u8_view(&[1, 4], &[0, 1], &[1, 2, 3, 4]),
+        ),
+    ] {
+        let len = bytes.len();
+        for cut in [len / 2, len.saturating_sub(1)] {
+            inputs.push((format!("{label}@trunc{cut}"), bytes[..cut].to_vec()));
+        }
+        let mut flipped = bytes.clone();
+        flipped[len / 2] ^= 0xFF;
+        inputs.push((format!("{label}@flip"), flipped));
+        inputs.push((format!("{label}@whole"), bytes));
     }
 
     // No `.gguf` file is committed, so without this nothing in the battery
