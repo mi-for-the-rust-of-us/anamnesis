@@ -74,10 +74,10 @@ jobs:
       contents: read
       id-token: write # OIDC auth to CodSpeed — no CODSPEED_TOKEN secret needed
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Rust toolchain, cache, and cargo-codspeed
-        uses: moonrepo/setup-rust@v0
+        uses: moonrepo/setup-rust@cafffba5d5c8bc38a5120e6e60f3561d541a47cd # v0.6.1
         with:
           channel: stable
           cache-target: release
@@ -97,7 +97,7 @@ jobs:
         run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth
 
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@f22792bfac16f3e14eb9fbea76f4a48e9cc22b93 # v4.19.1
         with:
           mode: walltime
           run: cargo codspeed run

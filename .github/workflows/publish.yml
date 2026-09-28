@@ -9,10 +9,30 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# SUPPLY-CHAIN POSTURE. The LiteLLM compromise of 2026-03-24 did not exploit
+# LiteLLM's code: a long-lived PyPI token, stolen from CI through an earlier
+# compromised GitHub Action, was used to upload straight to the registry. This
+# workflow is shaped so that neither half of that chain exists here:
+#
+#   * No registry secret. `cargo publish` authenticates through crates.io
+#     Trusted Publishing: GitHub's OIDC token is exchanged for a crates.io token
+#     that lives ~30 minutes and only for this repository + workflow file +
+#     `release` environment (as configured on crates.io). There is no
+#     `CARGO_REGISTRY_TOKEN` left to steal, from CI or from a laptop.
+#   * No mutable code in the job. Every third-party action is pinned to a full
+#     commit SHA (the tag it came from is in the trailing comment), and the job
+#     restores no build cache, since a cache written by an earlier CI run is
+#     code this job would otherwise execute with publishing rights.
+#   * A human in the loop. The `release` environment requires the maintainer's
+#     approval before the job starts, so a pushed tag alone cannot publish.
 jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    # Only a `v*` tag may publish. `workflow_dispatch` stays available for
+    # re-running a release, but must be started from the tag, not a branch.
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
     # `contents: write` is required by the "Create the GitHub Release" step
     # below. Without it the workflow token is read-only and `gh release create`
     # fails with `HTTP 403: Resource not accessible by integration` — which is
@@ -20,16 +40,23 @@ jobs:
     # already succeeded. Declared explicitly rather than relying on the
     # repository's default token permissions, which are read-only here and are
     # an org-level setting this file cannot see.
+    #
+    # `id-token: write` lets the job request the OIDC token that Trusted
+    # Publishing exchanges for a short-lived crates.io token.
     permissions:
       contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (v1)
+        with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      # Deliberately no `Swatinem/rust-cache` here: see SUPPLY-CHAIN POSTURE.
 
       # Full CI checks before publishing
       - name: Check formatting
@@ -52,11 +79,15 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Publish
+      # Publish, with a token minted for this run only (Trusted Publishing).
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
       - name: Publish to crates.io
         run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       # Since v0.7.3 the published crate excludes `tests/` (Cargo.toml
       # `exclude`), which took the .crate from 4.8 MiB to under 1 MiB. The test

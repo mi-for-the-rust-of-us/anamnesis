@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Release pipeline hardened against registry-token theft**, the root cause
+  of the 2026-03-24 LiteLLM supply-chain compromise. (anamnesis's `.pth`
+  parser is not affected by that incident: the malicious `litellm_init.pth` was
+  a Python `site-packages` start-up file, not a PyTorch checkpoint.) Releases
+  now publish through crates.io Trusted Publishing (OIDC), so no long-lived
+  `CARGO_REGISTRY_TOKEN` exists to steal. The publish job needs maintainer
+  approval through a `release` environment, runs only from a `v*` tag and
+  restores no build cache. Every third-party GitHub Action is pinned to a full
+  commit SHA, and Dependabot keeps the pins current. A new `deny` CI job runs
+  `cargo-deny` against `deny.toml` (RustSec advisories and yanked crates,
+  permissive licences only, crates.io as the only source).
+
 ## [0.7.8] - 2026-09-26
 
 ### Added

@@ -1,0 +1,47 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/), run by the
+# `deny` job in `.github/workflows/ci.yml` and locally with `cargo deny check`
+# (`[graph] all-features` below makes both cover every feature).
+#
+# Why this exists: a dependency's build script or proc-macro runs arbitrary code
+# on every machine that builds anamnesis, the same "runs just by being
+# installed" property the LiteLLM 1.82.8 `.pth` start-up hook abused. This file
+# cannot prove a dependency honest, but it makes the known ways one goes bad
+# visible: a RustSec advisory, a yanked release, a crate fetched from somewhere
+# other than crates.io, or a licence the crate could not be shipped under.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory (vulnerability, unsound, unmaintained) fails the job.
+# To accept one deliberately, add it to `ignore` with the reason, e.g.
+# `{ id = "RUSTSEC-0000-0000", reason = "..." }`.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences only, matching the crate's own MIT OR Apache-2.0.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: a git or alternative-registry dependency would bypass the
+# registry's immutability and the advisory database.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
