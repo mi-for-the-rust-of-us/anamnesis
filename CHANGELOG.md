@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GitHub Release with `contents: write` and no cargo. Every cargo command in
   `publish.yml` and `ci.yml` uses `--locked`, and a tag without a CHANGELOG
   section now fails before publishing rather than after.
+- **The CodSpeed job installs a pinned `cargo-codspeed`.** It used to fetch the
+  latest `cargo-binstall` and `cargo-codspeed` release assets, unverified, in a
+  job that holds `id-token: write`; it now runs
+  `cargo install cargo-codspeed --locked --version 5.0.1` and keeps no git
+  credentials after checkout.
 
 ## [0.7.8] - 2026-09-26
 

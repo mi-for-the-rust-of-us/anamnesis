@@ -75,13 +75,26 @@ jobs:
       id-token: write # OIDC auth to CodSpeed — no CODSPEED_TOKEN secret needed
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - name: Set up Rust toolchain, cache, and cargo-codspeed
+      - name: Set up Rust toolchain and cache
         uses: moonrepo/setup-rust@cafffba5d5c8bc38a5120e6e60f3561d541a47cd # v0.6.1
         with:
           channel: stable
           cache-target: release
-          bins: cargo-codspeed
+
+      # Pinned, and built from crates.io source with its own lockfile. The
+      # action's `bins:` input used to fetch the LATEST `cargo-binstall` release
+      # asset, which then fetched the latest `cargo-codspeed`, neither
+      # hash-checked, in a job that holds `id-token: write` (Phase 7.9, audit
+      # finding L-5). The version must share its MAJOR with the `codspeed-*`
+      # crates in Cargo.lock (see the `criterion` entry in Cargo.toml); keep the
+      # two bumped together. The first run after a bump pays for a source build
+      # out of the macro-runner minutes; `cargo install` skips the build when
+      # the cached binary already has this version.
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --locked --version 5.0.1
 
       # Every feature the four bench targets require, listed explicitly rather
       # than via `--all-features`, because ONE feature must stay off here:
