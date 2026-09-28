@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a Monday schedule, so an advisory published against an unchanged `main` (or
   the `Cargo.lock` that `cargo install --locked` users build) is reported.
 
+### Fixed
+
+- **`scripts/verify-claims.sh` is executable in the repository and logs to a
+  private temp file.** It was committed without the executable bit, so the
+  `./scripts/verify-claims.sh` the README and every GitHub Release tell users to
+  run failed with "Permission denied" on Linux and macOS; and it logged to the
+  fixed path `/tmp/amn-verify.log`, which another user of a shared host could
+  pre-plant as a symlink. It now uses `mktemp`, removed on exit.
+
 ## [0.7.8] - 2026-09-26
 
 ### Added
