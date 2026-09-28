@@ -129,3 +129,80 @@ mod h1_expanded_pth_views {
         )));
     }
 }
+
+// ---------------------------------------------------------------------------
+// N-1 (found by the design review of the fixes): the `.pth` strided copy walked
+// every dimension for every element, with no cap on rank, so `(N, 1, …, 1)`
+// with odd strides on the size-1 dimensions cost `N × rank`, invisible to
+// `inspect`. The `.pth` twin of H-3.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pth")]
+mod n1_pth_rank {
+    use std::io::Cursor;
+
+    use anamnesis::AnamnesisError;
+
+    use crate::common::pth::single_u8_view;
+
+    fn is_rank_cap(r: &Result<impl std::fmt::Debug, AnamnesisError>) -> bool {
+        matches!(r, Err(AnamnesisError::LimitExceeded { limit, .. }) if *limit == "PTH_MAX_DIMS")
+    }
+
+    #[test]
+    fn more_than_64_dimensions_are_refused_on_every_path() {
+        let shape = vec![1i64; 65];
+        let strides = vec![1i64; 65];
+        let bytes = single_u8_view(&shape, &strides, &[7]);
+        assert!(is_rank_cap(&anamnesis::parse_pth_bytes(bytes.clone())));
+        assert!(is_rank_cap(&anamnesis::inspect_pth_from_reader(
+            Cursor::new(&bytes)
+        )));
+        assert!(is_rank_cap(&anamnesis::parse_pth_front_matter_from_reader(
+            Cursor::new(&bytes)
+        )));
+    }
+
+    #[test]
+    fn size_one_dimensions_do_not_change_the_bytes() {
+        // (2, 1, 3) row-major, but with an arbitrary stride on the size-1
+        // dimension: PyTorch treats it as contiguous, and so must we.
+        let storage = [1u8, 2, 3, 4, 5, 6];
+        let odd =
+            anamnesis::parse_pth_bytes(single_u8_view(&[2, 1, 3], &[3, 99, 1], &storage)).unwrap();
+        let canonical =
+            anamnesis::parse_pth_bytes(single_u8_view(&[2, 1, 3], &[3, 3, 1], &storage)).unwrap();
+        assert_eq!(
+            odd.tensors().unwrap()[0].data,
+            canonical.tensors().unwrap()[0].data
+        );
+        assert_eq!(odd.tensors().unwrap()[0].shape, vec![2, 1, 3]);
+
+        // Transposed, with size-1 dimensions interleaved at odd strides.
+        let t = anamnesis::parse_pth_bytes(single_u8_view(&[1, 2, 1, 3], &[5, 1, 77, 2], &storage))
+            .unwrap();
+        assert_eq!(&*t.tensors().unwrap()[0].data, &[1, 3, 5, 2, 4, 6]);
+    }
+
+    #[test]
+    fn the_maximum_rank_with_odd_unit_strides_materialises_quickly() {
+        // 64 dimensions, 63 of them size 1 with odd strides: before the fix this
+        // took the strided copy and walked all 64 dimensions per element.
+        let n = 1i64 << 20;
+        let mut shape = vec![n];
+        shape.extend(std::iter::repeat_n(1i64, 63));
+        let mut strides = vec![1i64];
+        strides.extend(std::iter::repeat_n(3i64, 63));
+        let storage = vec![9u8; 1 << 20];
+        let parsed =
+            anamnesis::parse_pth_bytes(single_u8_view(&shape, &strides, &storage)).unwrap();
+        let started = std::time::Instant::now();
+        let tensors = parsed.tensors().unwrap();
+        assert_eq!(tensors[0].data.len(), 1 << 20);
+        assert!(
+            matches!(tensors[0].data, std::borrow::Cow::Borrowed(_)),
+            "a contiguous tensor with odd unit strides takes the zero-copy path"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+}

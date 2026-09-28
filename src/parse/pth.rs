@@ -98,6 +98,17 @@ const MAX_PICKLE_VM_DEPTH: u32 = 256;
 /// adversarial archive.
 const MAX_BYTEORDER_SIZE: u64 = 64;
 
+/// Maximum number of dimensions of a `.pth` tensor.
+///
+/// Real model tensors have at most a handful of dimensions, and `NumPy` caps an
+/// array at 64. Without a cap, the strided copy in `copy_to_contiguous` walks
+/// every dimension for every element, so a small file declaring a shape of
+/// `(N, 1, 1, …, 1)` with hundreds of thousands of size-1 dimensions costs
+/// `N × rank` work that `inspect` cannot see (Phase 7.9, finding N-1, the `.pth`
+/// twin of the `NPY` transposition in audit finding H-3). Always-on,
+/// independent of [`ParseLimits`].
+const PTH_MAX_DIMS: usize = 64;
+
 /// Rejects a `data.pkl` ZIP entry whose declared size exceeds [`MAX_PKL_SIZE`].
 ///
 /// Shared by the mmap path ([`parse_pth`]) and the reader path
@@ -433,25 +444,24 @@ impl ParsedPth {
             })?;
 
             let elem_size = m.dtype.byte_size();
-            let data: Cow<'_, [u8]> = if is_contiguous(&m.shape, &m.strides) {
-                let n_bytes = checked_num_elements(&m.shape)
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: element count overflow", m.name),
-                    })?
-                    .checked_mul(elem_size)
-                    .ok_or_else(|| AnamnesisError::Parse {
-                        reason: format!("tensor `{}`: byte count overflow", m.name),
-                    })?;
-                let end =
-                    m.storage_offset
-                        .checked_add(n_bytes)
+            let (layout_shape, layout_strides) = squeeze_unit_dims(&m.shape, &m.strides);
+            let data: Cow<'_, [u8]> =
+                if is_contiguous(&layout_shape, &layout_strides) {
+                    let n_bytes = checked_num_elements(&m.shape)
                         .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
+                            reason: format!("tensor `{}`: element count overflow", m.name),
+                        })?
+                        .checked_mul(elem_size)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: byte count overflow", m.name),
                         })?;
-                let bytes =
-                    storage
-                        .get(m.storage_offset..end)
-                        .ok_or_else(|| AnamnesisError::Parse {
+                    let end = m.storage_offset.checked_add(n_bytes).ok_or_else(|| {
+                        AnamnesisError::Parse {
+                            reason: format!("tensor `{}`: storage end offset overflow", m.name),
+                        }
+                    })?;
+                    let bytes = storage.get(m.storage_offset..end).ok_or_else(|| {
+                        AnamnesisError::Parse {
                             reason: format!(
                                 "tensor `{}`: storage read out of bounds \
                              ([{}..{}], storage len = {})",
@@ -460,25 +470,31 @@ impl ParsedPth {
                                 end,
                                 storage.len()
                             ),
-                        })?;
-                if self.big_endian {
-                    // Contiguous but big-endian: copy + byte-swap.
-                    let mut buf = bytes.to_vec();
-                    byteswap_inplace(&mut buf, elem_size);
-                    Cow::Owned(buf)
+                        }
+                    })?;
+                    if self.big_endian {
+                        // Contiguous but big-endian: copy + byte-swap.
+                        let mut buf = bytes.to_vec();
+                        byteswap_inplace(&mut buf, elem_size);
+                        Cow::Owned(buf)
+                    } else {
+                        // Zero-copy: borrow directly from the backing.
+                        Cow::Borrowed(bytes)
+                    }
                 } else {
-                    // Zero-copy: borrow directly from the backing.
-                    Cow::Borrowed(bytes)
-                }
-            } else {
-                // Non-contiguous: copy to contiguous layout.
-                let mut buf =
-                    copy_to_contiguous(storage, m.storage_offset, &m.shape, &m.strides, elem_size)?;
-                if self.big_endian && elem_size > 1 {
-                    byteswap_inplace(&mut buf, elem_size);
-                }
-                Cow::Owned(buf)
-            };
+                    // Non-contiguous: copy to contiguous layout.
+                    let mut buf = copy_to_contiguous(
+                        storage,
+                        m.storage_offset,
+                        &layout_shape,
+                        &layout_strides,
+                        elem_size,
+                    )?;
+                    if self.big_endian && elem_size > 1 {
+                        byteswap_inplace(&mut buf, elem_size);
+                    }
+                    Cow::Owned(buf)
+                };
 
             tensors.push(PthTensor {
                 name: m.name.clone(),
@@ -1784,6 +1800,9 @@ fn tuple_to_usize_vec(val: &PickleValue) -> crate::Result<Vec<usize>> {
 /// Returns [`AnamnesisError::Parse`] if `args` is not a 6-element `Tuple`,
 /// if the storage info is malformed, or if shape/strides/offset values
 /// cannot be extracted as valid dimensions.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if the shape has more than
+/// `PTH_MAX_DIMS` dimensions.
 // EXHAUSTIVE: PickleValue is private; wildcards catch irrelevant variants
 #[allow(clippy::wildcard_enum_match_arm)]
 fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef> {
@@ -1885,6 +1904,15 @@ fn parse_rebuild_args(name: &str, args: &PickleValue) -> crate::Result<TensorRef
                 "tensor `{name}`: shape ndim {} != strides ndim {}",
                 shape.len(),
                 strides.len()
+            ),
+        });
+    }
+    if shape.len() > PTH_MAX_DIMS {
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "PTH_MAX_DIMS",
+            message: format!(
+                "tensor `{name}`: {} dimensions exceed the {PTH_MAX_DIMS}-dimension cap",
+                shape.len()
             ),
         });
     }
@@ -2027,6 +2055,25 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
         }
     }
     strides
+}
+
+/// Drops the size-1 dimensions of a view, with their strides.
+///
+/// A size-1 dimension contributes nothing to where an element lives: its only
+/// index is 0, so its stride is never multiplied by anything but 0, and
+/// `PyTorch` itself ignores it when deciding contiguity. Removing such
+/// dimensions before the contiguity test and the strided copy keeps both
+/// independent of how many of them a file declares (Phase 7.9, finding N-1),
+/// and lets a contiguous tensor saved with an arbitrary stride on a size-1
+/// dimension take the zero-copy path. The output bytes are unchanged: the
+/// element order of the remaining dimensions is the same.
+fn squeeze_unit_dims(shape: &[usize], strides: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    shape
+        .iter()
+        .zip(strides)
+        .filter(|&(&dim, _)| dim != 1)
+        .map(|(&dim, &stride)| (dim, stride))
+        .unzip()
 }
 
 /// Returns `true` if the tensor's strides match contiguous (row-major) layout.
@@ -2227,7 +2274,7 @@ fn copy_to_contiguous(
 /// Returns [`AnamnesisError::DisallowedGlobal`] for a pickle `GLOBAL` outside
 /// the `torch.*` allowlist, and [`AnamnesisError::LimitExceeded`] for a
 /// permanent-cap rejection (`data.pkl` size, pickle payload / working-set /
-/// nesting depth). Both are always-on, so reachable even at the default
+/// nesting depth, tensor rank). Both are always-on, so reachable even at the default
 /// (unbounded) limits this wrapper passes.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
@@ -2276,7 +2323,7 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 ///
 /// Returns [`AnamnesisError::LimitExceeded`] if a declared `ZIP` entry count,
 /// `data.pkl` size, or pickle payload / working-set / nesting depth exceeds
-/// `limits` or a permanent cap.
+/// `limits` or a permanent cap, or a tensor has more than 64 dimensions.
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch` ZIP
@@ -2826,7 +2873,7 @@ impl crate::InspectSummary for PthInspectInfo {
 /// `MAX_BYTEORDER_SIZE` cap, the declared entry count / central-directory
 /// size exceeds the `ZIP_MAX_ENTRIES` cap or the caller's limits, or a
 /// `DEFLATE` entry's declared expansion ratio exceeds the caller's
-/// `max_decompression_ratio`.
+/// `max_decompression_ratio`, or a tensor has more than 64 dimensions.
 ///
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
@@ -3555,6 +3602,16 @@ mod tests {
     fn is_contiguous_true() {
         assert!(is_contiguous(&[3, 4], &[4, 1]));
         assert!(is_contiguous(&[5], &[1]));
+    }
+
+    #[test]
+    fn squeeze_unit_dims_drops_size_one_dimensions_only() {
+        assert_eq!(
+            squeeze_unit_dims(&[1, 3, 1, 2], &[99, 2, 7, 1]),
+            (vec![3, 2], vec![2, 1])
+        );
+        assert_eq!(squeeze_unit_dims(&[1, 1], &[5, 5]), (vec![], vec![]));
+        assert_eq!(squeeze_unit_dims(&[0, 1], &[1, 1]), (vec![0], vec![1]));
     }
 
     #[test]

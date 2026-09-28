@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   past the end of its storage, or names a storage the archive lacks, is now
   refused at parse time too, instead of on the first `tensors()` call. Present
   since `.pth` support landed.
+- **`.pth` tensors are capped at 64 dimensions, and size-1 dimensions no
+  longer drive the strided copy** (Phase 7.9, finding N-1, found while
+  designing the H-1 fix). `copy_to_contiguous` walked every dimension for every
+  element and the rank was uncapped, so a small file declaring
+  `(N, 1, 1, …, 1)` with odd strides on the size-1 dimensions cost `N × rank`,
+  a cost `inspect` cannot see. A 65-dimension tensor is now `LimitExceeded`
+  (`PTH_MAX_DIMS`) on every entry point; size-1 dimensions are dropped before
+  the contiguity test, so such a tensor takes the zero-copy path. Output bytes
+  are unchanged.
 
 ### Fixed
 
