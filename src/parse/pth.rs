@@ -1671,14 +1671,23 @@ impl<'a> PickleVm<'a> {
 
                 // GLOBAL (text mode: "module\nname\n")
                 b'c' => {
-                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
-                    let module = self.read_line()?.to_owned();
-                    // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
-                    let name = self.read_line()?.to_owned();
-                    if !is_allowed_global(&module, &name) {
-                        return Err(AnamnesisError::DisallowedGlobal { module, name });
+                    // Compared while still borrowed from the stream: a
+                    // disallowed line (possibly megabytes long) is never copied
+                    // whole, only previewed into the error.
+                    let module = self.read_line()?;
+                    let name = self.read_line()?;
+                    if !is_allowed_global(module, name) {
+                        return Err(AnamnesisError::DisallowedGlobal {
+                            module: preview(module),
+                            name: preview(name),
+                        });
                     }
-                    self.push_leaf(PickleValue::Global { module, name })?;
+                    self.push_leaf(PickleValue::Global {
+                        // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
+                        module: module.to_owned(),
+                        // BORROW: .to_owned() converts &str (borrowed from pickle stream) to owned String
+                        name: name.to_owned(),
+                    })?;
                 }
                 // STACK_GLOBAL (protocol 4+: pop name, pop module from stack)
                 0x93 => {
@@ -1696,8 +1705,8 @@ impl<'a> PickleVm<'a> {
                     };
                     if !is_allowed_global(module, name) {
                         return Err(AnamnesisError::DisallowedGlobal {
-                            module: module.to_owned(),
-                            name: name.to_owned(),
+                            module: preview(module),
+                            name: preview(name),
                         });
                     }
                     self.push_leaf(PickleValue::Global {

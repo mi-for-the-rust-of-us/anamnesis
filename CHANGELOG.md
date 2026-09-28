@@ -160,6 +160,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_item_count`, documented for `GGUF` and `ZIP` only until now, bounds the
   safetensors tensor count on every entry point. The public `find_*` methods
   keep their one-off linear scan.
+- **Error messages and CLI output can no longer rewrite a terminal or forge a
+  log line** (Phase 7.9, audit finding M-3;
+  [CWE-150](https://cwe.mitre.org/data/definitions/150.html) /
+  [CWE-117](https://cwe.mitre.org/data/definitions/117.html)). Tensor names,
+  the `GGUF` architecture, pickle globals and `ZIP` entry names reached error
+  messages and `amn parse` / `amn inspect` output verbatim, including `ESC`,
+  `CR` and bidi overrides: a crafted tensor name erased the `error:` line and
+  printed a green "OK: file verified" in its place, and a pickle global wrote a
+  fake `INFO model accepted` line into logs that record `DisallowedGlobal`,
+  the error hosts are told to alert on. A 20 MiB `GLOBAL` line also made a
+  20 MiB message. Every `AnamnesisError` now renders through one helper that
+  shows control and invisible formatting characters as `\u{..}` escapes and
+  cuts the message at 2048 characters; the CLI escapes the names it prints and
+  cuts them at 256; `DisallowedGlobal`'s `module` and `name` fields hold a
+  48-character preview, and a disallowed `GLOBAL` line is no longer copied in
+  full. Ordinary messages, quotes and backslashes included, are unchanged.
 
 ### Changed
 

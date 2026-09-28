@@ -19,6 +19,15 @@ use clap::{Parser, Subcommand};
 use crate::convert::{ConvertOptions, ConvertTarget, Format, detect_format};
 use crate::{InspectInfo, InspectOptions, TargetDtype, format_bytes, parse};
 
+/// A file-derived string (a tensor name, an architecture) made safe to print:
+/// control and invisible formatting characters escaped, and cut to a few
+/// hundred characters (Phase 7.9, audit finding M-3).
+// The listings that print file-derived names exist only with a format feature.
+#[cfg(any(feature = "npz", feature = "pth", feature = "gguf"))]
+fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    crate::parse::utils::display_untrusted(text, crate::parse::utils::MAX_PRINTED_NAME_CHARS)
+}
+
 /// Parse any format, recover any precision.
 #[derive(Parser)]
 #[command(name = "anamnesis", version, about)]
@@ -355,7 +364,7 @@ fn run_parse_pth(path: &std::path::Path) -> crate::Result<()> {
         let byte_len = t.byte_len as u64;
         println!(
             "  {:<30} {:<6} {:<15} {}",
-            t.name,
+            printable(&t.name),
             t.dtype,
             shape_str,
             format_bytes(byte_len)
@@ -387,7 +396,7 @@ fn run_parse_npz(path: &std::path::Path) -> crate::Result<()> {
         let byte_len = t.byte_len as u64;
         println!(
             "  {:<30} {:<6} {:<15} {}",
-            t.name,
+            printable(&t.name),
             t.dtype,
             shape_str,
             format_bytes(byte_len)
@@ -690,7 +699,7 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
         info.version
     );
     if let Some(arch) = info.architecture.as_deref() {
-        println!("  Arch:       {arch}");
+        println!("  Arch:       {}", printable(arch));
     }
     println!("  Tensors:    {}", info.tensor_count);
     println!("  Total size: {}", format_bytes(info.total_bytes));
@@ -709,7 +718,10 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
         let byte_len_str = t.byte_len.map_or_else(|| "?".into(), format_bytes);
         println!(
             "  {:<40} {:<8} {:<15} {}",
-            t.name, t.dtype, shape_str, byte_len_str
+            printable(&t.name),
+            t.dtype,
+            shape_str,
+            byte_len_str
         );
     }
     Ok(())

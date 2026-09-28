@@ -479,3 +479,67 @@ fn cli_remember_npz_accepts_a_vacuous_dtype_but_not_nonsense() {
         "a value that is not an output dtype must still be rejected"
     );
 }
+
+/// Phase 7.9, audit finding M-3: `amn parse` / `amn inspect` printed tensor
+/// names, the `GGUF` architecture and error messages verbatim, so a crafted file
+/// could clear the screen, set the terminal title, or replace an error with a
+/// green "OK". Nothing printed may carry a raw control or bidi character.
+#[cfg(feature = "gguf")]
+#[test]
+fn cli_output_escapes_file_text() {
+    fn gguf_string(text: &str) -> Vec<u8> {
+        let mut v = u64::try_from(text.len()).unwrap().to_le_bytes().to_vec();
+        v.extend_from_slice(text.as_bytes());
+        v
+    }
+    fn raw_gguf(arch: &str, name: &str, dims: &[u64]) -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes()); // tensors
+        out.extend_from_slice(&1u64.to_le_bytes()); // kv
+        out.extend_from_slice(&gguf_string("general.architecture"));
+        out.extend_from_slice(&8u32.to_le_bytes()); // STRING
+        out.extend_from_slice(&gguf_string(arch));
+        out.extend_from_slice(&gguf_string(name));
+        out.extend_from_slice(&u32::try_from(dims.len()).unwrap().to_le_bytes());
+        for d in dims {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes()); // F32
+        out.extend_from_slice(&0u64.to_le_bytes()); // offset
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        out.extend_from_slice(&[0u8; 4]);
+        out
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let arch = "\u{1b}[2J\u{1b}[H\u{1b}]0;PWNED\u{7}\u{1b}[31mSPOOFED";
+    let name = "blk.0\u{1b}[2K\r  model.safe_weight (verified OK)\u{202e}evil";
+    let ok = dir.path().join("ansi.gguf");
+    std::fs::write(&ok, raw_gguf(arch, name, &[1])).unwrap();
+    let bad = dir.path().join("ansi_err.gguf");
+    std::fs::write(&bad, raw_gguf("llama", name, &[0])).unwrap();
+
+    for (args, file) in [(["parse"], &ok), (["inspect"], &ok), (["parse"], &bad)] {
+        let output = Command::new(binary_path())
+            .args(args)
+            .arg(file)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        for bad_char in ['\u{1b}', '\r', '\u{7}', '\u{202e}'] {
+            assert!(
+                !text.contains(bad_char),
+                "{args:?} {}: raw {bad_char:?} in {text:?}",
+                file.display()
+            );
+        }
+        assert!(
+            text.contains("\\u{1b}"),
+            "{args:?}: escape not shown in {text:?}"
+        );
+    }
+}

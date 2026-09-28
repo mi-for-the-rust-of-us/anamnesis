@@ -1098,7 +1098,16 @@ impl fmt::Display for GgufInspectInfo {
         // `"Format:      "` is 13 chars, `"Arch:        "` is 13 chars, etc.
         write!(f, "Format:      GGUF v{}", self.version)?;
         if let Some(arch) = self.architecture.as_deref() {
-            write!(f, "\nArch:        {arch}")?;
+            // The architecture is file text: escape it before it reaches a
+            // terminal (Phase 7.9, audit finding M-3).
+            write!(
+                f,
+                "\nArch:        {}",
+                crate::parse::utils::display_untrusted(
+                    arch,
+                    crate::parse::utils::MAX_PRINTED_NAME_CHARS
+                )
+            )?;
         }
         write!(f, "\nTensors:     {}", self.tensor_count)?;
         write!(

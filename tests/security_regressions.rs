@@ -862,3 +862,118 @@ mod m7_safetensors_tensor_count {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// M-3: file-derived text reached error messages and `amn` output verbatim: a
+// crafted tensor name erased the `error:` line and printed a green
+// "OK: file verified" instead, and a pickle global forged a log line. Errors
+// now render with control and invisible formatting characters escaped and a
+// length cap, and pickle globals are previewed where they are read.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "gguf", feature = "pth"))]
+mod m3_escaped_output {
+    /// Characters that must never reach a terminal or a log from file text.
+    pub fn assert_inert(label: &str, text: &str) {
+        for bad in ['\u{1b}', '\r', '\n', '\u{7}', '\u{202e}', '\u{2066}'] {
+            assert!(!text.contains(bad), "{label}: raw {bad:?} in {text:?}");
+        }
+    }
+
+    #[cfg(feature = "gguf")]
+    #[test]
+    fn a_gguf_tensor_name_cannot_rewrite_the_error_line() {
+        use crate::common::gguf::{RawTensorInfo, raw_gguf};
+        // The audit's `ansi_err.gguf`: a zero-sized dimension, so parsing
+        // fails with the tensor name in the message.
+        let name = "\u{1b}[2K\r\u{1b}[32mOK: file verified\u{1b}[0m\u{1b}[8m";
+        let bytes = raw_gguf(
+            &[],
+            &[RawTensorInfo {
+                name,
+                dims: &[0],
+                ggml_type: 0,
+                offset: 0,
+            }],
+            32,
+            &[],
+        );
+        let message = anamnesis::parse_gguf_bytes(bytes).unwrap_err().to_string();
+        assert_inert("gguf error", &message);
+        assert!(
+            message.contains("\\u{1b}[32mOK: file verified"),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "pth")]
+    fn disallowed(pkl: &[u8]) -> anamnesis::AnamnesisError {
+        let bytes = crate::common::pth::pth_archive(pkl, &[], None);
+        let err = anamnesis::parse_pth_bytes(bytes).unwrap_err();
+        assert!(
+            matches!(err, anamnesis::AnamnesisError::DisallowedGlobal { .. }),
+            "{err}"
+        );
+        err
+    }
+
+    #[cfg(feature = "pth")]
+    #[test]
+    fn a_stack_global_cannot_forge_a_log_line() {
+        // STACK_GLOBAL("os\n2026-09-28 INFO model accepted\x1b[2K", "system").
+        let mut pkl = vec![0x80, 0x04];
+        for text in ["os\n2026-09-28 INFO model accepted\u{1b}[2K", "system"] {
+            pkl.push(b'X');
+            pkl.extend_from_slice(&u32::try_from(text.len()).unwrap().to_le_bytes());
+            pkl.extend_from_slice(text.as_bytes());
+        }
+        pkl.extend_from_slice(&[0x93, b'.']);
+        let err = disallowed(&pkl);
+        assert_inert("STACK_GLOBAL", &err.to_string());
+        let anamnesis::AnamnesisError::DisallowedGlobal { module, name } = err else {
+            unreachable!()
+        };
+        assert!(module.chars().count() <= 49, "{module:?}");
+        assert_eq!(name, "system");
+    }
+
+    #[cfg(feature = "pth")]
+    #[test]
+    fn a_two_mib_global_line_gives_a_short_error() {
+        let mut pkl = vec![0x80, 0x02, b'c'];
+        pkl.resize(pkl.len() + (2 << 20), b'A');
+        pkl.extend_from_slice(b"\nsystem\n.");
+        let message = disallowed(&pkl).to_string();
+        assert!(message.len() < 300, "{} bytes", message.len());
+    }
+
+    #[cfg(feature = "pth")]
+    #[test]
+    fn an_eight_mib_storage_key_gives_a_bounded_error() {
+        use crate::common::pth::{TensorSpec, pth_archive, state_dict_pickle};
+        let key = "k".repeat(8 << 20);
+        let pkl = state_dict_pickle(&[TensorSpec {
+            name: "w",
+            storage_class: "ByteStorage",
+            storage_key: &key,
+            offset: 0,
+            shape: &[1],
+            strides: &[1],
+        }]);
+        let message = anamnesis::parse_pth_bytes(pth_archive(&pkl, &[], None))
+            .unwrap_err()
+            .to_string();
+        // The message keeps its beginning and says how much was cut.
+        assert!(
+            message.starts_with("parse error: tensor `w`: storage `data/kkk"),
+            "{}",
+            &message[..100]
+        );
+        assert!(message.contains("more characters)"), "not truncated");
+        assert!(
+            message.chars().count() < 2200,
+            "{} chars",
+            message.chars().count()
+        );
+    }
+}
