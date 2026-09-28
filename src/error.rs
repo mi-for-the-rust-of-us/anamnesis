@@ -2,6 +2,15 @@
 
 /// Errors produced by anamnesis operations.
 ///
+/// Messages often quote the input (a tensor name, a pickle global, a ZIP entry
+/// name), and the input may be hostile. Every variant's `Display` therefore
+/// renders its text with control and invisible formatting characters escaped
+/// (`\u{1b}` for `ESC`, and so on) and cut to 2048 characters, so that printing
+/// or logging an error cannot rewrite a terminal or forge a log line. The
+/// variants' fields hold the text as the crate produced it; render through
+/// `Display` (or escape the fields yourself) before showing it to a person.
+///
+///
 /// # Rust → Python exception mapping (frozen for the Phase 8 bindings)
 ///
 /// The `PyO3` bindings expose each variant as a distinct, catchable Python
@@ -46,7 +55,7 @@ pub enum AnamnesisError {
     /// A format decoding failure (malformed header, invalid tensor metadata,
     /// truncated stream, out-of-bounds offset, or arithmetic overflow on a
     /// header-derived value). Maps to Python `ParseError`.
-    #[error("parse error: {reason}")]
+    #[error("parse error: {}", crate::parse::utils::error_text(.reason))]
     Parse {
         /// Human-readable description of what went wrong.
         reason: String,
@@ -54,7 +63,11 @@ pub enum AnamnesisError {
 
     /// A recognized but unimplemented format or feature. Maps to Python
     /// `UnsupportedError`.
-    #[error("unsupported format `{format}`: {detail}")]
+    #[error(
+        "unsupported format `{}`: {}",
+        crate::parse::utils::error_text(.format),
+        crate::parse::utils::error_text(.detail)
+    )]
     Unsupported {
         /// The format name (e.g., `"GPTQ"`, `"safetensors"`).
         format: String,
@@ -69,7 +82,7 @@ pub enum AnamnesisError {
     /// untrusted-input host can treat "too big for my budget" (e.g. *413 Payload
     /// Too Large*) differently from "malformed" (*400*). Maps to Python
     /// `LimitExceededError`.
-    #[error("limit exceeded ({limit}): {message}")]
+    #[error("limit exceeded ({limit}): {}", crate::parse::utils::error_text(.message))]
     LimitExceeded {
         /// Stable machine-readable tag naming the breached limit — the axis or
         /// constant name (e.g. `"max_single_alloc_bytes"`, `"max_total_bytes"`,
@@ -84,11 +97,18 @@ pub enum AnamnesisError {
     /// VM refuses to interpret. A dedicated variant (not [`Self::Parse`]) so a
     /// host can log / alert on a potentially hostile upload distinctly from a
     /// merely malformed one. Maps to Python `SecurityError`.
-    #[error("disallowed pickle global `{module}.{name}` (potential code execution)")]
+    #[error(
+        "disallowed pickle global `{}.{}` (potential code execution)",
+        crate::parse::utils::error_text(.module),
+        crate::parse::utils::error_text(.name)
+    )]
     DisallowedGlobal {
-        /// The referenced module (e.g. `"posix"`).
+        /// The referenced module (e.g. `"posix"`), cut to its first 48
+        /// characters: the name comes from the file, and a crafted one can be
+        /// megabytes long.
         module: String,
-        /// The referenced attribute / callable (e.g. `"system"`).
+        /// The referenced attribute / callable (e.g. `"system"`), cut like
+        /// `module`.
         name: String,
     },
 

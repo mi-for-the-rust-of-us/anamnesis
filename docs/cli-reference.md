@@ -99,6 +99,7 @@ passing scalar tensors through).
 |---|---|---|
 | `--to <value>` | `bf16` | Output dtype for **dequantised** tensors: `bf16`, `f32`, `f16`. `safetensors` is accepted as an alias for `bf16` on `.pth` / `.npz` / `.gguf` inputs (they always produce safetensors). See [Output dtype on `remember`](#output-dtype-on-remember). |
 | `--output`, `-o <path>` | *(derived)* | Output path; derived from the input if omitted (see [Output paths](#output-path-derivation)). |
+| `--force` | off | Overwrite an existing output file (see [Output files](#output-files)). |
 | `--threads <N>` | `min(cores, 4)` | Dequantisation worker threads (see [Threads](#threads)). |
 
 ```
@@ -165,6 +166,7 @@ whatever [`--out-dtype`](#output-dtype) selects, defaulting to `BF16`.
 |---|---|
 | `--to <target>` | **Required.** One of `safetensors` (alias `bf16`), `gguf`, `bnb-nf4` (aliases `bnb_nf4` / `nf4`). Case-insensitive. |
 | `--output`, `-o <path>` | Output path; derived from the input if omitted. |
+| `--force` | Overwrite an existing output file (see [Output files](#output-files)). |
 | `--gguf-metadata <FILE>` | JSON `GGUF` key/values to stamp on a `gguf` target (see [GGUF metadata](#gguf-metadata-flags)). |
 | `--gguf-kv <KEY=VALUE>` | Repeatable one-off `GGUF` metadata (string-valued). |
 | `--out-dtype <DTYPE>` | Element type for **dequantised** tensors: `bf16` (default), `f32`, `f16`. Every dequantising input since v0.7.4 (see [Output dtype](#output-dtype)). |
@@ -349,6 +351,26 @@ Stripped suffixes (case-sensitive, longest-first) include `-fp8`, `-GPTQ-Int4`,
 `model-GPTQ-Int4.safetensors` → `model-bf16.safetensors`,
 `weights-fp8.safetensors --to gguf` → `weights-gguf.gguf`.
 
+## Output files
+
+Since v0.7.9:
+
+- **No silent overwrite.** If the output path, given or derived, already exists,
+  `remember` and `convert` stop before doing any work unless `--force` is given:
+
+  ```
+  $ amn remember model.gguf
+  error: output `model.safetensors` already exists; pass --force to overwrite it
+  ```
+- **Never the input.** An output that is the input file is refused even with
+  `--force`, whether it is spelled the same, differently (`./model.gguf`), or
+  reached through a symbolic link (or, on Unix, a hard link).
+- **Atomic.** Every output is written to a temporary `.anamnesis-*.tmp` file in
+  the output's directory and renamed into place only once complete. A failed
+  run (a bad `--gguf-metadata` value, a full disk, `Ctrl-C`) leaves an existing
+  output exactly as it was and no partial file. On Unix the file is created with
+  mode `0600`; on Windows, replacing a file another program holds open fails.
+
 ## `ollama:` URL scheme
 
 Build with the `ollama` feature (`cargo install anamnesis --features cli,gguf,ollama`)
@@ -394,5 +416,7 @@ misrouting to the safetensors parser.
 ## Exit codes
 
 `0` on success; `1` on any error (the underlying `AnamnesisError` message is
-printed to stderr). For the error *kinds* and how a host can branch on them, see
+printed to stderr, with control and invisible formatting characters from the
+file shown as `\u{..}` escapes); `2` on a command-line usage error (reported by
+the argument parser). For the error *kinds* and how a host can branch on them, see
 the [README error taxonomy](../README.md#parsing-untrusted-input).

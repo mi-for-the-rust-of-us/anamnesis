@@ -212,11 +212,17 @@
 //!
 //! # Panic safety
 //!
-//! No public parse/inspect entry point panics or aborts on **any** input — a
-//! malformed, truncated, or hostile artefact is always a clean `Result::Err`
-//! ([`AnamnesisError`]), never an unwinding panic and never a `SIGBUS` (use the
-//! copy-based [`parse_bytes`] / `parse_*_from_reader` paths for untrusted input,
-//! which take an owned buffer instead of a memory map). The lint floor
+//! No public parse, inspect, `remember` or `convert` entry point panics or
+//! aborts on a hostile input: a malformed, truncated, or hostile artefact is
+//! always a clean `Result::Err` ([`AnamnesisError`]), never an unwinding panic
+//! and never a `SIGBUS` (use the copy-based [`parse_bytes`] /
+//! `parse_*_from_reader` paths for untrusted input, which take an owned buffer
+//! instead of a memory map). Nor can a small file make a call allocate without
+//! bound, which would abort through the allocator rather than panic: what a
+//! call materialises is checked against the caller's
+//! [`ParseLimits::max_total_bytes`] before it is allocated, and parse-time rules
+//! (no expanding `.pth` views, no aliased `GGUF` tensor data, at most 64
+//! dimensions) bound what any file can expand into (Phase 7.9). The lint floor
 //! (`unwrap_used` / `expect_used` / `panic` / `indexing_slicing` all denied) plus
 //! `checked_*` arithmetic on every header-derived value enforce this in the
 //! source; `tests/no_panic.rs` (a `catch_unwind` battery, run in debug so
@@ -464,6 +470,7 @@ pub mod cancel;
 pub mod cli;
 pub mod convert;
 pub mod error;
+mod fsio;
 pub mod inspect;
 pub mod lethe;
 pub mod limits;

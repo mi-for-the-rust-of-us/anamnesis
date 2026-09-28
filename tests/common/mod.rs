@@ -24,6 +24,8 @@
 //! - [`builders`]: in-memory `safetensors` / `NPZ` builders and temp files.
 //! - [`heap`]: `dhat` serialisation and deterministic synthesis for the
 //!   `peak_heap_*` binaries.
+//! - [`pth`]: crafted `.pth` state dicts (zero strides, aliased storages) for
+//!   the hostile-input suites.
 //! - [`bench`]: timing and fixture helpers for the `bench_*_adhoc` harnesses.
 
 // Each test crate compiles this whole module but calls only the helpers it
@@ -54,3 +56,4 @@ pub mod fixture;
 #[cfg(feature = "gguf")]
 pub mod gguf;
 pub mod heap;
+pub mod pth;

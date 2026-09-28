@@ -3,6 +3,9 @@
 //! Shared parsing utilities used across the format parsers and the modules
 //! built on them (`ParsedModel`, `lethe`).
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 /// Soft cap on `Vec` / `HashMap` pre-allocation sized from a file-declared
 /// count, shared by the `GGUF`, `NPZ`, and `.pth` parsers.
 ///
@@ -158,9 +161,107 @@ pub(crate) fn saturating_num_elements(shape: &[usize]) -> usize {
     usize::try_from(saturating_num_elements_u64(shape)).unwrap_or(usize::MAX)
 }
 
+/// Longest error message [`error_text`] renders, in characters.
+///
+/// Real messages are one line of a few hundred characters at most; the cap only
+/// bites when a message quotes attacker text (a tensor name, a pickle string).
+pub(crate) const MAX_ERROR_TEXT_CHARS: usize = 2048;
+
+/// Longest file-derived string (a tensor name, an architecture) the CLI prints
+/// in one field, in characters. Real names are well under 100.
+// Used by the `GGUF` summary's `Display` and by the CLI's per-format listings.
+#[cfg(any(
+    feature = "gguf",
+    all(feature = "cli", any(feature = "npz", feature = "pth"))
+))]
+pub(crate) const MAX_PRINTED_NAME_CHARS: usize = 256;
+
+/// Whether `c` must not reach a terminal or a log verbatim.
+///
+/// C0 and C1 controls and `DEL` (`char::is_control`) include `ESC`, which
+/// starts terminal escape sequences, and `CR` / `LF`, which forge or overwrite
+/// lines. The rest are invisible formatting characters that reorder or hide
+/// text: zero-width characters, left-to-right and right-to-left marks,
+/// embeddings and overrides (the "Trojan Source" bidi characters), isolates,
+/// the line and paragraph separators, and the byte-order mark.
+fn is_unsafe_for_display(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// Renders untrusted text so that it can reach a terminal or a log line
+/// without acting on it: every character [`is_unsafe_for_display`] flags becomes
+/// a visible `\u{..}` escape, and the result is cut to `max_chars` characters
+/// with a note of how much was dropped.
+///
+/// A model file names its tensors, architecture and pickle globals, and those
+/// names reached `amn`'s output and every error message verbatim: a crafted
+/// file could erase an `error:` line and print a green "OK: file verified" in
+/// its place, set the terminal title, forge log lines, or make an error
+/// message of tens of megabytes (Phase 7.9, audit finding M-3). Borrowed and
+/// unchanged in the common case, where nothing needs escaping.
+///
+/// Deliberately not `char::escape_debug`, which also escapes quotes and
+/// backslashes and would change every ordinary message that contains one.
+pub(crate) fn display_untrusted(text: &str, max_chars: usize) -> Cow<'_, str> {
+    let char_count = text.chars().count();
+    if char_count <= max_chars && !text.chars().any(is_unsafe_for_display) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len().min(max_chars.saturating_mul(4)));
+    for c in text.chars().take(max_chars) {
+        if is_unsafe_for_display(c) {
+            // EXPLICIT: `write!` into a `String` cannot fail.
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    if char_count > max_chars {
+        let _ = write!(out, "… ({} more characters)", char_count - max_chars);
+    }
+    Cow::Owned(out)
+}
+
+/// [`display_untrusted`] at the error-message cap: what every
+/// [`AnamnesisError`](crate::AnamnesisError) variant's `Display` renders its text through.
+pub(crate) fn error_text(text: &str) -> Cow<'_, str> {
+    display_untrusted(text, MAX_ERROR_TEXT_CHARS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_untrusted_borrows_clean_text_unchanged() {
+        let clean = r#"tensor `model.layers.0.weight` ("quoted", back\slash) ✓"#;
+        assert!(matches!(display_untrusted(clean, 256), Cow::Borrowed(t) if t == clean));
+    }
+
+    #[test]
+    fn display_untrusted_escapes_controls_and_invisible_formatting() {
+        let hostile = "a\u{1b}[2K\rb\nc\u{202e}d\u{200b}e\u{7f}f\u{9b}g\u{feff}h";
+        let shown = display_untrusted(hostile, 256);
+        assert_eq!(
+            shown,
+            "a\\u{1b}[2K\\u{d}b\\u{a}c\\u{202e}d\\u{200b}e\\u{7f}f\\u{9b}g\\u{feff}h"
+        );
+        assert!(!shown.chars().any(is_unsafe_for_display));
+    }
+
+    #[test]
+    fn display_untrusted_bounds_the_length_on_a_char_boundary() {
+        let long = "é".repeat(10);
+        assert_eq!(display_untrusted(&long, 4), "éééé… (6 more characters)");
+        assert_eq!(display_untrusted(&long, 10), long.as_str());
+    }
 
     #[test]
     fn checked_num_elements_basic() {

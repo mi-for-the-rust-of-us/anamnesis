@@ -12,40 +12,37 @@ env:
 # SUPPLY-CHAIN POSTURE. The LiteLLM compromise of 2026-03-24 did not exploit
 # LiteLLM's code: a long-lived PyPI token, stolen from CI through an earlier
 # compromised GitHub Action, was used to upload straight to the registry. This
-# workflow is shaped so that neither half of that chain exists here:
+# workflow is shaped so that no link of that chain exists here:
 #
 #   * No registry secret. `cargo publish` authenticates through crates.io
 #     Trusted Publishing: GitHub's OIDC token is exchanged for a crates.io token
 #     that lives ~30 minutes and only for this repository + workflow file +
 #     `release` environment (as configured on crates.io). There is no
 #     `CARGO_REGISTRY_TOKEN` left to steal, from CI or from a laptop.
-#   * No mutable code in the job. Every third-party action is pinned to a full
-#     commit SHA (the tag it came from is in the trailing comment), and the job
-#     restores no build cache, since a cache written by an earlier CI run is
-#     code this job would otherwise execute with publishing rights.
+#   * No third-party code runs while the job can mint that token. Building and
+#     testing executes the build scripts and proc-macros of every dependency,
+#     dev-dependencies included. That happens in `verify`, which holds no
+#     `id-token` permission and a read-only workflow token. `publish` then runs
+#     `cargo publish --no-verify`, which packages and uploads without compiling
+#     anything. (Phase 7.9, audit finding M-5: the first version of this file ran
+#     `cargo test` in the job that held `id-token: write`.)
+#   * No mutable code. Every third-party action is pinned to a full commit SHA
+#     (the tag it came from is in the trailing comment), no job restores a build
+#     cache, and every cargo command uses `--locked`, so a release builds exactly
+#     the committed `Cargo.lock`.
 #   * A human in the loop. The `release` environment requires the maintainer's
-#     approval before the job starts, so a pushed tag alone cannot publish.
+#     approval before `publish` starts, so a pushed tag alone cannot publish.
+#
+# Only a `v*` tag may publish. `workflow_dispatch` stays available for re-running
+# a release, but must be started from the tag, not a branch.
 jobs:
-  publish:
-    name: Publish
+  # Everything that compiles or runs code from dependencies.
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
-    # Only a `v*` tag may publish. `workflow_dispatch` stays available for
-    # re-running a release, but must be started from the tag, not a branch.
     if: startsWith(github.ref, 'refs/tags/v')
-    environment: release
-    # `contents: write` is required by the "Create the GitHub Release" step
-    # below. Without it the workflow token is read-only and `gh release create`
-    # fails with `HTTP 403: Resource not accessible by integration` — which is
-    # exactly what happened on the v0.7.3 tag, *after* `cargo publish` had
-    # already succeeded. Declared explicitly rather than relying on the
-    # repository's default token permissions, which are read-only here and are
-    # an org-level setting this file cannot see.
-    #
-    # `id-token: write` lets the job request the OIDC token that Trusted
-    # Publishing exchanges for a short-lived crates.io token.
     permissions:
-      contents: write
-      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -56,73 +53,91 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
-      # Deliberately no `Swatinem/rust-cache` here: see SUPPLY-CHAIN POSTURE.
+      # A tag whose CHANGELOG section is missing fails here, before anything is
+      # published, rather than in `release` after crates.io already has it.
+      - name: Check this version's CHANGELOG section
+        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > /dev/null
 
-      # Full CI checks before publishing
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       # `--document-private-items` as well as the public surface: a broken link
       # on a `pub(crate)` item is invisible to a public-items run, and CI's
       # `docs` job checks the same thing across feature combinations.
       - name: Doc check
-        run: cargo doc --all-features --no-deps --document-private-items
+        run: cargo doc --locked --all-features --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Publish, with a token minted for this run only (Trusted Publishing).
+      # The verification build `cargo publish` would otherwise run in the job
+      # that holds `id-token: write`: package the crate and build it from the
+      # packaged sources, exactly as crates.io users will.
+      - name: Package and verify
+        run: cargo package --locked
+
+  # Holds `id-token: write`, and runs no third-party code.
+  publish:
+    name: Publish
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    # `id-token: write` lets the job request the OIDC token that Trusted
+    # Publishing exchanges for a short-lived crates.io token. `contents: read`
+    # is what `actions/checkout` needs.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (v1)
+        with:
+          toolchain: stable
+
       - name: Authenticate to crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
+      # `--no-verify`: the verification build already ran in `verify`, from the
+      # same commit. Running it here would compile dependency build scripts
+      # while this job can mint a publish token.
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-      # Since v0.7.3 the published crate excludes `tests/` (Cargo.toml
-      # `exclude`), which took the .crate from 4.8 MiB to under 1 MiB. The test
-      # corpus reaches users through the GitHub Release created below: GitHub
-      # serves a source tarball per tag containing `tests/` verbatim, so no
-      # artefact is built or uploaded here that could drift from the tag.
-      #
-      # Runs AFTER `cargo publish` on purpose: a Release must never advertise a
-      # version whose publish failed.
-      - name: Extract this version's CHANGELOG section
-        id: notes
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Print the body between this version's heading and the next `## [`.
-          #
-          # The version is matched with `index(...) == 1`, a LITERAL
-          # prefix test, not a regex. An earlier draft used a dynamic regex
-          # (`$0 ~ "^## \\[" v "\\]"`) and silently matched nothing: inside the
-          # shell-quoted awk program `\\[` collapses to `\[`, which gawk treats
-          # as a plain `[`, so the pattern became `^## [0.7.3]` where `[0.7.3]`
-          # is a CHARACTER CLASS matching one of `0 . 7 3`. It could never match
-          # a literal bracket. Dots in a version string are regex metacharacters
-          # too, so literal matching is the right tool here regardless.
-          awk -v hdr="## [$VERSION]" '
-            index($0, hdr) == 1 { found = 1; next }
-            found && /^## \[/   { exit }
-            found               { print }
-          ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error::No CHANGELOG section found for [$VERSION]. \
-          Rename '## [Unreleased]' to '## [$VERSION] - YYYY-MM-DD' before tagging."
-            exit 1
-          fi
-          echo "Extracted $(wc -l < release-notes.md) lines of notes for $VERSION"
+  # Since v0.7.3 the published crate excludes `tests/` (Cargo.toml `exclude`),
+  # which took the .crate from 4.8 MiB to under 1 MiB. The test corpus reaches
+  # users through the GitHub Release created here: GitHub serves a source
+  # tarball per tag containing `tests/` verbatim, so no artefact is built or
+  # uploaded that could drift from the tag.
+  #
+  # Runs AFTER `publish` on purpose: a Release must never advertise a version
+  # whose publish failed. It needs `contents: write`, which is why it is its own
+  # job and runs no cargo. (Without that permission `gh release create` fails
+  # with `HTTP 403: Resource not accessible by integration`, which is exactly
+  # what happened on the v0.7.3 tag, after `cargo publish` had succeeded.)
+  release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Create the GitHub Release
         env:
@@ -130,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            cat release-notes.md
+            scripts/release-notes.sh "${GITHUB_REF_NAME#v}"
             cat <<'FOOTER'
 
           ---
@@ -153,7 +168,4 @@ jobs:
           script output for how to do that stronger check.
           FOOTER
           } > release-body.md
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file release-body.md \
-            --verify-tag
+          gh release create "$GITHUB_REF_NAME"             --title "$GITHUB_REF_NAME"             --notes-file release-body.md             --verify-tag

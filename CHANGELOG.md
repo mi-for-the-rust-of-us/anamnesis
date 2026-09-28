@@ -20,6 +20,223 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit SHA, and Dependabot keeps the pins current. A new `deny` CI job runs
   `cargo-deny` against `deny.toml` (RustSec advisories and yanked crates,
   permissive licences only, crates.io as the only source).
+- **A private way to report vulnerabilities.** `SECURITY.md` states what counts
+  as a vulnerability for a crate that parses untrusted files, how to report one
+  through GitHub's private advisory form instead of a public issue, and how fixes
+  are published (GitHub advisory, patch release, RustSec entry). The README's
+  untrusted-input section points to it.
+- **No dependency code runs while the release job can mint a publish token.**
+  The first Trusted Publishing workflow ran `cargo test` (and so every
+  dev-dependency's build scripts and proc-macros) in the job that held
+  `id-token: write`. `publish.yml` is now three jobs: `verify` builds, tests and
+  packages with a read-only token; `publish` holds `id-token: write` and runs
+  `cargo publish --no-verify`, which compiles nothing; `release` creates the
+  GitHub Release with `contents: write` and no cargo. Every cargo command in
+  `publish.yml` and `ci.yml` uses `--locked`, and a tag without a CHANGELOG
+  section now fails before publishing rather than after.
+- **The CodSpeed job installs a pinned `cargo-codspeed`.** It used to fetch the
+  latest `cargo-binstall` and `cargo-codspeed` release assets, unverified, in a
+  job that holds `id-token: write`; it now runs
+  `cargo install cargo-codspeed --locked --version 5.0.1` and keeps no git
+  credentials after checkout.
+- **Dependency advisories are checked weekly, not only on push.** The
+  `cargo-deny` job moved from `ci.yml` to its own `deny.yml`, which also runs on
+  a Monday schedule, so an advisory published against an unchanged `main` (or
+  the `Cargo.lock` that `cargo install --locked` users build) is reported.
+- **A `.pth` tensor view may not materialise more bytes than its storage
+  holds** (Phase 7.9, audit finding H-1;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). A view with a
+  zero stride on a dimension larger than 1 passed every existing check with a
+  one-byte storage, and `ParsedPth::tensors()` then sized its output from the
+  declared shape alone: a 380-byte file aborted the process with a 4 EiB
+  allocation (uncatchable, even under the `python` unwind profile), a 394-byte
+  one panicked, and a 374-byte one produced 1 GiB. No `ParseLimits` setting
+  helped, because the output of `tensors()` was charged to nothing. Every
+  parse, inspect and front-matter entry point now rejects such a view with
+  `Parse`, and `copy_to_contiguous` repeats the rule where it sizes its buffer.
+  Zero strides that expand nothing, such as Hugging Face's
+  `position_ids = arange(n).expand(1, -1)`, still parse. A view that reads
+  past the end of its storage, or names a storage the archive lacks, is now
+  refused at parse time too, instead of on the first `tensors()` call. Present
+  since `.pth` support landed.
+- **`.pth` tensors are capped at 64 dimensions, and size-1 dimensions no
+  longer drive the strided copy** (Phase 7.9, finding N-1, found while
+  designing the H-1 fix). `copy_to_contiguous` walked every dimension for every
+  element and the rank was uncapped, so a small file declaring
+  `(N, 1, 1, …, 1)` with odd strides on the size-1 dimensions cost `N × rank`,
+  a cost `inspect` cannot see. A 65-dimension tensor is now `LimitExceeded`
+  (`PTH_MAX_DIMS`) on every entry point; size-1 dimensions are dropped before
+  the contiguity test, so such a tensor takes the zero-copy path. Output bytes
+  are unchanged.
+- **`inspect` no longer under-reports `GPTQ` and `AWQ` output 8×** (Phase 7.9,
+  audit finding M-1). `dequantized_size` counted the `I32` elements of
+  `.qweight`, not the `32 / bits` weights packed into each, so a host sizing its
+  memory budget from `inspect` admitted 8× more than it thought for every
+  4-bit model (4× at 8-bit), honest files included, and `amn inspect` printed
+  the wrong figure. The estimate now comes from one per-tensor output-size
+  function, and a new test (`tests/inspect_matches_remember.rs`) holds it equal
+  to the bytes `remember` actually writes for every reference fixture at
+  `BF16`, `F32` and `F16`. A missing or edited bit width over-estimates rather
+  than under-estimates. Present since `inspect` gained `dequantized_size`.
+- **`ParseLimits` now bounds what a call materialises, not only what the
+  parser reads** (Phase 7.9, audit findings L-3 and M-2;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). Nothing after
+  parsing was charged: the owned copies `ParsedPth::tensors()` makes, the
+  dequantised output of `remember`, and every tensor the `convert` hub owns
+  were bounded by nothing but the host's memory. A `.pth` whose 4000 keys all
+  named one 64 KiB storage turned 117 KB of input into 250 MiB of output under
+  an 8 MiB budget. The parsed value now keeps the limits it was parsed under,
+  and each of those calls checks its total against `max_total_bytes` **before**
+  allocating anything, using the same figure the format's `inspect` reports as
+  `dequantized_size` (so a host gating on `dequantized_size <= max_total_bytes`
+  is not refused later, and one byte less is refused up front). Only the
+  aggregate axis applies to materialisation: dequantised tensors are
+  legitimately larger than `max_single_alloc`, which the owned-input entry
+  points already hold near the input size. Copies of data the crate already
+  holds use a fallible allocation, so a refusal from the allocator is
+  `LimitExceeded { limit: "available_memory" }` instead of an abort.
+- **A `.pth` may not materialise more than 16 times its storage bytes**
+  (Phase 7.9, audit finding M-2). Tied weights let several keys view one
+  storage, and each key is materialised in full; nothing capped how many keys
+  a file could point at one storage, so the default (unbounded) limits the CLI
+  and a plain `convert_bytes` run under gave no protection. A new permanent
+  floor, `PTH_MAX_MATERIALISE_RATIO` (16, far above any real model's tying),
+  rejects the file at parse time with `LimitExceeded` on every entry point.
+- **GGUF: overlapping tensor data is refused, and `general.alignment` must be
+  a power of two** (Phase 7.9, audit finding H-2;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). Each tensor's
+  byte range was checked to lie inside the file, but not against the others,
+  so a few hundred 32-byte tensor-info records could all name the same bytes,
+  each then dequantised or copied in full: 276 KB of input produced 105 MB of
+  output. Separately, any non-zero `general.alignment` was accepted, and a
+  `gguf` to `gguf` conversion inherited it and padded every tensor to it: a
+  1 MiB file with a 1 MiB alignment converted to 1 GB, while `inspect`
+  reported 3.9 KB. Every `GGUF` entry point now rejects overlapping ranges
+  (adjacent ones are fine, and llama.cpp's own layout rule already implies
+  this), the reader and the writer share one rule requiring a power-of-two
+  alignment (as llama.cpp does), and `convert` no longer inherits the source
+  alignment: the output uses the default of 32 unless the caller sets one.
+- **`NPY` arrays are capped at 64 dimensions, and the `Fortran`-order
+  transposition no longer scales with rank** (Phase 7.9, audit finding H-3).
+  The shape tuple was bounded only by the 1 MiB header cap, and the
+  transposition added in v0.7.6 walked every dimension for every element, so
+  a 240 KB archive declaring 80000 size-1 dimensions cost 4.2 s under tight
+  `ParseLimits` (hours at a few MB) while `inspect` saw an ordinary small array.
+  A shape with more than `NumPy`'s own limit of 64 dimensions is now
+  `LimitExceeded` (`NPY_MAX_DIMS`) on every entry point, and size-1 dimensions,
+  which change neither order, are dropped before transposing. Output bytes are
+  unchanged.
+- **A ZIP entry's declared size no longer sizes an `NPZ` buffer before the
+  bytes exist** (Phase 7.9, audit finding M-6;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). `parse_npz`
+  allocated each array from the entry's declared uncompressed size before
+  reading, so a 204-byte `.npz` claiming 3 GB committed 3 GB under default
+  limits, and panicked with "capacity overflow" on 32-bit targets. The shared
+  ZIP reader now requires a `STORED` entry to declare equal compressed and
+  uncompressed sizes (so its claim is bounded by bytes actually present, for
+  `.pth` too), `DEFLATE` arrays grow as inflated bytes arrive, and a size
+  beyond what the platform can address is `LimitExceeded` rather than a panic.
+  The `STORED` read path, the common one, is unchanged.
+- **One `byteorder` cap on every `.pth` path** (Phase 7.9, audit finding L-2).
+  `MAX_BYTEORDER_SIZE` (64 bytes) was applied by `inspect_pth_from_reader` and
+  the other reader paths only; `parse_pth` and `parse_pth_bytes` sliced the
+  whole entry and echoed it into the error, so a 20 MiB `byteorder` produced a
+  20 MiB message there and a clean `LimitExceeded` on the reader path. Both
+  now share one check, and an unknown byte order is echoed as a short preview.
+- **The pickle VM's `MARK` stack is capped** (Phase 7.9, audit finding L-1).
+  Each `MARK` pushed a `usize` onto a stack nothing charged, so a `data.pkl`
+  of nothing but `(` grew it 8 bytes per input byte: a 16 MiB pickle peaked at
+  160 MiB under a 32 MiB `max_total_bytes`, and a 100 MiB one at about
+  800 MiB, beyond the permanent `MAX_PICKLE_WORKING_SET` floor. More than 256
+  open marks (a real pickle holds its nesting depth, a handful) is now
+  `LimitExceeded` (`MAX_PICKLE_MARK_DEPTH`) on every entry point.
+- **safetensors header processing is no longer quadratic in the tensor count,
+  and `max_item_count` applies to it** (Phase 7.9, audit finding M-7). The
+  scheme detector, the config inference and `remember`'s companion lookups
+  each scanned the whole tensor list once per tensor: 40 000 tensors took
+  1.85 s, and the 100 MiB header cap admitted files costing about 40 minutes.
+  The crate now builds a name index once per call (80 ms for the same 40 000;
+  386 ms for 160 000), answering exactly as the linear scan did, and
+  `max_item_count`, documented for `GGUF` and `ZIP` only until now, bounds the
+  safetensors tensor count on every entry point. The public `find_*` methods
+  keep their one-off linear scan.
+- **Error messages and CLI output can no longer rewrite a terminal or forge a
+  log line** (Phase 7.9, audit finding M-3;
+  [CWE-150](https://cwe.mitre.org/data/definitions/150.html) /
+  [CWE-117](https://cwe.mitre.org/data/definitions/117.html)). Tensor names,
+  the `GGUF` architecture, pickle globals and `ZIP` entry names reached error
+  messages and `amn parse` / `amn inspect` output verbatim, including `ESC`,
+  `CR` and bidi overrides: a crafted tensor name erased the `error:` line and
+  printed a green "OK: file verified" in its place, and a pickle global wrote a
+  fake `INFO model accepted` line into logs that record `DisallowedGlobal`,
+  the error hosts are told to alert on. A 20 MiB `GLOBAL` line also made a
+  20 MiB message. Every `AnamnesisError` now renders through one helper that
+  shows control and invisible formatting characters as `\u{..}` escapes and
+  cuts the message at 2048 characters; the CLI escapes the names it prints and
+  cuts them at 256; `DisallowedGlobal`'s `module` and `name` fields hold a
+  48-character preview, and a disallowed `GLOBAL` line is no longer copied in
+  full. Ordinary messages, quotes and backslashes included, are unchanged.
+- **Output files are written atomically, and `convert` refuses its input as
+  its output** (Phase 7.9, audit finding M-8). The `GGUF` and `BnB-NF4`
+  writers opened their destination with `File::create`, truncating it before
+  anything was validated, so any later error left an empty or partial file
+  behind: `amn convert model.gguf --to gguf -o model.gguf` with a bad
+  alignment in `--gguf-metadata` left the input at 0 bytes. Every writer now
+  goes through a temporary file in the destination directory, renamed into
+  place only once complete (the `safetensors` writers already did, upstream),
+  and `convert` / `amn` refuse an output that is the input, including through
+  a symbolic link, another spelling, or (on Unix) a hard link.
+- **The thread pool degrades instead of aborting, and stops at the first
+  failure** (Phase 7.9, audit finding L-4). A worker thread the OS refused to
+  start made `Scope::spawn` panic, an abort under `panic = "abort"`; workers now
+  start through `Builder::spawn_scoped`, and a refusal leaves the work to the
+  threads already running, or to the calling thread. After a failure the other
+  workers used to dequantise the rest of the file anyway; they now stop, while
+  still reporting the lowest-indexed failure at every thread count. An
+  explicit thread budget is clamped to `available_parallelism` (it was passed
+  to the spawner as given, `--threads 1000000` included).
+- **The `ollama:` manifest read is bounded** (Phase 7.9, audit finding I-4).
+  The manifest was read whole with `std::fs::read`; `OLLAMA_MODELS` can point
+  at a shared or writable directory, so a huge file there was read into memory
+  first. It must now be a regular file of at most 1 MiB (a real one is a few
+  hundred bytes), or the resolver returns `LimitExceeded` / `Parse`.
+
+### Changed
+
+- **`convert`, `remember` and `ParsedPth::tensors()` can now return
+  `LimitExceeded` for a file that parsed.** A caller that passes tight
+  `ParseLimits` to a parse (or to `ConvertOptions::with_limits`) now also bounds
+  what the later call materialises, against `max_total_bytes`. Set it at or
+  above `inspect().dequantized_size` for the output dtype you ask for.
+- **`ParseLimits::max_item_count` now also counts safetensors tensors.** A host
+  that set it for `GGUF` or archive entries (the README's example uses 4096)
+  now also refuses a single-file safetensors checkpoint with more tensors than
+  that; raise it if you parse such files.
+- **`amn remember` and `amn convert` no longer overwrite an existing output
+  unless `--force` is given.** A derived output name made it easy to replace a
+  file by accident (`amn remember model.gguf` silently replaced a sibling
+  `model.safetensors`). Scripts that re-run a conversion into the same path
+  need `--force`. The library functions keep replacing an existing output, now
+  atomically.
+- **`GGUF` and `BnB-NF4` output files are created with mode `0600` on Unix**,
+  like the `safetensors` outputs already were (the temporary file's mode is
+  kept by the rename). `chmod` them if other users need to read them.
+- **On Windows, replacing an output that another program holds open now fails**
+  instead of succeeding: the atomic rename cannot replace a file with an open
+  handle that does not allow deletion. Close the file, or write elsewhere.
+
+### Fixed
+
+- **`scripts/verify-claims.sh` is executable in the repository and logs to a
+  private temp file.** It was committed without the executable bit, so the
+  `./scripts/verify-claims.sh` the README and every GitHub Release tell users to
+  run failed with "Permission denied" on Linux and macOS; and it logged to the
+  fixed path `/tmp/amn-verify.log`, which another user of a shared host could
+  pre-plant as a symlink. It now uses `mktemp`, removed on exit.
+- **An empty non-contiguous `.pth` tensor parses** (Phase 7.9, audit
+  finding I-9). A tensor with a zero dimension and non-row-major strides was
+  rejected with "max stride offset overflow", because the offset bound computed
+  `dim - 1` for the zero dimension. It now materialises as an empty buffer.
 
 ## [0.7.8] - 2026-09-26
 

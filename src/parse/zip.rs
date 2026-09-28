@@ -845,9 +845,24 @@ fn parse_cd_entries(cd: &[u8], declared: u64, out: &mut Vec<ZipEntry>) -> crate:
         // String. Real `.pth` / `.npz` names are ASCII, where UTF-8 and CP437
         // coincide; lossy decoding never errors on adversarial bytes.
         let name = String::from_utf8_lossy(name_bytes).into_owned();
+        let method = Compression::from_tag(method);
+        // A `STORED` entry holds its bytes verbatim, so its two sizes must
+        // agree. Readers trust the uncompressed one to size buffers; a 204-byte
+        // `.npz` whose single entry claimed 3 GB made `parse_npz` commit a 3 GB
+        // buffer before reading, and panicked on 32-bit targets (Phase 7.9,
+        // audit finding M-6). With the sizes tied, a `STORED` entry can only
+        // claim bytes that `data_start` finds present in the source.
+        if method == Compression::Stored && compressed_size != uncompressed_size {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "ZIP entry `{name}`: STORED entry declares {compressed_size} compressed \
+                     but {uncompressed_size} uncompressed bytes"
+                ),
+            });
+        }
         out.push(ZipEntry {
             name,
-            method: Compression::from_tag(method),
+            method,
             compressed_size,
             uncompressed_size,
             local_header_offset,

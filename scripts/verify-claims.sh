@@ -12,6 +12,12 @@
 # Usage:  ./scripts/verify-claims.sh
 set -euo pipefail
 
+# Per-run log in a private temp file (mktemp creates it 0600 with a random
+# name), removed on exit. A fixed /tmp path could be pre-planted as a symlink
+# by another user on a shared host.
+log="$(mktemp "${TMPDIR:-/tmp}/amn-verify.XXXXXX")"
+trap 'rm -f "$log"' EXIT
+
 cd "$(dirname "$0")/.."
 
 if [ ! -d tests/fixtures ]; then
@@ -60,14 +66,14 @@ for entry in "${SUITES[@]}"; do
   oracle="${rest#*:}"
   printf '%-34s %s\n' "$target" "$what"
   printf '%-34s   reference: %s\n' "" "$oracle"
-  if cargo test --release --all-features --test "$target" -- --quiet >/tmp/amn-verify.log 2>&1; then
+  if cargo test --release --all-features --test "$target" -- --quiet >"$log" 2>&1; then
     # Count from the summary line, not from '^test .* ok$': --quiet prints a dot
     # per test and never those lines, so the old pattern matched nothing and
     # every suite reported "PASS 0 tests". A zero count is now a FAILURE rather
     # than a silent pass, because "the binary compiled and ran no tests" and
     # "22 kernels verified" must not look identical in a script whose entire job
     # is substantiating a correctness claim.
-    count=$(sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' /tmp/amn-verify.log \
+    count=$(sed -n 's/.*test result: ok\. \([0-9]*\) passed.*/\1/p' "$log" \
             | awk '{ s += $1 } END { print s + 0 }')
     if [ "$count" -eq 0 ]; then
       printf '%-34s   \033[31mFAIL\033[0m  ran 0 tests (suite filtered out or empty)\n\n' ""
@@ -77,7 +83,7 @@ for entry in "${SUITES[@]}"; do
     fi
   else
     printf '%-34s   \033[31mFAIL\033[0m\n\n' ""
-    tail -30 /tmp/amn-verify.log
+    tail -30 "$log"
     FAILED=1
   fi
 done

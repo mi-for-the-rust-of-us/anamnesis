@@ -121,27 +121,37 @@ Before tagging a release (`v*`), complete these steps in order:
 5. Commit as `bump version to vX.Y.Z, update changelog date`
 6. Push the commit, wait for CI to go GREEN
 7. `git tag vX.Y.Z && git push origin vX.Y.Z`
-8. Wait for the publish workflow to go GREEN. Since v0.7.3 it does **two**
-   things: `cargo publish`, then `gh release create` for the tag. The Release
-   is what carries the test corpus, because `Cargo.toml`'s `exclude` keeps
-   `tests/` out of the published crate (under 1 MiB instead of 4.8 MiB), and
-   GitHub's per-tag source tarball ships it verbatim.
+8. **Approve the release, then wait for the publish workflow to go GREEN.**
+   Since v0.7.9 it runs three jobs:
+   - `verify` builds, tests and packages the crate (`cargo package --locked`),
+     with a read-only token and no `id-token` permission, and checks that
+     `CHANGELOG.md` has a section for the tag;
+   - `publish` waits for your approval on the `release` environment (Actions
+     tab → the run → **Review deployments**), then runs
+     `cargo publish --locked --no-verify` through Trusted Publishing. It
+     compiles nothing: no dependency build script ever runs in the job that
+     can mint a publish token;
+   - `release` runs `gh release create` for the tag. The Release is what
+     carries the test corpus, because `Cargo.toml`'s `exclude` keeps `tests/`
+     out of the published crate (under 1 MiB instead of 4.8 MiB), and GitHub's
+     per-tag source tarball ships it verbatim.
 9. Check the Release actually appeared and its notes are the right section.
-   If the job failed *after* `cargo publish` succeeded, **do not re-run the
-   workflow** — the publish step would fail on the already-taken version and
+   If `release` failed *after* `publish` succeeded, **do not re-run the
+   workflow**: the publish step would fail on the already-taken version and
    mask the real error. Fix the workflow for next time, then create the missing
    Release by hand from a clean checkout at the tag:
-   ```powershell
-   $v = "0.7.3"
-   awk -v hdr="## [$v]" 'index($0,hdr)==1{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md > release-body.md
+   ```bash
+   v=0.7.9
+   scripts/release-notes.sh "$v" > release-body.md
    # append the "Verifying the correctness claims" footer, then:
    gh release create "v$v" --title "v$v" --notes-file release-body.md --verify-tag
    ```
-   The workflow slices them out of `CHANGELOG.md` by matching
-   `## [X.Y.Z]`, and **fails the job** if no section matches — which is the
+   `scripts/release-notes.sh` slices the notes out of `CHANGELOG.md` by
+   matching `## [X.Y.Z]`, and **fails** if no section matches, which is the
    intended alarm for "step 3 was skipped and `## [Unreleased]` was never
-   renamed". Release creation runs *after* `cargo publish` on purpose, so a
-   Release can never advertise a version whose publish failed.
+   renamed". `verify` runs it first, so that alarm fires before anything is
+   published. Release creation runs *after* `publish` on purpose, so a Release
+   can never advertise a version whose publish failed.
 
 **Two checks specific to the packaging split**, worth running before the tag:
 

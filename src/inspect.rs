@@ -138,7 +138,10 @@ pub struct InspectInfo {
     /// Feeds the inspect-before-parse policy gate, so it has to track the width
     /// the caller will actually request: at `F32` the figure is double the
     /// `BF16` one for the dequantised share, while passthrough tensors keep
-    /// their source dtype and contribute the same bytes either way.
+    /// their source dtype and contribute the same bytes either way. Packed
+    /// schemes count weights, not stored elements (`GPTQ` / `AWQ` pack
+    /// `32 / bits` weights per `I32`, `BnB` 4-bit two per byte), so the figure
+    /// equals the tensor bytes `remember` writes.
     pub dequantized_size: u64,
     /// The output dtype [`dequantized_size`](Self::dequantized_size) assumes.
     ///
@@ -207,21 +210,16 @@ impl InspectInfo {
 
             match entry.role {
                 TensorRole::Quantized => {
-                    // BnB NF4/FP4: each U8 byte packs 2 values, so the element
-                    // count is 2 × byte_len. Every other scheme is 1 element per
-                    // stored element. Both then multiply by the *requested*
-                    // output width rather than a hard-coded 2 — the v0.7.4
-                    // change, without which `--to f32` would under-report this
-                    // estimate by exactly 2× in the one place whose whole job is
-                    // telling a caller how big the result will be.
-                    // CAST: usize → u64, element count fits in u64 for any realistic model
-                    #[allow(clippy::as_conversions)]
-                    let out_elements =
-                        if header.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
-                            (entry.byte_len() as u64).saturating_mul(2)
-                        } else {
-                            entry.num_elements() as u64
-                        };
+                    // Packed schemes store several weights per element (BnB
+                    // 4-bit: 2 per byte; GPTQ/AWQ: 32 / bits per `I32`), so the
+                    // element count comes from the header's one output-size
+                    // function, shared with the materialisation budget. It is
+                    // then multiplied by the *requested* output width rather
+                    // than a hard-coded 2: the v0.7.4 change, without which
+                    // `--to f32` under-reported this estimate by 2×, just as a
+                    // missed pack factor under-reported GPTQ/AWQ by 8× until
+                    // v0.7.9.
+                    let out_elements = header.dequantized_elements(entry);
                     dequantized_size =
                         dequantized_size.saturating_add(out_elements.saturating_mul(out_bytes));
                 }
@@ -669,6 +667,60 @@ mod tests {
             gptq_config: None,
             awq_config: None,
             bnb_config: None,
+        }
+    }
+
+    /// A packed `GPTQ` / `AWQ` header: one `.qweight` of `[16, 64]` `I32`
+    /// elements, i.e. 128 × 64 weights at 4-bit or 64 × 64 at 8-bit.
+    fn packed_header(scheme: QuantScheme, bits: Option<u8>) -> SafetensorsHeader {
+        use crate::parse::safetensors::{AwqConfig, GptqConfig};
+        SafetensorsHeader {
+            tensors: vec![make_entry(
+                "l.qweight",
+                Dtype::I32,
+                TensorRole::Quantized,
+                &[16, 64],
+            )],
+            scheme,
+            metadata: None,
+            header_size: 0,
+            gptq_config: (scheme == QuantScheme::Gptq)
+                .then_some(bits)
+                .flatten()
+                .map(|bits| GptqConfig {
+                    bits,
+                    group_size: 128,
+                }),
+            awq_config: (scheme == QuantScheme::Awq)
+                .then_some(bits)
+                .flatten()
+                .map(|bits| AwqConfig {
+                    bits,
+                    group_size: 128,
+                }),
+            bnb_config: None,
+        }
+    }
+
+    /// `GPTQ` / `AWQ` pack `32 / bits` weights into each `I32` of `.qweight`;
+    /// the estimate must count weights, not packed elements (Phase 7.9, audit
+    /// finding M-1: it under-reported 4-bit models 8×). An absent or unusable
+    /// bit width assumes the larger factor, the fail-safe direction.
+    #[test]
+    fn packed_schemes_count_weights_not_packed_elements() {
+        let bf16 = InspectOptions::new();
+        for scheme in [QuantScheme::Gptq, QuantScheme::Awq] {
+            let size = |bits| {
+                InspectInfo::with_options(&packed_header(scheme, bits), &bf16).dequantized_size
+            };
+            assert_eq!(size(Some(4)), 16 * 64 * 8 * 2, "{scheme:?} 4-bit");
+            assert_eq!(size(Some(8)), 16 * 64 * 4 * 2, "{scheme:?} 8-bit");
+            assert_eq!(size(None), 16 * 64 * 8 * 2, "{scheme:?} without config");
+            assert_eq!(
+                size(Some(3)),
+                16 * 64 * 8 * 2,
+                "{scheme:?} with an edited bit width"
+            );
         }
     }
 

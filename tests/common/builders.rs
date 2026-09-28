@@ -25,6 +25,60 @@ pub fn build_safetensors_bf16(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
     safetensors::tensor::serialize(views, None).unwrap()
 }
 
+/// Builds a `safetensors` file from raw tensors of any dtype, writing the
+/// header by hand so dtypes the `safetensors` crate would reject for a view
+/// (packed `I32` weights, `F8_E4M3`) can be laid out as quantised checkpoints
+/// store them. Inputs: (name, dtype string as in the header, shape, bytes),
+/// stored in the given order.
+pub fn build_safetensors_raw(tensors: &[(&str, &str, &[usize], &[u8])]) -> Vec<u8> {
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, dtype, shape, bytes) in tensors {
+        let start = data.len();
+        data.extend_from_slice(bytes);
+        header.insert(
+            (*name).to_owned(),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [start, data.len()],
+            }),
+        );
+    }
+    let json = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let mut out = (json.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&json);
+    out.extend_from_slice(&data);
+    out
+}
+
+/// A synthetic per-tensor `FP8` checkpoint large enough that its dequantised
+/// output dwarfs the header a parse charges: one `F8_E4M3` `[256, 256]` weight
+/// with a scalar `F32` scale, and one `BF16` `[256]` passthrough.
+pub fn build_fp8_checkpoint() -> Vec<u8> {
+    build_safetensors_raw(&[
+        ("l.weight", "F8_E4M3", &[256, 256], &vec![0x38u8; 256 * 256]),
+        ("l.weight_scale", "F32", &[], &1.0f32.to_le_bytes()),
+        ("norm.weight", "BF16", &[256], &vec![0u8; 512]),
+    ])
+}
+
+/// A synthetic 4-bit `GPTQ` checkpoint, 256 x 256: packed `I32` `qweight`,
+/// `qzeros` and `F16` scales in one group.
+pub fn build_gptq_checkpoint() -> Vec<u8> {
+    let (inf, outf) = (256usize, 256usize);
+    build_safetensors_raw(&[
+        (
+            "l.qweight",
+            "I32",
+            &[inf / 8, outf],
+            &vec![0x11u8; inf / 8 * outf * 4],
+        ),
+        ("l.qzeros", "I32", &[1, outf / 8], &vec![0u8; outf / 8 * 4]),
+        ("l.scales", "F16", &[1, outf], &[0x00, 0x3c].repeat(outf)),
+    ])
+}
+
 /// Builds a tiny `F32` `NPZ` archive (a `ZIP` of `.npy` entries) in-memory.
 pub fn build_npz_f32(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
     use std::io::Write;
@@ -60,6 +114,80 @@ pub fn build_npz_f32(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
         zip.write_all(&entry_bytes).unwrap();
     }
     zip.finish().unwrap().into_inner()
+}
+
+/// An `NPY` v2 file: magic (6) + version (2) + `u32` header length (4), then
+/// `dict` verbatim, padded with spaces to a 16-byte boundary and ended by a
+/// newline as `NumPy` writes it, then `data`.
+fn npy_v2(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut header = dict.as_bytes().to_vec();
+    while !(12 + header.len() + 1).is_multiple_of(16) {
+        header.push(b' ');
+    }
+    header.push(b'\n');
+    let mut npy = b"\x93NUMPY\x02\x00".to_vec();
+    npy.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+    npy.extend_from_slice(&header);
+    npy.extend_from_slice(data);
+    npy
+}
+
+/// Builds an `NPZ` archive from raw `NPY` v2 entries, each `(array name, header
+/// dict, data)`, all `STORED`. The header dict is written verbatim (padded and
+/// newline-terminated as `NumPy` does), so a test can declare shapes, orders and
+/// dtypes `build_npz_f32` would never produce.
+pub fn build_npz_raw(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
+    let options: zip::write::SimpleFileOptions =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, dict, data) in entries {
+        zip.start_file(format!("{name}.npy"), options).unwrap();
+        zip.write_all(&npy_v2(dict, data)).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// A one-array `NPZ` (entry `w.npy`, `STORED` or `DEFLATE`) whose central
+/// directory then claims `declared_size` uncompressed bytes, whatever the entry
+/// really holds (`None` leaves the honest size): the size lie behind Phase 7.9
+/// audit finding M-6. The archive is written by the `zip` crate and only the
+/// central-directory field is patched, which is the one the vendored reader
+/// trusts.
+pub fn npz_with_declared_size(
+    dict: &str,
+    data: &[u8],
+    deflate: bool,
+    declared_size: Option<u32>,
+) -> Vec<u8> {
+    use std::io::Write;
+    let npy = npy_v2(dict, data);
+
+    let method = if deflate {
+        zip::CompressionMethod::Deflated
+    } else {
+        zip::CompressionMethod::Stored
+    };
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
+    zip.start_file(
+        "w.npy",
+        zip::write::SimpleFileOptions::default().compression_method(method),
+    )
+    .unwrap();
+    zip.write_all(&npy).unwrap();
+    let mut bytes = zip.finish().unwrap().into_inner();
+    let Some(declared_size) = declared_size else {
+        return bytes;
+    };
+
+    // Central-directory file header: signature, then the uncompressed size at
+    // byte 24.
+    let cd = bytes
+        .windows(4)
+        .position(|w| w == b"PK\x01\x02")
+        .expect("central directory");
+    bytes[cd + 24..cd + 28].copy_from_slice(&declared_size.to_le_bytes());
+    bytes
 }
 
 /// Writes `bytes` to `fixture.<ext>` in a fresh temp directory. The returned

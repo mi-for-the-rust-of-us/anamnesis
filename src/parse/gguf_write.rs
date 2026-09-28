@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::Path;
 
 use crate::error::AnamnesisError;
@@ -42,12 +42,6 @@ const GGUF_WRITE_VERSION: u32 = 3;
 
 /// Metadata key that records the tensor-data alignment in the produced file.
 const ALIGNMENT_KEY: &str = "general.alignment";
-
-/// Internal `BufWriter` capacity for the path-based [`write_gguf`] entry
-/// point. 64 `KiB` matches the
-/// [`READER_BUF_SIZE`](super::gguf) the parser uses on the read side, so
-/// the syscall amortisation envelope is symmetric end-to-end.
-const WRITER_BUF_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // GgufWriteTensor
@@ -87,19 +81,24 @@ pub struct GgufWriteTensor<'a> {
 ///
 /// `metadata` is the caller-supplied `KV` table. `general.alignment` is
 /// injected automatically if absent (default 32 B); if present it must be a
-/// non-zero `U32`. Tensor-data alignment respects whichever value ends up in
-/// the written file.
+/// `U32` power of two, as llama.cpp requires. Tensor-data alignment respects
+/// whichever value ends up in the written file.
 ///
 /// Tensors are emitted in the order supplied. Their `data_offset`s are
 /// laid out contiguously inside the data section, each rounded up to the
 /// next alignment boundary. The data section itself starts at the first
 /// alignment boundary past the tensor-info table.
 ///
+/// The file is written to a temporary file in the same directory and renamed
+/// over `path` only once complete, so an error (a rejected tensor, a bad
+/// alignment, a full disk) leaves an existing `path` as it was. Until v0.7.9
+/// `path` was truncated first.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Unsupported`] when any tensor's dtype is
 /// `is_quantized()` (quantised emit lands in Phase 8.5), or when a supplied
-/// `general.alignment` value is non-`U32` or zero.
+/// `general.alignment` value is non-`U32` or not a power of two.
 ///
 /// Returns [`AnamnesisError::Parse`] when a tensor's `data.len()` disagrees
 /// with the dtype/shape-implied byte count, when any element-count or offset
@@ -121,9 +120,13 @@ pub fn write_gguf<S: BuildHasher>(
     tensors: &[GgufWriteTensor<'_>],
     metadata: &HashMap<String, GgufMetadataValue, S>,
 ) -> crate::Result<()> {
-    let file = std::fs::File::create(path.as_ref()).map_err(AnamnesisError::Io)?;
-    let writer = BufWriter::with_capacity(WRITER_BUF_SIZE, file);
-    write_gguf_to_writer(writer, tensors, metadata)
+    // Through a temporary file renamed into place: a validation error (a
+    // quantised dtype, a bad alignment) or an I/O failure leaves `path` as it
+    // was, where `File::create` used to truncate it first (Phase 7.9, audit
+    // finding M-8).
+    crate::fsio::write_atomically(path.as_ref(), |writer| {
+        write_gguf_to_writer(writer, tensors, metadata)
+    })
 }
 
 /// Reader-generic core of [`write_gguf`]: emits a `GGUF` v3 file into any
@@ -157,8 +160,8 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
     crate::parse::utils::reject_duplicate_names(tensors.iter().map(|t| t.name))?;
 
     // 2. Resolve the effective alignment. If the caller supplied
-    //    `general.alignment` we honour it (provided it is a non-zero
-    //    `U32`); otherwise we inject the default so the file is fully
+    //    `general.alignment` we honour it (provided it is a `U32` power of
+    //    two); otherwise we inject the default so the file is fully
     //    self-describing.
     let (alignment_u32, needs_inject_alignment) = resolve_alignment(metadata)?;
     let alignment_u64 = u64::from(alignment_u32);
@@ -425,10 +428,16 @@ fn resolve_alignment<S: BuildHasher>(
     metadata: &HashMap<String, GgufMetadataValue, S>,
 ) -> crate::Result<(u32, bool)> {
     match metadata.get(ALIGNMENT_KEY) {
-        Some(GgufMetadataValue::U32(v)) if *v != 0 => Ok((*v, false)),
-        Some(GgufMetadataValue::U32(_)) => Err(AnamnesisError::Unsupported {
+        Some(GgufMetadataValue::U32(v)) if crate::parse::gguf::is_valid_alignment(*v) => {
+            Ok((*v, false))
+        }
+        Some(GgufMetadataValue::U32(0)) => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: "general.alignment must be non-zero".into(),
+        }),
+        Some(GgufMetadataValue::U32(v)) => Err(AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!("general.alignment must be a power of two, got {v}"),
         }),
         Some(_) => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
@@ -733,12 +742,14 @@ mod tests {
     fn write_to_tempfile(
         tensors: &[GgufWriteTensor<'_>],
         metadata: &HashMap<String, GgufMetadataValue>,
-    ) -> tempfile::NamedTempFile {
+    ) -> tempfile::TempPath {
         let tmp = tempfile::Builder::new()
             .suffix(".gguf")
             .tempfile()
-            .expect("create tempfile");
-        write_gguf(tmp.path(), tensors, metadata).expect("write_gguf");
+            .expect("create tempfile")
+            // Closed, so the atomic write can rename over it on every platform.
+            .into_temp_path();
+        write_gguf(&*tmp, tensors, metadata).expect("write_gguf");
         tmp
     }
 
@@ -751,7 +762,7 @@ mod tests {
         );
 
         let tmp = write_to_tempfile(&[], &metadata);
-        let parsed = parse_gguf(tmp.path()).expect("parse_gguf");
+        let parsed = parse_gguf(&*tmp).expect("parse_gguf");
 
         assert_eq!(parsed.version(), 3);
         assert!(parsed.is_empty());
@@ -787,7 +798,7 @@ mod tests {
         }];
 
         let tmp = write_to_tempfile(&tensors, &HashMap::new());
-        let parsed = parse_gguf(tmp.path()).expect("parse_gguf");
+        let parsed = parse_gguf(&*tmp).expect("parse_gguf");
         let collected: Vec<_> = parsed.tensors().collect();
         assert_eq!(collected.len(), 1);
         let t = &collected[0];
@@ -828,7 +839,7 @@ mod tests {
         ];
 
         let tmp = write_to_tempfile(&tensors, &HashMap::new());
-        let parsed = parse_gguf(tmp.path()).expect("parse_gguf");
+        let parsed = parse_gguf(&*tmp).expect("parse_gguf");
         let collected: Vec<_> = parsed.tensors().collect();
         assert_eq!(collected.len(), 3);
 
@@ -883,7 +894,7 @@ mod tests {
         );
 
         let tmp = write_to_tempfile(&[], &metadata);
-        let parsed = parse_gguf(tmp.path()).expect("parse_gguf");
+        let parsed = parse_gguf(&*tmp).expect("parse_gguf");
 
         assert_eq!(
             parsed
@@ -944,8 +955,10 @@ mod tests {
         let tmp = tempfile::Builder::new()
             .suffix(".gguf")
             .tempfile()
-            .expect("create tempfile");
-        let err = write_gguf(tmp.path(), &tensors, &HashMap::new()).expect_err("should reject");
+            .expect("create tempfile")
+            // Closed, so the atomic write can rename over it on every platform.
+            .into_temp_path();
+        let err = write_gguf(&*tmp, &tensors, &HashMap::new()).expect_err("should reject");
         match err {
             AnamnesisError::Unsupported { format, detail } => {
                 assert_eq!(format, "GGUF");
@@ -969,8 +982,10 @@ mod tests {
         let tmp = tempfile::Builder::new()
             .suffix(".gguf")
             .tempfile()
-            .expect("create tempfile");
-        let err = write_gguf(tmp.path(), &tensors, &HashMap::new()).expect_err("should reject");
+            .expect("create tempfile")
+            // Closed, so the atomic write can rename over it on every platform.
+            .into_temp_path();
+        let err = write_gguf(&*tmp, &tensors, &HashMap::new()).expect_err("should reject");
         match err {
             AnamnesisError::Parse { reason } => {
                 assert!(
@@ -997,7 +1012,7 @@ mod tests {
         metadata.insert(ALIGNMENT_KEY.into(), GgufMetadataValue::U32(8));
 
         let tmp = write_to_tempfile(&tensors, &metadata);
-        let parsed = parse_gguf(tmp.path()).expect("parse_gguf");
+        let parsed = parse_gguf(&*tmp).expect("parse_gguf");
         assert_eq!(parsed.alignment(), 8);
         for info in parsed.tensor_info() {
             assert_eq!(info.data_offset % 8, 0, "tensor `{}` misaligned", info.name);
@@ -1013,8 +1028,10 @@ mod tests {
         let tmp = tempfile::Builder::new()
             .suffix(".gguf")
             .tempfile()
-            .expect("create tempfile");
-        let err = write_gguf(tmp.path(), &[], &metadata).expect_err("should reject");
+            .expect("create tempfile")
+            // Closed, so the atomic write can rename over it on every platform.
+            .into_temp_path();
+        let err = write_gguf(&*tmp, &[], &metadata).expect_err("should reject");
         match err {
             AnamnesisError::Unsupported { format, detail } => {
                 assert_eq!(format, "GGUF");

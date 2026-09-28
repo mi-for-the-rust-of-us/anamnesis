@@ -378,7 +378,7 @@ impl fmt::Display for QuantScheme {
 /// - Fine-grained: 2D with both dims > 1 (e.g., `[16, 32]` for 128×128 blocks)
 /// - Per-channel: 2D with second dim = 1 (e.g., `[2048, 1]`, one scale per row)
 /// - Per-tensor: scalar `[]` or 1D `[1]`
-fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
+fn detect_scheme(entries: &[TensorEntry], index: &NameIndex<'_>) -> QuantScheme {
     let has_quantized = entries.iter().any(|e| e.role == TensorRole::Quantized);
     if !has_quantized {
         return QuantScheme::Unquantized;
@@ -395,7 +395,7 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
         let base = entry.name.strip_suffix(".qweight");
         if let Some(base) = base {
             let scales_name = format!("{base}.scales");
-            if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+            if let Some(scales) = index.named(&scales_name) {
                 let qw_cols = entry.shape.last().copied().unwrap_or(0);
                 let sc_cols = scales.shape.last().copied().unwrap_or(0);
 
@@ -435,9 +435,9 @@ fn detect_scheme(entries: &[TensorEntry]) -> QuantScheme {
     for entry in entries.iter().filter(|e| e.role == TensorRole::Quantized) {
         for suffix in &["_scale_inv", "_scale"] {
             let expected = format!("{}{suffix}", entry.name);
-            if let Some(scale) = entries
-                .iter()
-                .find(|s| s.name == expected && s.role == TensorRole::Scale)
+            if let Some(scale) = index
+                .named(&expected)
+                .filter(|s| s.role == TensorRole::Scale)
             {
                 // 2D scale with both dims > 1 → fine-grained block scales
                 // shape.len() >= 2 guarantees .last() is Some
@@ -621,6 +621,50 @@ pub struct SafetensorsHeader {
 }
 
 impl SafetensorsHeader {
+    /// Number of output elements `remember` produces from the quantized tensor
+    /// `entry` of this header: the one size function `inspect`'s
+    /// `dequantized_size` is built from, so the estimate a host gates on is the
+    /// output it gets.
+    ///
+    /// Most schemes store one weight per element. Two pack several:
+    ///
+    /// - `BnB` 4-bit: two weights per `U8` byte.
+    /// - `GPTQ` / `AWQ`: `32 / bits` weights per `I32` of `.qweight` (8 at
+    ///   4-bit, 4 at 8-bit). Until v0.7.9 this was missed, and `inspect`
+    ///   under-reported 4-bit models 8× (Phase 7.9, audit finding M-1). When
+    ///   the config is absent or its bit width is not 4 or 8 (the fields are
+    ///   public, so a caller can edit them), the estimate assumes 8 weights per
+    ///   element: an over-estimate refuses more, never less.
+    ///
+    /// Saturating, because the result feeds a size estimate: an absurd shape
+    /// reads as `u64::MAX`, which a gate treats as too big.
+    pub(crate) fn dequantized_elements(&self, entry: &TensorEntry) -> u64 {
+        // CAST: usize → u64, element and byte counts fit in u64
+        #[allow(clippy::as_conversions)]
+        let (elements, bytes) = (entry.num_elements() as u64, entry.byte_len() as u64);
+        if self.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
+            return bytes.saturating_mul(2);
+        }
+        if entry.dtype != Dtype::I32 {
+            return elements;
+        }
+        // `Some(bits)` for a packed scheme: `bits` is the configured width,
+        // itself `None` when the config is absent.
+        let packed_bits = if self.scheme == QuantScheme::Gptq {
+            Some(self.gptq_config.as_ref().map(|c| c.bits))
+        } else if self.scheme == QuantScheme::Awq {
+            Some(self.awq_config.as_ref().map(|c| c.bits))
+        } else {
+            None
+        };
+        match packed_bits {
+            None => elements,
+            Some(Some(8)) => elements.saturating_mul(4),
+            // 4-bit, or an absent / unusable width: assume the larger factor.
+            Some(Some(_) | None) => elements.saturating_mul(8),
+        }
+    }
+
     /// Returns an iterator over quantized tensors.
     pub fn quantized_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
         self.tensors
@@ -661,14 +705,13 @@ impl SafetensorsHeader {
     /// Finds the scale tensor for a given weight tensor name.
     ///
     /// Looks for `{weight_name}_scale_inv` first, then `{weight_name}_scale`.
+    ///
+    /// A linear scan per call. The crate's own dequantisation looks every
+    /// companion up through an index built once instead, so a header with many
+    /// tensors does not cost `O(N²)`.
     #[must_use]
     pub fn find_scale_for(&self, weight_name: &str) -> Option<&TensorEntry> {
-        let scale_inv = format!("{weight_name}_scale_inv");
-        let scale = format!("{weight_name}_scale");
-        self.tensors
-            .iter()
-            .find(|e| e.name == scale_inv)
-            .or_else(|| self.tensors.iter().find(|e| e.name == scale))
+        scale_for(&self.tensors.as_slice(), weight_name)
     }
 
     /// Returns an iterator over zero-point tensors.
@@ -702,38 +745,22 @@ impl SafetensorsHeader {
     ///
     /// Strips the `.qweight` suffix and looks up `{base}.scales`,
     /// `{base}.qzeros`, and `{base}.g_idx` by name.
+    ///
+    /// A linear scan per call, like [`find_scale_for`](Self::find_scale_for).
     #[must_use]
     pub fn find_gptq_companions(&self, qweight_name: &str) -> Option<GptqCompanions<'_>> {
-        let base = qweight_name.strip_suffix(".qweight")?;
-        let scales_name = format!("{base}.scales");
-        let qzeros_name = format!("{base}.qzeros");
-        let g_idx_name = format!("{base}.g_idx");
-
-        let scales = self.tensors.iter().find(|e| e.name == scales_name)?;
-        let qzeros = self.tensors.iter().find(|e| e.name == qzeros_name)?;
-        let g_idx = self.tensors.iter().find(|e| e.name == g_idx_name);
-
-        Some(GptqCompanions {
-            scales,
-            qzeros,
-            g_idx,
-        })
+        gptq_companions(&self.tensors.as_slice(), qweight_name)
     }
 
     /// Finds the `AWQ` companion tensors (`.scales`, `.qzeros`) for a given
     /// `.qweight` tensor name.
     ///
     /// Same tensor names as `GPTQ` but no `.g_idx` (AWQ always uses sequential groups).
+    ///
+    /// A linear scan per call, like [`find_scale_for`](Self::find_scale_for).
     #[must_use]
     pub fn find_awq_companions(&self, qweight_name: &str) -> Option<AwqCompanions<'_>> {
-        let base = qweight_name.strip_suffix(".qweight")?;
-        let scales_name = format!("{base}.scales");
-        let qzeros_name = format!("{base}.qzeros");
-
-        let scales = self.tensors.iter().find(|e| e.name == scales_name)?;
-        let qzeros = self.tensors.iter().find(|e| e.name == qzeros_name)?;
-
-        Some(AwqCompanions { scales, qzeros })
+        awq_companions(&self.tensors.as_slice(), qweight_name)
     }
 
     /// Returns an iterator over quant-map tensors (`BnB` lookup tables).
@@ -768,46 +795,166 @@ impl SafetensorsHeader {
     /// Looks up `{name}.absmax`, `{name}.quant_map`, and optionally
     /// `{name}.nested_absmax`, `{name}.nested_quant_map`, and
     /// `{name}.quant_state.bitsandbytes__*`.
+    ///
+    /// A linear scan per call, like [`find_scale_for`](Self::find_scale_for).
     #[must_use]
     pub fn find_bnb4_companions(&self, weight_name: &str) -> Option<Bnb4Companions<'_>> {
-        let absmax_name = format!("{weight_name}.absmax");
-        let quant_map_name = format!("{weight_name}.quant_map");
-        let nested_absmax_name = format!("{weight_name}.nested_absmax");
-        let nested_quant_map_name = format!("{weight_name}.nested_quant_map");
-        // quant_state tensor name varies: `.quant_state.bitsandbytes__nf4` or `__fp4`
-        let quant_state_prefix = format!("{weight_name}.quant_state.bitsandbytes__");
-
-        let absmax = self.tensors.iter().find(|e| e.name == absmax_name)?;
-        let quant_map = self.tensors.iter().find(|e| e.name == quant_map_name)?;
-        let nested_absmax = self.tensors.iter().find(|e| e.name == nested_absmax_name);
-        let nested_quant_map = self
-            .tensors
-            .iter()
-            .find(|e| e.name == nested_quant_map_name);
-        let quant_state = self
-            .tensors
-            .iter()
-            .find(|e| e.name.starts_with(&quant_state_prefix));
-
-        Some(Bnb4Companions {
-            absmax,
-            quant_map,
-            nested_absmax,
-            nested_quant_map,
-            quant_state,
-        })
+        bnb4_companions(&self.tensors.as_slice(), weight_name)
     }
 
     /// Finds the `BnB` `INT8` companion tensor (`.SCB`) for a given `.weight`
     /// tensor name.
     ///
     /// Strips the `.weight` suffix and looks up `{base}.SCB`.
+    ///
+    /// A linear scan per call, like [`find_scale_for`](Self::find_scale_for).
     #[must_use]
     pub fn find_bnb_int8_scb(&self, weight_name: &str) -> Option<&TensorEntry> {
-        let base = weight_name.strip_suffix(".weight")?;
-        let scb_name = format!("{base}.SCB");
-        self.tensors.iter().find(|e| e.name == scb_name)
+        bnb_int8_scb(&self.tensors.as_slice(), weight_name)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Name lookup
+// ---------------------------------------------------------------------------
+
+/// Finds tensors by name, answering exactly as a first-match linear scan of the
+/// tensor list would.
+///
+/// Two implementations: the tensor slice itself (a linear scan, what the public
+/// `find_*` methods use for a one-off lookup) and [`NameIndex`] (a binary search
+/// over an index built once, what the crate uses wherever one call looks up a
+/// companion for every tensor). Until v0.7.9 every such loop scanned the whole
+/// list per tensor, so 40 000 empty tensors cost 1.85 s and the 100 MiB header
+/// cap admitted inputs costing about 40 minutes (Phase 7.9, audit finding M-7).
+pub(crate) trait NameLookup<'a> {
+    /// The first tensor named `name`.
+    fn named(&self, name: &str) -> Option<&'a TensorEntry>;
+    /// The first tensor whose name starts with `prefix`.
+    fn first_with_prefix(&self, prefix: &str) -> Option<&'a TensorEntry>;
+}
+
+impl<'a> NameLookup<'a> for &'a [TensorEntry] {
+    fn named(&self, name: &str) -> Option<&'a TensorEntry> {
+        self.iter().find(|e| e.name == name)
+    }
+
+    fn first_with_prefix(&self, prefix: &str) -> Option<&'a TensorEntry> {
+        self.iter().find(|e| e.name.starts_with(prefix))
+    }
+}
+
+/// A name index over a tensor list, built once in `O(N log N)` and queried in
+/// `O(log N)`.
+///
+/// It records positions rather than assuming the list is sorted: the
+/// [`SafetensorsHeader::tensors`] field is public, so a caller may have
+/// reordered or edited it after parsing, and the answers must still be the
+/// linear scan's. The sort is stable, so among equal names the first in list
+/// order comes first, and a prefix query returns the lowest list position in
+/// its range.
+pub(crate) struct NameIndex<'a> {
+    /// The tensor list the positions refer to.
+    entries: &'a [TensorEntry],
+    /// `(name, position in entries)`, stably sorted by name.
+    sorted: Vec<(&'a str, usize)>,
+}
+
+impl<'a> NameIndex<'a> {
+    /// Indexes `entries` by name.
+    pub(crate) fn new(entries: &'a [TensorEntry]) -> Self {
+        let mut sorted: Vec<(&'a str, usize)> = entries
+            .iter()
+            .enumerate()
+            // BORROW: explicit `.as_str()`, indexing the borrowed names.
+            .map(|(position, entry)| (entry.name.as_str(), position))
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        Self { entries, sorted }
+    }
+}
+
+impl<'a> NameLookup<'a> for NameIndex<'a> {
+    fn named(&self, name: &str) -> Option<&'a TensorEntry> {
+        let start = self.sorted.partition_point(|&(n, _)| n < name);
+        self.sorted
+            .get(start)
+            .filter(|&&(n, _)| n == name)
+            .and_then(|&(_, position)| self.entries.get(position))
+    }
+
+    fn first_with_prefix(&self, prefix: &str) -> Option<&'a TensorEntry> {
+        let start = self.sorted.partition_point(|&(n, _)| n < prefix);
+        self.sorted
+            .get(start..)?
+            .iter()
+            .take_while(|(n, _)| n.starts_with(prefix))
+            .map(|&(_, position)| position)
+            .min()
+            .and_then(|position| self.entries.get(position))
+    }
+}
+
+/// The scale tensor of an `FP8` weight: `{weight_name}_scale_inv` first, then
+/// `{weight_name}_scale`.
+pub(crate) fn scale_for<'a>(
+    tensors: &impl NameLookup<'a>,
+    weight_name: &str,
+) -> Option<&'a TensorEntry> {
+    tensors
+        .named(&format!("{weight_name}_scale_inv"))
+        .or_else(|| tensors.named(&format!("{weight_name}_scale")))
+}
+
+/// The `GPTQ` companions of a `.qweight`: `.scales`, `.qzeros`, optional
+/// `.g_idx`.
+pub(crate) fn gptq_companions<'a>(
+    tensors: &impl NameLookup<'a>,
+    qweight_name: &str,
+) -> Option<GptqCompanions<'a>> {
+    let base = qweight_name.strip_suffix(".qweight")?;
+    Some(GptqCompanions {
+        scales: tensors.named(&format!("{base}.scales"))?,
+        qzeros: tensors.named(&format!("{base}.qzeros"))?,
+        g_idx: tensors.named(&format!("{base}.g_idx")),
+    })
+}
+
+/// The `AWQ` companions of a `.qweight`: `.scales` and `.qzeros`.
+pub(crate) fn awq_companions<'a>(
+    tensors: &impl NameLookup<'a>,
+    qweight_name: &str,
+) -> Option<AwqCompanions<'a>> {
+    let base = qweight_name.strip_suffix(".qweight")?;
+    Some(AwqCompanions {
+        scales: tensors.named(&format!("{base}.scales"))?,
+        qzeros: tensors.named(&format!("{base}.qzeros"))?,
+    })
+}
+
+/// The `BnB` 4-bit companions of a `.weight`.
+pub(crate) fn bnb4_companions<'a>(
+    tensors: &impl NameLookup<'a>,
+    weight_name: &str,
+) -> Option<Bnb4Companions<'a>> {
+    Some(Bnb4Companions {
+        absmax: tensors.named(&format!("{weight_name}.absmax"))?,
+        quant_map: tensors.named(&format!("{weight_name}.quant_map"))?,
+        nested_absmax: tensors.named(&format!("{weight_name}.nested_absmax")),
+        nested_quant_map: tensors.named(&format!("{weight_name}.nested_quant_map")),
+        // The quant-state name ends in the scheme: `…bitsandbytes__nf4` or `__fp4`.
+        quant_state: tensors
+            .first_with_prefix(&format!("{weight_name}.quant_state.bitsandbytes__")),
+    })
+}
+
+/// The `BnB` `INT8` companion (`.SCB`) of a `.weight`.
+pub(crate) fn bnb_int8_scb<'a>(
+    tensors: &impl NameLookup<'a>,
+    weight_name: &str,
+) -> Option<&'a TensorEntry> {
+    let base = weight_name.strip_suffix(".weight")?;
+    tensors.named(&format!("{base}.SCB"))
 }
 
 // ---------------------------------------------------------------------------
@@ -819,14 +966,14 @@ impl SafetensorsHeader {
 /// `AWQ` packs along `out_features`: `qweight` shape is `[in_features, out_features / pack_factor]`.
 /// - `bits = 32 / (out_features / qweight.cols)` where `out_features = scales.cols`
 /// - `group_size = in_features / scales.rows`
-fn infer_awq_config(entries: &[TensorEntry]) -> Option<AwqConfig> {
+fn infer_awq_config(entries: &[TensorEntry], index: &NameIndex<'_>) -> Option<AwqConfig> {
     for entry in entries
         .iter()
         .filter(|e| e.role == TensorRole::Quantized && e.name.ends_with(".qweight"))
     {
         let base = entry.name.strip_suffix(".qweight")?;
         let scales_name = format!("{base}.scales");
-        if let Some(scales) = entries.iter().find(|e| e.name == scales_name)
+        if let Some(scales) = index.named(&scales_name)
             && entry.shape.len() >= 2
             && scales.shape.len() >= 2
         {
@@ -867,6 +1014,7 @@ fn infer_awq_config(entries: &[TensorEntry]) -> Option<AwqConfig> {
 /// - `group_size = in_features / scales.rows`
 fn infer_gptq_config(
     entries: &[TensorEntry],
+    index: &NameIndex<'_>,
     metadata: Option<&HashMap<String, String>>,
 ) -> Option<GptqConfig> {
     // Try metadata first (AutoGPTQ format).
@@ -894,7 +1042,7 @@ fn infer_gptq_config(
     {
         let base = entry.name.strip_suffix(".qweight")?;
         let scales_name = format!("{base}.scales");
-        if let Some(scales) = entries.iter().find(|e| e.name == scales_name) {
+        if let Some(scales) = index.named(&scales_name) {
             // qweight shape: (in_features / pack_factor, out_features)
             // scales shape:  (num_groups, out_features)
             // in_features = scales shape's last dim tells us out_features;
@@ -941,7 +1089,7 @@ fn infer_gptq_config(
 /// - `block_size = total_elements / absmax_count`
 ///
 /// Double-quant is detected by the presence of `.weight.nested_absmax`.
-fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
+fn infer_bnb_config(entries: &[TensorEntry], index: &NameIndex<'_>) -> Option<BnbConfig> {
     // Find the first quantized weight with a .quant_map companion.
     for entry in entries
         .iter()
@@ -950,7 +1098,7 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
         let absmax_name = format!("{}.absmax", entry.name);
         let nested_name = format!("{}.nested_absmax", entry.name);
 
-        if let Some(absmax) = entries.iter().find(|e| e.name == absmax_name) {
+        if let Some(absmax) = index.named(&absmax_name) {
             // total_elements = weight bytes × 2 (two NF4 values per byte)
             let total_elements = entry.byte_len().checked_mul(2)?;
             let absmax_count = absmax.num_elements();
@@ -958,7 +1106,7 @@ fn infer_bnb_config(entries: &[TensorEntry]) -> Option<BnbConfig> {
                 return None;
             }
             let block_size = total_elements / absmax_count;
-            let double_quant = entries.iter().any(|e| e.name == nested_name);
+            let double_quant = index.named(&nested_name).is_some();
 
             return Some(BnbConfig {
                 block_size,
@@ -1041,7 +1189,7 @@ pub fn parse_safetensors_header_with_limits(
 
     let (header_size, metadata) =
         safetensors::SafeTensors::read_metadata(buffer).map_err(AnamnesisError::from)?;
-    build_header_from_metadata(header_size, &metadata)
+    build_header_from_metadata(header_size, &metadata, limits)
 }
 
 /// Builds a [`SafetensorsHeader`] from a pre-parsed
@@ -1056,8 +1204,16 @@ pub fn parse_safetensors_header_with_limits(
 fn build_header_from_metadata(
     header_size: usize,
     metadata: &safetensors::tensor::Metadata,
+    limits: &ParseLimits,
 ) -> crate::Result<SafetensorsHeader> {
     let st_tensors = metadata.tensors();
+    // `max_item_count` applies to safetensors too (Phase 7.9, audit finding
+    // M-7): until v0.7.9 it was documented for `GGUF` and `ZIP` only, so a
+    // header of 40 000 tensors passed a limit of 1000.
+    let count = u64::try_from(st_tensors.len()).map_err(|_| AnamnesisError::Parse {
+        reason: "safetensors tensor count overflows u64".into(),
+    })?;
+    limits.check_item_count(count, "safetensors tensor count")?;
     let mut entries = Vec::with_capacity(st_tensors.len());
 
     for (name, info) in &st_tensors {
@@ -1075,23 +1231,24 @@ fn build_header_from_metadata(
     // Sort by name for deterministic ordering (HashMap iteration is arbitrary).
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let scheme = detect_scheme(&entries);
+    let index = NameIndex::new(&entries);
+    let scheme = detect_scheme(&entries, &index);
     let file_metadata = metadata.metadata().clone();
 
     let gptq_config = if scheme == QuantScheme::Gptq {
-        infer_gptq_config(&entries, file_metadata.as_ref())
+        infer_gptq_config(&entries, &index, file_metadata.as_ref())
     } else {
         None
     };
 
     let awq_config = if scheme == QuantScheme::Awq {
-        infer_awq_config(&entries)
+        infer_awq_config(&entries, &index)
     } else {
         None
     };
 
     let bnb_config = if scheme == QuantScheme::Bnb4 {
-        infer_bnb_config(&entries)
+        infer_bnb_config(&entries, &index)
     } else {
         None
     };
@@ -1231,7 +1388,7 @@ pub fn parse_safetensors_header_from_reader_with_limits<R: Read>(
             reason: format!("failed to parse safetensors header: {e}"),
         })?;
 
-    build_header_from_metadata(header_len, &metadata)
+    build_header_from_metadata(header_len, &metadata, limits)
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,6 +1501,41 @@ mod tests {
 
     // -- Scheme detection ----------------------------------------------------
 
+    /// The index must answer exactly as the linear scan the public `find_*`
+    /// methods use, including on a list a caller has reordered, and for names
+    /// that repeat (Phase 7.9, audit finding M-7).
+    #[test]
+    fn name_index_agrees_with_the_linear_scan() {
+        let entries: Vec<TensorEntry> = ["b", "a.x", "c", "a", "b", "a.q_2", "a.q_1"]
+            .iter()
+            .map(|name| make_entry(name, Dtype::F32, TensorRole::Passthrough))
+            .collect();
+        let index = NameIndex::new(&entries);
+        let linear = entries.as_slice();
+        let position = |found: Option<&TensorEntry>| {
+            found.and_then(|e| entries.iter().position(|x| std::ptr::eq(x, e)))
+        };
+        for name in ["a", "b", "c", "a.x", "missing", ""] {
+            assert_eq!(
+                position(index.named(name)),
+                position(linear.named(name)),
+                "named({name:?})"
+            );
+        }
+        // The duplicate `b` resolves to its first occurrence, position 0.
+        assert_eq!(position(index.named("b")), Some(0));
+        for prefix in ["a.q_", "a.", "a", "z", ""] {
+            assert_eq!(
+                position(index.first_with_prefix(prefix)),
+                position(linear.first_with_prefix(prefix)),
+                "first_with_prefix({prefix:?})"
+            );
+        }
+        // Of the two `a.q_*` names, the first in list order (position 5), not
+        // the smallest by name (`a.q_1`, position 6).
+        assert_eq!(position(index.first_with_prefix("a.q_")), Some(5));
+    }
+
     fn make_entry(name: &str, dtype: Dtype, role: TensorRole) -> TensorEntry {
         make_entry_with_shape(name, dtype, role, vec![128, 128])
     }
@@ -1421,7 +1613,10 @@ mod tests {
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
             make_entry("lm_head.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
-        assert_eq!(detect_scheme(&entries), QuantScheme::Unquantized);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::Unquantized
+        );
     }
 
     #[test]
@@ -1431,7 +1626,10 @@ mod tests {
             make_entry("layer.0.weight_scale_inv", Dtype::F32, TensorRole::Scale),
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
-        assert_eq!(detect_scheme(&entries), QuantScheme::FineGrainedFp8);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::FineGrainedFp8
+        );
     }
 
     #[test]
@@ -1440,7 +1638,10 @@ mod tests {
             make_entry("layer.0.weight", Dtype::F8E4M3, TensorRole::Quantized),
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
-        assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::PerTensorFp8
+        );
     }
 
     #[test]
@@ -1463,7 +1664,10 @@ mod tests {
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
         // Scalar scale_inv → per-tensor, NOT fine-grained
-        assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::PerTensorFp8
+        );
     }
 
     #[test]
@@ -1479,7 +1683,10 @@ mod tests {
             ),
         ];
         // 1D scale_inv → per-tensor, NOT fine-grained
-        assert_eq!(detect_scheme(&entries), QuantScheme::PerTensorFp8);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::PerTensorFp8
+        );
     }
 
     #[test]
@@ -1501,7 +1708,10 @@ mod tests {
             make_entry("model.norm.weight", Dtype::BF16, TensorRole::Passthrough),
         ];
         // 2D scale_inv → fine-grained
-        assert_eq!(detect_scheme(&entries), QuantScheme::FineGrainedFp8);
+        assert_eq!(
+            detect_scheme(&entries, &NameIndex::new(&entries)),
+            QuantScheme::FineGrainedFp8
+        );
     }
 
     // -- find_scale_for ------------------------------------------------------

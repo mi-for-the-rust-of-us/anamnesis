@@ -175,3 +175,23 @@ runs (coverage 3479), `fuzz_convert_bytes` 2.7 M runs (coverage 5943, up from
 4184 now that the fuzzer gets past the old crash): **zero crashes**. The lesson
 is recorded in `CLAUDE.md` § Fuzzing: a compile check is not coverage, and
 both targets crashed within three minutes of their first real run.
+
+**Phase 7.9 campaign (v0.7.9, 2026-09-28)**, WSL2 Ubuntu, nightly + `cargo-fuzz`
+0.13.1, 180 s per target, run on the security-hardening branch after every
+fix had landed. This time with `-rss_limit_mb=2048` **and** `-timeout=10`:
+the audit's findings were files that parse cleanly and then allocate gigabytes
+or run for minutes, which a fuzzer reports only when a resource limit turns
+them into a failure.
+
+| Target | Runs | Coverage | RSS | Result |
+|---|---:|---:|---:|---|
+| `fuzz_pth_bytes` | 53.9 M | 177 | 417 MB | clean |
+| `fuzz_npz_bytes` | 37.6 M | 281 | 466 MB | clean |
+| `fuzz_gguf_bytes` | 6.0 M | 777 | 411 MB | clean |
+| `fuzz_convert_bytes` | 2.0 M | 2080 | 454 MB | clean |
+
+**≈99.6 M executions, no crash, no timeout, no RSS overrun.** None of the
+audit's proofs of concept had been found by fuzzing before: each returns `Ok`
+from the parse, so only a resource limit could have flagged it. They are
+pinned as tests instead (`tests/security_regressions.rs`,
+`tests/peak_heap_npz_declared_size.rs`) and a few feed `tests/no_panic.rs`.

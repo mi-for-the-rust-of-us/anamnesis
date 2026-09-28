@@ -81,3 +81,57 @@ pub fn check_bf16_against_golden(
         "{name}: {mismatches}/{total} elements differ by more than {max_ulp} ULP"
     );
 }
+
+/// One tensor-info record of a raw `GGUF` file.
+pub struct RawTensorInfo<'a> {
+    /// Tensor name.
+    pub name: &'a str,
+    /// Dimensions as stored on disk (innermost first).
+    pub dims: &'a [u64],
+    /// `ggml_type` discriminant (`0` = `F32`).
+    pub ggml_type: u32,
+    /// Offset relative to the start of the tensor-data section.
+    pub offset: u64,
+}
+
+/// `GGUF` metadata value type discriminant for `UINT32`.
+pub const GGUF_KV_U32: u32 = 4;
+
+/// Writes a `GGUF` v3 file byte for byte, with none of the writer's validation:
+/// the hostile-input tests need files the crate's own writer refuses to make
+/// (aliased offsets, odd alignments). Each metadata entry is
+/// `(key, value type discriminant, encoded value)`. The tensor-info table is
+/// padded to `alignment`, then `data` follows.
+pub fn raw_gguf(
+    kvs: &[(&str, u32, &[u8])],
+    tensors: &[RawTensorInfo<'_>],
+    alignment: usize,
+    data: &[u8],
+) -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, text: &str) {
+        out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
+    let mut out = b"GGUF".to_vec();
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+    for (key, value_type, value) in kvs {
+        string(&mut out, key);
+        out.extend_from_slice(&value_type.to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    for t in tensors {
+        string(&mut out, t.name);
+        out.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+        for dim in t.dims {
+            out.extend_from_slice(&dim.to_le_bytes());
+        }
+        out.extend_from_slice(&t.ggml_type.to_le_bytes());
+        out.extend_from_slice(&t.offset.to_le_bytes());
+    }
+    let pad = (alignment - out.len() % alignment) % alignment;
+    out.resize(out.len() + pad, 0);
+    out.extend_from_slice(data);
+    out
+}

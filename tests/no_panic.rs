@@ -40,6 +40,8 @@
     clippy::wildcard_enum_match_arm
 )]
 
+mod common;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
@@ -158,6 +160,74 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
                 flipped[pos] ^= 0xFF;
                 inputs.push((format!("{name}@flip{pos}"), flipped));
             }
+        }
+    }
+
+    // Crafted hostile `.pth` files from the Phase 7.9 audit, with their
+    // near-misses: before the fix, the first one aborted the process on any call
+    // that materialised it, which `catch_unwind` cannot observe.
+    #[cfg(feature = "pth")]
+    for (label, bytes) in [
+        (
+            "pth-expanded-2^62",
+            common::pth::single_u8_view(&[1 << 62, 3], &[0, 0], &[7]),
+        ),
+        (
+            "pth-expanded-2^30",
+            common::pth::single_u8_view(&[1 << 30], &[0], &[7]),
+        ),
+        (
+            "pth-position-ids",
+            common::pth::single_u8_view(&[1, 4], &[0, 1], &[1, 2, 3, 4]),
+        ),
+    ] {
+        let len = bytes.len();
+        for cut in [len / 2, len.saturating_sub(1)] {
+            inputs.push((format!("{label}@trunc{cut}"), bytes[..cut].to_vec()));
+        }
+        let mut flipped = bytes.clone();
+        flipped[len / 2] ^= 0xFF;
+        inputs.push((format!("{label}@flip"), flipped));
+        inputs.push((format!("{label}@whole"), bytes));
+    }
+
+    // Crafted hostile `GGUF` files from the Phase 7.9 audit: tensors aliasing
+    // one data range, and an alignment that is not a power of two.
+    #[cfg(feature = "gguf")]
+    {
+        use common::gguf::{GGUF_KV_U32, RawTensorInfo, raw_gguf};
+        let dims = [4u64];
+        let aliased: Vec<RawTensorInfo<'_>> = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| RawTensorInfo {
+                name,
+                dims: &dims,
+                ggml_type: 0,
+                offset: 0,
+            })
+            .collect();
+        let odd = 48u32.to_le_bytes();
+        for (label, bytes) in [
+            ("gguf-aliased", raw_gguf(&[], &aliased, 32, &[0u8; 16])),
+            (
+                "gguf-alignment-48",
+                raw_gguf(
+                    &[("general.alignment", GGUF_KV_U32, &odd)],
+                    &aliased[..1],
+                    48,
+                    &[0u8; 16],
+                ),
+            ),
+        ] {
+            let len = bytes.len();
+            inputs.push((
+                format!("{label}@trunc{}", len / 2),
+                bytes[..len / 2].to_vec(),
+            ));
+            let mut flipped = bytes.clone();
+            flipped[len / 2] ^= 0xFF;
+            inputs.push((format!("{label}@flip"), flipped));
+            inputs.push((format!("{label}@whole"), bytes));
         }
     }
 

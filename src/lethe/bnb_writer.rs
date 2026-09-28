@@ -126,6 +126,10 @@ fn quant_state_json_bytes(shape: &[usize]) -> Vec<u8> {
 /// Tensor output order is sorted by tensor name lexicographically for
 /// deterministic serialisation.
 ///
+/// The file is written to a temporary file in the same directory and renamed
+/// over `output` only once complete, so a failed write leaves an existing
+/// `output` as it was.
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] when an input's `bf16_data.len()`
@@ -151,7 +155,11 @@ pub fn write_bnb_nf4_safetensors(
     output: impl AsRef<Path>,
 ) -> crate::Result<()> {
     let bytes = write_bnb_nf4_safetensors_bytes(inputs)?;
-    std::fs::write(output.as_ref(), &bytes).map_err(AnamnesisError::Io)
+    // Through a temporary file renamed into place, so a failed write leaves
+    // any previous `output` intact (Phase 7.9, audit finding M-8).
+    crate::fsio::write_atomically(output.as_ref(), |writer| {
+        std::io::Write::write_all(writer, &bytes).map_err(AnamnesisError::Io)
+    })
 }
 
 /// In-memory variant of [`write_bnb_nf4_safetensors`]. Returns the
