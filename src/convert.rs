@@ -759,12 +759,18 @@ pub fn derive_output_path_for_dtype(
 /// Returns [`AnamnesisError::Unsupported`] if the input format's Cargo feature
 /// is disabled, if the target is not reachable from this input, or if a tensor's
 /// dtype has no counterpart in the target format.
-/// Returns [`AnamnesisError::LimitExceeded`] if the input breaches
-/// `options.limits` or a permanent per-format cap.
+/// Returns [`AnamnesisError::LimitExceeded`] if the input, or the hub it would
+/// materialise, breaches `options.limits` or a permanent per-format cap.
 /// Returns [`AnamnesisError::Parse`] on a malformed input, and
-/// [`AnamnesisError::Io`] if the input cannot be read or the output written.
+/// [`AnamnesisError::Io`] if the input cannot be read, the output cannot be
+/// written, or `output` is the input file itself (kind `InvalidInput`, checked
+/// before anything is read).
 /// Returns [`AnamnesisError::Cancelled`] if `options.cancel` is set before the
 /// run completes; no output file is written.
+///
+/// The output is written to a temporary file in its directory and renamed into
+/// place only once complete, so an error at any point leaves an existing
+/// `output` as it was. An existing `output` is replaced on success.
 ///
 /// # Memory
 ///
@@ -817,6 +823,9 @@ where
     // TRAIT_OBJECT: the hook threads through several private readers with
     // different generic parameters; one `&mut dyn FnMut()` keeps a single
     // signature instead of a type parameter on each of them.
+    // Before reading anything: replacing the input while it is being read
+    // wastes the run at best (Phase 7.9, audit finding M-8).
+    crate::fsio::refuse_same_file(input, output)?;
     let hub = read_hub(input, options, &mut on_tensor)?;
     write_hub(&hub, target, Sink::File(output), options)
 }
@@ -1611,7 +1620,9 @@ fn write_bnb_nf4_target(
     let bytes = write_bnb_nf4_safetensors_bytes(&inputs)?;
     crate::cancel::check(cancel)?;
     match sink {
-        Sink::File(output) => std::fs::write(output, &bytes).map_err(AnamnesisError::Io)?,
+        Sink::File(output) => crate::fsio::write_atomically(output, |writer| {
+            std::io::Write::write_all(writer, &bytes).map_err(AnamnesisError::Io)
+        })?,
         Sink::Memory(buf) => buf.extend_from_slice(&bytes),
     }
 

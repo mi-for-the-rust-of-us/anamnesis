@@ -543,3 +543,137 @@ fn cli_output_escapes_file_text() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7.9, audit finding M-8: the GGUF and BnB writers truncated their
+// output before validating, so `-o` equal to the input destroyed the input on
+// any error, and every subcommand silently replaced an existing output.
+// ---------------------------------------------------------------------------
+
+/// Runs the CLI and returns `(success, stdout + stderr)`.
+fn run_cli(args: &[&std::ffi::OsStr]) -> (bool, String) {
+    let output = Command::new(binary_path()).args(args).output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    (output.status.success(), text)
+}
+
+/// No `.anamnesis-*.tmp` file may be left behind in `dir`.
+fn assert_no_temporaries(dir: &std::path::Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().starts_with(".anamnesis-"),
+            "temporary file left behind: {}",
+            name.display()
+        );
+    }
+}
+
+#[test]
+fn cli_refuses_to_overwrite_an_existing_output_without_force() {
+    let (dir, input) = create_test_fixture();
+    // `remember` derives `test-bf16.safetensors` from `test-fp8.safetensors`.
+    let derived = dir.path().join("test-bf16.safetensors");
+    std::fs::write(&derived, b"precious").unwrap();
+
+    let (ok, text) = run_cli(&["remember".as_ref(), input.as_os_str()]);
+    assert!(!ok, "overwrote without --force: {text}");
+    assert!(
+        text.contains("already exists") && text.contains("--force"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&derived).unwrap(), b"precious");
+
+    let (ok, text) = run_cli(&["remember".as_ref(), input.as_os_str(), "--force".as_ref()]);
+    assert!(ok, "{text}");
+    assert_ne!(std::fs::read(&derived).unwrap(), b"precious");
+    assert_no_temporaries(dir.path());
+}
+
+#[test]
+fn cli_refuses_the_input_as_output_even_with_force() {
+    let (dir, input) = create_test_fixture();
+    let before = std::fs::read(&input).unwrap();
+    for command in [&["remember"][..], &["convert", "--to", "safetensors"][..]] {
+        let mut args: Vec<&std::ffi::OsStr> = command.iter().map(AsRef::as_ref).collect();
+        args.extend([
+            input.as_os_str(),
+            "-o".as_ref(),
+            input.as_os_str(),
+            "--force".as_ref(),
+        ]);
+        let (ok, text) = run_cli(&args);
+        assert!(!ok, "{command:?}: {text}");
+        assert!(text.contains("is the input file"), "{command:?}: {text}");
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            before,
+            "{command:?} changed the input"
+        );
+    }
+    // The same file reached through another spelling.
+    let dotted = dir.path().join(".").join("test-fp8.safetensors");
+    let (ok, text) = run_cli(&[
+        "convert".as_ref(),
+        input.as_os_str(),
+        "--to".as_ref(),
+        "safetensors".as_ref(),
+        "-o".as_ref(),
+        dotted.as_os_str(),
+        "--force".as_ref(),
+    ]);
+    assert!(!ok && text.contains("is the input file"), "{text}");
+}
+
+/// The audit's reproduction: a GGUF write that fails validation (an alignment
+/// that is not a power of two) must leave an existing output as it was.
+#[cfg(feature = "gguf")]
+#[test]
+fn cli_a_failed_gguf_write_leaves_the_existing_output_intact() {
+    let (dir, input) = create_test_fixture();
+    let output = dir.path().join("out.gguf");
+    std::fs::write(&output, b"previous").unwrap();
+    let metadata = dir.path().join("kv.json");
+    std::fs::write(&metadata, br#"{"general.alignment": 48}"#).unwrap();
+
+    let (ok, text) = run_cli(&[
+        "convert".as_ref(),
+        input.as_os_str(),
+        "--to".as_ref(),
+        "gguf".as_ref(),
+        "-o".as_ref(),
+        output.as_os_str(),
+        "--gguf-metadata".as_ref(),
+        metadata.as_os_str(),
+        "--force".as_ref(),
+    ]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("power of two"), "{text}");
+    assert_eq!(std::fs::read(&output).unwrap(), b"previous");
+    assert_no_temporaries(dir.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_refuses_a_link_to_the_input_as_output() {
+    let (dir, input) = create_test_fixture();
+    let symlink = dir.path().join("sym.safetensors");
+    std::os::unix::fs::symlink(&input, &symlink).unwrap();
+    let hardlink = dir.path().join("hard.safetensors");
+    std::fs::hard_link(&input, &hardlink).unwrap();
+    for link in [&symlink, &hardlink] {
+        let (ok, text) = run_cli(&[
+            "remember".as_ref(),
+            input.as_os_str(),
+            "-o".as_ref(),
+            link.as_os_str(),
+            "--force".as_ref(),
+        ]);
+        assert!(
+            !ok && text.contains("is the input file"),
+            "{}: {text}",
+            link.display()
+        );
+    }
+}

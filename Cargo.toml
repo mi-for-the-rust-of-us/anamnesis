@@ -151,6 +151,10 @@ safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Temp-file-and-rename output writes (`src/fsio.rs`), so a failed write never
+# leaves a truncated file (Phase 7.9, audit finding M-8). Already in the tree:
+# `safetensors`' own atomic writer depends on it, so this adds no crate.
+tempfile = "3"
 
 [[bin]]
 name = "anamnesis"
@@ -219,7 +223,6 @@ criterion = { package = "codspeed-criterion-compat", version = "5" }
 # decomposition (BnB-DQ). See `tests/peak_heap_README.md` for the
 # rationale + calibration tables.
 dhat = "0.3"
-tempfile = "3"
 # Phase 6.12: `zip` is dev-only now — the runtime container parsing is owned by
 # the vendored `src/parse/zip.rs` reader. The crate is retained here for the
 # `ZipWriter` test fixtures and as the differential oracle the vendored reader

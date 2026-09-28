@@ -464,6 +464,7 @@ pub mod cancel;
 pub mod cli;
 pub mod convert;
 pub mod error;
+mod fsio;
 pub mod inspect;
 pub mod lethe;
 pub mod limits;

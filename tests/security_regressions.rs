@@ -977,3 +977,25 @@ mod m3_escaped_output {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// M-8: `convert` accepted its input as its output. With the non-atomic GGUF
+// writer of the time, a failed conversion then left the input at 0 bytes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m8_convert_refuses_its_input_as_output() {
+    let bytes = common::builders::build_fp8_checkpoint();
+    let (_dir, input) = common::builders::write_temp(&bytes, "safetensors");
+    let r = anamnesis::convert(
+        &input,
+        anamnesis::ConvertTarget::Safetensors,
+        &input,
+        &anamnesis::ConvertOptions::new(),
+    );
+    assert!(
+        matches!(&r, Err(anamnesis::AnamnesisError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), bytes);
+}

@@ -176,6 +176,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cuts them at 256; `DisallowedGlobal`'s `module` and `name` fields hold a
   48-character preview, and a disallowed `GLOBAL` line is no longer copied in
   full. Ordinary messages, quotes and backslashes included, are unchanged.
+- **Output files are written atomically, and `convert` refuses its input as
+  its output** (Phase 7.9, audit finding M-8). The `GGUF` and `BnB-NF4`
+  writers opened their destination with `File::create`, truncating it before
+  anything was validated, so any later error left an empty or partial file
+  behind: `amn convert model.gguf --to gguf -o model.gguf` with a bad
+  alignment in `--gguf-metadata` left the input at 0 bytes. Every writer now
+  goes through a temporary file in the destination directory, renamed into
+  place only once complete (the `safetensors` writers already did, upstream),
+  and `convert` / `amn` refuse an output that is the input, including through
+  a symbolic link, another spelling, or (on Unix) a hard link.
 
 ### Changed
 
@@ -188,6 +198,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that set it for `GGUF` or archive entries (the README's example uses 4096)
   now also refuses a single-file safetensors checkpoint with more tensors than
   that; raise it if you parse such files.
+- **`amn remember` and `amn convert` no longer overwrite an existing output
+  unless `--force` is given.** A derived output name made it easy to replace a
+  file by accident (`amn remember model.gguf` silently replaced a sibling
+  `model.safetensors`). Scripts that re-run a conversion into the same path
+  need `--force`. The library functions keep replacing an existing output, now
+  atomically.
+- **`GGUF` and `BnB-NF4` output files are created with mode `0600` on Unix**,
+  like the `safetensors` outputs already were (the temporary file's mode is
+  kept by the rename). `chmod` them if other users need to read them.
+- **On Windows, replacing an output that another program holds open now fails**
+  instead of succeeding: the atomic rename cannot replace a file with an open
+  handle that does not allow deletion. Close the file, or write elsewhere.
 
 ### Fixed
 

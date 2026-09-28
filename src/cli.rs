@@ -86,6 +86,12 @@ enum Commands {
         /// Output file path (derived from input if omitted).
         #[arg(long, short)]
         output: Option<PathBuf>,
+        /// Overwrite the output file if it already exists. Without it, an
+        /// existing output (including one derived from the input name) is an
+        /// error, so a rerun cannot silently replace a file. The input itself is
+        /// never accepted as the output.
+        #[arg(long)]
+        force: bool,
         /// Dequantisation worker threads. Defaults to `min(cpu cores, 4)` — the
         /// measured scaling knee — so the rest of the machine stays free.
         /// Values below 1 are clamped to 1 (fully sequential). Output is
@@ -114,6 +120,12 @@ enum Commands {
         /// Output file path (derived from input if omitted).
         #[arg(long, short)]
         output: Option<PathBuf>,
+        /// Overwrite the output file if it already exists. Without it, an
+        /// existing output (including one derived from the input name) is an
+        /// error, so a rerun cannot silently replace a file. The input itself is
+        /// never accepted as the output.
+        #[arg(long)]
+        force: bool,
         /// JSON file of `GGUF` metadata key/values to stamp on a `gguf` target.
         ///
         /// Values are typed: plain JSON is inferred (string, bool, integer →
@@ -161,6 +173,46 @@ enum Commands {
 // Subcommand runners
 // ---------------------------------------------------------------------------
 
+/// Where `convert` writes: `-o` if given (otherwise a name derived from the
+/// input), and whether an existing file there may be replaced (`--force`).
+#[derive(Clone, Copy)]
+struct OutputArg<'a> {
+    /// The `-o` path, if one was given.
+    path: Option<&'a Path>,
+    /// Whether `--force` was given.
+    force: bool,
+}
+
+/// Refuses to write `output` over `input`, or over any existing file unless
+/// `--force` was given, before any work starts.
+///
+/// Until v0.7.9 every writing subcommand replaced whatever was at its output
+/// path, and a derived name made that easy to do by accident: `amn remember
+/// model.gguf` silently replaced a sibling `model.safetensors`. With the
+/// non-atomic `GGUF` writer of the time, `-o` equal to the input destroyed the
+/// input on any error (Phase 7.9, audit finding M-8). The check follows
+/// symbolic links for the same-file test, and uses `symlink_metadata` for the
+/// existence test so a dangling link at the output path also counts as
+/// existing.
+///
+/// # Errors
+///
+/// Returns [`crate::AnamnesisError::Io`] with kind `InvalidInput` if `output`
+/// is the input file, or `AlreadyExists` if it exists and `force` is false.
+fn guard_output(input: &Path, output: &Path, force: bool) -> crate::Result<()> {
+    crate::fsio::refuse_same_file(input, output)?;
+    if !force && std::fs::symlink_metadata(output).is_ok() {
+        return Err(crate::AnamnesisError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "output `{}` already exists; pass --force to overwrite it",
+                output.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Parses CLI arguments and dispatches to the appropriate subcommand
 /// runner.
 ///
@@ -189,15 +241,17 @@ pub fn run() -> crate::Result<()> {
             path,
             to,
             output,
+            force,
             threads,
         } => {
             let resolved = resolve_input_path(path)?;
-            run_remember(&resolved, &to, output.as_deref(), threads)
+            run_remember(&resolved, &to, output.as_deref(), force, threads)
         }
         Commands::Convert {
             path,
             to,
             output,
+            force,
             gguf_metadata,
             gguf_kv,
             out_dtype,
@@ -207,7 +261,10 @@ pub fn run() -> crate::Result<()> {
             run_convert(
                 &resolved,
                 &to,
-                output.as_deref(),
+                OutputArg {
+                    path: output.as_deref(),
+                    force,
+                },
                 gguf_metadata.as_deref(),
                 &gguf_kv,
                 &out_dtype,
@@ -455,10 +512,11 @@ fn run_remember(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
+    force: bool,
     threads: Option<usize>,
 ) -> crate::Result<()> {
     match detect_format(path)? {
-        Format::Safetensors => run_remember_safetensors(path, to, output, threads),
+        Format::Safetensors => run_remember_safetensors(path, to, output, force, threads),
         #[cfg(feature = "pth")]
         Format::Pth => {
             // A `.pth` is already full precision, so `remember` copies its
@@ -482,7 +540,7 @@ fn run_remember(
                     ),
                 });
             }
-            run_remember_pth(path, output)
+            run_remember_pth(path, output, force)
         }
         #[cfg(feature = "npz")]
         Format::Npz => {
@@ -509,7 +567,7 @@ fn run_remember(
                     ),
                 });
             }
-            run_remember_npz(path, output)
+            run_remember_npz(path, output, force)
         }
         #[cfg(feature = "gguf")]
         Format::Gguf => {
@@ -531,7 +589,7 @@ fn run_remember(
                         ),
                     })?
             };
-            run_remember_gguf(path, output, target, threads)
+            run_remember_gguf(path, output, force, target, threads)
         }
     }
 }
@@ -540,6 +598,7 @@ fn run_remember_safetensors(
     path: &std::path::Path,
     to: &str,
     output: Option<&std::path::Path>,
+    force: bool,
     threads: Option<usize>,
 ) -> crate::Result<()> {
     let target: TargetDtype = to.parse()?;
@@ -569,6 +628,7 @@ fn run_remember_safetensors(
             target.as_dtype(),
         ),
     };
+    guard_output(path, &output_path, force)?;
 
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
     // caller's `--threads`, clamped to at least 1 by the builder.
@@ -616,7 +676,11 @@ fn run_remember_safetensors(
 /// different things on different formats — something a Python binding would
 /// have had to reproduce.
 #[cfg(feature = "npz")]
-fn run_remember_npz(path: &std::path::Path, output: Option<&std::path::Path>) -> crate::Result<()> {
+fn run_remember_npz(
+    path: &std::path::Path,
+    output: Option<&std::path::Path>,
+    force: bool,
+) -> crate::Result<()> {
     let tensors = crate::parse_npz(path)?;
     let info = crate::inspect_npz(path)?;
 
@@ -628,6 +692,7 @@ fn run_remember_npz(path: &std::path::Path, output: Option<&std::path::Path>) ->
         out.set_extension("safetensors");
         out
     };
+    guard_output(path, &output_path, force)?;
 
     println!(
         "Converting {} → {}",
@@ -651,7 +716,11 @@ fn run_remember_npz(path: &std::path::Path, output: Option<&std::path::Path>) ->
 }
 
 #[cfg(feature = "pth")]
-fn run_remember_pth(path: &std::path::Path, output: Option<&std::path::Path>) -> crate::Result<()> {
+fn run_remember_pth(
+    path: &std::path::Path,
+    output: Option<&std::path::Path>,
+    force: bool,
+) -> crate::Result<()> {
     let parsed = crate::parse_pth(path)?;
     let info = parsed.inspect();
 
@@ -663,6 +732,7 @@ fn run_remember_pth(path: &std::path::Path, output: Option<&std::path::Path>) ->
         out.set_extension("safetensors");
         out
     };
+    guard_output(path, &output_path, force)?;
 
     println!(
         "Converting {} → {}",
@@ -746,6 +816,7 @@ fn run_parse_gguf(path: &std::path::Path) -> crate::Result<()> {
 fn run_remember_gguf(
     path: &std::path::Path,
     output: Option<&std::path::Path>,
+    force: bool,
     target: TargetDtype,
     threads: Option<usize>,
 ) -> crate::Result<()> {
@@ -759,6 +830,7 @@ fn run_remember_gguf(
         out.set_extension("safetensors");
         out
     };
+    guard_output(path, &output_path, force)?;
 
     println!(
         "Converting {} → {}",
@@ -860,7 +932,7 @@ fn parse_out_dtype(s: &str) -> crate::Result<crate::Dtype> {
 fn run_convert(
     path: &std::path::Path,
     to: &str,
-    output: Option<&std::path::Path>,
+    output: OutputArg<'_>,
     gguf_metadata: Option<&std::path::Path>,
     gguf_kv: &[String],
     out_dtype: &str,
@@ -875,12 +947,13 @@ fn run_convert(
         Some(n) => options.with_threads(n),
         None => options,
     };
-    let output_path = output.map_or_else(
+    let output_path = output.path.map_or_else(
         // Name the file after the dtype it will actually hold: `--out-dtype
         // f32` must not derive `model-bf16.safetensors`.
         || crate::convert::derive_output_path_for_dtype(path, target, dequant_dtype),
         Path::to_owned,
     );
+    guard_output(path, &output_path, output.force)?;
 
     println!(
         "Converting {} -> {}",
