@@ -187,6 +187,8 @@ no memory map). Pinned in stable CI by `tests/no_panic.rs` and the `cargo fuzz`
 harness.
 
 Walkthrough: [Inspect before you parse](docs/tutorials/inspect-before-you-parse.md).
+Found an input that breaks this contract? Please report it privately, as
+[SECURITY.md](SECURITY.md) describes, rather than in a public issue.
 The per-version hardening history is in [Validation → robustness timeline](docs/validation.md#robustness-hardening-timeline).
 
 ## Formats & quantization support

@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit SHA, and Dependabot keeps the pins current. A new `deny` CI job runs
   `cargo-deny` against `deny.toml` (RustSec advisories and yanked crates,
   permissive licences only, crates.io as the only source).
+- **A private way to report vulnerabilities.** `SECURITY.md` states what counts
+  as a vulnerability for a crate that parses untrusted files, how to report one
+  through GitHub's private advisory form instead of a public issue, and how fixes
+  are published (GitHub advisory, patch release, RustSec entry). The README's
+  untrusted-input section points to it.
 
 ## [0.7.8] - 2026-09-26
 
