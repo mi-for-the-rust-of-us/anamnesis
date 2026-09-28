@@ -100,9 +100,10 @@ pub struct ParseLimits {
     max_total_bytes: u64,
 
     /// Upper bound on the total number of declared items in a file — `GGUF`
-    /// tensors and metadata KV entries, or `ZIP` central-directory entries (the
-    /// `.npz` and `.pth` containers, via the vendored reader). [`u64::MAX`]
-    /// means unbounded — only the per-format constant cap applies.
+    /// tensors and metadata KV entries, `ZIP` central-directory entries (the
+    /// `.npz` and `.pth` containers, via the vendored reader), and, since
+    /// v0.7.9, safetensors tensors. [`u64::MAX`] means unbounded — only the
+    /// per-format constant cap applies.
     max_item_count: u64,
 
     /// Upper bound on a compressed archive entry's uncompressed-to-compressed
@@ -252,10 +253,6 @@ impl ParseLimits {
     // has no caller, which is correct (not dead code in the public sense).
     // `check_alloc` always has a caller via the always-on safetensors path, so
     // it needs no such guard.
-    #[cfg_attr(
-        not(any(feature = "npz", feature = "pth", feature = "gguf")),
-        allow(dead_code)
-    )]
     pub(crate) fn check_item_count(&self, count: u64, context: &str) -> crate::Result<()> {
         if count > self.max_item_count {
             return Err(crate::AnamnesisError::LimitExceeded {

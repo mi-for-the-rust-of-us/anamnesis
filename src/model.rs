@@ -30,8 +30,8 @@ use crate::backing::Backing;
 use crate::error::AnamnesisError;
 use crate::inspect::{InspectInfo, InspectOptions};
 use crate::parse::safetensors::{
-    Dtype, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
-    parse_safetensors_header_with_limits,
+    Dtype, NameIndex, QuantScheme, SafetensorsHeader, TensorEntry, TensorRole,
+    parse_safetensors_header_with_limits, scale_for,
 };
 use crate::parse::utils::checked_num_elements;
 #[cfg(feature = "awq")]
@@ -1063,19 +1063,19 @@ impl ParsedModel {
     fn dequantize_quantized_entry<E: OutputElement>(
         &self,
         entry: &TensorEntry,
+        index: &NameIndex<'_>,
     ) -> crate::Result<TensorDequant> {
         let weight_data = self.tensor_data(entry.data_offsets.0, entry.data_offsets.1)?;
 
         let result = match self.header.scheme {
             QuantScheme::FineGrainedFp8 => {
-                let scale_entry = self.header.find_scale_for(&entry.name).ok_or_else(|| {
-                    AnamnesisError::Parse {
+                let scale_entry =
+                    scale_for(index, &entry.name).ok_or_else(|| AnamnesisError::Parse {
                         reason: format!(
                             "no scale tensor found for quantized weight `{}`",
                             entry.name
                         ),
-                    }
-                })?;
+                    })?;
                 let scale_data =
                     self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
                 let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
@@ -1084,14 +1084,13 @@ impl ParsedModel {
                 TensorDequant::Owned(entry.name.clone(), out, entry.shape.clone())
             }
             QuantScheme::PerChannelFp8 => {
-                let scale_entry = self.header.find_scale_for(&entry.name).ok_or_else(|| {
-                    AnamnesisError::Parse {
+                let scale_entry =
+                    scale_for(index, &entry.name).ok_or_else(|| AnamnesisError::Parse {
                         reason: format!(
                             "no scale tensor found for quantized weight `{}`",
                             entry.name
                         ),
-                    }
-                })?;
+                    })?;
                 let scale_data =
                     self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
                 let (rows, cols) = Self::shape_to_rows_cols(&entry.shape)?;
@@ -1106,7 +1105,7 @@ impl ParsedModel {
             }
             QuantScheme::PerTensorFp8 => {
                 // Look for a companion scale tensor; default to 1.0 if none.
-                let scale = if let Some(scale_entry) = self.header.find_scale_for(&entry.name) {
+                let scale = if let Some(scale_entry) = scale_for(index, &entry.name) {
                     let scale_data =
                         self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
                     Self::read_scalar_scale(scale_data, scale_entry.dtype, &entry.name)?
@@ -1124,12 +1123,10 @@ impl ParsedModel {
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("GPTQ config not available for `{}`", entry.name),
                     })?;
-                let companions =
-                    self.header
-                        .find_gptq_companions(&entry.name)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("GPTQ companions not found for `{}`", entry.name),
-                        })?;
+                let companions = crate::parse::safetensors::gptq_companions(index, &entry.name)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("GPTQ companions not found for `{}`", entry.name),
+                    })?;
 
                 let scales_data = self.tensor_data(
                     companions.scales.data_offsets.0,
@@ -1212,9 +1209,7 @@ impl ParsedModel {
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("AWQ config not available for `{}`", entry.name),
                     })?;
-                let companions = self
-                    .header
-                    .find_awq_companions(&entry.name)
+                let companions = crate::parse::safetensors::awq_companions(index, &entry.name)
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("AWQ companions not found for `{}`", entry.name),
                     })?;
@@ -1289,12 +1284,10 @@ impl ParsedModel {
                     .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("BnB config not available for `{}`", entry.name),
                     })?;
-                let companions =
-                    self.header
-                        .find_bnb4_companions(&entry.name)
-                        .ok_or_else(|| AnamnesisError::Parse {
-                            reason: format!("BnB4 companions not found for `{}`", entry.name),
-                        })?;
+                let companions = crate::parse::safetensors::bnb4_companions(index, &entry.name)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("BnB4 companions not found for `{}`", entry.name),
+                    })?;
 
                 let absmax_data = self.tensor_data(
                     companions.absmax.data_offsets.0,
@@ -1410,11 +1403,10 @@ impl ParsedModel {
             }
             #[cfg(feature = "bnb")]
             QuantScheme::BnbInt8 => {
-                let scb_entry = self.header.find_bnb_int8_scb(&entry.name).ok_or_else(|| {
-                    AnamnesisError::Parse {
+                let scb_entry = crate::parse::safetensors::bnb_int8_scb(index, &entry.name)
+                    .ok_or_else(|| AnamnesisError::Parse {
                         reason: format!("BnB INT8 SCB companion not found for `{}`", entry.name),
-                    }
-                })?;
+                    })?;
                 let scb_data =
                     self.tensor_data(scb_entry.data_offsets.0, scb_entry.data_offsets.1)?;
 
@@ -1507,6 +1499,12 @@ impl ParsedModel {
             "safetensors dequantisation",
         )?;
 
+        // Companion lookups go through one name index, built here once: a
+        // linear scan per quantised tensor made a many-tensor header quadratic
+        // (Phase 7.9, audit finding M-7). `NameIndex` is `Sync` (shared
+        // references only), so every worker reads it.
+        let index = NameIndex::new(&self.header.tensors);
+
         // Total on-disk span of the quantised weights, the size gate
         // `parallel::map_indexed` consults before it spawns anything. The
         // companion scale / zero-point tensors add a small constant fraction on
@@ -1529,7 +1527,7 @@ impl ParsedModel {
             threads,
             work_bytes,
             cancel,
-            |_, &(_, entry)| self.dequantize_quantized_entry::<E>(entry),
+            |_, &(_, entry)| self.dequantize_quantized_entry::<E>(entry, &index),
             |dq| {
                 if matches!(dq, TensorDequant::Owned(..)) {
                     on_tensor();

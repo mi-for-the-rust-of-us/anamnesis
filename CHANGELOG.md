@@ -150,6 +150,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   800 MiB, beyond the permanent `MAX_PICKLE_WORKING_SET` floor. More than 256
   open marks (a real pickle holds its nesting depth, a handful) is now
   `LimitExceeded` (`MAX_PICKLE_MARK_DEPTH`) on every entry point.
+- **safetensors header processing is no longer quadratic in the tensor count,
+  and `max_item_count` applies to it** (Phase 7.9, audit finding M-7). The
+  scheme detector, the config inference and `remember`'s companion lookups
+  each scanned the whole tensor list once per tensor: 40 000 tensors took
+  1.85 s, and the 100 MiB header cap admitted files costing about 40 minutes.
+  The crate now builds a name index once per call (80 ms for the same 40 000;
+  386 ms for 160 000), answering exactly as the linear scan did, and
+  `max_item_count`, documented for `GGUF` and `ZIP` only until now, bounds the
+  safetensors tensor count on every entry point. The public `find_*` methods
+  keep their one-off linear scan.
 
 ### Changed
 
@@ -158,6 +168,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParseLimits` to a parse (or to `ConvertOptions::with_limits`) now also bounds
   what the later call materialises, against `max_total_bytes`. Set it at or
   above `inspect().dequantized_size` for the output dtype you ask for.
+- **`ParseLimits::max_item_count` now also counts safetensors tensors.** A host
+  that set it for `GGUF` or archive entries (the README's example uses 4096)
+  now also refuses a single-file safetensors checkpoint with more tensors than
+  that; raise it if you parse such files.
 
 ### Fixed
 

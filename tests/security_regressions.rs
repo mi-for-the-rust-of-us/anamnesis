@@ -794,3 +794,71 @@ fn l1_a_mark_flood_is_refused_on_every_path() {
         &anamnesis::inspect_pth_from_reader(std::io::Cursor::new(&bytes)).map(|_| ())
     ));
 }
+
+// ---------------------------------------------------------------------------
+// M-7: safetensors header processing scanned the whole tensor list once per
+// tensor (40 000 tensors: 1.85 s; the 100 MiB header cap admitted ~40 minutes),
+// and `max_item_count` did not apply to safetensors at all.
+// ---------------------------------------------------------------------------
+
+mod m7_safetensors_tensor_count {
+    use std::io::Cursor;
+
+    use anamnesis::{AnamnesisError, ParseLimits};
+
+    use crate::common::builders::build_safetensors_raw;
+
+    /// `n` zero-size `F8_E4M3` tensors: every one is "quantised" and has no
+    /// scale, the worst case for the scheme detector's companion search.
+    fn many_fp8(n: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..n).map(|i| format!("t{i:07}")).collect();
+        let tensors: Vec<(&str, &str, &[usize], &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), "F8_E4M3", &[0usize][..], &[][..]))
+            .collect();
+        build_safetensors_raw(&tensors)
+    }
+
+    fn is_item_cap(r: &Result<impl std::fmt::Debug, AnamnesisError>) -> bool {
+        matches!(r, Err(AnamnesisError::LimitExceeded { limit, .. }) if *limit == "max_item_count")
+    }
+
+    #[test]
+    fn max_item_count_applies_to_safetensors_on_every_path() {
+        let bytes = many_fp8(2000);
+        let limits = ParseLimits::default().with_max_item_count(1000);
+        assert!(is_item_cap(
+            &anamnesis::parse_safetensors_header_with_limits(&bytes, &limits)
+        ));
+        assert!(is_item_cap(
+            &anamnesis::parse_safetensors_header_from_reader_with_limits(
+                Cursor::new(&bytes),
+                &limits
+            )
+        ));
+        // `ParsedModel` is not `Debug`, so compare the error side only.
+        assert!(is_item_cap(
+            &anamnesis::parse_bytes_with_limits(bytes.clone(), &limits).map(|_| ())
+        ));
+        assert!(is_item_cap(
+            &anamnesis::parse_from_reader_with_limits(Cursor::new(&bytes), &limits).map(|_| ())
+        ));
+        let enough = ParseLimits::default().with_max_item_count(2000);
+        assert!(anamnesis::parse_bytes_with_limits(bytes, &enough).is_ok());
+    }
+
+    #[test]
+    fn a_many_tensor_header_parses_in_linear_time() {
+        // Quadratic before: 40 000 tensors took 1.85 s in release, far longer
+        // in a debug test build. The bound is generous for debug builds.
+        let bytes = many_fp8(40_000);
+        let started = std::time::Instant::now();
+        let model = anamnesis::parse_bytes(bytes).unwrap();
+        assert_eq!(model.header.tensors.len(), 40_000);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+}
