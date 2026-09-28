@@ -195,6 +195,9 @@ pub struct ParsedModel {
     /// shard touches only the header (~1 MiB) instead of materialising the
     /// whole file.
     buffer: Backing,
+    /// The limits the file was parsed under. `remember` and `convert` check the
+    /// bytes they materialise against them.
+    limits: ParseLimits,
 }
 
 /// Parses a `.safetensors` file, returning a [`ParsedModel`] holding both
@@ -272,7 +275,11 @@ pub fn parse_with_limits(
 /// them.
 fn parsed_model_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Result<ParsedModel> {
     let header = parse_safetensors_header_with_limits(&buffer, limits)?;
-    Ok(ParsedModel { header, buffer })
+    Ok(ParsedModel {
+        header,
+        buffer,
+        limits: limits.clone(),
+    })
 }
 
 /// Parses `.safetensors` bytes already held in memory, returning a
@@ -713,6 +720,9 @@ impl ParsedModel {
     /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     ///
     /// # Memory
@@ -767,6 +777,9 @@ impl ParsedModel {
     /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
     /// triggered before the run completes; no output is written.
@@ -794,6 +807,9 @@ impl ParsedModel {
     /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     pub fn remember_with_progress<F>(
         &self,
@@ -828,6 +844,9 @@ impl ParsedModel {
     /// `<layer>.qweight` is written as `<layer>.weight`, which can collide).
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
     /// triggered before the run completes; no output is written.
@@ -879,6 +898,9 @@ impl ParsedModel {
     /// if serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     ///
     /// # Memory
     ///
@@ -918,6 +940,9 @@ impl ParsedModel {
     /// if serialization fails.
     /// Returns [`AnamnesisError::Unsupported`] if the quantization scheme
     /// is not yet implemented.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
     /// triggered before the run completes; no output is written.
     pub fn remember_to_bytes_with_options(
@@ -969,6 +994,12 @@ impl ParsedModel {
         // `&mut dyn FnMut()` rather than a type parameter on each of them. It
         // fires on the calling thread only, exactly as `dequantize_all`'s own
         // hook does.
+        // The hub owns the passthrough tensors too, so they join the check
+        // `dequantize_all` makes for the dequantised share, before either runs.
+        self.limits.check_materialised(
+            self.materialised_bytes::<E>(true)?,
+            "safetensors conversion",
+        )?;
         let (dequantized_data, passthrough_refs) =
             self.dequantize_all::<E, _>(threads, cancel, &mut *on_tensor)?;
 
@@ -1003,8 +1034,9 @@ impl ParsedModel {
                 name: name.to_owned(),
                 shape: shape.to_vec(),
                 dtype,
-                // BORROW: copy the buffer-borrowed bytes so the hub outlives `self`.
-                data: data.to_vec(),
+                // Copy the buffer-borrowed bytes so the hub outlives `self`,
+                // reporting a refused allocation as an error.
+                data: crate::limits::owned_copy(data, "safetensors passthrough tensor")?,
             });
         }
 
@@ -1468,6 +1500,13 @@ impl ParsedModel {
             }
         }
 
+        // What dequantisation will allocate, checked against the parse's limits
+        // before any of it is.
+        self.limits.check_materialised(
+            self.materialised_bytes::<E>(false)?,
+            "safetensors dequantisation",
+        )?;
+
         // Total on-disk span of the quantised weights, the size gate
         // `parallel::map_indexed` consults before it spawns anything. The
         // companion scale / zero-point tensors add a small constant fraction on
@@ -1527,6 +1566,47 @@ impl ParsedModel {
             passthrough_indexed.into_iter().map(|(_, r)| r).collect();
 
         Ok((dequantized_data, passthrough_refs))
+    }
+
+    /// Internal: the bytes dequantising this model to `E` materialises (the
+    /// quantised tensors' output, from the header's per-tensor output-size
+    /// function, so it equals what `inspect` reports), plus the passthrough
+    /// tensors' stored bytes when `include_passthrough` is set (the `convert`
+    /// hub copies them; `remember` borrows them).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::Parse`] if the total overflows `u64`.
+    fn materialised_bytes<E: OutputElement>(
+        &self,
+        include_passthrough: bool,
+    ) -> crate::Result<u64> {
+        let overflow = || AnamnesisError::Parse {
+            reason: "materialised byte total overflows u64".into(),
+        };
+        let elem_bytes = u64::try_from(E::BYTES).map_err(|_| overflow())?;
+        let mut total: u64 = 0;
+        for entry in &self.header.tensors {
+            let bytes = match entry.role {
+                TensorRole::Quantized => self
+                    .header
+                    .dequantized_elements(entry)
+                    .checked_mul(elem_bytes)
+                    .ok_or_else(overflow)?,
+                TensorRole::Passthrough if include_passthrough => {
+                    u64::try_from(entry.byte_len()).map_err(|_| overflow())?
+                }
+                TensorRole::Passthrough
+                | TensorRole::Scale
+                | TensorRole::ZeroPoint
+                | TensorRole::GroupIndex
+                | TensorRole::QuantMap
+                | TensorRole::NestedScale
+                | TensorRole::QuantState => 0,
+            };
+            total = total.checked_add(bytes).ok_or_else(overflow)?;
+        }
+        Ok(total)
     }
 
     /// Internal: build the `safetensors` `TensorView` list from the dequantised

@@ -78,6 +78,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the bytes `remember` actually writes for every reference fixture at
   `BF16`, `F32` and `F16`. A missing or edited bit width over-estimates rather
   than under-estimates. Present since `inspect` gained `dequantized_size`.
+- **`ParseLimits` now bounds what a call materialises, not only what the
+  parser reads** (Phase 7.9, audit findings L-3 and M-2;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). Nothing after
+  parsing was charged: the owned copies `ParsedPth::tensors()` makes, the
+  dequantised output of `remember`, and every tensor the `convert` hub owns
+  were bounded by nothing but the host's memory. A `.pth` whose 4000 keys all
+  named one 64 KiB storage turned 117 KB of input into 250 MiB of output under
+  an 8 MiB budget. The parsed value now keeps the limits it was parsed under,
+  and each of those calls checks its total against `max_total_bytes` **before**
+  allocating anything, using the same figure the format's `inspect` reports as
+  `dequantized_size` (so a host gating on `dequantized_size <= max_total_bytes`
+  is not refused later, and one byte less is refused up front). Only the
+  aggregate axis applies to materialisation: dequantised tensors are
+  legitimately larger than `max_single_alloc`, which the owned-input entry
+  points already hold near the input size. Copies of data the crate already
+  holds use a fallible allocation, so a refusal from the allocator is
+  `LimitExceeded { limit: "available_memory" }` instead of an abort.
+- **A `.pth` may not materialise more than 16 times its storage bytes**
+  (Phase 7.9, audit finding M-2). Tied weights let several keys view one
+  storage, and each key is materialised in full; nothing capped how many keys
+  a file could point at one storage, so the default (unbounded) limits the CLI
+  and a plain `convert_bytes` run under gave no protection. A new permanent
+  floor, `PTH_MAX_MATERIALISE_RATIO` (16, far above any real model's tying),
+  rejects the file at parse time with `LimitExceeded` on every entry point.
+
+### Changed
+
+- **`convert`, `remember` and `ParsedPth::tensors()` can now return
+  `LimitExceeded` for a file that parsed.** A caller that passes tight
+  `ParseLimits` to a parse (or to `ConvertOptions::with_limits`) now also bounds
+  what the later call materialises, against `max_total_bytes`. Set it at or
+  above `inspect().dequantized_size` for the output dtype you ask for.
 
 ### Fixed
 

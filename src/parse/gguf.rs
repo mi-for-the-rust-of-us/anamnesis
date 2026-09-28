@@ -1150,9 +1150,18 @@ pub struct ParsedGguf {
     metadata: HashMap<String, GgufMetadataValue>,
     /// Per-tensor metadata with absolute byte offsets.
     tensor_infos: Vec<GgufTensorInfo>,
+    /// The limits the file was parsed under. Dequantisation (`remember`,
+    /// `convert`) checks the bytes it materialises against them.
+    limits: ParseLimits,
 }
 
 impl ParsedGguf {
+    /// The limits the file was parsed under, which bound what dequantising it
+    /// may materialise.
+    pub(crate) const fn limits(&self) -> &ParseLimits {
+        &self.limits
+    }
+
     /// Returns the `GGUF` format version read from the header.
     #[must_use]
     pub const fn version(&self) -> u32 {
@@ -1951,6 +1960,7 @@ fn parsed_gguf_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Res
         alignment: front.alignment,
         metadata: front.metadata,
         tensor_infos: front.tensor_infos,
+        limits: limits.clone(),
     })
 }
 

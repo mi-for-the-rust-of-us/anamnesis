@@ -21,6 +21,15 @@
 //! [`ParseLimits::default`] is *unbounded* on every axis ([`u64::MAX`] sentinel),
 //! so the default leaves only the per-format constants in force — behaviour
 //! identical to a build with no [`ParseLimits`] at all.
+//!
+//! The limits a file was parsed under stay with the parsed value. Since v0.7.9
+//! every call that **materialises** tensor data from it (`ParsedPth::tensors`,
+//! `remember`, `convert`) checks the bytes it is about to own against
+//! [`ParseLimits::max_total_bytes`] before allocating any of them. The figure it
+//! checks is the one the format's `inspect` reports as `dequantized_size`, so a
+//! host that gates on `dequantized_size <= max_total_bytes` is not refused
+//! later. Parsing and materialisation are bounded separately: each is checked
+//! against the full `max_total_bytes`, not against what is left of it.
 
 /// Caller-supplied resource budget threaded through the parser entry points.
 ///
@@ -79,8 +88,15 @@ pub struct ParseLimits {
     /// every value it pushes plus the deep size of each memo clone — so a
     /// crafted pickle that amplifies a small opcode stream into multi-GiB heap
     /// is bounded here too (and, independently of this caller budget, by the
-    /// VM's permanent `MAX_PICKLE_WORKING_SET` floor). [`u64::MAX`] means
-    /// unbounded.
+    /// VM's permanent `MAX_PICKLE_WORKING_SET` floor).
+    ///
+    /// Since v0.7.9 it also bounds what a call **materialises** from a parsed
+    /// file: the owned copies `ParsedPth::tensors` makes, the dequantised
+    /// output of `remember`, and every tensor the `convert` hub owns, each
+    /// checked in full before anything is allocated (Phase 7.9, audit findings
+    /// L-3 and M-2). The serialised output buffer a writer builds from those
+    /// tensors is not charged; it is about the size of what was. [`u64::MAX`]
+    /// means unbounded.
     max_total_bytes: u64,
 
     /// Upper bound on the total number of declared items in a file — `GGUF`
@@ -367,6 +383,70 @@ impl Default for ParseLimits {
 /// [`ParseLimits::max_single_alloc_bytes`] ceiling and the cumulative
 /// [`ParseLimits::max_total_bytes`] aggregate budget.
 ///
+impl ParseLimits {
+    /// Checks the bytes one call is about to **materialise** (tensor data it
+    /// allocates and returns, as opposed to header structures a parser reads)
+    /// against [`ParseLimits::max_total_bytes`], before any of it is allocated.
+    ///
+    /// Only the aggregate axis applies. `max_single_alloc_bytes` bounds what a
+    /// parser allocates from a header's *declared* sizes, and the owned-input
+    /// entry points already check the whole input against it, so hosts set it
+    /// near the input size; dequantised tensors are legitimately several times
+    /// larger than their stored form, and a per-tensor check would refuse
+    /// honest conversions. The single-tensor abuses it could catch are closed by
+    /// structural rules at parse time instead (a `.pth` view may not expand).
+    ///
+    /// Until v0.7.9 nothing after parsing was charged at all (Phase 7.9, audit
+    /// findings L-3 and M-2). The figure a call charges is the one its format's
+    /// `inspect` reports, so a host whose gate checks
+    /// `dequantized_size <= max_total_bytes` is never refused later.
+    ///
+    /// `context` names the call for the error message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+    /// if `bytes` exceeds [`ParseLimits::max_total_bytes`].
+    pub(crate) fn check_materialised(&self, bytes: u64, context: &str) -> crate::Result<()> {
+        if bytes > self.max_total_bytes {
+            return Err(crate::AnamnesisError::LimitExceeded {
+                limit: "max_total_bytes",
+                message: format!(
+                    "{context} would materialise {bytes} bytes, exceeding caller \
+                     ParseLimits max_total_bytes {}",
+                    self.max_total_bytes
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Copies `bytes` into a new owned buffer, reporting an allocation the system
+/// refuses as an error instead of aborting the process.
+///
+/// Used where the crate copies tensor data it already holds (a borrowed view
+/// into the owned hub, a big-endian storage before swapping), after the total
+/// has passed [`ParseLimits::check_materialised`]. A failed `Vec` allocation is
+/// an abort, which no `catch_unwind` (and no `PyO3` exception boundary) can
+/// observe; `try_reserve_exact` turns it into a clean `Err` wherever the
+/// allocator reports failure rather than overcommitting.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::LimitExceeded`](crate::AnamnesisError::LimitExceeded)
+/// with `limit: "available_memory"` if the allocation fails.
+pub(crate) fn owned_copy(bytes: &[u8], context: &str) -> crate::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| crate::AnamnesisError::LimitExceeded {
+            limit: "available_memory",
+            message: format!("{context}: could not allocate {} bytes", bytes.len()),
+        })?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
 /// One `Budget` is created per parse from the caller's [`ParseLimits`] and
 /// threaded through the eager-allocation sites: each site `charge`s the bytes
 /// it is about to allocate, fail-fast *before* the allocation. The aggregate

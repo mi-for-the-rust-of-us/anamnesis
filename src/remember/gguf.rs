@@ -2006,6 +2006,9 @@ impl crate::ParsedGguf {
     /// tensor's element count overflows `usize`, or two tensors share a name.
     /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
     /// safetensors equivalent.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`](crate::ParseLimits) the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     ///
     /// # Memory
@@ -2038,6 +2041,9 @@ impl crate::ParsedGguf {
     /// tensor's element count overflows `usize`, or two tensors share a name.
     /// Returns [`AnamnesisError::Unsupported`] if a `GGUF` dtype has no
     /// safetensors equivalent.
+    /// Returns [`AnamnesisError::LimitExceeded`] if the dequantised output would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`](crate::ParseLimits) the file was parsed
+    /// under (checked before anything is dequantised).
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     /// Returns [`AnamnesisError::Cancelled`] if the options' `CancelToken` is
     /// triggered before the run completes; no output is written.

@@ -29,7 +29,7 @@
 //! multi-GiB allocation.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -108,6 +108,20 @@ const MAX_BYTEORDER_SIZE: u64 = 64;
 /// twin of the `NPY` transposition in audit finding H-3). Always-on,
 /// independent of [`ParseLimits`].
 const PTH_MAX_DIMS: usize = 64;
+
+/// Maximum ratio of the bytes a `.pth` materialises to the bytes of the
+/// distinct storages its tensors view.
+///
+/// Several tensors may legitimately view one storage (tied weights: an
+/// embedding and the language-model head, or the four-way tie of T5's shared
+/// embedding), so the tensors of an honest file materialise at most a few times
+/// their storage bytes. Nothing but this ratio stops a file from naming one
+/// storage under thousands of keys, each of which `tensors()` and `convert`
+/// materialise in full: 117 KB of input produced 250 MiB of output (Phase 7.9,
+/// audit finding M-2). 16 is far above any real model and still bounds the
+/// amplification a default-limits caller can be made to perform. Always-on,
+/// independent of [`ParseLimits`], like the other permanent floors.
+const PTH_MAX_MATERIALISE_RATIO: u64 = 16;
 
 /// Rejects a `data.pkl` ZIP entry whose declared size exceeds [`MAX_PKL_SIZE`].
 ///
@@ -367,6 +381,9 @@ pub struct ParsedPth {
     entry_index: EntryIndex,
     /// Whether the file uses big-endian storage.
     big_endian: bool,
+    /// The limits the file was parsed under. [`ParsedPth::tensors`] checks the
+    /// bytes it materialises against them.
+    limits: ParseLimits,
 }
 
 /// Compact, sorted `suffix → (data_start, data_len)` index over a `.pth`
@@ -413,17 +430,73 @@ impl ParsedPth {
     /// Returns [`AnamnesisError::Parse`] if a storage entry is missing
     /// or a tensor's byte range exceeds the storage.
     ///
+    /// Returns [`AnamnesisError::LimitExceeded`] if the owned copies would
+    /// exceed the `max_total_bytes` of the [`ParseLimits`] the file was parsed
+    /// under (checked before anything is copied), or if the system refuses an
+    /// allocation (`limit: "available_memory"`).
+    ///
     /// # Memory
     ///
     /// For contiguous little-endian tensors, data is zero-copy (`Cow::Borrowed`
     /// from the mmap) — no per-tensor allocation. Non-contiguous or big-endian
     /// tensors allocate an owned `Vec<u8>` of `n_elements × dtype.byte_size()`
-    /// bytes. Peak memory: the mmap (file-sized) plus one owned copy per
-    /// non-contiguous tensor. The `Vec<PthTensor>` itself is lightweight
-    /// (metadata + `Cow` pointers).
+    /// bytes, and the sum of those copies is what is checked against the parse's
+    /// `max_total_bytes`. Peak memory: the mmap (file-sized) plus one owned copy
+    /// per non-contiguous or big-endian tensor, at most
+    /// `PTH_MAX_MATERIALISE_RATIO` (16) times the file's storage bytes. The
+    /// `Vec<PthTensor>` itself is lightweight (metadata + `Cow` pointers).
     pub fn tensors(&self) -> crate::Result<Vec<PthTensor<'_>>> {
-        let mut tensors = Vec::with_capacity(self.meta.len());
+        self.materialise(false)
+    }
+
+    /// [`ParsedPth::tensors`] for a caller that will copy **every** tensor into
+    /// memory it owns (the `convert` hub), so the check covers the borrowed
+    /// tensors too: the whole output is charged once, up front.
+    ///
+    /// # Errors
+    ///
+    /// As [`ParsedPth::tensors`].
+    pub(crate) fn tensors_for_owned_copy(&self) -> crate::Result<Vec<PthTensor<'_>>> {
+        self.materialise(true)
+    }
+
+    /// Shared body of [`ParsedPth::tensors`] and
+    /// [`ParsedPth::tensors_for_owned_copy`]: sizes every tensor from its
+    /// metadata, checks the total the caller will own against the parse's
+    /// limits, and only then copies anything.
+    ///
+    /// `charge_borrowed` adds the zero-copy tensors to the total, for a caller
+    /// that copies them itself.
+    fn materialise(&self, charge_borrowed: bool) -> crate::Result<Vec<PthTensor<'_>>> {
+        // Pass 1, no allocation of tensor data: the layout of each tensor and
+        // whether it needs an owned copy, and the total the caller will own.
+        let mut layouts = Vec::with_capacity(self.meta.len());
+        let mut owned_total: u64 = 0;
         for m in &self.meta {
+            let (layout_shape, layout_strides) = squeeze_unit_dims(&m.shape, &m.strides);
+            let contiguous = is_contiguous(&layout_shape, &layout_strides);
+            if charge_borrowed || self.big_endian || !contiguous {
+                // `validate_tensor_views` already sized every view at parse time.
+                let n_bytes = view_byte_len(&m.shape, m.dtype.byte_size()).ok_or_else(|| {
+                    AnamnesisError::Parse {
+                        reason: format!("tensor `{}`: byte count overflows u64", m.name),
+                    }
+                })?;
+                owned_total =
+                    owned_total
+                        .checked_add(n_bytes)
+                        .ok_or_else(|| AnamnesisError::Parse {
+                            reason: "materialised byte total overflows u64".into(),
+                        })?;
+            }
+            layouts.push((layout_shape, layout_strides, contiguous));
+        }
+        self.limits
+            .check_materialised(owned_total, "`.pth` tensor materialisation")?;
+
+        // Pass 2: materialise.
+        let mut tensors = Vec::with_capacity(self.meta.len());
+        for (m, (layout_shape, layout_strides, contiguous)) in self.meta.iter().zip(layouts) {
             let storage_suffix = format!("data/{}", m.storage_key);
             let (storage_start, storage_len) = self
                 .entry_index
@@ -444,9 +517,8 @@ impl ParsedPth {
             })?;
 
             let elem_size = m.dtype.byte_size();
-            let (layout_shape, layout_strides) = squeeze_unit_dims(&m.shape, &m.strides);
             let data: Cow<'_, [u8]> =
-                if is_contiguous(&layout_shape, &layout_strides) {
+                if contiguous {
                     let n_bytes = checked_num_elements(&m.shape)
                         .ok_or_else(|| AnamnesisError::Parse {
                             reason: format!("tensor `{}`: element count overflow", m.name),
@@ -474,7 +546,7 @@ impl ParsedPth {
                     })?;
                     if self.big_endian {
                         // Contiguous but big-endian: copy + byte-swap.
-                        let mut buf = bytes.to_vec();
+                        let mut buf = crate::limits::owned_copy(bytes, "big-endian `.pth` tensor")?;
                         byteswap_inplace(&mut buf, elem_size);
                         Cow::Owned(buf)
                     } else {
@@ -551,6 +623,8 @@ impl ParsedPth {
     /// Returns [`AnamnesisError::Io`] if the output file cannot be written.
     /// Returns [`AnamnesisError::Parse`] if tensor extraction or
     /// serialization fails.
+    /// Returns [`AnamnesisError::LimitExceeded`] under the conditions of
+    /// [`tensors()`](Self::tensors).
     pub fn to_safetensors(&self, output: impl AsRef<std::path::Path>) -> crate::Result<()> {
         let tensors = self.tensors()?;
         crate::remember::pth::pth_to_safetensors(&tensors, output)
@@ -568,6 +642,8 @@ impl ParsedPth {
     ///
     /// Returns [`AnamnesisError::Parse`] if tensor extraction or
     /// serialization fails.
+    /// Returns [`AnamnesisError::LimitExceeded`] under the conditions of
+    /// [`tensors()`](Self::tensors).
     ///
     /// # Memory
     ///
@@ -2443,6 +2519,7 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
         meta,
         entry_index,
         big_endian,
+        limits: limits.clone(),
     })
 }
 
@@ -2642,16 +2719,26 @@ fn view_byte_len(shape: &[usize], elem_size: usize) -> Option<u64> {
 /// central directory. Sharing this one check keeps `inspect` and `parse` from
 /// disagreeing about which files are acceptable.
 ///
+/// The same pass enforces `PTH_MAX_MATERIALISE_RATIO`: the tensors together may
+/// not materialise more than 16 times the bytes of the distinct storages they
+/// view, which bounds how many keys may alias one storage (audit finding M-2).
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if a tensor names a storage the archive
 /// does not hold, if its offset lies beyond the end of that storage, if its
-/// byte length overflows `u64`, or if it would materialise more bytes than the
-/// storage holds from its offset.
+/// byte length (or the total over all tensors) overflows `u64`, or if it would
+/// materialise more bytes than the storage holds from its offset.
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if the total exceeds
+/// `PTH_MAX_MATERIALISE_RATIO` times the distinct storage bytes.
 fn validate_tensor_views(
     meta: &[TensorMeta],
     storage_len: impl Fn(&str) -> Option<u64>,
 ) -> crate::Result<()> {
+    let mut seen_storages: HashSet<&str> = HashSet::new();
+    let mut storage_total: u64 = 0;
+    let mut view_total: u64 = 0;
     for m in meta {
         let len = storage_len(&m.storage_key).ok_or_else(|| AnamnesisError::Parse {
             reason: format!(
@@ -2683,6 +2770,27 @@ fn validate_tensor_views(
                 ),
             });
         }
+        let overflow = || AnamnesisError::Parse {
+            reason: "materialised byte total overflows u64".into(),
+        };
+        view_total = view_total.checked_add(n_bytes).ok_or_else(overflow)?;
+        // BORROW: explicit `.as_str()`, keying the set by the borrowed key.
+        if seen_storages.insert(m.storage_key.as_str()) {
+            storage_total = storage_total.checked_add(len).ok_or_else(overflow)?;
+        }
+    }
+    // A storage total so large that the product overflows `u64` bounds nothing
+    // any view total could exceed.
+    if let Some(cap) = storage_total.checked_mul(PTH_MAX_MATERIALISE_RATIO)
+        && view_total > cap
+    {
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "PTH_MAX_MATERIALISE_RATIO",
+            message: format!(
+                "tensors would materialise {view_total} bytes from {storage_total} bytes of \
+                 storage, more than {PTH_MAX_MATERIALISE_RATIO} times over"
+            ),
+        });
     }
     Ok(())
 }

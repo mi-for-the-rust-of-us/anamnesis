@@ -42,8 +42,9 @@
 //! materialised hub (streaming output) is `ROADMAP.md` Phase 10.
 
 // `Cow` is used by the `bnb` (`to_bf16_bytes`) and `gguf` (`write_gguf_target`)
-// writers to borrow rather than copy; unused when neither feature is on.
-#[cfg(any(feature = "bnb", feature = "gguf"))]
+// writers to borrow rather than copy, and by the `pth` hub reader to tell an
+// owned tensor from a borrowed one; unused when none of those features is on.
+#[cfg(any(feature = "bnb", feature = "gguf", feature = "pth"))]
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -115,8 +116,13 @@ impl ConvertTarget {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ConvertOptions {
-    /// Resource budget applied to the *input* parse. Defaults to
-    /// [`ParseLimits::default`] (unbounded beyond the permanent per-format caps).
+    /// Resource budget applied to the input parse **and**, since v0.7.9, to
+    /// what the conversion materialises: every tensor the hub owns (the
+    /// dequantised output plus the passthrough copies) is checked against
+    /// [`ParseLimits::max_total_bytes`] before any of it is allocated, using the
+    /// figure the input format's `inspect` reports as `dequantized_size`.
+    /// Defaults to [`ParseLimits::default`] (unbounded beyond the permanent
+    /// per-format caps).
     pub limits: ParseLimits,
     /// Per-tensor dequantisation thread budget, with the same semantics as
     /// [`RememberOptions::threads`](crate::RememberOptions): `None` (the default)
@@ -960,7 +966,7 @@ fn hub_from_model(
 /// Returns [`AnamnesisError::Parse`] if the bytes match no supported format or
 /// the input is malformed, [`AnamnesisError::Unsupported`] for a target or
 /// output dtype this build cannot produce, [`AnamnesisError::LimitExceeded`] if
-/// the input exceeds `options.limits`, and
+/// the input, or the hub it would materialise, exceeds `options.limits`, and
 /// [`AnamnesisError::Cancelled`] if the run was cancelled through
 /// `options.cancel`.
 ///
@@ -972,6 +978,12 @@ fn hub_from_model(
 /// them before the hub drops. Budget roughly `2 × input + hub + output`, against
 /// the file path's `input + hub` where the input is a mapping rather than a copy
 /// and the output streams to disk.
+///
+/// The hub is the input format's `inspect().dequantized_size`, which is not the
+/// input size: dequantising multiplies it (about 4× for 4-bit weights at `BF16`,
+/// up to about 20× for 1.5-bit `GGUF` weights at `F32`). `options.limits` bounds
+/// it: the hub is checked against `max_total_bytes` before anything is
+/// dequantised, and the output is about the hub's size again.
 ///
 /// The owned copy is inherent to taking `&[u8]`: the byte parsers own their
 /// buffers, so a borrowed slice must be copied once. A caller who already holds
@@ -1191,17 +1203,23 @@ fn read_pth(path: &Path, limits: &ParseLimits) -> crate::Result<Hub> {
 /// mapping. Nothing is dequantised: a `state_dict` is already full precision.
 #[cfg(feature = "pth")]
 fn hub_from_pth(parsed: &crate::ParsedPth) -> crate::Result<Hub> {
-    let pth_tensors = parsed.tensors()?;
+    // Every tensor ends up owned by the hub, so the whole output is checked
+    // against the parse's limits before anything is copied.
+    let pth_tensors = parsed.tensors_for_owned_copy()?;
 
     let mut tensors = Vec::with_capacity(pth_tensors.len());
     for t in pth_tensors {
+        let data = match t.data {
+            Cow::Owned(data) => data,
+            // Copy the (possibly mmap-borrowed) bytes so the hub outlives the
+            // `ParsedPth`, reporting a refused allocation as an error.
+            Cow::Borrowed(bytes) => crate::limits::owned_copy(bytes, "`.pth` tensor")?,
+        };
         tensors.push(HubTensor {
             name: t.name,
             shape: t.shape,
             dtype: t.dtype.to_dtype()?,
-            // BORROW: `into_owned()` copies the (possibly mmap-borrowed) bytes so
-            // the hub outlives the `ParsedPth`.
-            data: t.data.into_owned(),
+            data,
         });
     }
     Ok(Hub {
@@ -1291,6 +1309,39 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
         acc.saturating_add(u64::try_from(view.data.len()).unwrap_or(u64::MAX))
     });
 
+    // What the hub will own, checked against the parse's limits before any
+    // dequantisation or copy: `n_elements × E::BYTES` for a quantised tensor,
+    // its stored bytes for a passthrough one. The same figures
+    // `GgufInspectInfo::dequantized_size` reports.
+    let mut hub_bytes: u64 = 0;
+    for view in &views {
+        let bytes = if view.dtype.is_quantized() {
+            let n_elements = crate::parse::utils::checked_num_elements(view.shape)
+                .and_then(|n| n.checked_mul(E::BYTES))
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!(
+                        "GGUF tensor `{}` shape {:?} output size overflows usize",
+                        view.name, view.shape
+                    ),
+                })?;
+            u64::try_from(n_elements).map_err(|_| AnamnesisError::Parse {
+                reason: "GGUF output size overflows u64".into(),
+            })?
+        } else {
+            u64::try_from(view.data.len()).map_err(|_| AnamnesisError::Parse {
+                reason: "GGUF tensor size overflows u64".into(),
+            })?
+        };
+        hub_bytes = hub_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| AnamnesisError::Parse {
+                reason: "GGUF materialised byte total overflows u64".into(),
+            })?;
+    }
+    parsed
+        .limits()
+        .check_materialised(hub_bytes, "GGUF dequantisation")?;
+
     // `ParsedGguf` is `Sync` (asserted in `tests/parallel_contract.rs`), and the
     // closure below reads only the shared-immutable view it is handed, writing
     // solely into the `HubTensor` it returns.
@@ -1326,9 +1377,9 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
                     name: tensor.name.to_owned(),
                     shape,
                     dtype: gguf_type_to_hub(tensor.dtype)?,
-                    // BORROW: `to_vec()` copies the mmap-borrowed slice so the
-                    // hub outlives the `ParsedGguf`.
-                    data: tensor.data.to_vec(),
+                    // Copy the mmap-borrowed slice so the hub outlives the
+                    // `ParsedGguf`, reporting a refused allocation as an error.
+                    data: crate::limits::owned_copy(&tensor.data, "GGUF tensor")?,
                 })
             }
         },
