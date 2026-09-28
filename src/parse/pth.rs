@@ -98,6 +98,30 @@ const MAX_PICKLE_VM_DEPTH: u32 = 256;
 /// adversarial archive.
 const MAX_BYTEORDER_SIZE: u64 = 64;
 
+/// Refuses a `byteorder` entry larger than `MAX_BYTEORDER_SIZE`, before it is
+/// sliced or read.
+///
+/// Shared by the mmap / bytes path and the reader path, so the cap cannot drift
+/// between them again: until v0.7.9 only the reader path applied it, and the
+/// other sliced the whole entry and echoed it into the error, so a 20 MiB
+/// `byteorder` made a 20 MiB error message (Phase 7.9, audit finding L-2).
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::LimitExceeded`] if `declared` exceeds the cap.
+fn enforce_byteorder_cap(declared: u64, entry_name: &str) -> crate::Result<()> {
+    if declared > MAX_BYTEORDER_SIZE {
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "MAX_BYTEORDER_SIZE",
+            message: format!(
+                "ZIP entry `{entry_name}`: declared size {declared} bytes exceeds the \
+                 {MAX_BYTEORDER_SIZE}-byte byteorder cap"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Maximum number of dimensions of a `.pth` tensor.
 ///
 /// Real model tensors have at most a handful of dimensions, and `NumPy` caps an
@@ -2468,6 +2492,10 @@ fn parsed_pth_from_backing(buffer: Backing, limits: &ParseLimits) -> crate::Resu
     // 2. Read byte order (default to little-endian).
     let big_endian = match entry_index.get("byteorder") {
         Some((start, len)) => {
+            let declared = u64::try_from(len).map_err(|_| AnamnesisError::Parse {
+                reason: "byteorder entry size overflows u64".into(),
+            })?;
+            enforce_byteorder_cap(declared, "byteorder")?;
             let end = start
                 .checked_add(len)
                 .ok_or_else(|| AnamnesisError::Parse {
@@ -3165,16 +3193,7 @@ fn read_pth_archive_for_inspect<R: Read + Seek>(
 
     let big_endian = match byteorder_entry {
         Some(entry) => {
-            if entry.uncompressed_size > MAX_BYTEORDER_SIZE {
-                return Err(AnamnesisError::LimitExceeded {
-                    limit: "MAX_BYTEORDER_SIZE",
-                    message: format!(
-                        "ZIP entry `{}`: declared size {} bytes exceeds the \
-                         {MAX_BYTEORDER_SIZE}-byte byteorder cap",
-                        entry.name, entry.uncompressed_size
-                    ),
-                });
-            }
+            enforce_byteorder_cap(entry.uncompressed_size, &entry.name)?;
             parse_byteorder(&read_pth_entry_bytes(&mut src, entry, limits)?)?
         }
         None => false, // default: little-endian
@@ -3446,7 +3465,10 @@ fn parse_byteorder(bytes: &[u8]) -> crate::Result<bool> {
         "little" => Ok(false),
         "big" => Ok(true),
         other => Err(AnamnesisError::Parse {
-            reason: format!("unknown byte order `{other}` (expected `little` or `big`)"),
+            reason: format!(
+                "unknown byte order `{}` (expected `little` or `big`)",
+                preview(other)
+            ),
         }),
     }
 }

@@ -715,3 +715,60 @@ mod m6_zip_size_lies {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// L-2: the `byteorder` cap was applied on the reader path only; the mmap and
+// bytes paths sliced the whole entry and echoed it into the error, so a 20 MiB
+// entry made a 20 MiB message on one path and a clean `LimitExceeded` on the
+// other.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pth")]
+mod l2_byteorder_parity {
+    use std::io::Cursor;
+
+    use anamnesis::AnamnesisError;
+
+    use crate::common::pth::{TensorSpec, pth_archive, state_dict_pickle};
+
+    fn with_byteorder(order: &[u8]) -> Vec<u8> {
+        let pkl = state_dict_pickle(&[TensorSpec {
+            name: "w",
+            storage_class: "ByteStorage",
+            storage_key: "0",
+            offset: 0,
+            shape: &[1],
+            strides: &[1],
+        }]);
+        pth_archive(&pkl, &[("0", &[1])], Some(order))
+    }
+
+    fn is_cap(r: &Result<impl std::fmt::Debug, AnamnesisError>) -> bool {
+        matches!(r, Err(AnamnesisError::LimitExceeded { limit, .. }) if *limit == "MAX_BYTEORDER_SIZE")
+    }
+
+    #[test]
+    fn an_oversized_byteorder_is_refused_on_every_path() {
+        let bytes = with_byteorder(&vec![b'x'; 1 << 20]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big-byteorder.pth");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(is_cap(&anamnesis::parse_pth(&path)));
+        assert!(is_cap(&anamnesis::parse_pth_bytes(bytes.clone())));
+        assert!(is_cap(&anamnesis::parse_pth_from_reader(Cursor::new(
+            &bytes
+        ))));
+        assert!(is_cap(&anamnesis::inspect_pth_from_reader(Cursor::new(
+            &bytes
+        ))));
+    }
+
+    #[test]
+    fn an_unknown_byteorder_is_echoed_bounded() {
+        // 64 bytes: within the cap, but not `little` or `big`.
+        let err = anamnesis::parse_pth_bytes(with_byteorder(&[b'q'; 64])).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("unknown byte order"), "{message}");
+        assert!(message.len() < 200, "{} bytes: {message}", message.len());
+    }
+}

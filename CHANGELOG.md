@@ -137,6 +137,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.pth` too), `DEFLATE` arrays grow as inflated bytes arrive, and a size
   beyond what the platform can address is `LimitExceeded` rather than a panic.
   The `STORED` read path, the common one, is unchanged.
+- **One `byteorder` cap on every `.pth` path** (Phase 7.9, audit finding L-2).
+  `MAX_BYTEORDER_SIZE` (64 bytes) was applied by `inspect_pth_from_reader` and
+  the other reader paths only; `parse_pth` and `parse_pth_bytes` sliced the
+  whole entry and echoed it into the error, so a 20 MiB `byteorder` produced a
+  20 MiB message there and a clean `LimitExceeded` on the reader path. Both
+  now share one check, and an unknown byte order is echoed as a short preview.
 
 ### Changed
 
