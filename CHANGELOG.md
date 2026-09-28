@@ -143,6 +143,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole entry and echoed it into the error, so a 20 MiB `byteorder` produced a
   20 MiB message there and a clean `LimitExceeded` on the reader path. Both
   now share one check, and an unknown byte order is echoed as a short preview.
+- **The pickle VM's `MARK` stack is capped** (Phase 7.9, audit finding L-1).
+  Each `MARK` pushed a `usize` onto a stack nothing charged, so a `data.pkl`
+  of nothing but `(` grew it 8 bytes per input byte: a 16 MiB pickle peaked at
+  160 MiB under a 32 MiB `max_total_bytes`, and a 100 MiB one at about
+  800 MiB, beyond the permanent `MAX_PICKLE_WORKING_SET` floor. More than 256
+  open marks (a real pickle holds its nesting depth, a handful) is now
+  `LimitExceeded` (`MAX_PICKLE_MARK_DEPTH`) on every entry point.
 
 ### Changed
 

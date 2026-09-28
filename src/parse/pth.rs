@@ -91,6 +91,18 @@ const MAX_PICKLE_WORKING_SET: u64 = 512 * 1024 * 1024;
 /// any stack-overflow threshold. Always-on, independent of [`ParseLimits`].
 const MAX_PICKLE_VM_DEPTH: u32 = 256;
 
+/// Maximum number of simultaneously open `MARK`s in the pickle VM.
+///
+/// Each `MARK` pushes one `usize` onto a stack that nothing else charged, so a
+/// `data.pkl` of nothing but `(` opcodes grew it by 8 bytes per input byte: a
+/// 16 MiB pickle peaked at 160 MiB under a 32 MiB `max_total_bytes`, and a
+/// 100 MiB one at about 800 MiB, beyond even the permanent
+/// `MAX_PICKLE_WORKING_SET` (Phase 7.9, audit finding L-1; the v0.6.3 audit had
+/// already suggested a cap). An open mark belongs to a container still being
+/// built, so real pickles hold at most their nesting depth, a handful; the cap
+/// matches [`MAX_PICKLE_VM_DEPTH`]. Always-on, independent of [`ParseLimits`].
+const MAX_PICKLE_MARK_DEPTH: usize = 256;
+
 /// Maximum declared size for a `.pth` archive's `byteorder` entry.
 ///
 /// The entry contains literally `"little"` or `"big"` (≤6 bytes). 64 B is
@@ -1537,7 +1549,17 @@ impl<'a> PickleVm<'a> {
                 // EMPTY_TUPLE
                 b')' => self.push_leaf(PickleValue::Tuple(Vec::new()))?,
                 // MARK
-                b'(' => self.mark_stack.push(self.stack.len()),
+                b'(' => {
+                    if self.mark_stack.len() >= MAX_PICKLE_MARK_DEPTH {
+                        return Err(AnamnesisError::LimitExceeded {
+                            limit: "MAX_PICKLE_MARK_DEPTH",
+                            message: format!(
+                                "pickle opens more than {MAX_PICKLE_MARK_DEPTH} MARKs at once"
+                            ),
+                        });
+                    }
+                    self.mark_stack.push(self.stack.len());
+                }
 
                 // TUPLE (pop to mark → tuple)
                 b't' => {
@@ -2380,8 +2402,9 @@ fn copy_to_contiguous(
 /// Returns [`AnamnesisError::DisallowedGlobal`] for a pickle `GLOBAL` outside
 /// the `torch.*` allowlist, and [`AnamnesisError::LimitExceeded`] for a
 /// permanent-cap rejection (`data.pkl` size, pickle payload / working-set /
-/// nesting depth, tensor rank). Both are always-on, so reachable even at the default
-/// (unbounded) limits this wrapper passes.
+/// nesting depth, open `MARK`s, tensor rank, materialisation ratio). Both are
+/// always-on, so reachable even at the default (unbounded) limits this wrapper
+/// passes.
 ///
 /// Returns [`AnamnesisError::Unsupported`] for legacy (pre-1.6) `.pth`
 /// files that are raw pickle without ZIP wrapping.
@@ -2429,7 +2452,8 @@ pub fn parse_pth(path: impl AsRef<Path>) -> crate::Result<ParsedPth> {
 ///
 /// Returns [`AnamnesisError::LimitExceeded`] if a declared `ZIP` entry count,
 /// `data.pkl` size, or pickle payload / working-set / nesting depth exceeds
-/// `limits` or a permanent cap, or a tensor has more than 64 dimensions.
+/// `limits` or a permanent cap, the pickle opens more than 256 `MARK`s at once,
+/// or a tensor has more than 64 dimensions.
 /// Returns [`AnamnesisError::DisallowedGlobal`] if the pickle references a
 /// `GLOBAL` outside the `torch.*` allowlist.
 /// Returns [`AnamnesisError::Parse`] if the file is not a valid `PyTorch` ZIP
@@ -4288,6 +4312,28 @@ mod tests {
             matches!(err, AnamnesisError::LimitExceeded { limit, .. } if limit == "max_total_bytes"),
             "expected working-set budget rejection, got: {err}"
         );
+    }
+
+    /// A `MARK` flood is refused at the mark-depth cap, not after hundreds of
+    /// MiB (Phase 7.9, audit finding L-1). Nested `MARK`s up to the cap are
+    /// fine: this pickle then fails later, on the unmatched stack.
+    #[test]
+    fn vm_caps_the_mark_stack() {
+        let flood = |marks: usize| {
+            let mut pkl = vec![0x80, 0x02];
+            pkl.resize(pkl.len() + marks, b'(');
+            pkl.push(b'.');
+            PickleVm::new(&pkl, &UNBOUNDED_LIMITS)
+                .execute()
+                .unwrap_err()
+        };
+        let over = flood(MAX_PICKLE_MARK_DEPTH + 1);
+        assert!(
+            matches!(over, AnamnesisError::LimitExceeded { limit, .. } if limit == "MAX_PICKLE_MARK_DEPTH"),
+            "{over}"
+        );
+        let at = flood(MAX_PICKLE_MARK_DEPTH);
+        assert!(!matches!(at, AnamnesisError::LimitExceeded { .. }), "{at}");
     }
 
     /// Vector (b): memoised-subtree replay is charged the clone's deep heap, so

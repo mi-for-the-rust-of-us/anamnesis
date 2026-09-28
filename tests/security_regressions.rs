@@ -772,3 +772,25 @@ mod l2_byteorder_parity {
         assert!(message.len() < 200, "{} bytes: {message}", message.len());
     }
 }
+
+// ---------------------------------------------------------------------------
+// L-1: the pickle VM's `MARK` stack was charged to nothing: a 16 MiB pickle of
+// `(` opcodes peaked at 160 MiB under a 32 MiB budget. It is now capped at 256
+// open marks.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pth")]
+#[test]
+fn l1_a_mark_flood_is_refused_on_every_path() {
+    let mut pkl = vec![0x80u8, 0x02];
+    pkl.resize(pkl.len() + (1 << 20), b'(');
+    pkl.push(b'.');
+    let bytes = common::pth::pth_archive(&pkl, &[], None);
+    let is_cap = |r: &Result<_, anamnesis::AnamnesisError>| matches!(r, Err(anamnesis::AnamnesisError::LimitExceeded { limit, .. }) if *limit == "MAX_PICKLE_MARK_DEPTH");
+    assert!(is_cap(
+        &anamnesis::parse_pth_bytes(bytes.clone()).map(|_| ())
+    ));
+    assert!(is_cap(
+        &anamnesis::inspect_pth_from_reader(std::io::Cursor::new(&bytes)).map(|_| ())
+    ));
+}
