@@ -126,6 +126,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LimitExceeded` (`NPY_MAX_DIMS`) on every entry point, and size-1 dimensions,
   which change neither order, are dropped before transposing. Output bytes are
   unchanged.
+- **A ZIP entry's declared size no longer sizes an `NPZ` buffer before the
+  bytes exist** (Phase 7.9, audit finding M-6;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). `parse_npz`
+  allocated each array from the entry's declared uncompressed size before
+  reading, so a 204-byte `.npz` claiming 3 GB committed 3 GB under default
+  limits, and panicked with "capacity overflow" on 32-bit targets. The shared
+  ZIP reader now requires a `STORED` entry to declare equal compressed and
+  uncompressed sizes (so its claim is bounded by bytes actually present, for
+  `.pth` too), `DEFLATE` arrays grow as inflated bytes arrive, and a size
+  beyond what the platform can address is `LimitExceeded` rather than a panic.
+  The `STORED` read path, the common one, is unchanged.
 
 ### Changed
 

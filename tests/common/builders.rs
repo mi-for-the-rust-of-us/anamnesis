@@ -116,6 +116,22 @@ pub fn build_npz_f32(tensors: &[(&str, &[usize], &[u8])]) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
+/// An `NPY` v2 file: magic (6) + version (2) + `u32` header length (4), then
+/// `dict` verbatim, padded with spaces to a 16-byte boundary and ended by a
+/// newline as `NumPy` writes it, then `data`.
+fn npy_v2(dict: &str, data: &[u8]) -> Vec<u8> {
+    let mut header = dict.as_bytes().to_vec();
+    while !(12 + header.len() + 1).is_multiple_of(16) {
+        header.push(b' ');
+    }
+    header.push(b'\n');
+    let mut npy = b"\x93NUMPY\x02\x00".to_vec();
+    npy.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+    npy.extend_from_slice(&header);
+    npy.extend_from_slice(data);
+    npy
+}
+
 /// Builds an `NPZ` archive from raw `NPY` v2 entries, each `(array name, header
 /// dict, data)`, all `STORED`. The header dict is written verbatim (padded and
 /// newline-terminated as `NumPy` does), so a test can declare shapes, orders and
@@ -126,21 +142,52 @@ pub fn build_npz_raw(entries: &[(&str, &str, &[u8])]) -> Vec<u8> {
     let options: zip::write::SimpleFileOptions =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, dict, data) in entries {
-        let mut header = dict.as_bytes().to_vec();
-        // v2: magic (6) + version (2) + u32 length (4), then the dict, padded
-        // with spaces to a 16-byte boundary and ended by a newline.
-        while (12 + header.len() + 1) % 16 != 0 {
-            header.push(b' ');
-        }
-        header.push(b'\n');
-        let mut npy = b"\x93NUMPY\x02\x00".to_vec();
-        npy.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
-        npy.extend_from_slice(&header);
-        npy.extend_from_slice(data);
         zip.start_file(format!("{name}.npy"), options).unwrap();
-        zip.write_all(&npy).unwrap();
+        zip.write_all(&npy_v2(dict, data)).unwrap();
     }
     zip.finish().unwrap().into_inner()
+}
+
+/// A one-array `NPZ` (entry `w.npy`, `STORED` or `DEFLATE`) whose central
+/// directory then claims `declared_size` uncompressed bytes, whatever the entry
+/// really holds (`None` leaves the honest size): the size lie behind Phase 7.9
+/// audit finding M-6. The archive is written by the `zip` crate and only the
+/// central-directory field is patched, which is the one the vendored reader
+/// trusts.
+pub fn npz_with_declared_size(
+    dict: &str,
+    data: &[u8],
+    deflate: bool,
+    declared_size: Option<u32>,
+) -> Vec<u8> {
+    use std::io::Write;
+    let npy = npy_v2(dict, data);
+
+    let method = if deflate {
+        zip::CompressionMethod::Deflated
+    } else {
+        zip::CompressionMethod::Stored
+    };
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::<u8>::new()));
+    zip.start_file(
+        "w.npy",
+        zip::write::SimpleFileOptions::default().compression_method(method),
+    )
+    .unwrap();
+    zip.write_all(&npy).unwrap();
+    let mut bytes = zip.finish().unwrap().into_inner();
+    let Some(declared_size) = declared_size else {
+        return bytes;
+    };
+
+    // Central-directory file header: signature, then the uncompressed size at
+    // byte 24.
+    let cd = bytes
+        .windows(4)
+        .position(|w| w == b"PK\x01\x02")
+        .expect("central directory");
+    bytes[cd + 24..cd + 28].copy_from_slice(&declared_size.to_le_bytes());
+    bytes
 }
 
 /// Writes `bytes` to `fixture.<ext>` in a fresh temp directory. The returned

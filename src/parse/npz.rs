@@ -715,19 +715,30 @@ fn to_c_order(
 /// `data.len() == n_blocks × type_size` cross-check the `GGUF` dequant path
 /// performs, and complements the absolute `NPZ_MAX_ARRAY_BYTES` cap.
 ///
+/// `stored` says how far `entry_size` can be trusted. For a `STORED` entry the
+/// `ZIP` reader has tied it to the compressed size and checked those bytes are
+/// present, so the array is read into one zero-filled buffer of its full size:
+/// the fast path (`docs/perf-experiments.md`, Experiment 1). For a `DEFLATE`
+/// entry it is only a claim the compressed stream may not honour, so the buffer
+/// grows as inflated bytes arrive instead: a few hundred bytes declaring
+/// gigabytes no longer commit gigabytes before failing (Phase 7.9, audit
+/// finding M-6).
+///
 /// # Errors
 ///
 /// Returns [`AnamnesisError::Parse`] if the element count or byte count
 /// overflows `usize`, if `data_bytes` exceeds the entry's declared size, or if
 /// the entry's bytes are truncated or fail to inflate.
 /// Returns [`AnamnesisError::LimitExceeded`] if `data_bytes` exceeds the
-/// `NPZ_MAX_ARRAY_BYTES` cap or the caller's `budget` (per-item
-/// single-allocation cap + cumulative aggregate).
+/// `NPZ_MAX_ARRAY_BYTES` cap, the caller's `budget` (per-item
+/// single-allocation cap + cumulative aggregate), or what this platform can
+/// address (`isize::MAX` bytes, reachable on 32-bit targets).
 /// Returns [`AnamnesisError::Io`] if the underlying reader fails.
 fn read_array_data(
     reader: &mut impl Read,
     header: &NpyHeader,
     entry_size: u64,
+    stored: bool,
     budget: &mut Budget,
 ) -> crate::Result<Vec<u8>> {
     let n_elements = checked_num_elements(&header.shape).ok_or_else(|| AnamnesisError::Parse {
@@ -767,11 +778,43 @@ fn read_array_data(
     // layered on top of the permanent caps above. The aggregate is what bounds
     // `parse_npz`'s peak heap (every array is held in the returned map at once).
     budget.charge_alloc(data_bytes_u64, "NPZ array data")?;
+    // No buffer can exceed `isize::MAX` bytes. On a 32-bit target a declared
+    // size past it made `vec!` panic with "capacity overflow" instead of
+    // failing cleanly.
+    if isize::try_from(data_bytes).is_err() {
+        return Err(AnamnesisError::LimitExceeded {
+            limit: "available_memory",
+            message: format!(
+                "NPY array size {data_bytes} bytes exceeds what this platform can address"
+            ),
+        });
+    }
 
-    let mut buf = vec![0u8; data_bytes];
-    reader
-        .read_exact(&mut buf)
-        .map_err(|e| classify_decode_error(e, &format!("NPY array data ({data_bytes} bytes)")))?;
+    let context = || format!("NPY array data ({data_bytes} bytes)");
+    let mut buf = if stored {
+        let mut buf = vec![0u8; data_bytes];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| classify_decode_error(e, &context()))?;
+        buf
+    } else {
+        let mut buf = Vec::new();
+        reader
+            .by_ref()
+            .take(data_bytes_u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| classify_decode_error(e, &context()))?;
+        if buf.len() != data_bytes {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "failed to decode {}: entry ends after {} bytes",
+                    context(),
+                    buf.len()
+                ),
+            });
+        }
+        buf
+    };
 
     // Byte-swap for big-endian data with multi-byte elements.
     if header.big_endian && header.dtype.byte_size() > 1 {
@@ -1372,7 +1415,8 @@ fn parse_npz_from_zip_reader<R: Read + Seek>(
         let mut entry_reader = open_npz_entry_reader(&mut src, entry, &name)?;
         let header = parse_npy_header(&mut entry_reader, &mut budget)?;
 
-        let raw = read_array_data(&mut entry_reader, &header, entry_size, &mut budget)?;
+        let stored = entry.method == crate::parse::zip::Compression::Stored;
+        let raw = read_array_data(&mut entry_reader, &header, entry_size, stored, &mut budget)?;
         // `NumPy` records the order it found, and a transposed view is
         // `F`-contiguous, so this arm is reached by ordinary scripts rather
         // than exotic ones. Materialising C-order here keeps the row-major
@@ -1715,8 +1759,14 @@ mod tests {
 
         // u64::MAX entry size: this test exercises the read/byteswap path, not
         // the entry-size guard (covered by its own test below).
-        let result =
-            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
+        let result = read_array_data(
+            &mut reader,
+            &header,
+            u64::MAX,
+            true,
+            &mut Budget::unbounded(),
+        )
+        .unwrap();
         assert_eq!(result, data);
     }
 
@@ -1734,8 +1784,14 @@ mod tests {
         let header = parse_npy_header(&mut reader, &mut Budget::unbounded()).unwrap();
         assert!(header.big_endian);
 
-        let result =
-            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
+        let result = read_array_data(
+            &mut reader,
+            &header,
+            u64::MAX,
+            true,
+            &mut Budget::unbounded(),
+        )
+        .unwrap();
         // After byteswap: [00, 00, 80, 3F] = 1.0 in LE
         assert_eq!(result, vec![0x00, 0x00, 0x80, 0x3F]);
         let val = f32::from_le_bytes([result[0], result[1], result[2], result[3]]);
@@ -1768,8 +1824,14 @@ mod tests {
         assert_eq!(header.dtype, NpzDtype::F64);
         assert_eq!(header.shape, vec![1]);
 
-        let result =
-            read_array_data(&mut reader, &header, u64::MAX, &mut Budget::unbounded()).unwrap();
+        let result = read_array_data(
+            &mut reader,
+            &header,
+            u64::MAX,
+            true,
+            &mut Budget::unbounded(),
+        )
+        .unwrap();
         assert_eq!(result, 42.5_f64.to_le_bytes());
     }
 
@@ -2682,7 +2744,13 @@ mod tests {
         // u64::MAX entry size so the absolute cap (not the entry-size guard)
         // is what rejects this shape.
         let mut empty = std::io::Cursor::new(Vec::new());
-        let result = read_array_data(&mut empty, &header, u64::MAX, &mut Budget::unbounded());
+        let result = read_array_data(
+            &mut empty,
+            &header,
+            u64::MAX,
+            true,
+            &mut Budget::unbounded(),
+        );
         assert!(
             result.is_err(),
             "oversized declared array must be rejected, got Ok"
@@ -2702,7 +2770,8 @@ mod tests {
             shape: vec![1000],
         };
         let mut empty = std::io::Cursor::new(Vec::new());
-        let Err(err) = read_array_data(&mut empty, &header, 16, &mut Budget::unbounded()) else {
+        let Err(err) = read_array_data(&mut empty, &header, 16, true, &mut Budget::unbounded())
+        else {
             panic!("over-declared shape vs entry size must be rejected");
         };
         let msg = err.to_string();

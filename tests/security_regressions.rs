@@ -655,3 +655,63 @@ mod h3_npy_rank {
         assert_eq!(arrays["w"].shape.len(), 64);
     }
 }
+
+// ---------------------------------------------------------------------------
+// M-6: a `ZIP` entry's declared uncompressed size sized the `NPZ` array buffer
+// before a byte was read. A 204-byte `.npz` claiming 3 GB committed a 3 GB
+// buffer (and panicked with "capacity overflow" on 32-bit targets). `STORED`
+// entries must now declare equal sizes, and `DEFLATE` arrays grow as inflated
+// bytes arrive.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "npz")]
+mod m6_zip_size_lies {
+    use std::io::Cursor;
+
+    use anamnesis::AnamnesisError;
+
+    use crate::common::builders::npz_with_declared_size;
+
+    /// 16 real bytes behind a header declaring 3 000 000 000 of them.
+    fn lying(deflate: bool) -> Vec<u8> {
+        npz_with_declared_size(
+            "{'descr': '|u1', 'fortran_order': False, 'shape': (3000000000,), }",
+            &[0u8; 16],
+            deflate,
+            Some(0xF000_0000),
+        )
+    }
+
+    #[test]
+    fn a_stored_entry_must_declare_equal_sizes() {
+        let bytes = lying(false);
+        for r in [
+            anamnesis::parse_npz_bytes(bytes.clone()).map(|_| ()),
+            anamnesis::inspect_npz_from_reader(Cursor::new(&bytes)).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&r, Err(AnamnesisError::Parse { reason }) if reason.contains("STORED entry declares")),
+                "{r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deflate_entry_that_lies_is_a_clean_error() {
+        let r = anamnesis::parse_npz_bytes(lying(true));
+        assert!(
+            matches!(&r, Err(AnamnesisError::Parse { reason }) if reason.contains("entry ends after")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn honest_stored_and_deflate_archives_still_parse() {
+        for deflate in [false, true] {
+            let dict = "{'descr': '|u1', 'fortran_order': False, 'shape': (4,), }";
+            let honest = npz_with_declared_size(dict, &[1, 2, 3, 4], deflate, None);
+            let arrays = anamnesis::parse_npz_bytes(honest).unwrap();
+            assert_eq!(arrays["w"].data, vec![1, 2, 3, 4], "deflate: {deflate}");
+        }
+    }
+}
