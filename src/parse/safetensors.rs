@@ -621,6 +621,50 @@ pub struct SafetensorsHeader {
 }
 
 impl SafetensorsHeader {
+    /// Number of output elements `remember` produces from the quantized tensor
+    /// `entry` of this header: the one size function `inspect`'s
+    /// `dequantized_size` is built from, so the estimate a host gates on is the
+    /// output it gets.
+    ///
+    /// Most schemes store one weight per element. Two pack several:
+    ///
+    /// - `BnB` 4-bit: two weights per `U8` byte.
+    /// - `GPTQ` / `AWQ`: `32 / bits` weights per `I32` of `.qweight` (8 at
+    ///   4-bit, 4 at 8-bit). Until v0.7.9 this was missed, and `inspect`
+    ///   under-reported 4-bit models 8× (Phase 7.9, audit finding M-1). When
+    ///   the config is absent or its bit width is not 4 or 8 (the fields are
+    ///   public, so a caller can edit them), the estimate assumes 8 weights per
+    ///   element: an over-estimate refuses more, never less.
+    ///
+    /// Saturating, because the result feeds a size estimate: an absurd shape
+    /// reads as `u64::MAX`, which a gate treats as too big.
+    pub(crate) fn dequantized_elements(&self, entry: &TensorEntry) -> u64 {
+        // CAST: usize → u64, element and byte counts fit in u64
+        #[allow(clippy::as_conversions)]
+        let (elements, bytes) = (entry.num_elements() as u64, entry.byte_len() as u64);
+        if self.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
+            return bytes.saturating_mul(2);
+        }
+        if entry.dtype != Dtype::I32 {
+            return elements;
+        }
+        // `Some(bits)` for a packed scheme: `bits` is the configured width,
+        // itself `None` when the config is absent.
+        let packed_bits = if self.scheme == QuantScheme::Gptq {
+            Some(self.gptq_config.as_ref().map(|c| c.bits))
+        } else if self.scheme == QuantScheme::Awq {
+            Some(self.awq_config.as_ref().map(|c| c.bits))
+        } else {
+            None
+        };
+        match packed_bits {
+            None => elements,
+            Some(Some(8)) => elements.saturating_mul(4),
+            // 4-bit, or an absent / unusable width: assume the larger factor.
+            Some(Some(_) | None) => elements.saturating_mul(8),
+        }
+    }
+
     /// Returns an iterator over quantized tensors.
     pub fn quantized_tensors(&self) -> impl Iterator<Item = &TensorEntry> {
         self.tensors

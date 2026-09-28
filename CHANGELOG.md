@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`PTH_MAX_DIMS`) on every entry point; size-1 dimensions are dropped before
   the contiguity test, so such a tensor takes the zero-copy path. Output bytes
   are unchanged.
+- **`inspect` no longer under-reports `GPTQ` and `AWQ` output 8×** (Phase 7.9,
+  audit finding M-1). `dequantized_size` counted the `I32` elements of
+  `.qweight`, not the `32 / bits` weights packed into each, so a host sizing its
+  memory budget from `inspect` admitted 8× more than it thought for every
+  4-bit model (4× at 8-bit), honest files included, and `amn inspect` printed
+  the wrong figure. The estimate now comes from one per-tensor output-size
+  function, and a new test (`tests/inspect_matches_remember.rs`) holds it equal
+  to the bytes `remember` actually writes for every reference fixture at
+  `BF16`, `F32` and `F16`. A missing or edited bit width over-estimates rather
+  than under-estimates. Present since `inspect` gained `dequantized_size`.
 
 ### Fixed
 
