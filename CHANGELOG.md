@@ -102,6 +102,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a plain `convert_bytes` run under gave no protection. A new permanent
   floor, `PTH_MAX_MATERIALISE_RATIO` (16, far above any real model's tying),
   rejects the file at parse time with `LimitExceeded` on every entry point.
+- **GGUF: overlapping tensor data is refused, and `general.alignment` must be
+  a power of two** (Phase 7.9, audit finding H-2;
+  [CWE-770](https://cwe.mitre.org/data/definitions/770.html)). Each tensor's
+  byte range was checked to lie inside the file, but not against the others,
+  so a few hundred 32-byte tensor-info records could all name the same bytes,
+  each then dequantised or copied in full: 276 KB of input produced 105 MB of
+  output. Separately, any non-zero `general.alignment` was accepted, and a
+  `gguf` to `gguf` conversion inherited it and padded every tensor to it: a
+  1 MiB file with a 1 MiB alignment converted to 1 GB, while `inspect`
+  reported 3.9 KB. Every `GGUF` entry point now rejects overlapping ranges
+  (adjacent ones are fine, and llama.cpp's own layout rule already implies
+  this), the reader and the writer share one rule requiring a power-of-two
+  alignment (as llama.cpp does), and `convert` no longer inherits the source
+  alignment: the output uses the default of 32 unless the caller sets one.
 
 ### Changed
 

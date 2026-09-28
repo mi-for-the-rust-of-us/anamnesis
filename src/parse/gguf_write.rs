@@ -87,8 +87,8 @@ pub struct GgufWriteTensor<'a> {
 ///
 /// `metadata` is the caller-supplied `KV` table. `general.alignment` is
 /// injected automatically if absent (default 32 B); if present it must be a
-/// non-zero `U32`. Tensor-data alignment respects whichever value ends up in
-/// the written file.
+/// `U32` power of two, as llama.cpp requires. Tensor-data alignment respects
+/// whichever value ends up in the written file.
 ///
 /// Tensors are emitted in the order supplied. Their `data_offset`s are
 /// laid out contiguously inside the data section, each rounded up to the
@@ -99,7 +99,7 @@ pub struct GgufWriteTensor<'a> {
 ///
 /// Returns [`AnamnesisError::Unsupported`] when any tensor's dtype is
 /// `is_quantized()` (quantised emit lands in Phase 8.5), or when a supplied
-/// `general.alignment` value is non-`U32` or zero.
+/// `general.alignment` value is non-`U32` or not a power of two.
 ///
 /// Returns [`AnamnesisError::Parse`] when a tensor's `data.len()` disagrees
 /// with the dtype/shape-implied byte count, when any element-count or offset
@@ -157,8 +157,8 @@ pub fn write_gguf_to_writer<W: Write + Seek, S: BuildHasher>(
     crate::parse::utils::reject_duplicate_names(tensors.iter().map(|t| t.name))?;
 
     // 2. Resolve the effective alignment. If the caller supplied
-    //    `general.alignment` we honour it (provided it is a non-zero
-    //    `U32`); otherwise we inject the default so the file is fully
+    //    `general.alignment` we honour it (provided it is a `U32` power of
+    //    two); otherwise we inject the default so the file is fully
     //    self-describing.
     let (alignment_u32, needs_inject_alignment) = resolve_alignment(metadata)?;
     let alignment_u64 = u64::from(alignment_u32);
@@ -425,10 +425,16 @@ fn resolve_alignment<S: BuildHasher>(
     metadata: &HashMap<String, GgufMetadataValue, S>,
 ) -> crate::Result<(u32, bool)> {
     match metadata.get(ALIGNMENT_KEY) {
-        Some(GgufMetadataValue::U32(v)) if *v != 0 => Ok((*v, false)),
-        Some(GgufMetadataValue::U32(_)) => Err(AnamnesisError::Unsupported {
+        Some(GgufMetadataValue::U32(v)) if crate::parse::gguf::is_valid_alignment(*v) => {
+            Ok((*v, false))
+        }
+        Some(GgufMetadataValue::U32(0)) => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: "general.alignment must be non-zero".into(),
+        }),
+        Some(GgufMetadataValue::U32(v)) => Err(AnamnesisError::Unsupported {
+            format: "GGUF".into(),
+            detail: format!("general.alignment must be a power of two, got {v}"),
         }),
         Some(_) => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),

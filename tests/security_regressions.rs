@@ -447,3 +447,161 @@ mod l3_gate_equivalence {
         assert!(refused_before_materialising(&remember(gate - 1)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// H-2: GGUF tensor-info records could alias one data range (each copy then
+// dequantised in full: 276 KB in, 105 MB out), and the writer padded every
+// tensor to whatever alignment the source declared (1 MiB in, 1 GB out, with
+// `inspect` reporting 3.9 KB).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gguf")]
+mod h2_gguf_aliasing_and_alignment {
+    use std::collections::HashMap;
+    use std::io::Cursor;
+
+    use anamnesis::{AnamnesisError, ConvertOptions, ConvertTarget, GgufMetadataValue};
+
+    use crate::common::gguf::{GGUF_KV_U32, RawTensorInfo, raw_gguf};
+
+    /// A `GGUF` of one-dimensional `F32` tensors of `elements` each, at the
+    /// given relative offsets, over `data`.
+    fn gguf(
+        kvs: &[(&str, u32, &[u8])],
+        offsets: &[u64],
+        elements: u64,
+        alignment: usize,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let names: Vec<String> = (0..offsets.len()).map(|i| format!("t{i}")).collect();
+        let dims = [elements];
+        let infos: Vec<RawTensorInfo<'_>> = names
+            .iter()
+            .zip(offsets)
+            .map(|(name, &offset)| RawTensorInfo {
+                name,
+                dims: &dims,
+                ggml_type: 0,
+                offset,
+            })
+            .collect();
+        raw_gguf(kvs, &infos, alignment, data)
+    }
+
+    fn is_parse(r: &Result<impl std::fmt::Debug, AnamnesisError>, needle: &str) -> bool {
+        matches!(r, Err(AnamnesisError::Parse { reason }) if reason.contains(needle))
+    }
+
+    #[test]
+    fn aliased_tensor_data_is_refused_on_every_path() {
+        // 100 tensors of 64 KiB, all at offset 0 of one 64 KiB region.
+        let bytes = gguf(&[], &[0; 100], 16 * 1024, 32, &vec![0u8; 64 * 1024]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aliased.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(is_parse(&anamnesis::parse_gguf(&path), "overlap"));
+        assert!(is_parse(
+            &anamnesis::parse_gguf_bytes(bytes.clone()),
+            "overlap"
+        ));
+        assert!(is_parse(
+            &anamnesis::parse_gguf_from_reader(Cursor::new(&bytes)),
+            "overlap"
+        ));
+        assert!(is_parse(
+            &anamnesis::inspect_gguf_from_reader(Cursor::new(&bytes)),
+            "overlap"
+        ));
+        assert!(is_parse(
+            &anamnesis::parse_gguf_front_matter_from_reader(Cursor::new(&bytes)),
+            "overlap"
+        ));
+        assert!(is_parse(
+            &anamnesis::convert_bytes(&bytes, ConvertTarget::Safetensors, &ConvertOptions::new()),
+            "overlap"
+        ));
+    }
+
+    #[test]
+    fn partly_overlapping_and_adjacent_tensors() {
+        // Two 8-element F32 tensors (32 bytes each). At offsets 0 and 32 they
+        // are adjacent, which is how every real file is laid out.
+        let data = vec![0u8; 64];
+        assert!(anamnesis::parse_gguf_bytes(gguf(&[], &[0, 32], 8, 32, &data)).is_ok());
+        // At alignment 16, offsets 0 and 16 overlap by 16 bytes.
+        let align16 = 16u32.to_le_bytes();
+        let kv: [(&str, u32, &[u8]); 1] = [("general.alignment", GGUF_KV_U32, &align16)];
+        assert!(is_parse(
+            &anamnesis::parse_gguf_bytes(gguf(&kv, &[0, 16], 8, 16, &data)),
+            "overlap"
+        ));
+    }
+
+    #[test]
+    fn the_reader_refuses_an_alignment_that_is_not_a_power_of_two() {
+        for alignment in [48u32, 7] {
+            let value = alignment.to_le_bytes();
+            let kv: [(&str, u32, &[u8]); 1] = [("general.alignment", GGUF_KV_U32, &value)];
+            let bytes = gguf(&kv, &[0], 1, alignment as usize, &[0u8; 4]);
+            assert!(
+                is_parse(&anamnesis::parse_gguf_bytes(bytes), "not a power of two"),
+                "alignment {alignment}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_writer_refuses_an_alignment_that_is_not_a_power_of_two() {
+        let st = crate::common::builders::build_fp8_checkpoint();
+        for alignment in [48u32, 7] {
+            let options = ConvertOptions::new().with_gguf_metadata(HashMap::from([(
+                "general.alignment".to_owned(),
+                GgufMetadataValue::U32(alignment),
+            )]));
+            let r = anamnesis::convert_bytes(&st, ConvertTarget::Gguf, &options);
+            assert!(
+                matches!(&r, Err(AnamnesisError::Unsupported { detail, .. }) if detail.contains("power of two")),
+                "alignment {alignment}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_source_alignment_is_not_inherited() {
+        // Eight one-element tensors, legitimately 64 KiB apart under a 64 KiB
+        // alignment. Converting to GGUF used to pad every output tensor to
+        // 64 KiB too; the output now uses the default alignment of 32.
+        let big = 1u32 << 16;
+        let value = big.to_le_bytes();
+        let kv: [(&str, u32, &[u8]); 1] = [("general.alignment", GGUF_KV_U32, &value)];
+        let offsets: Vec<u64> = (0..8).map(|i| i * u64::from(big)).collect();
+        let bytes = gguf(
+            &kv,
+            &offsets,
+            1,
+            big as usize,
+            &vec![0u8; 7 * big as usize + 4],
+        );
+        assert_eq!(
+            anamnesis::parse_gguf_bytes(bytes.clone())
+                .unwrap()
+                .alignment(),
+            big
+        );
+
+        let (out, _) =
+            anamnesis::convert_bytes(&bytes, ConvertTarget::Gguf, &ConvertOptions::new()).unwrap();
+        let converted = anamnesis::parse_gguf_bytes(out.clone()).unwrap();
+        assert_eq!(converted.alignment(), 32);
+        assert!(out.len() < 4096, "output is {} bytes", out.len());
+
+        // An alignment the caller asks for explicitly is still honoured.
+        let options = ConvertOptions::new().with_gguf_metadata(HashMap::from([(
+            "general.alignment".to_owned(),
+            GgufMetadataValue::U32(64),
+        )]));
+        let (out, _) = anamnesis::convert_bytes(&bytes, ConvertTarget::Gguf, &options).unwrap();
+        assert_eq!(anamnesis::parse_gguf_bytes(out).unwrap().alignment(), 64);
+    }
+}

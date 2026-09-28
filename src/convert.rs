@@ -246,6 +246,10 @@ impl ConvertOptions {
 
     /// Sets the `GGUF` key/value metadata written to a `gguf` target, merged over
     /// any KV inherited from a `GGUF` source.
+    ///
+    /// The source's `general.alignment` is **not** inherited: the output is
+    /// laid out at the default of 32 bytes unless this map sets
+    /// `general.alignment`, which must then be a `U32` power of two.
     #[cfg(feature = "gguf")]
     #[must_use]
     pub fn with_gguf_metadata(
@@ -1392,13 +1396,20 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     // through untouched and must not be reported as dequantised.
     let dequantized = views.iter().filter(|v| v.dtype.is_quantized()).count();
 
+    // Preserve the source KV so a dequantise-in-place `gguf -> gguf` stays
+    // loadable; caller-supplied KV is merged over it by the writer. Except the
+    // source's `general.alignment`: the writer pads every tensor to it, so a
+    // file declaring a large one turned into an output that many times larger
+    // (Phase 7.9, audit finding H-2). The output is laid out at the writer's
+    // default unless the caller asks for an alignment explicitly.
+    let mut gguf_metadata = parsed.metadata().clone();
+    gguf_metadata.remove("general.alignment");
+
     Ok(Hub {
         tensors,
         st_metadata: None,
         dequantized,
-        // Preserve the source KV so a dequantise-in-place `gguf -> gguf` stays
-        // loadable; caller-supplied KV is merged over it by the writer.
-        gguf_metadata: parsed.metadata().clone(),
+        gguf_metadata,
     })
 }
 

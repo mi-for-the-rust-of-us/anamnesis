@@ -65,6 +65,19 @@ const GGUF_MAGIC_LE_U32: u32 = u32::from_le_bytes(*GGUF_MAGIC);
 /// when interpreted little-endian is actually stored big-endian.
 const GGUF_MAGIC_BE_U32: u32 = u32::from_be_bytes(*GGUF_MAGIC);
 
+/// Whether `alignment` is an acceptable `general.alignment`: a non-zero power of
+/// two, which is what llama.cpp's `gguf_init` requires.
+///
+/// Shared by the reader ([`read_gguf_structure`]) and the writer
+/// (`gguf_write::resolve_alignment`), so the crate can neither accept a file it
+/// would refuse to write nor write one it would refuse to read. Until v0.7.9
+/// both accepted any non-zero `u32`, and the writer then padded every tensor to
+/// it: a 1 MiB file with `general.alignment = 1 MiB` and a thousand one-element
+/// tensors converted to 1 GB (Phase 7.9, audit finding H-2).
+pub(crate) const fn is_valid_alignment(alignment: u32) -> bool {
+    alignment.is_power_of_two()
+}
+
 /// Default tensor-data alignment when `general.alignment` metadata is absent.
 pub(crate) const DEFAULT_ALIGNMENT: u32 = 32;
 
@@ -2176,10 +2189,15 @@ fn read_gguf_structure<R: Read + Seek>(
 
     // Resolve alignment (honour `general.alignment` if present).
     let alignment = match metadata.get("general.alignment") {
-        Some(GgufMetadataValue::U32(v)) if *v != 0 => *v,
-        Some(GgufMetadataValue::U32(_)) => {
+        Some(GgufMetadataValue::U32(v)) if is_valid_alignment(*v) => *v,
+        Some(GgufMetadataValue::U32(0)) => {
             return Err(AnamnesisError::Parse {
                 reason: "GGUF: general.alignment is zero".into(),
+            });
+        }
+        Some(GgufMetadataValue::U32(v)) => {
+            return Err(AnamnesisError::Parse {
+                reason: format!("GGUF: general.alignment {v} is not a power of two"),
             });
         }
         Some(other) => {
@@ -2287,6 +2305,7 @@ fn read_gguf_structure<R: Read + Seek>(
         }
         info.data_offset = absolute;
     }
+    reject_overlapping_tensor_data(&tensor_infos)?;
 
     Ok(GgufFrontMatter {
         version,
@@ -2294,6 +2313,52 @@ fn read_gguf_structure<R: Read + Seek>(
         metadata,
         tensor_infos,
     })
+}
+
+/// Rejects a tensor table in which two tensors' data ranges overlap.
+///
+/// Each tensor's range was already checked to lie inside the file, but not
+/// against the others, so several tensor-info records (about 32 bytes each)
+/// could name the same bytes. Every one of them is then dequantised or copied
+/// in full: 276 KB of input produced 105 MB of output (Phase 7.9, audit finding
+/// H-2). llama.cpp's `gguf_init` rules this out by requiring each offset to be
+/// the running, aligned sum of the previous sizes; real files are laid out that
+/// way, so requiring disjoint ranges refuses nothing honest. Adjacent ranges
+/// (one ending where the next begins) are fine.
+///
+/// Runs after the patch sweep, on absolute offsets. A tensor whose byte length
+/// is unknown counts as one byte, so it still may not share a start.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] naming the first two overlapping tensors.
+fn reject_overlapping_tensor_data(infos: &[GgufTensorInfo]) -> crate::Result<()> {
+    let mut ranges: Vec<(u64, u64, &str)> = infos
+        .iter()
+        .map(|info| {
+            let end = info
+                .data_offset
+                .checked_add(info.byte_len.unwrap_or(1).max(1))
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!("GGUF tensor `{}`: end offset overflow", info.name),
+                })?;
+            Ok((info.data_offset, end, info.name.as_str()))
+        })
+        .collect::<crate::Result<_>>()?;
+    ranges.sort_unstable_by_key(|&(start, end, _)| (start, end));
+    for pair in ranges.windows(2) {
+        if let [(a_start, a_end, a), (b_start, b_end, b)] = pair
+            && b_start < a_end
+        {
+            return Err(AnamnesisError::Parse {
+                reason: format!(
+                    "GGUF tensors `{a}` [{a_start}..{a_end}] and `{b}` [{b_start}..{b_end}] \
+                     overlap (aliased tensor data is not supported)"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Full front matter of a parsed `GGUF` file — version, alignment, the
