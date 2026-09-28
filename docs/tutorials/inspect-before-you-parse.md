@@ -129,6 +129,8 @@ error: parse error: GGUF: invalid magic (expected `GGUF`/0x46554747, got 0x58585
 
 Every parser entry point shares this discipline: checked arithmetic on header-derived sizes, an allocation cap *before* any `vec!`, a strict allowlist in the `.pth` pickle VM (it never invokes Python callables), and a vendored read-only ZIP reader for `.npz` / `.pth`. A malformed or hostile file becomes a clean `Err` and a non-zero exit, not a dead process.
 
+Since v0.7.9 the same discipline covers what a small file could make anamnesis *produce*, not only what it reads: a `.pth` tensor view that would expand beyond its storage, `GGUF` tensors that alias one data range, and shapes of more than 64 dimensions are refused at parse time, so no few-hundred-byte file can make a later call allocate gigabytes or spin for minutes. And the error text is safe to show: a tensor name full of terminal escape codes prints as visible `\u{1b}` escapes rather than rewriting your screen.
+
 ## Step 4 — bound it in code with `ParseLimits`
 
 The CLI uses generous default caps. When you embed anamnesis in a service — a multi-tenant backend, an edge device — you want *your* ceilings, not the server-scale defaults. The library API takes a caller-supplied `ParseLimits` budget, enforced fail-fast before allocation:
@@ -140,14 +142,14 @@ use anamnesis::{ParseLimits, parse_with_limits};
 // `ParseLimits::default()` is permissive; the `with_*` builders set your ceilings.
 let limits = ParseLimits::default()
     .with_max_single_alloc(512 * 1024 * 1024)       // no single tensor over 512 MiB
-    .with_max_total_bytes(2 * 1024 * 1024 * 1024)   // 2 GiB cumulative parse-time heap
-    .with_max_item_count(4096)                       // cap the declared tensor count
+    .with_max_total_bytes(2 * 1024 * 1024 * 1024)   // 2 GiB, for parsing and again for what remember/convert produce
+    .with_max_item_count(4096)                       // cap the declared tensor count (every format)
     .with_max_decompression_ratio(100);             // zip-bomb guard for .npz / .pth
 
 let model = parse_with_limits("upload.safetensors", &limits)?; // over budget → Err(LimitExceeded)
 ```
 
-`ParseLimits::default()` is permissive (the CLI's behaviour); you tighten the axes that matter for your environment. For a header-only gate over data you are streaming or fetching remotely — without a file on disk — use the reader-based `inspect_*_from_reader` calls to read the declared totals first, check them against your policy, and only then parse. That is the same *inspect → check → parse* pattern, made programmatic.
+`ParseLimits::default()` is permissive (the CLI's behaviour); you tighten the axes that matter for your environment. The limits stay with the parsed model: a later `remember`, `convert` or `.pth` `tensors()` call checks what it is about to allocate against `max_total_bytes` first, using the very figure `inspect` reports as `dequantized_size`. So the rule for sizing the budget is simple: at least `dequantized_size` for the output dtype you will ask for. For a header-only gate over data you are streaming or fetching remotely — without a file on disk — use the reader-based `inspect_*_from_reader` calls to read the declared totals first, check them against your policy, and only then parse. That is the same *inspect → check → parse* pattern, made programmatic.
 
 ## What you've learned
 
@@ -155,5 +157,6 @@ let model = parse_with_limits("upload.safetensors", &limits)?; // over budget �
 - `amn inspect` is a cheap, header-only preview (it doesn't read weight bodies for `.gguf` / `.npz` / `.pth`); `amn parse` is the full commitment, so gate it behind an inspect you trust.
 - A hostile file is rejected with a clear error and a non-zero exit — anamnesis caps declared sizes before allocating, so a 7-exabyte header claim costs microseconds, not an OOM.
 - In a service, pass a `ParseLimits` budget (or use `inspect_*_from_reader` for a streamed/remote gate) to enforce *your* ceilings instead of the server-scale defaults.
+- The budget also bounds what `remember` / `convert` produce, against the same `dequantized_size` `inspect` shows you, so the gate you check and the limit you set agree.
 
 For the questions this raises — *"is it safe to parse a file from a stranger?"*, *"how do I bound memory?"* — see the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). To go the other direction and recover full-precision weights once you trust a file, see [Dequantize a GGUF model to BF16](dequantize-a-gguf-model.md).

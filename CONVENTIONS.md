@@ -607,6 +607,48 @@ references (`torch._utils.…`, `collections.OrderedDict`, …); all others
 return `Unsupported`. New parsers that interpret input symbols follow the
 same shape.
 
+### Bound what a parsed file can expand into, not only what it declares
+
+The caps above bound what a parser *reads*. A parsed file then drives
+allocations of its own: a `.pth` view is copied into a contiguous buffer, a
+quantised tensor is dequantised, the `convert` hub owns everything. Phase 7.9
+found four small files that turned into gigabytes or minutes of work *after*
+parsing succeeded. The rules that closed them:
+
+- **Size the output from the metadata and check it before allocating.** Every
+  call that materialises tensor data computes its total first and checks it
+  against `ParseLimits::check_materialised` (the caller's `max_total_bytes`).
+  Compute the total with the same function `inspect` uses to report
+  `dequantized_size`, so the gate a host checks and the limit it sets agree.
+- **A view may not expand.** A tensor that reads its storage with repeated
+  elements (a zero stride on a dimension larger than 1) is refused at parse time
+  on every path (`validate_tensor_views`). Real checkpoints do not contain them;
+  a one-byte storage behind one is how a 380-byte file aborted the process.
+- **Data ranges may not alias.** Tensors that share bytes (`GGUF`
+  `reject_overlapping_tensor_data`) or keys that name one storage many times
+  (`PTH_MAX_MATERIALISE_RATIO`) multiply the output by an attacker's factor.
+- **Cap ranks, and keep strided loops independent of size-1 dimensions.** A
+  shape tuple is attacker-sized; a per-element loop over every dimension is
+  `O(elements × rank)`. Cap the rank (`NPY_MAX_DIMS`, `PTH_MAX_DIMS`, 64) and
+  squeeze size-1 dimensions before any strided copy or transposition.
+- **Never size a buffer from a claim the input need not honour.** A `STORED`
+  ZIP entry's two sizes must agree; a `DEFLATE` entry's uncompressed size is
+  only a claim, so read it growing rather than into a buffer of that size.
+- **Keep per-lookup work logarithmic.** A lookup inside a per-tensor loop over
+  an attacker-sized list makes the header quadratic; build a name index once.
+
+### Render attacker text through the error `Display`, not verbatim
+
+File-derived strings (tensor names, metadata, pickle globals, ZIP entry names)
+end up in error messages, logs and terminals. `AnamnesisError`'s `Display`
+renders every variant's text through `parse::utils::error_text`, which escapes
+control and invisible formatting characters (`ESC`, `CR`, bidi overrides, …) as
+`\u{..}` and cuts the message at 2048 characters, so an error site may format a
+file string directly. Anything else that prints file text (the CLI's listings,
+a `Display` impl carrying a file string) goes through `display_untrusted` with a
+bound. Where the text itself is unbounded (a pickle `GLOBAL` line), store a
+preview in the error rather than the whole string.
+
 ### Pre-validate slices once, iterate branch-free inside
 
 The two-level rule from

@@ -158,8 +158,8 @@ built-in per-format floors):
 | Axis | Builder | Bounds |
 |---|---|---|
 | Single allocation | `with_max_single_alloc` | the largest single header-declared buffer |
-| Cumulative heap | `with_max_total_bytes` | the running sum across the whole file (many-small-items blow-up) |
-| Item count | `with_max_item_count` | declared tensors / arrays / KV entries / archive members |
+| Cumulative heap | `with_max_total_bytes` | the running sum across the whole file (many-small-items blow-up), and, separately, what `remember` / `convert` / `ParsedPth::tensors()` materialise from it, checked before allocating against the figure `inspect` reports as `dequantized_size` |
+| Item count | `with_max_item_count` | declared tensors (all four formats) / arrays / KV entries / archive members |
 | Decompression ratio | `with_max_decompression_ratio` | a compressed entry's uncompressed:compressed ratio (`.npz` zip-bomb cap) |
 
 **Error taxonomy.** A rejection's *kind* is its `AnamnesisError` variant, so a
@@ -180,16 +180,28 @@ are `Io`. The v0.8.0 Python bindings map these one-to-one:
 | `Cancelled` | builtin `KeyboardInterrupt` |
 | `Io` | builtin `OSError` |
 
-**No panic, no abort.** No public parse/inspect entry point panics or aborts on
-any input: a hostile file is always a clean `Err`, never an unwinding panic and
-never a `SIGBUS` (the copy-based `parse_bytes` / `parse_*_from_reader` paths use
-no memory map). Pinned in stable CI by `tests/no_panic.rs` and the `cargo fuzz`
-harness.
+**The gate and the budget agree.** Set `max_total_bytes` at or above
+`inspect().dequantized_size` for the output dtype you will ask for, and the later
+`remember` or `convert` is not refused; set it lower and the call is refused
+before anything is dequantised. Structural rules hold even at the default
+(unbounded) limits: a `.pth` tensor view may not expand beyond its storage, a
+`.pth` may not materialise more than 16 times its storage bytes, `GGUF` tensors
+may not share data, and shapes are capped at 64 dimensions.
+
+**No panic, no abort.** No public parse, inspect, `remember` or `convert` entry
+point panics or aborts on a hostile file: it is always a clean `Err`, never an
+unwinding panic and never a `SIGBUS` (the copy-based `parse_bytes` /
+`parse_*_from_reader` paths use no memory map), and no small file can make a
+call allocate without bound. Pinned in stable CI by `tests/no_panic.rs`,
+`tests/security_regressions.rs` and the `cargo fuzz` harness. Error messages are
+safe to print or log: control and invisible formatting characters from the file
+are shown as `\u{..}` escapes, and a message is cut at 2048 characters.
 
 Walkthrough: [Inspect before you parse](docs/tutorials/inspect-before-you-parse.md).
+The per-version hardening history is in [Validation → robustness timeline](docs/validation.md#robustness-hardening-timeline).
+
 Found an input that breaks this contract? Please report it privately, as
 [SECURITY.md](SECURITY.md) describes, rather than in a public issue.
-The per-version hardening history is in [Validation → robustness timeline](docs/validation.md#robustness-hardening-timeline).
 
 ## Formats & quantization support
 

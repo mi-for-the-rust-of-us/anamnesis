@@ -10,11 +10,22 @@ benefits Rust consumers too); this file records the Python-facing consequences.
 
 ## Panic safety & the `unwind` requirement (Phase 6.13 Step 3)
 
-**Guarantee.** No public parse/inspect entry point panics or aborts on *any*
-input. A malformed, truncated, or hostile artefact is always a clean
-`Result::Err` (`AnamnesisError`), never an unwinding panic and never a `SIGBUS`
-(the copy-based `parse_bytes` / `parse_*_from_reader` paths from Step 1 use no
-mmap). This is pinned by `tests/no_panic.rs` (a `catch_unwind` battery over
+**Guarantee.** No public parse, inspect, `remember` or `convert` entry point
+panics or aborts on a hostile input. A malformed, truncated, or hostile artefact
+is always a clean `Result::Err` (`AnamnesisError`), never an unwinding panic and
+never a `SIGBUS` (the copy-based `parse_bytes` / `parse_*_from_reader` paths from
+Step 1 use no mmap).
+
+**Allocation failure is not a panic**, so `panic = "unwind"` alone could not
+catch it: a failed `Vec` allocation aborts the process whatever the profile.
+Since v0.7.9 a small file cannot drive one. A call that materialises tensors
+checks their total against the caller's `max_total_bytes` before allocating
+(`LimitExceeded` with `limit: "max_total_bytes"`, mapped to
+`LimitExceededError`). Parse-time rules bound what any file can expand into, even
+at default limits, and copies of data the crate already holds use a fallible
+allocation reported as `LimitExceeded` with `limit: "available_memory"`. What
+remains is an honest file genuinely too large for the machine, which the binding
+should gate with `inspect` and `max_total_bytes` like any other host. This is pinned by `tests/no_panic.rs` (a `catch_unwind` battery over
 adversarial inputs across every entry point, and since v0.7.8 across the methods
 called on a successful result too, run in debug so integer-overflow panics are
 in scope), by `tests/fuzz_regressions.rs` (the inputs fuzzing has caught), and
