@@ -40,10 +40,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # The axis v0.7.3 shipped red on: a `pub(crate)` item consumed only from a
       # feature-gated module is live under `--all-features` and dead without it,
@@ -51,10 +51,10 @@ jobs:
       # only in the manual release gauntlet (CLAUDE.md); running it here on both
       # toolchains catches it on the push that introduces it.
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
       # 64-bit layout asserts once made `--features gguf` fail to compile on
       # 32-bit targets, which a Python wheel matrix (win32, armv7) can include.
@@ -62,7 +62,7 @@ jobs:
       - name: Check (32-bit, all features)
         run: |
           rustup target add i686-unknown-linux-gnu
-          cargo check --target i686-unknown-linux-gnu --all-features
+          cargo check --locked --target i686-unknown-linux-gnu --all-features
 
   # Rustdoc was checked only by `publish.yml`, at release time, with
   # `--all-features` and public items only. That misses two whole classes of
@@ -98,7 +98,7 @@ jobs:
           # Default features first, then each axis. `$combo` is intentionally
           # unquoted: the multi-word entries must word-split into flags.
           echo "::group::cargo doc (default features)"
-          cargo doc --no-deps --document-private-items
+          cargo doc --locked --no-deps --document-private-items
           echo "::endgroup::"
           for combo in \
             "--all-features" \
@@ -114,7 +114,7 @@ jobs:
             "--features cli,gguf,npz,pth"
           do
             echo "::group::cargo doc $combo"
-            cargo doc --no-deps --document-private-items $combo
+            cargo doc --locked --no-deps --document-private-items $combo
             echo "::endgroup::"
           done
 

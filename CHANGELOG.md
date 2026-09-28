@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through GitHub's private advisory form instead of a public issue, and how fixes
   are published (GitHub advisory, patch release, RustSec entry). The README's
   untrusted-input section points to it.
+- **No dependency code runs while the release job can mint a publish token.**
+  The first Trusted Publishing workflow ran `cargo test` (and so every
+  dev-dependency's build scripts and proc-macros) in the job that held
+  `id-token: write`. `publish.yml` is now three jobs: `verify` builds, tests and
+  packages with a read-only token; `publish` holds `id-token: write` and runs
+  `cargo publish --no-verify`, which compiles nothing; `release` creates the
+  GitHub Release with `contents: write` and no cargo. Every cargo command in
+  `publish.yml` and `ci.yml` uses `--locked`, and a tag without a CHANGELOG
+  section now fails before publishing rather than after.
 
 ## [0.7.8] - 2026-09-26
 
