@@ -218,3 +218,12 @@ rest of `corpus/`; `tests/gguf_new_types.rs` builds the same one-tensor layout
 **≈20.5 M executions, no crash, no timeout, no RSS overrun.** The seeds were
 also run end to end through the CLI (`amn inspect`, `amn remember`), which
 reports each type's size and writes a `BF16` tensor of 256 elements.
+
+**Re-run after the `NVFP4` scale fold (`6c523d3`)**, same settings. Folding a
+weight's `<stem>.scale` into it is new code that hostile input reaches through
+`convert_bytes`, so the two targets that cover it were seeded with an `NVFP4`
+weight paired with a one-value scale and with a per-expert scale (one seed per
+writer for `fuzz_convert_bytes`). `fuzz_convert_bytes` 1.08 M runs, coverage
+3286 (up from 2525 above, the fold path), RSS 447 MB; `fuzz_gguf_limits`
+0.96 M runs, coverage 868, RSS 389 MB. **No crash, no timeout, no new
+artifact.**
