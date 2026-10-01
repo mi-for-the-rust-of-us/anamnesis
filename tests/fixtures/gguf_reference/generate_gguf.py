@@ -39,12 +39,28 @@ Models (download via ``hf-fm download-file --flat --output-dir models/``):
   ships IQ2_XS + IQ3_S tensors, NO IQ2_S. Use the Qwen2.5-0.5B IQ2_M file for IQ2_S
   instead. Verified by remote-header probe 2026-04-22.
 
+  distaste447/zeta-2.1-NVFP-GGUF at revision 3cb915940e83fede1fb4e961df81d901acd71773
+    (zeta-2.1-NVFP4.gguf, 5.18 GiB): NVFP4, and its per-tensor `.scale` for the
+    folded fixture (Phase 7.10, issue #15). Pass `--revision` to hf-fm.
+
+ggml's C reference (Phase 7.10). `gguf-py` has no quantiser for NVFP4, Q1_0 or
+Q2_0 and no dequantiser for Q1_0 or Q2_0, so those fixtures come from ggml's own
+C (`quantize_row_*_ref` / `dequantize_row_*`), through the small `ggml_ref/`
+harness built by `ggml_ref/build.sh` at a pinned llama.cpp commit. When that
+binary is present, EVERY fixture is also checked against it: the `gguf-py`
+golden must equal ggml's C dequantisation of the same bytes, bit for bit, or the
+generator stops. Set `GGML_REF` to the binary if it is not at the default path.
+
 Usage:
-  pip install gguf numpy
-  python generate_gguf.py
+  pip install "git+https://github.com/ggml-org/llama.cpp@37b53fd4545847188fdad29e38ba57875efc8228#subdirectory=gguf-py" numpy
+  tests/fixtures/gguf_reference/ggml_ref/build.sh      # Linux / WSL
+  python generate_gguf.py                  # every fixture
+  python generate_gguf.py --only a,b       # only the named fixtures
 """
 
+import os
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -149,8 +165,30 @@ FIXTURES = [
     # Real-model MXFP4 mostly ships only inside the 11 GB gpt-oss-20b GGUF
     # — too large to justify when the synthetic path is bit-exact.
     ("synthetic_mxfp4", None, GGMLQuantizationType.MXFP4),
+    # ---- NVFP4 (Phase 7.10, issue #15) ----
+    # The real file from the issue. gguf-py dequantises NVFP4, so the golden
+    # is its own; the C reference must agree (checked below).
+    ("zeta21_nvfp4", "zeta-2.1-NVFP4.gguf", GGMLQuantizationType.NVFP4),
     # Q8_1, Q8_K: not shipped by any real model — unit tests cover these
 ]
+
+# Types gguf-py cannot quantise (Phase 7.10): synthesised from the same seeded
+# input as the synthetic fixtures above, but quantised and dequantised by
+# ggml's C. For NVFP4, gguf-py's dequantisation must also agree.
+C_REF_FIXTURES = [
+    ("synthetic_nvfp4", GGMLQuantizationType.NVFP4),
+    ("synthetic_q1_0", GGMLQuantizationType.Q1_0),
+    ("synthetic_q2_0", GGMLQuantizationType.Q2_0),
+]
+
+# NVFP4 with its per-tensor scale folded in, as `remember` / `convert` write
+# it: the same slice as `zeta21_nvfp4`, golden = gguf-py's dequantisation times
+# the tensor's own `.scale`, which is written beside the fixture as 4 bytes.
+FOLDED_FIXTURES = [
+    ("zeta21_nvfp4_folded", "zeta-2.1-NVFP4.gguf"),
+]
+
+GGML_REF = Path(os.environ.get("GGML_REF", "~/.cache/anamnesis-ggml-ref/ggml_ref")).expanduser()
 
 
 def f32_array_to_bf16_bytes(f32_arr: np.ndarray) -> bytes:
@@ -165,6 +203,38 @@ def f32_array_to_bf16_bytes(f32_arr: np.ndarray) -> bytes:
     rounding_bias = np.uint32(0x7FFF) + lsb
     bf16_bits = ((bits + rounding_bias) >> 16).astype(np.uint16)
     return bf16_bits.tobytes()
+
+
+def ggml_ref(mode: str, target_type: GGMLQuantizationType, n: int, payload: bytes) -> bytes:
+    """Run ggml's C reference (`ggml_ref/ref.c`): `quantize` or `dequantize`."""
+    result = subprocess.run(
+        [str(GGML_REF), mode, str(target_type.value), str(n)],
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ggml_ref {mode} {target_type.name}: {result.stderr.decode().strip()}")
+    return result.stdout
+
+
+def check_against_c(name: str, raw_bytes: bytes, target_type: GGMLQuantizationType,
+                    n: int, golden: np.ndarray, scale: float | None = None) -> str:
+    """Require the golden to equal ggml's C dequantisation of the same bytes.
+
+    `scale`, when given, is the per-tensor factor the golden was multiplied by,
+    applied to the C result the same way (one `f32` multiply). Returns a short
+    note for the log; raises if the two disagree in any bit.
+    """
+    if not GGML_REF.exists():
+        return "C check skipped (no ggml_ref binary)"
+    c = np.frombuffer(ggml_ref("dequantize", target_type, n, raw_bytes), dtype=np.float32)
+    if scale is not None:
+        c = c * np.float32(scale)
+    if not np.array_equal(c.view(np.uint32), golden.view(np.uint32)):
+        bad = int(np.count_nonzero(c.view(np.uint32) != golden.view(np.uint32)))
+        raise AssertionError(f"{name}: golden differs from ggml's C in {bad} of {n} values")
+    return "== ggml C"
 
 
 def write_fixture_v2(
@@ -288,6 +358,8 @@ def generate_fixture(name: str, gguf_path: Path, target_type: GGMLQuantizationTy
     assert f32.shape == (SLICE_ELEMENTS,), f"expected {SLICE_ELEMENTS}, got {f32.shape}"
     assert f32.dtype == np.float32
 
+    c_note = check_against_c(name, raw_bytes, target_type, SLICE_ELEMENTS, f32)
+
     # Write fixture (v2: BF16 and F32 goldens, both derived from `f32` here).
     output_path = Path(__file__).parent / f"{name}.bin"
     disc = target_type.value
@@ -299,7 +371,7 @@ def generate_fixture(name: str, gguf_path: Path, target_type: GGMLQuantizationTy
         f"{SLICE_ELEMENTS} elements, "
         f"raw={raw_byte_len} B, bf16={golden_len} B, f32={SLICE_ELEMENTS * 4} B, "
         f"fixture={output_path.stat().st_size} B, "
-        f"gguf dequant={best_us:.1f} µs (best of 5)"
+        f"gguf dequant={best_us:.1f} µs (best of 5), {c_note}"
     )
 
 
@@ -334,6 +406,8 @@ def generate_synthetic_fixture(name: str, target_type: GGMLQuantizationType) -> 
     assert f32.shape == (SLICE_ELEMENTS,), f"expected {SLICE_ELEMENTS}, got {f32.shape}"
     assert f32.dtype == np.float32
 
+    c_note = check_against_c(name, raw_bytes, target_type, SLICE_ELEMENTS, f32)
+
     golden_len = SLICE_ELEMENTS * 2
     output_path = Path(__file__).parent / f"{name}.bin"
     disc = target_type.value
@@ -344,7 +418,85 @@ def generate_synthetic_fixture(name: str, target_type: GGMLQuantizationType) -> 
         f"{SLICE_ELEMENTS} elements, "
         f"raw={raw_byte_len} B, golden={golden_len} B, "
         f"fixture={output_path.stat().st_size} B, "
-        f"gguf dequant={best_us:.1f} µs (best of 5)"
+        f"gguf dequant={best_us:.1f} µs (best of 5), {c_note}"
+    )
+
+
+def generate_c_ref_fixture(name: str, target_type: GGMLQuantizationType) -> None:
+    """Synthesise one fixture for a type gguf-py cannot quantise (Phase 7.10).
+
+    The seeded input is the one `generate_synthetic_fixture` uses. Both the
+    quantisation and the golden come from ggml's C (`ggml_ref`), the canonical
+    implementation, so no reimplementation is involved. Where gguf-py does
+    implement the dequantisation (NVFP4), its output must also agree.
+    """
+    rng = np.random.default_rng(seed=42)
+    f32_input = (rng.standard_normal(SLICE_ELEMENTS) * 0.1).astype(np.float32)
+
+    block_size, type_size = GGML_QUANT_SIZES[target_type]
+    raw_byte_len = SLICE_ELEMENTS // block_size * type_size
+    raw_bytes = ggml_ref("quantize", target_type, SLICE_ELEMENTS, f32_input.tobytes())
+    assert len(raw_bytes) == raw_byte_len, f"{name}: {len(raw_bytes)} B, expected {raw_byte_len}"
+    f32 = np.frombuffer(
+        ggml_ref("dequantize", target_type, SLICE_ELEMENTS, raw_bytes), dtype=np.float32
+    ).copy()
+
+    try:
+        py = dequantize(np.frombuffer(raw_bytes, dtype=np.uint8), target_type)
+        assert np.array_equal(py.view(np.uint32), f32.view(np.uint32)), (
+            f"{name}: gguf-py and ggml's C disagree"
+        )
+        py_note = "gguf-py == C"
+    except NotImplementedError:
+        py_note = "gguf-py has no dequantiser; C only"
+
+    output_path = Path(__file__).parent / f"{name}.bin"
+    write_fixture_v2(output_path, target_type.value, SLICE_ELEMENTS, raw_bytes, f32)
+    print(
+        f"  {name}: synthetic (seed=42) via ggml C, {target_type.name} "
+        f"(disc={target_type.value}), {SLICE_ELEMENTS} elements, raw={raw_byte_len} B, "
+        f"fixture={output_path.stat().st_size} B, {py_note}"
+    )
+
+
+def generate_folded_fixture(name: str, gguf_path: Path) -> None:
+    """The `zeta21_nvfp4` slice with its tensor's per-tensor scale folded in.
+
+    `remember` / `convert` multiply an NVFP4 weight by its `<stem>.scale` (see
+    `nvfp4_scale_pairs` in src/parse/gguf.rs). The golden here is gguf-py's
+    dequantisation times that scale as an `f32`, which is what folding must
+    produce; the C reference, times the same scale, must agree. The scale is
+    written beside the fixture as `<name>.scale` (4 bytes, little-endian f32)
+    so the Rust test can rebuild the weight + scale pair.
+    """
+    target_type = GGMLQuantizationType.NVFP4
+    reader = GGUFReader(str(gguf_path))
+    tensor = next(
+        (t for t in reader.tensors
+         if t.tensor_type == target_type and t.n_elements >= SLICE_ELEMENTS),
+        None,
+    )
+    assert tensor is not None, f"{name}: no NVFP4 tensor with >= {SLICE_ELEMENTS} elements"
+    assert tensor.name.endswith(".weight"), f"{name}: {tensor.name} is not a .weight"
+    scale_name = tensor.name[: -len(".weight")] + ".scale"
+    scale_tensor = next((t for t in reader.tensors if t.name == scale_name), None)
+    assert scale_tensor is not None, f"{name}: {tensor.name} has no {scale_name}"
+    assert scale_tensor.tensor_type == GGMLQuantizationType.F32 and scale_tensor.n_elements == 1
+    scale = np.float32(np.asarray(scale_tensor.data).reshape(-1)[0])
+
+    block_size, type_size = GGML_QUANT_SIZES[target_type]
+    raw_byte_len = SLICE_ELEMENTS // block_size * type_size
+    raw_bytes = tensor.data.reshape(-1)[:raw_byte_len].tobytes()
+    f32 = dequantize(np.frombuffer(raw_bytes, dtype=np.uint8), target_type) * scale
+    assert f32.dtype == np.float32
+    c_note = check_against_c(name, raw_bytes, target_type, SLICE_ELEMENTS, f32, float(scale))
+
+    output_path = Path(__file__).parent / f"{name}.bin"
+    write_fixture_v2(output_path, target_type.value, SLICE_ELEMENTS, raw_bytes, f32)
+    (Path(__file__).parent / f"{name}.scale").write_bytes(struct.pack("<f", scale))
+    print(
+        f"  {name}: tensor={tensor.name} x {scale_name}={float(scale):.9g}, "
+        f"{SLICE_ELEMENTS} elements, fixture={output_path.stat().st_size} B, {c_note}"
     )
 
 
@@ -358,9 +510,16 @@ if __name__ == "__main__":
         print(f"\nDone: {count} fixture(s) upgraded.")
         raise SystemExit(0)
 
+    only = None
+    if "--only" in sys.argv:
+        only = set(sys.argv[sys.argv.index("--only") + 1].split(","))
+
     print("Generating GGUF cross-validation fixtures...")
     print(f"Models directory: {MODELS_DIR}")
+    print(f"ggml C reference: {GGML_REF} ({'present' if GGML_REF.exists() else 'ABSENT'})")
     for name, filename, target_type in FIXTURES:
+        if only is not None and name not in only:
+            continue
         if filename is None:
             # Synthetic-source path: no model file needed.
             generate_synthetic_fixture(name, target_type)
@@ -372,4 +531,22 @@ if __name__ == "__main__":
                   f"--flat --output-dir \"{MODELS_DIR}\"")
             continue
         generate_fixture(name, gguf_path, target_type)
+
+    for name, target_type in C_REF_FIXTURES:
+        if only is not None and name not in only:
+            continue
+        if not GGML_REF.exists():
+            print(f"\n  SKIP {name}: needs the ggml C reference "
+                  f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
+            continue
+        generate_c_ref_fixture(name, target_type)
+
+    for name, filename in FOLDED_FIXTURES:
+        if only is not None and name not in only:
+            continue
+        gguf_path = MODELS_DIR / filename
+        if not gguf_path.exists():
+            print(f"\n  SKIP {name}: model not found at {gguf_path}")
+            continue
+        generate_folded_fixture(name, gguf_path)
     print("\nDone.")
