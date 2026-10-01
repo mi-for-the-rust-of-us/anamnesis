@@ -1,6 +1,6 @@
 # Validation & tested models
 
-<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
+<!-- Last updated: 2026-10-01, anamnesis v0.7.9 + Phase 7.10 (unreleased) -->
 
 The evidence behind anamnesis's correctness, performance, and robustness claims —
 the per-scheme cross-validation tables, the conversion / parsing benchmarks, the
@@ -22,7 +22,7 @@ peak-heap assertions, and the untrusted-input hardening timeline. The
 
 ## Contents
 
-- [Dequantization](#dequantization) — FP8 · GPTQ · AWQ · BitsAndBytes · GGUF block-quant
+- [Dequantization](#dequantization) — FP8 · GPTQ · AWQ · BitsAndBytes · NVIDIA NVFP4 · GGUF block-quant
 - [Quantization (Lethe)](#quantization-lethe--phase-5)
 - [Format conversion pipeline](#format-conversion-pipeline-phase-6-v060)
 - [Whole-model throughput](#whole-model-throughput-phase-7--72) — thread scaling · vs `gguf-py`
@@ -79,40 +79,67 @@ Cross-validated against real `bitsandbytes` (`functional.dequantize_4bit` / `int
 
 > **Note:** INT8 speedup is modest because the operation is trivially simple (`i8→f32→multiply`). Both PyTorch and anamnesis are near memory bandwidth limits at ~0.7–0.8 ns/element. The AVX2 hot loop is fully vectorized — the 1.2× reflects the inherent ceiling, not a missed optimization.
 
+### NVIDIA NVFP4 (ModelOpt safetensors)
+
+Behind the `nvfp4` feature (Phase 7.10). Cross-validated against NVIDIA's own `modelopt` (`NVFP4QTensor.dequantize`, 0.47.0; the checkpoint was written by 0.37.0, whose `dequantize` is identical apart from the import path of its unused GPU fast path) on a real layer: the first 16 rows of `model.layers.0.self_attn.q_proj` of `nvidia/Llama-3.1-8B-Instruct-NVFP4`, kept in its original layout. Bit-exact at `F32` and 0 `ULP` at `BF16`, through the kernel and through the public `parse_bytes` → `remember` path. The `F32` comparison was checked to have teeth: multiplying the value by the block scale before the per-tensor scale instead of after, swapping the nibble order, or storing `-0.0` for the "negative zero" code each fail it.
+
+| Model | Tensor | Elements | vs `modelopt` (one thread) |
+|---|---|---|---|
+| Llama-3.1-8B-Instruct-NVFP4 | `q_proj`, rows 0–15 | 65,536 | 21x faster (15.1 µs against 317.7 µs, medians) |
+
+> **Note:** measured in WSL2 for both sides, 20 warm-up and 200 timed calls (`bench_nvfp4_kernel` in `tests/cross_validation_nvfp4.rs` against `tests/fixtures/nvfp4_reference/time_modelopt.py`). As a check against the model's actual weights rather than against `modelopt`, the whole `q_proj` (4096 × 4096) dequantised by `amn remember` tracks the original `BF16` Llama-3.1-8B-Instruct tensor with a least-squares scale of 0.997 and a correlation of 0.9960; the remaining 9 % relative error is what 4-bit `E2M1` costs. Without the `nvfp4` feature such a checkpoint is still recognised and refused by name; until Phase 7.10 it was misread as fine-grained `FP8`.
+
 ### GGUF block-quant
 
-Cross-validated against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on **22 block-quant kernels** from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct) plus 3 synthetic fixtures (`TQ1_0` / `TQ2_0` / `MXFP4` — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on HuggingFace, and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload, so a deterministic random tensor is the practical fixture source). Bit-exact output (0 ULP difference). **All 22 of 22 GGUF block types supported** — Phase 4.5 closed in step 6 (MXFP4). Feature-gated behind `gguf`.
+Cross-validated, as of Phase 4.5, against the `gguf` Python package (`ggml-org` reference, mirrors `ggml-quants.c`) on **22 block-quant kernels** from 4 real models (bartowski SmolLM2-135M-Instruct, TheBloke TinyLlama-1.1B-Chat, bartowski Mistral-7B-Instruct-v0.3, bartowski Qwen2.5-0.5B-Instruct) plus 3 synthetic fixtures (`TQ1_0` / `TQ2_0` / `MXFP4` — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on HuggingFace, and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload, so a deterministic random tensor is the practical fixture source). Bit-exact output (0 ULP difference). Feature-gated behind `gguf`.
 
-**Since v0.7.3 this is verified at full `f32` width, which it never was before.** Every earlier GGUF cross-validation rounded the reference to `BF16` before comparing, discarding 16 mantissa bits: a kernel could have associated its arithmetic differently from `gguf-py` (`(d·sc)·q` against `d·(sc·q)`, or a contraction on a `d·q - dmin·m` line) and every fixture would still have passed. The fixtures now carry an `f32` golden alongside the `BF16` one, and **all 22 kernels match it exactly, with no tolerance** — so the "0 ULP" claim is now against the reference *as the reference computes it*, not merely against the reference rounded to the width anamnesis happened to emit.
+**Phase 7.10 added `NVFP4`, `Q1_0` and `Q2_0`, so 25 of 25 production block types are cross-validated.** Upstream `ggml` introduced the three in 2026 ([issue #15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)). `gguf-py` cannot quantise any of them and cannot dequantise `Q1_0` or `Q2_0`, so their goldens come from ggml's own C (`quantize_row_*_ref` and `dequantize_row_*` at llama.cpp `37b53fd`, through `tests/fixtures/gguf_reference/ggml_ref/`): synthetic fixtures for all three, plus a slice of a real `NVFP4` tensor from `distaste447/zeta-2.1-NVFP-GGUF`, the file the issue was found on. Where `gguf-py` does implement a type, it and the C must agree before a fixture is written. The generator now applies that check to **every** fixture, and regenerating the 22 earlier ones reproduced each byte for byte with every golden equal to ggml's C: an independent confirmation of each `GGUF` kernel shipped since v0.4.
+
+`NVFP4` has a second, per-tensor scale stored as a separate `<stem>.scale` tensor, which `remember` and `convert` fold into the weight. That fold is cross-validated too: the real slice times its tensor's scale, through `convert_bytes`, matches `gguf-py`'s dequantisation times the same `f32` scale at 0 `ULP`. On the whole `zeta-2.1` model the folded weights track zed-industries' original `BF16` checkpoint with a least-squares scale of 0.995 to 0.998 and a correlation of 0.9955, the gap being 4-bit `E2M1` quantisation itself.
+
+**Since v0.7.3 this is verified at full `f32` width, which it never was before.** Every earlier GGUF cross-validation rounded the reference to `BF16` before comparing, discarding 16 mantissa bits: a kernel could have associated its arithmetic differently from `gguf-py` (`(d·sc)·q` against `d·(sc·q)`, or a contraction on a `d·q - dmin·m` line) and every fixture would still have passed. The fixtures now carry an `f32` golden alongside the `BF16` one, and **all 25 kernels match it exactly, with no tolerance** — so the "0 ULP" claim is now against the reference *as the reference computes it*, not merely against the reference rounded to the width anamnesis happened to emit.
 
 The comparison was shown to have teeth rather than assumed to: **76.5 %** of the 1 441 792 reference values (1 102 549 of them) carry mantissa bits `BF16` cannot represent, and flipping a single mantissa bit in one golden fails exactly one element of 65 536 at 1 `ULP` while the `BF16` comparison stays green. Both goldens come from `gguf-py`; the `BF16` one is never derived by rounding the `f32` one in Rust, which would compare anamnesis against its own arithmetic.
 
-| Kernel | Model | vs `gguf` Python (AVX2) |
-|---|---|---|
-| Q4_0 | SmolLM2-135M | 6.9x faster |
-| Q4_1 | SmolLM2-135M | 6.3x faster |
-| Q5_0 | TinyLlama-1.1B | 31.3x faster |
-| Q5_1 | SmolLM2-135M | 11.4x faster |
-| Q8_0 | SmolLM2-135M | 6.3x faster |
-| IQ4_NL | SmolLM2-135M | 12.2x faster |
-| Q2_K | TinyLlama-1.1B | 6.7x faster |
-| Q3_K | SmolLM2-135M | 10.9x faster |
-| Q4_K | SmolLM2-135M | 8.1x faster |
-| Q5_K | SmolLM2-135M | 11.6x faster |
-| Q6_K | SmolLM2-135M | 26.6x faster |
-| IQ4_XS | SmolLM2-135M | 12.6x faster |
-| IQ2_XXS | Mistral-7B-v0.3 | 3.45x faster |
-| IQ2_XS | Mistral-7B-v0.3 | 2.84x faster |
-| IQ2_S | Qwen2.5-0.5B | 4.10x faster |
-| IQ3_XXS | Mistral-7B-v0.3 | 3.32x faster |
-| IQ3_S | Mistral-7B-v0.3 | 4.37x faster |
-| IQ1_S | Mistral-7B-v0.3 | 15.00x faster |
-| IQ1_M | Mistral-7B-v0.3 | 7.85x faster |
-| TQ1_0 | synthetic | 35.59x faster |
-| TQ2_0 | synthetic | 26.31x faster |
-| MXFP4 | synthetic | 30.14x faster |
+| Kernel | Fixture | anamnesis (µs) | `gguf-py` (µs) | Speedup |
+|---|---|---:|---:|---:|
+| Q4_0 | SmolLM2-135M | 17.9 | 214.2 | 12.0× |
+| Q4_1 | SmolLM2-135M | 19.2 | 211.7 | 11.0× |
+| Q5_0 | TinyLlama-1.1B | 11.1 | 378.2 | 34.1× |
+| Q5_1 | SmolLM2-135M | 18.4 | 382.4 | 20.8× |
+| Q8_0 | SmolLM2-135M | 17.7 | 87.4 | 4.9× |
+| IQ4_NL | SmolLM2-135M | 44.1 | 427.3 | 9.7× |
+| Q2_K | TinyLlama-1.1B | 33.3 | 246.9 | 7.4× |
+| Q3_K | SmolLM2-135M | 19.7 | 408.2 | 20.7× |
+| Q4_K | SmolLM2-135M | 15.6 | 246.8 | 15.8× |
+| Q5_K | SmolLM2-135M | 19.9 | 584.2 | 29.4× |
+| Q6_K | SmolLM2-135M | 16.8 | 346.7 | 20.6× |
+| IQ4_XS | SmolLM2-135M | 23.1 | 494.0 | 21.4× |
+| IQ2_XXS | Mistral-7B-v0.3 | 173.8 | 675.5 | 3.9× |
+| IQ2_XS | Mistral-7B-v0.3 | 155.8 | 850.2 | 5.5× |
+| IQ2_S | Qwen2.5-0.5B | 158.5 | 628.6 | 4.0× |
+| IQ3_XXS | Mistral-7B-v0.3 | 177.7 | 937.0 | 5.3× |
+| IQ3_S | Mistral-7B-v0.3 | 50.1 | 862.3 | 17.2× |
+| IQ1_S | Mistral-7B-v0.3 | 53.5 | 661.0 | 12.4× |
+| IQ1_M | Mistral-7B-v0.3 | 27.3 | 817.3 | 29.9× |
+| TQ1_0 | synthetic | 10.1 | 223.3 | 22.1× |
+| TQ2_0 | synthetic | 8.2 | 178.7 | 21.8× |
+| MXFP4 | synthetic | 14.4 | 394.6 | 27.4× |
+| NVFP4 | zeta-2.1 (real) | 15.5 | 456.2 | 29.4× |
+| NVFP4 | synthetic | 15.7 | 457.0 | 29.1× |
+| Q1_0 | synthetic | 13.9 | n/a | n/a (`gguf-py` has no dequantiser) |
+| Q2_0 | synthetic | 13.8 | n/a | n/a (`gguf-py` has no dequantiser) |
 
-> **Note:** `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights — they are covered by unit tests only. Speedup measured on 65,536 elements (release build, `target-cpu=native`, best-of-5 per kernel). The `IQ2_*` and `IQ3_*` kernels land in the 2.8×–4.4× range rather than the 6×–31× range of the pure-arithmetic `Q*` kernels because their pass 1 involves a codebook LUT gather and a per-element sign branch — neither of which the auto-vectoriser can eliminate. The `IQ1_*` kernels are notably faster (7.9×–15.0×) because their inner loop replaces the per-element sign branch with a single scalar `±delta` per 8-element group, and the codebook gather is a plain `[u64; 2048]` table lookup. The ternary `TQ*` kernels are the **fastest in the crate** (26×–36×) — no codebook lookup at all, just bit shifts (`TQ2_0`) or a base-3 multiplication trick (`TQ1_0`) decoding directly to `{-d, 0, +d}`. `MXFP4` lands at 30× — structurally identical to `IQ4_NL` (12.2×) but with a tighter 17 B/block layout (1 B `E8M0` exponent vs 2 B `f16`) and a smaller codebook (16 entries × 4-bit nibble lookup) that the auto-vectoriser handles cleanly. Phase 7 (CPU SIMD pass) will further address the IQ2/IQ3 case with hand-written AVX2 intrinsics.
+> **How these were measured (2026-10-01).** Both sides dequantise the same 65,536-element fixture with one protocol: 20 warm-up calls, then 200 timed calls in one process; the table gives medians. anamnesis: release build, `target-cpu=native`, `BF16` output (`tests/bench_gguf_table_adhoc.rs`). `gguf-py`: llama.cpp `37b53fd`, `float32` output, which is wider (`tests/fixtures/gguf_reference/time_gguf_py.py`). One after the other on an idle x86-64 Windows machine, RAM at its rated 3200 MT/s:
+>
+> ```text
+> $env:RUSTFLAGS = "-C target-cpu=native"
+> cargo test --release --features gguf --test bench_gguf_table_adhoc -- --ignored --nocapture
+> $env:RUSTFLAGS = $null
+> python tests/fixtures/gguf_reference/time_gguf_py.py
+> ```
+>
+> **These replace an older table that could not be reproduced.** Its figures were single cold calls timed inside the cross-validation tests, which run in parallel threads by default, so a kernel could be timed while its neighbours competed for the same cores; several moved by 2× or more against today's numbers in both directions. `Q8_1` and `Q8_K` are internal `llama.cpp` activation quant types, not shipped as model weights, and are covered by unit tests only. The `IQ2_*` and `IQ3_XXS` kernels are the slowest relative to `gguf-py` (3.9× to 5.5×): their pass 1 is a lattice-codebook gather with per-element sign handling, the case the auto-vectoriser cannot remove ([Experiment 10](perf-experiments.md)).
 
 > **Limitations (peak heap):** Whole-model dequantisation via `ParsedModel::remember` or `amn remember model.gguf -o out.safetensors` retains every dequantised tensor in heap memory simultaneously until the underlying `safetensors::serialize_to_file` call returns. Peak heap is `O(total_BF16_output_size)` ≈ `2 × n_parameters` bytes — comfortable for **≤7 B** models on a 32 GB system, **tight at 13 B**, **OOMs at 70 B+**. The single-tensor kernel `dequantize_gguf_blocks_to_bf16` is already streaming (O(one block)); the orchestrator-level streaming output path is planned for Phase 10 — see [ROADMAP.md](../ROADMAP.md).
 
@@ -199,7 +226,7 @@ the library anamnesis is cross-validated against:
 > **This is not a like-for-like output, and the numbers should not be quoted without it.**
 > `gguf-py` returns `float32`; anamnesis returns `BF16` — half the bytes, and the narrower type.
 > What is verified is that anamnesis's `BF16` is bit-identical to `gguf-py`'s `float32`
-> **correctly rounded to `BF16`** (0 ULP, all 22 kernels), so the two agree on the values and
+> **correctly rounded to `BF16`** (0 ULP, on all 23 kernels `gguf-py` implements; `Q1_0` and `Q2_0`, which it does not, match ggml's own C), so the two agree on the values and
 > differ only in delivered width; both do their block arithmetic in `f32` internally. Since that
 > width difference is itself worth ~2× of memory traffic on a bandwidth-bound workload, halving
 > `gguf-py`'s time as a generous correction still leaves ~8.7–14× and ~17–26×. The like-for-like

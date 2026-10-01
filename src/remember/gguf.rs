@@ -77,9 +77,10 @@
 //! Little-endian, `n_elements × E::BYTES` bytes. `BF16` and `F16` round to
 //! nearest even; `F32` performs no conversion at all, so its output is the
 //! `f32` the kernel computed and therefore the reference's own value.
-//! `tests/cross_validation_gguf.rs` checks all 22 production kernels
-//! against `gguf-py` at both widths, the `F32` comparison being bit-exact
-//! with no tolerance.
+//! `tests/cross_validation_gguf.rs` checks all 25 production kernels at
+//! both widths, the `F32` comparison being bit-exact with no tolerance,
+//! against `gguf-py` and, for the types `gguf-py` cannot produce (`NVFP4`,
+//! `Q1_0`, `Q2_0`), against ggml's own C.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;

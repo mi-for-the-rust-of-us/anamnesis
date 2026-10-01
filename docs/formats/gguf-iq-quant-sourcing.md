@@ -1,8 +1,10 @@
-# GGUF `IQ*` / `TQ*` / `MXFP4` — fixture-sourcing reference
+# GGUF `IQ*` / `TQ*` / `MXFP4` / `NVFP4` / `Q1_0` / `Q2_0`: fixture-sourcing reference
 
 One-page reference for finding HuggingFace GGUF files that ship each of the `IQ*`, `TQ*`, and `MXFP4` block types, for use in anamnesis cross-validation fixtures. Distilled from a sourcing investigation on 2026-04-22 after Phase 4.5 steps 1–2 landed.
 
-Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixture per block type, extracted from a real model tensor where possible and synthesised via the Python `gguf` package where not. **As of step 6 (MXFP4) the last remaining coverage gap was closed** — anamnesis dequantises every GGUF block type shipping on HuggingFace today (22 of 22 production kernels). This document tracks where each type comes from and is now a historical reference rather than a live to-do list.
+Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixture per block type, extracted from a real model tensor where possible and synthesised via the Python `gguf` package where not. **As of step 6 (MXFP4) the last remaining coverage gap was closed** — anamnesis dequantised every GGUF block type shipping on HuggingFace at the time (22 of 22 production kernels). This document tracks where each type comes from and is now a historical reference rather than a live to-do list.
+
+**Phase 7.10 reopened it, briefly.** Upstream `ggml` added `NVFP4` (40), `Q1_0` (41) and `Q2_0` (42) in 2026, and a user's `NVFP4` file was refused outright ([issue #15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)). All three now have kernels and fixtures, so 25 of 25 production kernels are cross-validated. `gguf-py` cannot quantise any of the three and cannot dequantise `Q1_0` or `Q2_0`, so their goldens come from ggml's own C through `tests/fixtures/gguf_reference/ggml_ref/`, and the generator now checks every fixture against that C. A weekly CI job (`ggml-drift.yml`) compares upstream's `enum ggml_type` with the parser's, so the next addition is found by CI rather than by a user.
 
 ## Contents
 
@@ -17,7 +19,7 @@ Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixtur
 
 ## Block-layout summary
 
-All sizes from `ggml-common.h` at commit cut 2026-04-22. `QK_K = 256`.
+All sizes from `ggml-common.h` at commit cut 2026-04-22, except the three Phase 7.10 rows, which are from llama.cpp [`37b53fd`](https://github.com/ggml-org/llama.cpp/blob/37b53fd4545847188fdad29e38ba57875efc8228/ggml/src/ggml-common.h). `QK_K = 256`.
 
 | `ggml_type` | Disc | Block | `type_size` | Notes |
 |---|---:|---:|---:|---|
@@ -33,6 +35,9 @@ All sizes from `ggml-common.h` at commit cut 2026-04-22. `QK_K = 256`.
 | `TQ1_0` | 34 | 256 | 54 | shipped (`Phase 4.5 step 5`) |
 | `TQ2_0` | 35 | 256 | 66 | shipped (`Phase 4.5 step 5`) |
 | `MXFP4` | 39 | 32 | 17 | shipped (`Phase 4.5 step 6`) |
+| `NVFP4` | 40 | 64 | 36 | shipped (`Phase 7.10`, issue #15); four `UE4M3` scales per block, one per 16 elements |
+| `Q1_0` | 41 | 128 | 18 | shipped (`Phase 7.10`, issue #15); `f16` scale + 1 bit per element |
+| `Q2_0` | 42 | 64 | 18 | shipped (`Phase 7.10`, issue #15); `f16` scale + 2 bits per element |
 
 Every type's byte size is verifiable in [`src/parse/gguf.rs::type_size()`](../../src/parse/gguf.rs). After step 6 every variant returns `Some(_)` — there is no longer any deferred type.
 
@@ -61,10 +66,15 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `TQ1_0` | `synthetic_tq1_0.bin` | **synthetic** via `gguf.quants.quantize()` (seed=42, scale=0.1) | already (no download) |
 | `TQ2_0` | `synthetic_tq2_0.bin` | **synthetic** via `gguf.quants.quantize()` (same seed) | already (no download) |
 | `MXFP4` | `synthetic_mxfp4.bin` | **synthetic** via `gguf.quants.quantize()` (same seed) | already (no download) |
+| `NVFP4` | `zeta21_nvfp4.bin` | `distaste447/zeta-2.1-NVFP-GGUF` / `zeta-2.1-NVFP4.gguf` at `3cb91594`, `output.weight` (golden from `gguf-py`, checked against ggml's C) | **5.18 GiB** (one-off) |
+| `NVFP4` (scale folded) | `zeta21_nvfp4_folded.bin` + `.scale` | the same slice times its tensor's `output.scale`, as `remember` writes it | same file |
+| `NVFP4` | `synthetic_nvfp4.bin` | **synthetic**, quantised and dequantised by ggml's C (same seed); `gguf-py`'s dequantise agrees | already (no download) |
+| `Q1_0` | `synthetic_q1_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
+| `Q2_0` | `synthetic_q2_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
 
-### Pending kernels (Phase 4.5 step 6)
+### Pending kernels
 
-**All Phase 4.5 kernels shipped.** The pending-kernels table is intentionally empty after step 6 — every recognised `GgufType` block-quant variant has a dedicated kernel and a committed cross-validation fixture. Future GGUF format additions will reopen this section.
+None. Every recognised `GgufType` block-quant variant has a dedicated kernel and a committed cross-validation fixture: Phase 4.5 closed the original set and Phase 7.10 the three types `ggml` added in 2026. The next upstream addition will reopen this section, and `ggml-drift.yml` is what will notice it.
 
 ### Alternative real-model sources (for future cross-checking)
 
@@ -114,6 +124,8 @@ Confirmed 2026-04-22 on `gguf==0.17+`:
 | `IQ2_XXS`, `IQ2_XS`, `IQ2_S` | ❌ `NotImplementedError` | ✅ | **real-model source required** |
 | `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` | ❌ `NotImplementedError` | ✅ | **real-model source required** |
 | `TQ1_0`, `TQ2_0`, `MXFP4` | ✅ | ✅ | **all three backed by Phase 4.5 step 5 + 6 synthetic fixtures** |
+| `NVFP4` | ❌ | ✅ | synthetic fixture quantised by ggml's C; `gguf-py`'s dequantise must agree (checked at `gguf-py` 0.19.0, llama.cpp `37b53fd`) |
+| `Q1_0`, `Q2_0` | ❌ | ❌ | **ggml's C is the only reference** (`ggml_ref/`) |
 
 This asymmetry drove the "synthetic vs real-model" split in the sourcing matrix above. With step 6 landed every variant has a committed fixture.
 
@@ -183,5 +195,6 @@ for name, tt in [
 - **Dequant reference**: `ggml-org/llama.cpp/ggml/src/ggml-quants.c` — `dequantize_row_iq*`, `dequantize_row_tq*`, `dequantize_row_mxfp4` scalar functions (the Python `gguf` package's `dequantize()` mirrors these).
 - **Python reference**: `gguf` PyPI package, `gguf/quants.py` — the `Q*Class.quantize_blocks` / `dequantize_blocks` methods.
 - **Probe script** (session-local, 2026-04-22): `/tmp/probe_gguf_manual.py`, `/tmp/probe_all_remaining.py`.
+- **ggml's C itself** (Phase 7.10): `tests/fixtures/gguf_reference/ggml_ref/` builds `ggml-base` at llama.cpp `37b53fd` and calls each type's `from_float_ref` / `to_float` (`quantize_row_*_ref` / `dequantize_row_*`). It is the reference for the types `gguf-py` lacks, and a second, independent check on every other golden.
 
-Update this document whenever a new Phase 4.5 step lands or a new source surfaces.
+Update this document whenever a `GGUF` type is added or a new source surfaces.

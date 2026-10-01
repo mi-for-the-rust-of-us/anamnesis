@@ -160,7 +160,7 @@ The `Arch: qwen2` line survived the round trip — the source KV was carried thr
 
 The headline is that **every input reaches every current target** in one command, because the hub decouples readers from writers: FP8 / GPTQ / AWQ / BnB safetensors, GGUF, NPZ, and `.pth` all read *in*; `safetensors`, scalar `gguf`, and `bnb-nf4` all write *out*. Scalar dtypes are preserved end to end, so `.pth → safetensors` and an `NPZ`-`F32` → `GGUF` stay bit-for-bit lossless; only genuinely quantized tensors become `BF16`.
 
-What is **not** here yet: the **quantized GGUF target columns** (`gguf-q4km`, FP8, IQ, TQ, MXFP4). Writing those needs encode kernels that land in a later phase; until then `--to gguf` always writes a *scalar* GGUF. Asking for a target whose Cargo feature is disabled returns a clear `Unsupported` error naming the feature to rebuild with, never a silent no-op.
+What is **not** here yet: the **quantized GGUF target columns** (`gguf-q4km`, FP8, IQ, TQ, MXFP4, NVFP4). Writing those needs encode kernels that land in a later phase; until then `--to gguf` always writes a *scalar* GGUF. Asking for a target whose Cargo feature is disabled returns a clear `Unsupported` error naming the feature to rebuild with, never a silent no-op.
 
 ## What you've learned
 

@@ -2,9 +2,9 @@
 
 *Take a llama.cpp GGUF quant, recover full `BF16` weights, and load the result in any Rust ML framework — candle, burn, or tch.*
 
-*~1000 words · about 4 min read*
+*~1350 words · about 5 min read*
 
-<!-- Last updated: 2026-08-15, anamnesis v0.7.4 -->
+<!-- Last updated: 2026-10-01, anamnesis v0.7.9 + Phase 7.10 (unreleased) -->
 
 <!--
 STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
@@ -16,6 +16,9 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
    `SmolLM2-135M-Instruct-Q4_K_M.gguf`. Every output block below is real,
    captured from `amn` against that file — paste exact output, do not
    paraphrase. If you re-capture, update the counts/sizes here to match.
+   Step 5 pins `distaste447/zeta-2.1-NVFP-GGUF` at revision
+   `3cb915940e83fede1fb4e961df81d901acd71773`, file `zeta-2.1-NVFP4.gguf`
+   (5.18 GiB), the file issue #15 was found on; same rule.
 3. Output blocks: trim only when a block runs long and the trimmed lines
    are representative repetition (note the trim with `…`).
 4. Shell: commands are identical on Windows/macOS/Linux; only show a
@@ -36,6 +39,7 @@ STYLE CONVENTIONS for editing this tutorial — keep growth consistent.
 - [Step 3 — Dequantize to BF16](#step-3--dequantize-to-bf16)
   - [If you want `float32` instead (v0.7.3+)](#if-you-want-float32-instead-v073)
 - [Step 4 — Verify the result](#step-4--verify-the-result)
+- [Step 5: An NVFP4 file and its second scale](#step-5-an-nvfp4-file-and-its-second-scale)
 - [What you've learned](#what-youve-learned)
 
 ## Why dequantize first?
@@ -111,7 +115,7 @@ Converting SmolLM2-135M-Instruct-Q4_K_M.gguf -> SmolLM2-135M-Instruct-Q4_K_M-f32
 
 Note the derived filename ends in `-f32`, not `-bf16`: it tracks the dtype, so a file never claims a width it does not hold.
 
-`f32` output performs **no narrowing at all**, so the values are the `f32` that `gguf-py` itself produces — verified bit-exactly against it across all 22 kernels, with no tolerance. Two things to expect. The file is twice the size (**513 MB against 257 MB** here), and the conversion runs about **1.5–1.6× slower**, because doubling the output bytes costs real bandwidth. That is the price of the precision, not a defect.
+`f32` output performs **no narrowing at all**, so the values are the `f32` that `gguf-py` itself produces — verified bit-exactly against it on every kernel it implements, with no tolerance (the two it does not, `Q1_0` and `Q2_0`, are checked against ggml's own C instead). Two things to expect. The file is twice the size (**513 MB against 257 MB** here), and the conversion runs about **1.5–1.6× slower**, because doubling the output bytes costs real bandwidth. That is the price of the precision, not a defect.
 
 There is also `--out-dtype f16`, which buys 3 significand bits over `bf16` at the same 2 bytes — but pays for them with a much narrower exponent range, overflowing to infinity above 65504 where `bf16` matches `f32`'s range. It is not simply the better 2-byte choice.
 
@@ -139,6 +143,49 @@ let vb = VarBuilder::from_mmaped_safetensors(&["smol-bf16.safetensors"], DType::
 
 — the same call that would have failed on the original GGUF.
 
+## Step 5: An NVFP4 file and its second scale
+
+`NVFP4` is NVIDIA's 4-bit float format, and `GGUF` files carry it as `ggml_type` 40. anamnesis reads it from v0.7.10. This step uses a real one, a 7-billion-parameter code model:
+
+```
+$ hf-fm download-file distaste447/zeta-2.1-NVFP-GGUF zeta-2.1-NVFP4.gguf --revision 3cb915940e83fede1fb4e961df81d901acd71773 --timeout-per-file-secs 1800
+$ amn inspect zeta-2.1-NVFP4.gguf
+Format:      GGUF v3
+Arch:        llama
+Tensors:     740
+Total size:  5.17 GB
+Dequantized: 15.37 GB (BF16)
+Dtypes:      NVFP4, F32, BF16
+Alignment:   32 bytes
+```
+
+Before v0.7.10 that command stopped at `unknown ggml_type discriminant 40`, and nothing about the file could be read at all.
+
+`amn parse` lists the tensors, and shows what makes `NVFP4` different:
+
+```
+$ amn parse zeta-2.1-NVFP4.gguf
+…
+  blk.0.ffn_down.weight                    NVFP4 [14336, 4096]   32 MB
+  blk.0.ffn_down.scale                     F32 [1]             4 B
+  blk.0.ffn_down.input_scale               F32 [1]             4 B
+…
+```
+
+Every `NVFP4` weight scales twice. Each 16-element sub-block carries a scale inside the block, and the whole tensor carries a second one, stored beside it as `<name>.scale`. llama.cpp multiplies that second scale in at inference time. On this model it is between 9.3e-5 and 2.3e-3, so a weight decoded without it would be 400 to 11 000 times too large. `remember` folds it in for you:
+
+```
+$ amn remember zeta-2.1-NVFP4.gguf -o zeta-bf16.safetensors
+Converting zeta-2.1-NVFP4.gguf → zeta-bf16.safetensors
+  740 tensors
+  225 NVFP4 per-tensor scales folded into their weights
+  Output: zeta-bf16.safetensors
+```
+
+The output holds 515 tensors, not 740: each folded `.scale` now lives inside its weight, so it is not written a second time, where a loader could apply it again. The `.input_scale` tensors are activation scales for an `NVFP4` runtime; they pass through untouched, and `amn inspect` on the output lists them as scale tensors. The folded weights track the model's original `BF16` release with a correlation of 0.9955, the remaining gap being what 4-bit quantization costs.
+
+If you call the library per tensor instead (`ParsedGguf::dequantize_tensor_as`), you get the block decode alone, exactly what ggml's `dequantize_row_nvfp4` returns, and multiplying by `<name>.scale` is up to you.
+
 ## What you've learned
 
 - GGUF k-quants don't load in Rust ML frameworks; `amn remember` recovers them to standard `BF16` safetensors that do.
@@ -146,5 +193,6 @@ let vb = VarBuilder::from_mmaped_safetensors(&["smol-bf16.safetensors"], DType::
 - A `Q4_K_M` file is a mix of block types, and the tensors GGUF left in `F32` simply pass through untouched.
 - Dequantization trades size for compatibility (here 99 MB → 257 MB), so check the numbers up front.
 - `amn convert --out-dtype f32` (v0.7.3) and `amn remember --to f32` (v0.7.4) skip the `BF16` narrowing entirely when you need the reference `float32`, at twice the bytes and ~1.5× the time.
+- An `NVFP4` weight comes with a second, per-tensor scale; `remember` and `convert` fold it in, so the file you load holds the model's actual weights (v0.7.10).
 
 For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs. And to change *container* rather than just recover precision — GGUF → `bnb-nf4`, or writing a scalar GGUF with your own metadata — see [Convert a model between formats](convert-between-formats.md).

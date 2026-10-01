@@ -238,7 +238,7 @@ dtype](#output-dtype). `GGUF` since v0.7.3, quantised safetensors since v0.7.4.
 `.pth` and `.npz` dequantise nothing, so the flag is inert rather than refused.
 
 Still out of scope until Phase 8.5: **quantised GGUF target columns**
-(`gguf-q4km`, FP8, IQ, TQ, MXFP4). A combination whose Cargo feature is disabled
+(`gguf-q4km`, FP8, IQ, TQ, MXFP4, NVFP4). A combination whose Cargo feature is disabled
 returns a clear `AnamnesisError::Unsupported` naming the feature to rebuild with.
 
 ```
