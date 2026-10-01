@@ -33,9 +33,9 @@
 # `benches/ab.rs`, which answers in seconds. Removing the trigger makes that
 # structural rather than a matter of remembering.
 #
-# WHAT IT STILL BUYS. Nobody runs a local benchmark on every merge. This job
-# runs on every push to `main` that touches code (see the `paths:` filter), and
-# it holds the ARM time series that would otherwise not exist.
+# WHAT IT STILL BUYS. Nobody runs a local benchmark on every release. This job
+# runs once per release (see the job's `if:`), and it holds the ARM time series,
+# one point per version, that would otherwise not exist.
 #
 # Macro runners require a GitHub *organization* (not a personal account) and
 # draw from the org's monthly macro-runner minutes. The local best-of-N protocol
@@ -55,6 +55,11 @@ on:
   # If the allowance runs out again, comment `push:` out with a dated note
   # rather than leaving the job failing: a red check on every push trains
   # readers to click past it, which is the failure Phase 7.7 item 11 was about.
+  #
+  # The filter was not enough. Phase 7.10 grew the suite to ~25 minutes, and
+  # the v0.7.10 release day alone ran it three times (a Dependabot merge, the
+  # version bump, a test-only lint fix): about 70 minutes for one release. So
+  # the job now runs only for the release bump; see its `if:`.
   push:
     branches: [main]
     paths:
@@ -66,9 +71,25 @@ on:
   # A deliberate run, e.g. to record a baseline at a release tag.
   workflow_dispatch:
 
+# A newer run supersedes an older one still queued or running, so a burst of
+# pushes or dispatches costs one suite, not one per event.
+concurrency:
+  group: codspeed
+  cancel-in-progress: true
+
 jobs:
   benchmarks:
     name: Run benchmarks
+    # ONE RUN PER RELEASE. On a push, run only for the release bump, which the
+    # release checklist commits to `main` as "bump version to vX.Y.Z, ...";
+    # every other push to `main` skips the job, and a skipped job consumes no
+    # runner minutes. Not a `tags:` trigger on purpose: CodSpeed compares a run
+    # against the latest run on the default branch, and a tag-triggered run
+    # would leave `main` with no history to compare against. Gated here rather
+    # than by branch so the time series stays on `main`.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'bump version to v')
     runs-on: codspeed-macro
     permissions:
       contents: read
@@ -104,7 +125,7 @@ jobs:
       # CodSpeed BASE disagrees with criterion's own median by ~2×. See the
       # `bench-fileio` entry in `Cargo.toml` for the numbers.
       #
-      # Required-features by target: ab and dequant need gptq/awq/bnb/gguf, parsing
+      # Required-features by target: ab and dequant need gptq/awq/bnb/gguf/nvfp4, parsing
       # needs npz/pth/gguf, convert needs gguf. `parallel` is on by default.
       - name: Build the benchmark targets
         run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth,nvfp4

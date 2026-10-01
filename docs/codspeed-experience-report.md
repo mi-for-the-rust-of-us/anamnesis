@@ -134,7 +134,7 @@ path can.
 | Question | Instrument |
 |---|---|
 | Is this change faster? | Local paired harness (tango), x86-64, ~30 s, ~2 % floor |
-| Has ARM drifted since last release? | CodSpeed, `main` pushes only, with a `paths:` filter |
+| Has ARM drifted since last release? | CodSpeed, once per release: only the version-bump push to `main` runs it (since v0.7.10; before that, every `main` push through a `paths:` filter) |
 | Does it still produce identical bytes? | Cross-validation suites, unchanged |
 
 We kept CodSpeed. `aarch64` is a first-class target for a GGUF library, since
