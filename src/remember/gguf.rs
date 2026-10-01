@@ -14,14 +14,19 @@
 //!
 //! - **Legacy block quants** (32-element blocks): `Q4_0`, `Q4_1`, `Q5_0`,
 //!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`, `MXFP4`.
+//! - **64-element blocks**: `NVFP4`, `Q2_0`.
+//! - **128-element blocks**: `Q1_0`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
 //!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 //!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`.
 //!
-//! Phase 4.5 closed in step 6 with `MXFP4` — every block-quantised
-//! `GgufType` variant has a dedicated kernel. The dispatcher's only
-//! remaining `Unsupported` path is for scalar (non-block-quant) types
-//! that are reinterpret-only and never reach the dequantisation layer.
+//! Every block-quantised `GgufType` variant has a dedicated kernel. Phase 4.5
+//! closed the original set with `MXFP4`; Phase 7.10 added `NVFP4`, `Q1_0` and
+//! `Q2_0` after upstream `ggml` introduced them (issue #15). The dispatcher's
+//! only `Unsupported` path is for the eight scalar types, which are
+//! reinterpret-only and never reach the dequantisation layer. A test-only
+//! exhaustive classification (`kernel_classification`) makes sure a future
+//! block type cannot slip into that path unnoticed.
 //!
 //! # Two public entry points, each in a generic and a `BF16` form
 //!
@@ -58,9 +63,10 @@
 //!    implementations are confirmed packed-SIMD.
 //!
 //! **Pass 2 is the *only* place the output width appears.** That is why
-//! all 24 kernel bodies below are byte-identical to their pre-v0.7.3 form:
-//! they fill an `[f32; QK]` scratch and never name an output type. Only
-//! their signatures thread `E` through to the shared runner.
+//! the 24 kernel bodies that predate v0.7.3 are byte-identical to their
+//! pre-v0.7.3 form, and why the three added in Phase 7.10 follow the same
+//! shape: all 27 fill an `[f32; QK]` scratch and never name an output type.
+//! Only their signatures thread `E` through to the shared runner.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
 //! `dequantize_row_*` reference implementations, and cross-validated against
@@ -120,6 +126,87 @@ const K_VALUES_IQ4_NL: [i8; 16] = [
 /// Ported verbatim from `ggml-common.h::kvalues_mxfp4`. Indexed by the
 /// 4-bit storage nibble (`0..16`).
 const K_VALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Element count per `NVFP4` block (`QK_NVFP4` in `ggml-common.h`).
+const QK_NVFP4: usize = 64;
+
+/// Element count per `NVFP4` sub-block, each with its own `UE4M3` scale
+/// (`QK_NVFP4_SUB` in `ggml-common.h`).
+const QK_NVFP4_SUB: usize = 16;
+
+/// Element count per `Q1_0` block (`QK1_0` in `ggml-common.h`).
+const QK1_0: usize = 128;
+
+/// Element count per `Q2_0` block (`QK2_0` in `ggml-common.h`).
+const QK2_0: usize = 64;
+
+/// `NVFP4` sub-block scales: every `UE4M3` byte decoded to `f32`, already
+/// carrying the `0.5` factor that cancels the doubled [`K_VALUES_MXFP4`]
+/// codebook `NVFP4` shares with `MXFP4`.
+///
+/// Indexed by the raw scale byte, all 256 of them: bit 7 is not a sign and is
+/// ignored by the decode, but `0x7F` alone (not `0xFF`) maps to zero, so the
+/// table cannot be folded to 128 entries. See [`ue4m3_to_fp32_half`].
+const UE4M3_TO_FP32_HALF: [f32; 256] = ue4m3_table();
+
+/// Decodes one `UE4M3` byte the way `ggml-impl.h::ggml_ue4m3_to_fp32` does,
+/// including its trailing `× 0.5`.
+///
+/// - `0x00` and `0x7F` decode to `0.0` (`0x7F` is `E4M3`'s `NaN` pattern,
+///   which `ggml` maps to zero).
+/// - Bit 7 is ignored: the exponent is `(x >> 3) & 0xF`. So `0x80` decodes to
+///   `0.0` through the subnormal path, and `0xFF` to `240.0`, not to zero.
+/// - Exponent `0` is subnormal: `man × 2⁻⁹`, then halved, so `man × 2⁻¹⁰`.
+/// - Otherwise `(1 + man/8) × 2^(exp − 7)`, halved, so `(8 + man) × 2^(exp − 11)`.
+///
+/// Every result is a small integer (at most 15) times a power of two between
+/// `2⁻¹⁰` and `2⁻³`, so each is an exact `f32`. The upstream decode computes
+/// the same real value in steps that are themselves exact (`ldexpf`, `1 +
+/// man/8`, `× 0.5`), so the two agree bit for bit; the
+/// `ue4m3_table_matches_reference_formula` test checks all 256 bytes.
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+const fn ue4m3_to_fp32_half(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    // BITWISE: UE4M3 has no sign; bits [6:3] are the exponent (bit 7 is
+    // masked off, as upstream does) and bits [2:0] the mantissa.
+    let exp = (x >> 3) & 0xF;
+    let man = x & 0x7;
+    if exp == 0 {
+        // CAST: u8 → f32, man is at most 7, exact in f32
+        (man as f32) * POW2_M10
+    } else {
+        // BITWISE: build 2^(exp − 11) directly as an f32 exponent field; the
+        // biased exponent `exp + 116` lies in 117..=131, always a normal f32.
+        // CAST: u8 → u32 for the shift, lossless
+        let scale = f32::from_bits(((exp as u32) + 116) << 23);
+        // CAST: u8 → f32, 8 + man is at most 15, exact in f32
+        ((8 + man) as f32) * scale
+    }
+}
+
+/// `2⁻¹⁰`, the `UE4M3` subnormal step after the `× 0.5` factor.
+const POW2_M10: f32 = 1.0 / 1024.0;
+
+/// Builds [`UE4M3_TO_FP32_HALF`] at compile time.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation
+)]
+const fn ue4m3_table() -> [f32; 256] {
+    let mut table = [0.0_f32; 256];
+    let mut i = 0;
+    // EXPLICIT: `for` is not available in a `const fn`.
+    while i < 256 {
+        // INDEX: i < 256 by the loop bound; the table has 256 entries
+        // CAST: usize → u8, i < 256 by the loop bound
+        table[i] = ue4m3_to_fp32_half(i as u8);
+        i += 1;
+    }
+    table
+}
 
 // ---------------------------------------------------------------------------
 // Infallible byte readers
@@ -224,7 +311,7 @@ fn read_scales12(block: &[u8], offset: usize) -> [u8; 12] {
 // Pass 2, the shared `f32` -> output-element writer, now lives on the
 // `OutputElement` trait in `remember::output`. Each implementation owns a
 // complete monomorphic loop, so the choice of output width costs the kernels
-// nothing: all 24 of them below still fill an `[f32; QK]` scratch buffer and
+// nothing: all 27 of them below still fill an `[f32; QK]` scratch buffer and
 // never mention an output type.
 
 // ---------------------------------------------------------------------------
@@ -384,6 +471,46 @@ where
     Ok(())
 }
 
+/// Outer-loop runner for the block sizes [`run_legacy_kernel`] and
+/// [`run_super_kernel`] do not cover: 64 elements (`NVFP4`, `Q2_0`) and 128
+/// (`Q1_0`).
+///
+/// The same shape as the other two, with the block size a const parameter.
+/// The output buffer is an array of `QK` per-element slots at the widest
+/// output width, flattened, because `[u8; QK * MAX_OUTPUT_BYTES]` would need
+/// `generic_const_exprs` (unstable).
+///
+/// The two older runners are deliberately **not** rebuilt on this one. They
+/// carry every pre-existing kernel, and the v0.7.8 close-out measured a
+/// change to code that runs once per call moving a hot loop by +69 %
+/// (`docs/perf-experiments.md` Experiment 19).
+#[inline]
+fn run_block_kernel<E, F, P, const QK: usize>(
+    data: &[u8],
+    type_size: usize,
+    mut sink: F,
+    mut unpack: P,
+) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+    P: FnMut(&[u8], &mut [f32; QK]),
+{
+    let mut scratch = [0.0_f32; QK];
+    let mut block_buf = [[0u8; MAX_OUTPUT_BYTES]; QK];
+    // INDEX: the flattened buffer holds `QK × MAX_OUTPUT_BYTES` bytes, and
+    // `E::BYTES <= MAX_OUTPUT_BYTES` is proven at compile time by the `const`
+    // block in `remember::output` (`OutputElement` is sealed).
+    #[allow(clippy::indexing_slicing)]
+    let block_out = &mut block_buf.as_flattened_mut()[..QK * E::BYTES];
+    for in_block in data.chunks_exact(type_size) {
+        unpack(in_block, &mut scratch);
+        E::write_scratch(&scratch, block_out);
+        sink(block_out)?;
+    }
+    Ok(())
+}
+
 /// Routes a validated `(data, dtype)` pair to the correct per-type
 /// streaming kernel. Called by both public entry points.
 fn dispatch_streaming<E, F>(data: &[u8], dtype: GgufType, sink: F) -> crate::Result<()>
@@ -391,10 +518,25 @@ where
     E: OutputElement,
     F: FnMut(&[u8]) -> crate::Result<()>,
 {
-    // EXHAUSTIVE: internal dispatch over GgufType. Scalar (non-block)
-    // types fall through to the wildcard arm — they are reinterpret-
-    // only and never reach the dequantisation layer. After Phase 4.5
-    // step 6 every block-quantised variant has a dedicated kernel.
+    // EXHAUSTIVE: internal dispatch over GgufType; the wildcard covers only
+    // the eight scalar types, which are reinterpret-only and never reach the
+    // dequantisation layer.
+    //
+    // KEPT AS A WILDCARD ON MEASUREMENT. The wildcard also swallows any *new*
+    // block type, which is how `NVFP4`, `Q1_0` and `Q2_0` would have been
+    // refused as "not a block-quantised type" (issue #15). Phase 7.10 first
+    // named the scalar types instead, so that a new variant could not compile
+    // without a decision here; the paired harness measured that at +5.17 %
+    // on `gguf_q4k_f16` (median of 10, min +4.03 %, max +6.75 %, 10/10
+    // flagged, tango, x86-64, against v0.7.9), and +5.21 % with the new
+    // kernels `#[inline(never)]`, while restoring the wildcard measured
+    // -0.15 %. The `Q4_K` kernel's source is unchanged in all three; only the
+    // switch lowering moved. `docs/perf-experiments.md` Experiment 20.
+    //
+    // The guarantee moved to the tests instead: `kernel_classification` is an
+    // exhaustive, test-only `match`, so a new variant cannot compile the test
+    // suite until it is classified, and `every_quantized_type_has_a_kernel`
+    // proves each quantized type reaches a kernel rather than this arm.
     #[allow(clippy::wildcard_enum_match_arm)]
     match dtype {
         GgufType::Q4_0 => dequant_q4_0::<E, _>(data, sink),
@@ -421,6 +563,9 @@ where
         GgufType::TQ1_0 => dequant_tq1_0::<E, _>(data, sink),
         GgufType::TQ2_0 => dequant_tq2_0::<E, _>(data, sink),
         GgufType::MXFP4 => dequant_mxfp4::<E, _>(data, sink),
+        GgufType::NVFP4 => dequant_nvfp4::<E, _>(data, sink),
+        GgufType::Q1_0 => dequant_q1_0::<E, _>(data, sink),
+        GgufType::Q2_0 => dequant_q2_0::<E, _>(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!(
@@ -458,8 +603,7 @@ where
 ///
 /// Returns [`AnamnesisError::Unsupported`] if `dtype` is a scalar
 /// (non-block-quant) type that is structurally not a quantised block
-/// format. Every block-quantised variant has a dedicated kernel after
-/// Phase 4.5 step 6.
+/// format. Every block-quantised variant has a dedicated kernel.
 ///
 /// # Memory
 ///
@@ -522,15 +666,22 @@ pub fn dequantize_gguf_to_bf16(
 /// # The block length depends on `E`
 ///
 /// The `sink` closure receives `QK × E::BYTES` bytes per call, where `QK` is
-/// 32 for the legacy block kernels (`Q4_0`–`Q8_1`, `IQ4_NL`, `MXFP4`) and 256
-/// for the K-quant super-block kernels (`Q2_K`–`Q8_K`, `IQ4_XS`, `IQ2_XXS`,
-/// `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`):
+/// the type's block size ([`GgufType::block_size`]): 32 for the legacy block
+/// kernels (`Q4_0`–`Q8_1`, `IQ4_NL`, `MXFP4`), 64 for `NVFP4` and `Q2_0`, 128
+/// for `Q1_0`, and 256 for the K-quant super-block kernels (`Q2_K`–`Q8_K`,
+/// `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`,
+/// `IQ1_M`, `TQ1_0`, `TQ2_0`):
 ///
-/// | `E` | legacy block | super-block |
-/// |---|---:|---:|
-/// | [`Bf16Out`] | 64 B | 512 B |
-/// | [`F16Out`](crate::remember::output::F16Out) | 64 B | 512 B |
-/// | [`F32Out`](crate::remember::output::F32Out) | 128 B | 1024 B |
+/// | `E` | 32-element | 64-element | 128-element | 256-element |
+/// |---|---:|---:|---:|---:|
+/// | [`Bf16Out`] | 64 B | 128 B | 256 B | 512 B |
+/// | [`F16Out`](crate::remember::output::F16Out) | 64 B | 128 B | 256 B | 512 B |
+/// | [`F32Out`](crate::remember::output::F32Out) | 128 B | 256 B | 512 B | 1024 B |
+///
+/// The 64- and 128-element rows arrived in Phase 7.10. A sink that assumed
+/// one of the two older lengths was already relying on something this
+/// contract never promised; derive the length from `block_size()` and
+/// `E::BYTES`.
 ///
 /// **A sink that hard-codes `chunks_exact(2)` is correct only for the 2-byte
 /// output types.** Derive the stride from `E::BYTES` rather than assuming it,
@@ -848,6 +999,113 @@ where
             let hi = K_VALUES_MXFP4[usize::from(in_block[1 + j] >> 4)];
             scratch[j] = f32::from(lo) * d;
             scratch[j + 16] = f32::from(hi) * d;
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 64- and 128-element blocks: pass-1 closures
+// ---------------------------------------------------------------------------
+
+/// `NVFP4` kernel, 36-byte blocks: `d[4]` (one `UE4M3` scale per 16-element
+/// sub-block) + `qs[32]` (4-bit packed `E2M1` nibbles).
+///
+/// NVIDIA's 4-bit float format as `ggml` stores it (added upstream in 2026).
+/// It shares `MXFP4`'s doubled `E2M1` codebook ([`K_VALUES_MXFP4`]), but the
+/// scale is a float8 per **16** elements rather than a power-of-two exponent
+/// per 32, and the nibble order is per sub-block: within sub-block `s`, the
+/// low nibbles of `qs[8s..8s + 8]` fill positions `16s..16s + 8` and the high
+/// nibbles fill `16s + 8..16s + 16`. Formula, with `d_s` from
+/// [`UE4M3_TO_FP32_HALF`]:
+///
+/// ```text
+/// y[16s + j]     = K_VALUES_MXFP4[qs[8s + j] & 0xF] × d_s   for j ∈ 0..8
+/// y[16s + j + 8] = K_VALUES_MXFP4[qs[8s + j] >> 4]  × d_s   for j ∈ 0..8
+/// ```
+///
+/// Ported verbatim from `ggml-quants.c::dequantize_row_nvfp4` (llama.cpp
+/// `37b53fd`).
+#[allow(clippy::indexing_slicing)]
+fn dequant_nvfp4<E, F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    const N_SUB: usize = QK_NVFP4 / QK_NVFP4_SUB;
+    const HALF_SUB: usize = QK_NVFP4_SUB / 2;
+    run_block_kernel::<E, _, _, QK_NVFP4>(data, 36, sink, |in_block, scratch| {
+        // INDEX: `chunks_exact(36)` gives 36 bytes: scales at 0..4, nibbles
+        // at 4..36 (4 + 8s + j <= 35); outputs 16s + j + 8 <= 63 < QK_NVFP4.
+        // Nibbles are masked to 0..16 for the codebook lookup.
+        for s in 0..N_SUB {
+            let d = UE4M3_TO_FP32_HALF[usize::from(in_block[s])];
+            for j in 0..HALF_SUB {
+                // BITWISE: split each qs byte into two 4-bit codebook indices
+                let q = in_block[N_SUB + s * HALF_SUB + j];
+                let lo = K_VALUES_MXFP4[usize::from(q & 0x0F)];
+                let hi = K_VALUES_MXFP4[usize::from(q >> 4)];
+                scratch[s * QK_NVFP4_SUB + j] = f32::from(lo) * d;
+                scratch[s * QK_NVFP4_SUB + j + HALF_SUB] = f32::from(hi) * d;
+            }
+        }
+    })
+}
+
+/// `Q1_0` kernel, 18-byte blocks: `d: f16` + `qs[16]` (one bit per element).
+///
+/// Each element is `+d` or `-d`: bit `j % 8` of `qs[j / 8]`, least
+/// significant first, selects `+d` when set. The negation is a sign-bit flip,
+/// which is exactly what `ggml`'s `-d` is, so a `NaN` or signed-zero scale
+/// comes out bit-identical.
+///
+/// Ported from `ggml-quants.c::dequantize_row_q1_0` (llama.cpp `37b53fd`).
+#[allow(clippy::indexing_slicing)]
+fn dequant_q1_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_block_kernel::<E, _, _, QK1_0>(data, 18, sink, |in_block, scratch| {
+        let d_bits = read_f16_bytes([in_block[0], in_block[1]]).to_bits();
+        // INDEX: `chunks_exact(18)` gives 18 bytes, so `2 + byte_index <= 17`;
+        // outputs `byte_index × 8 + bit <= 127 < QK1_0`.
+        for byte_index in 0..QK1_0 / 8 {
+            let byte = in_block[2 + byte_index];
+            for bit in 0..8 {
+                // BITWISE: take bit `bit` of the byte (LSB first); a clear bit
+                // sets the f32 sign bit, turning `d` into `-d` without a branch
+                let clear = u32::from(!(byte >> bit) & 1);
+                scratch[byte_index * 8 + bit] = f32::from_bits(d_bits ^ (clear << 31));
+            }
+        }
+    })
+}
+
+/// `Q2_0` kernel, 18-byte blocks: `d: f16` + `qs[16]` (four 2-bit codes per
+/// byte).
+///
+/// Element `j` is the 2-bit code at bits `2 × (j % 4)` of `qs[j / 4]`, least
+/// significant first, mapped `00 → -1`, `01 → 0`, `10 → +1`, `11 → +2`, then
+/// scaled: `y[j] = (code − 1) × d`.
+///
+/// Ported from `ggml-quants.c::dequantize_row_q2_0` (llama.cpp `37b53fd`).
+#[allow(clippy::indexing_slicing)]
+fn dequant_q2_0<E, F>(data: &[u8], sink: F) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    run_block_kernel::<E, _, _, QK2_0>(data, 18, sink, |in_block, scratch| {
+        let d = read_f16_bytes([in_block[0], in_block[1]]);
+        // INDEX: `chunks_exact(18)` gives 18 bytes, so `2 + byte_index <= 17`;
+        // outputs `byte_index × 4 + slot <= 63 < QK2_0`.
+        for byte_index in 0..QK2_0 / 4 {
+            let byte = in_block[2 + byte_index];
+            for slot in 0..4 {
+                // BITWISE: 2-bit code at bits [2·slot + 1 : 2·slot], biased by -1
+                let code = i16::from((byte >> (2 * slot)) & 0x03) - 1;
+                scratch[byte_index * 4 + slot] = f32::from(code) * d;
+            }
         }
     })
 }
@@ -3374,6 +3632,281 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // NVFP4, Q1_0, Q2_0 (Phase 7.10, issue #15)
+    // -----------------------------------------------------------------
+
+    /// Decodes `F32` kernel output into `f32` values, so the assertions below
+    /// see the kernel's own arithmetic with no `BF16` narrowing in between.
+    fn f32_words(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&w| f32::from_le_bytes(w))
+            .collect()
+    }
+
+    /// Every `UE4M3` byte, against an independent `f64` transcription of
+    /// `ggml-impl.h::ggml_ue4m3_to_fp32`, compared bit for bit.
+    #[test]
+    fn ue4m3_table_matches_reference_formula() {
+        for x in 0..=255_u8 {
+            let expected = if x == 0 || x == 0x7F {
+                0.0_f64
+            } else {
+                let exp = i32::from((x >> 3) & 0xF);
+                let man = f64::from(x & 0x7);
+                let raw = if exp == 0 {
+                    man * 2.0_f64.powi(-9)
+                } else {
+                    (1.0 + man / 8.0) * 2.0_f64.powi(exp - 7)
+                };
+                raw * 0.5
+            };
+            let expected = expected as f32;
+            assert_eq!(
+                UE4M3_TO_FP32_HALF[usize::from(x)].to_bits(),
+                expected.to_bits(),
+                "UE4M3 byte {x:#04x}"
+            );
+        }
+        // The cases a port most easily gets wrong.
+        assert_eq!(UE4M3_TO_FP32_HALF[0x7F], 0.0, "0x7F is the zeroed NaN");
+        assert_eq!(
+            UE4M3_TO_FP32_HALF[0xFF], 240.0,
+            "bit 7 is ignored, not a NaN"
+        );
+        assert_eq!(UE4M3_TO_FP32_HALF[0x80], 0.0, "0x80 is a zero subnormal");
+        assert_eq!(
+            UE4M3_TO_FP32_HALF[0x01],
+            2.0_f32.powi(-10),
+            "smallest subnormal"
+        );
+        assert_eq!(UE4M3_TO_FP32_HALF[0x38], 0.5, "exponent 7, mantissa 0");
+        assert_eq!(
+            UE4M3_TO_FP32_HALF[0x7E], 224.0,
+            "largest finite E4M3, halved"
+        );
+    }
+
+    /// Low nibbles fill the first eight elements of each 16-element sub-block
+    /// and high nibbles the last eight; each sub-block takes its own scale.
+    /// `MXFP4`'s `j` / `j + 16` order would put the high nibbles in the
+    /// wrong sub-block.
+    #[test]
+    fn nvfp4_nibble_order_and_scale_are_per_sub_block() {
+        let mut block = vec![0u8; 36];
+        // Scales 0.5, 1.0, 2.0, 0.25.
+        block[..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x30]);
+        let scales = [0.5_f32, 1.0, 2.0, 0.25];
+        for s in 0..4 {
+            // First byte of each sub-block: low nibble 1 (+1), high nibble 9 (-1).
+            block[4 + s * 8] = 0x91;
+            // Last byte: low nibble 7 (+12), high nibble 15 (-12).
+            block[4 + s * 8 + 7] = 0xF7;
+        }
+        let out = f32_words(&dequantize_gguf::<F32Out>(&block, GgufType::NVFP4, 64).unwrap());
+        assert_eq!(out.len(), 64);
+        for (s, &d) in scales.iter().enumerate() {
+            for j in 0..16 {
+                let expected = match j {
+                    0 => 1.0 * d,
+                    8 => -d,
+                    7 => 12.0 * d,
+                    15 => -12.0 * d,
+                    _ => 0.0,
+                };
+                assert_eq!(out[s * 16 + j], expected, "sub-block {s}, element {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_extreme_scale_bytes() {
+        let mut block = vec![0x77u8; 36]; // every nibble 7 → codebook +12
+        block[..4].copy_from_slice(&[0x7F, 0xFF, 0x80, 0x01]);
+        let out = f32_words(&dequantize_gguf::<F32Out>(&block, GgufType::NVFP4, 64).unwrap());
+        let expected = [0.0, 12.0 * 240.0, 0.0, 12.0 * 2.0_f32.powi(-10)];
+        for (s, &want) in expected.iter().enumerate() {
+            for j in 0..16 {
+                assert_eq!(out[s * 16 + j], want, "sub-block {s}, element {j}");
+            }
+        }
+    }
+
+    /// Bit `j % 8` of `qs[j / 8]`, least significant first, picks `+d`.
+    #[test]
+    fn q1_0_bits_are_lsb_first() {
+        let mut block = vec![0u8; 18];
+        block[..2].copy_from_slice(&f16_bytes(0.5));
+        block[2] = 0b0000_0101; // elements 0 and 2
+        block[17] = 0b1000_0000; // element 127
+        let out = f32_words(&dequantize_gguf::<F32Out>(&block, GgufType::Q1_0, 128).unwrap());
+        assert_eq!(out.len(), 128);
+        for (j, &v) in out.iter().enumerate() {
+            let expected = if matches!(j, 0 | 2 | 127) { 0.5 } else { -0.5 };
+            assert_eq!(v, expected, "element {j}");
+        }
+    }
+
+    /// `ggml` computes `-d` once and selects it, so a zero scale gives `+0.0`
+    /// and `-0.0`, not two `+0.0`. The kernel's sign-bit flip must agree.
+    #[test]
+    fn q1_0_negation_is_a_sign_flip() {
+        let mut block = vec![0u8; 18];
+        block[2] = 0x01; // element 0 set, the rest clear
+        let out = f32_words(&dequantize_gguf::<F32Out>(&block, GgufType::Q1_0, 128).unwrap());
+        assert_eq!(out[0].to_bits(), 0x0000_0000, "set bit: +0.0");
+        assert_eq!(out[1].to_bits(), 0x8000_0000, "clear bit: -0.0");
+    }
+
+    /// Codes `00, 01, 10, 11` map to `-1, 0, +1, +2` times `d`, packed least
+    /// significant first, four per byte; two blocks check the block stride.
+    #[test]
+    fn q2_0_code_map_and_order() {
+        let mut data = vec![0u8; 36];
+        data[..2].copy_from_slice(&f16_bytes(2.0));
+        data[2] = 0b11_10_01_00; // elements 0..4: codes 0, 1, 2, 3
+        data[17] = 0b00_01_10_11; // elements 60..64: codes 3, 2, 1, 0
+        data[18..20].copy_from_slice(&f16_bytes(-1.0));
+        data[20] = 0b11_11_11_11; // block 2, elements 0..4: code 3
+        let out = f32_words(&dequantize_gguf::<F32Out>(&data, GgufType::Q2_0, 128).unwrap());
+        assert_eq!(out.len(), 128);
+        assert_eq!(&out[..4], &[-2.0, 0.0, 2.0, 4.0]);
+        assert_eq!(&out[60..64], &[4.0, 2.0, 0.0, -2.0]);
+        assert!(out[4..60].iter().all(|&v| v == -2.0), "code 0 elsewhere");
+        assert_eq!(&out[64..68], &[-2.0; 4], "block 2: code 3 × -1.0");
+        assert!(
+            out[68..].iter().all(|&v| v == 1.0),
+            "block 2: code 0 × -1.0"
+        );
+    }
+
+    #[test]
+    fn new_block_types_reject_wrong_lengths() {
+        for (dtype, block) in [
+            (GgufType::NVFP4, 64),
+            (GgufType::Q1_0, 128),
+            (GgufType::Q2_0, 64),
+        ] {
+            let err = dequantize_gguf_to_bf16(&[], dtype, block).unwrap_err();
+            assert!(
+                matches!(err, AnamnesisError::Parse { .. }),
+                "{dtype}: {err:?}"
+            );
+            let err = dequantize_gguf_to_bf16(&[0u8; 64], dtype, block / 2).unwrap_err();
+            assert!(
+                matches!(err, AnamnesisError::Parse { .. }),
+                "{dtype}: {err:?}"
+            );
+        }
+    }
+
+    /// Whether `dtype` has a dequantisation kernel (`true`) or is a scalar
+    /// type the dispatcher refuses (`false`).
+    ///
+    /// Exhaustive on purpose, and test-only on purpose. `dispatch_streaming`
+    /// keeps a wildcard arm because naming every variant there measured
+    /// +5 % on `gguf_q4k_f16` (Experiment 20), so it is *this* `match` that a
+    /// new `GgufType` variant fails to compile against. Classifying it is the
+    /// decision the dispatcher's wildcard would otherwise make silently.
+    const fn kernel_classification(dtype: GgufType) -> bool {
+        match dtype {
+            GgufType::Q4_0
+            | GgufType::Q4_1
+            | GgufType::Q5_0
+            | GgufType::Q5_1
+            | GgufType::Q8_0
+            | GgufType::Q8_1
+            | GgufType::Q2_K
+            | GgufType::Q3_K
+            | GgufType::Q4_K
+            | GgufType::Q5_K
+            | GgufType::Q6_K
+            | GgufType::Q8_K
+            | GgufType::IQ2_XXS
+            | GgufType::IQ2_XS
+            | GgufType::IQ3_XXS
+            | GgufType::IQ1_S
+            | GgufType::IQ4_NL
+            | GgufType::IQ3_S
+            | GgufType::IQ2_S
+            | GgufType::IQ4_XS
+            | GgufType::IQ1_M
+            | GgufType::TQ1_0
+            | GgufType::TQ2_0
+            | GgufType::MXFP4
+            | GgufType::NVFP4
+            | GgufType::Q1_0
+            | GgufType::Q2_0 => true,
+            GgufType::F32
+            | GgufType::F16
+            | GgufType::BF16
+            | GgufType::F64
+            | GgufType::I8
+            | GgufType::I16
+            | GgufType::I32
+            | GgufType::I64 => false,
+        }
+    }
+
+    /// Every variant classified as having a kernel really reaches one, at
+    /// every output width, and every other variant is refused. Walks the enum
+    /// through `from_u32` (the parser's own round-trip test pins that it
+    /// reaches every variant), dequantising one all-zero block of each.
+    #[test]
+    fn every_quantized_type_has_a_kernel() {
+        fn check<E: OutputElement>(dtype: GgufType) -> crate::Result<Vec<u8>> {
+            let block = dtype.block_size();
+            let data = vec![0u8; dtype.type_size().unwrap()];
+            dequantize_gguf::<E>(&data, dtype, block)
+        }
+        let mut kernels = 0;
+        for disc in 0..64 {
+            let Ok(dtype) = GgufType::from_u32(disc) else {
+                continue;
+            };
+            assert_eq!(
+                kernel_classification(dtype),
+                dtype.is_quantized(),
+                "{dtype}: classification disagrees with is_quantized()"
+            );
+            if kernel_classification(dtype) {
+                kernels += 1;
+                for result in [
+                    check::<Bf16Out>(dtype),
+                    check::<F16Out>(dtype),
+                    check::<F32Out>(dtype),
+                ] {
+                    let out = result.unwrap_or_else(|e| panic!("{dtype}: {e}"));
+                    assert!(!out.is_empty(), "{dtype}");
+                }
+            } else {
+                let err = check::<Bf16Out>(dtype).unwrap_err();
+                assert!(
+                    matches!(err, AnamnesisError::Unsupported { .. }),
+                    "{dtype}: {err:?}"
+                );
+            }
+        }
+        assert_eq!(kernels, 27, "one kernel per block-quantised type");
+    }
+
+    /// The scalar types reach the dispatcher's wildcard arm and are refused
+    /// with the message they always had.
+    #[test]
+    fn scalar_types_are_still_refused() {
+        let err = dequantize_gguf_to_bf16(&[0u8; 4], GgufType::F32, 1).unwrap_err();
+        match err {
+            AnamnesisError::Unsupported { format, detail } => {
+                assert_eq!(format, "GGUF");
+                assert!(detail.contains("not a block-quantised type"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Caller-chosen output dtype (Phase 7.3)
     // -----------------------------------------------------------------
 
@@ -3382,7 +3915,8 @@ mod tests {
     /// This is the contract a caller's `chunks_exact(2)` would silently break
     /// under `F32`, so it is asserted per output type rather than documented
     /// and hoped for. `Q8_0` is a 32-element legacy block (34 B in), `Q4_K` a
-    /// 256-element super-block (144 B in).
+    /// 256-element super-block (144 B in), and since Phase 7.10 `NVFP4` /
+    /// `Q2_0` are 64-element blocks and `Q1_0` a 128-element one.
     #[test]
     fn streaming_block_length_tracks_the_output_type() {
         fn observed<E: OutputElement>(dtype: GgufType, type_size: usize, n: usize) -> Vec<usize> {
@@ -3411,6 +3945,17 @@ mod tests {
             observed::<F32Out>(GgufType::Q4_K, 144, 512),
             vec![1024, 1024]
         );
+
+        // 64-element blocks: 128 B at 2-byte output, 256 B at F32.
+        for (dtype, type_size) in [(GgufType::NVFP4, 36), (GgufType::Q2_0, 18)] {
+            assert_eq!(observed::<Bf16Out>(dtype, type_size, 128), vec![128, 128]);
+            assert_eq!(observed::<F16Out>(dtype, type_size, 128), vec![128, 128]);
+            assert_eq!(observed::<F32Out>(dtype, type_size, 128), vec![256, 256]);
+        }
+        // 128-element blocks: 256 B at 2-byte output, 512 B at F32.
+        assert_eq!(observed::<Bf16Out>(GgufType::Q1_0, 18, 256), vec![256, 256]);
+        assert_eq!(observed::<F16Out>(GgufType::Q1_0, 18, 256), vec![256, 256]);
+        assert_eq!(observed::<F32Out>(GgufType::Q1_0, 18, 256), vec![512, 512]);
     }
 
     /// `F32` output is the `f32` the kernel actually computed, and `BF16` is

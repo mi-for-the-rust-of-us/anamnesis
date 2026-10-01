@@ -288,7 +288,7 @@ impl GgufType {
     /// any known `ggml_type`. Reserved or removed discriminants (4, 5, 31–33,
     /// 36–38) also produce this error, as does everything from 43 upwards
     /// (43 is upstream's `GGML_TYPE_COUNT` sentinel, not a type).
-    fn from_u32(value: u32) -> crate::Result<Self> {
+    pub(crate) fn from_u32(value: u32) -> crate::Result<Self> {
         let ty = match value {
             0 => Self::F32,
             1 => Self::F16,
@@ -1377,7 +1377,7 @@ impl ParsedGguf {
     /// Returns [`AnamnesisError::Unsupported`] if the dtype is a
     /// recognised scalar (non-block-quant) type for which dequantisation
     /// is structurally meaningless — every block-quantised `GgufType`
-    /// has a dedicated kernel after Phase 4.5 step 6.
+    /// has a dedicated kernel.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
     /// `usize`, the mmap slice is out of bounds, or the underlying
