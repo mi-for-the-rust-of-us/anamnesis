@@ -18,7 +18,7 @@ Before every commit, run and fix any issues from:
 ## Documentation Checks
 
 Rustdoc is checked in CI by the `docs` job in `.github/workflows/ci.yml`, which
-runs **twelve feature combinations** with `RUSTDOCFLAGS="-D warnings"` and
+runs **thirteen feature combinations** with `RUSTDOCFLAGS="-D warnings"` and
 `--document-private-items`. Both halves are load-bearing, and each was added
 because the missing half had already let breakage through:
 
@@ -43,6 +43,7 @@ foreach ($c in @(
     "--no-default-features --features bnb",
     "--no-default-features --features gptq",
     "--no-default-features --features awq",
+    "--no-default-features --features nvfp4",
     "--no-default-features --features cli",
     "--no-default-features --features ollama",
     "--features cli,gguf,npz,pth")) {
@@ -79,9 +80,10 @@ If a commit claims a perf win (faster, less memory, fewer allocations, fewer bra
 
 1. **Decide with the paired harness, on x86-64.** [`benches/ab.rs`](benches/ab.rs) (tango) loads the baseline and the candidate together and interleaves them sample by sample, so drift cancels; its floor is ~2 %. Export the baseline from the parent commit, then compare:
    ```powershell
-   cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf   # on the baseline
-   cargo bench --bench=ab --features gptq,awq,bnb,gguf -- compare target/benchmarks/ab --filter 'gptq_*' --noise-threshold 2.5
+   cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf,nvfp4   # on the baseline
+   cargo bench --bench=ab --features gptq,awq,bnb,gguf,nvfp4 -- compare target/benchmarks/ab.exe --filter 'gptq_*' --noise-threshold 2.5
    ```
+   On Windows the exported binary is `ab.exe`, and `compare` needs that exact path: `target/benchmarks/ab` fails with "Benchmark not found". `compare` also **exits 1 whenever it flags a change**, so do not stop a run loop on a non-zero exit, or it ends after the first flagged run; collect all ten and judge the medians.
    **Run it about 10 times per arm** (these arms take milliseconds) and judge the median, with min and max. Filter each run to the family under test plus one untouched family as a control (e.g. `'{gptq,fp8_tensor}_*'`): on this desktop a full-suite run can be contended part-way through and swing untouched kernels by ±100 %, and the control is how a noisy run is recognised. See `CONVENTIONS.md` § *Benchmark evidence* for which instrument may decide what, and each one's measured floor.
 2. **For an absolute magnitude on a real fixture** (a model file, not the synthetic layer), use a best-of-5 release-mode median with `target-cpu=native`. Templates: the `tests/bench_*_adhoc.rs` files, each gated `#[ignore]` and run with `cargo test --release --features <flag> --test <name> <test_fn> -- --nocapture --ignored`.
 3. **Record both before and after numbers in the commit message** — median + range (min/max), and the bench command used. This is what makes a regression reversible: the next reviewer (or the next person to read `git log`) can re-run the same bench against the parent commit and know the answer.
@@ -160,7 +162,11 @@ Before tagging a release (`v*`), complete these steps in order:
 - `scripts/verify-claims.sh` (or `.ps1`) should pass from a clean checkout.
   That is the path the README points a consumer at for verifying the
   correctness claims, so it needs to work at the tag, not just on your
-  machine.
+  machine. On Windows keep that checkout's build directory short (set
+  `CARGO_TARGET_DIR` to something like the repository's own `target/`):
+  MSVC's `link.exe` ignores the system's long-path setting and fails with
+  `LNK1104` once a path passes 260 characters, which a worktree under a temp
+  directory does. Every suite then reports FAIL before running a test.
 
 **Never tag before bumping `Cargo.toml`** — `cargo publish` will reject the crate if the version in the registry already exists.
 

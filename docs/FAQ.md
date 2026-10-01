@@ -1,6 +1,6 @@
 # Frequently Asked Questions
 
-<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
+<!-- Last updated: 2026-10-01, anamnesis v0.7.9 + Phase 7.10 (unreleased) -->
 
 <!--
 STYLE CONVENTIONS for editing this FAQ. Keep growth consistent.
@@ -99,14 +99,14 @@ Note that `0.7.0` was originally planned as a CPU **SIMD** pass. It shipped as m
 Install from crates.io with the `cli` feature enabled:
 
 ```
-cargo install anamnesis --features cli,pth,npz,gguf,bnb,awq,gptq
+cargo install anamnesis --features cli,pth,npz,gguf,bnb,awq,gptq,nvfp4
 ```
 
 The Minimum Rust Version (MSRV) is **1.88**. The library itself (no CLI) is a normal `cargo add anamnesis` dependency.
 
 ### Which feature flags do I need?
 
-`cli` builds the `anamnesis`/`amn` binaries; FP8 safetensors support is always on, but the other formats are feature-gated so you only compile what you use: `pth`, `npz`, `gguf`, `bnb`, `awq`, `gptq`, and `ollama` (adds the `ollama:` URL scheme, implies `gguf`). Enable the ones matching the files you handle, e.g. `--features cli,gguf` if you only work with GGUF.
+`cli` builds the `anamnesis`/`amn` binaries; FP8 safetensors support is always on, but the other formats are feature-gated so you only compile what you use: `pth`, `npz`, `gguf`, `bnb`, `awq`, `gptq`, `nvfp4` (NVIDIA `ModelOpt` NVFP4 checkpoints), and `ollama` (adds the `ollama:` URL scheme, implies `gguf`). Enable the ones matching the files you handle, e.g. `--features cli,gguf` if you only work with GGUF.
 
 ## Formats and inspection
 
@@ -205,7 +205,7 @@ It does not have to be. `amn convert model.gguf --to safetensors --out-dtype f32
 
 `BF16` is the dtype the safetensors / Hugging Face ecosystem serves weights in, and at 2 bytes per element it halves the memory traffic on a path that is bandwidth-bound end to end. It is, though, lossy against the *exact* dequantized value: a `Q8_0` value is an `f16` scale times an `int8`, needing up to ~18 bits of significand where `BF16` holds 8. Measured on `SmolLM2-135M-Q4_K_M`, only 3–20 % of values land exactly on a `BF16` grid point and the rest round by at most half a ULP (≈ 0.39 % relative). That also scopes the project's "bit-exact, 0 ULP" claim precisely: it is 0 ULP against the reference **rounded to `BF16`**, which is how every cross-validation fixture is built, not against the true value, for which you need `float32`.
 
-`--out-dtype f32` is the option that removes anamnesis's own narrowing step entirely, so the value you get is the `f32` that `gguf-py` itself produces. On x86-64, expect it to be *slower* than `bf16`, not faster: it doubles the output bytes on a path that is bandwidth-bound, which is the honest cost of the precision rather than a defect. Apple Silicon is the exception: on an M3 Pro the kernels measured 0.51x to 1.07x the `bf16` time, faster in four of seven families.
+`--out-dtype f32` is the option that removes anamnesis's own narrowing step entirely, so the value you get is the `f32` that `gguf-py` itself produces (for `Q1_0` and `Q2_0`, which `gguf-py` cannot dequantise, the `f32` ggml's own C produces). On x86-64, expect it to be *slower* than `bf16`, not faster: it doubles the output bytes on a path that is bandwidth-bound, which is the honest cost of the precision rather than a defect. Apple Silicon is the exception: on an M3 Pro the kernels measured 0.51x to 1.07x the `bf16` time, faster in four of seven families.
 
 `f16` is not simply "the better 2-byte option". It buys 3 significand bits over `bf16` (11 versus 8) and pays a far narrower exponent range: `bf16` shares `f32`'s range, while `f16` overflows to infinity above 65504 and flushes to zero below about `2⁻²⁴`. anamnesis follows plain IEEE semantics there rather than saturating, so its output matches what NumPy and PyTorch produce for the same conversion.
 
@@ -269,7 +269,7 @@ That is deliberate. A passthrough tensor is copied, never decoded, so widening i
 
 ### Is anamnesis still bit-exact against PyTorch at `f32`?
 
-Yes, and as of v0.7.4 that is tested rather than assumed. Every kernel family is cross-validated at full `f32` width against the canonical library's own output, compared bit for bit with no tolerance: `FP8` against PyTorch, `GPTQ` against GPTQModel, `AWQ` against AutoAWQ, `BnB` against bitsandbytes, and `GGUF` against `gguf-py`.
+Yes, and as of v0.7.4 that is tested rather than assumed. Every kernel family is cross-validated at full `f32` width against the canonical library's own output, compared bit for bit with no tolerance: `FP8` against PyTorch, `GPTQ` against GPTQModel, `AWQ` against AutoAWQ, `BnB` against bitsandbytes, NVIDIA `NVFP4` safetensors against `modelopt`, and `GGUF` against `gguf-py`, and since Phase 7.10 also against ggml's own C: that is the only reference for `Q1_0` and `Q2_0`, and every other `GGUF` golden is checked against it too.
 
 This mattered more than it sounds, because exactness at `BF16` never implied exactness at `f32`. Rounding the reference to `BF16` before comparing discards 16 mantissa bits, and in these fixtures 38 to 98 percent of values carry bits `BF16` cannot represent, most families sitting above 77 percent. The comparison was throwing away most of the available signal.
 

@@ -18,6 +18,12 @@
 //! asserted never to unwind. The suite runs under the default (debug) test
 //! profile, so debug-only integer-overflow panics are in scope.
 //!
+//! Phase 7.10 extended the battery to what it added: crafted `GGUF` files of
+//! `ggml_type` 40, 41 and 42 (with every shape of `NVFP4` per-tensor `.scale`
+//! the fold applies or must leave alone), crafted and real `ModelOpt` `NVFP4`
+//! safetensors, and the new public kernels called directly with lengths and
+//! shapes that disagree.
+//!
 //! Two boundaries are deliberate, not omissions:
 //! - **`SIGBUS` is out of scope by nature.** The `parse*` path/mmap variants map
 //!   the file; a *post-map* truncation faults with `SIGBUS` — an OS signal
@@ -80,7 +86,273 @@ const FIXTURES: &[&str] = &[
     // their neighbours are exactly the "almost valid" inputs this battery wants.
     "tests/fixtures/fuzz_regressions/pth_duplicate_state_dict_key.pth",
     "tests/fixtures/fuzz_regressions/gptq_bits_zero.safetensors",
+    // A real NVIDIA `ModelOpt` `NVFP4` layer (Phase 7.10): recognised in every
+    // build, dequantised under `nvfp4`, refused by name without it.
+    "tests/fixtures/nvfp4_reference/llama31_8b_nvfp4_q_proj.safetensors",
 ];
+
+/// Pushes `bytes` with the near-misses every crafted input gets: cut in half,
+/// one byte flipped in the middle, and whole.
+fn push_with_near_misses(inputs: &mut Vec<(String, Vec<u8>)>, label: &str, bytes: Vec<u8>) {
+    let len = bytes.len();
+    inputs.push((
+        format!("{label}@trunc{}", len / 2),
+        bytes[..len / 2].to_vec(),
+    ));
+    let mut flipped = bytes.clone();
+    if let Some(byte) = flipped.get_mut(len / 2) {
+        *byte ^= 0xFF;
+    }
+    inputs.push((format!("{label}@flip"), flipped));
+    inputs.push((format!("{label}@whole"), bytes));
+}
+
+/// `n` bytes of a fixed pattern that reaches every nibble and scale-byte value.
+fn patterned(n: usize) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i.wrapping_mul(37).wrapping_add(11)) as u8)
+        .collect()
+}
+
+/// Little-endian `f32` bytes.
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A `GGUF` file of `(name, dims, ggml_type, data)` tensors, each data range
+/// placed at the next 32-byte boundary. No validation: these are hostile.
+#[cfg(feature = "gguf")]
+fn crafted_gguf(tensors: &[(&str, &[u64], u32, Vec<u8>)]) -> Vec<u8> {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+    let mut data = Vec::new();
+    let mut infos = Vec::new();
+    for (name, dims, ggml_type, bytes) in tensors {
+        infos.push(RawTensorInfo {
+            name,
+            dims,
+            ggml_type: *ggml_type,
+            offset: data.len() as u64,
+        });
+        data.extend_from_slice(bytes);
+        data.resize(data.len().next_multiple_of(32), 0);
+    }
+    raw_gguf(&[], &infos, 32, &data)
+}
+
+/// `ggml_type` discriminants the Phase 7.10 inputs use.
+#[cfg(feature = "gguf")]
+mod ggml {
+    pub const F32: u32 = 0;
+    pub const F16: u32 = 1;
+    pub const NVFP4: u32 = 40;
+    pub const Q1_0: u32 = 41;
+    pub const Q2_0: u32 = 42;
+}
+
+/// Label prefix of the crafted `GGUF` inputs for `ggml_type` 40, 41 and 42.
+#[cfg(feature = "gguf")]
+const GGUF_NEW_TYPES: &str = "gguf-t";
+
+/// Crafted `GGUF` files holding the `ggml_type`s added in Phase 7.10, well
+/// formed and not: whole blocks, a partial block, data cut short, and every
+/// shape of `NVFP4` per-tensor `.scale` the fold either applies or must leave
+/// alone, including values that are not finite and dimensions whose products
+/// overflow.
+#[cfg(feature = "gguf")]
+fn new_gguf_type_inputs() -> Vec<(String, Vec<u8>)> {
+    use ggml::{F16, F32, NVFP4, Q1_0, Q2_0};
+    const W: &str = "blk.0.attn_q.weight";
+    const S: &str = "blk.0.attn_q.scale";
+    // NVFP4 and Q2_0 hold 64 values per block, Q1_0 128; 36, 18 and 18 bytes.
+    let nvfp4 = |blocks: usize| patterned(36 * blocks);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("40", crafted_gguf(&[(W, &[64, 2], NVFP4, nvfp4(2))])),
+        ("41", crafted_gguf(&[(W, &[128, 2], Q1_0, patterned(36))])),
+        ("42", crafted_gguf(&[(W, &[64, 2], Q2_0, patterned(36))])),
+        // All bits set: the largest nibble everywhere, and UE4M3 `0xFF`, which
+        // ggml decodes to 240 rather than NaN.
+        (
+            "40-ones",
+            crafted_gguf(&[(W, &[64], NVFP4, vec![0xFF; 36])]),
+        ),
+        (
+            "41-ones",
+            crafted_gguf(&[(W, &[128], Q1_0, vec![0xFF; 18])]),
+        ),
+        ("42-ones", crafted_gguf(&[(W, &[64], Q2_0, vec![0xFF; 18])])),
+        // Half a Q1_0 block: issue #15's own reproducer shape.
+        (
+            "41-half-block",
+            crafted_gguf(&[(W, &[64], Q1_0, patterned(18))]),
+        ),
+        // Four blocks declared, one present.
+        (
+            "40-short-data",
+            crafted_gguf(&[(W, &[64, 4], NVFP4, nvfp4(1))]),
+        ),
+        (
+            "40-zero-dim",
+            crafted_gguf(&[(W, &[64, 0], NVFP4, Vec::new())]),
+        ),
+        // The fold's slab arithmetic over dimensions whose product overflows.
+        (
+            "40-huge-dims+scale",
+            crafted_gguf(&[
+                (W, &[64, 1 << 40, 1 << 30], NVFP4, nvfp4(1)),
+                (S, &[1 << 30], F32, f32_bytes(&[1.0])),
+            ]),
+        ),
+        (
+            "40+scale",
+            crafted_gguf(&[
+                (W, &[64, 2], NVFP4, nvfp4(2)),
+                (S, &[1], F32, f32_bytes(&[3.0e-4])),
+            ]),
+        ),
+        (
+            "40+scale-nan",
+            crafted_gguf(&[
+                (W, &[64, 2], NVFP4, nvfp4(2)),
+                (S, &[1], F32, f32_bytes(&[f32::NAN])),
+            ]),
+        ),
+        (
+            "40+scale-inf",
+            crafted_gguf(&[
+                (W, &[64, 2], NVFP4, nvfp4(2)),
+                (S, &[1], F32, f32_bytes(&[f32::INFINITY])),
+            ]),
+        ),
+        // Three experts, one scale each; then a count that matches no axis.
+        (
+            "40+per-expert-scale",
+            crafted_gguf(&[
+                (W, &[64, 2, 3], NVFP4, nvfp4(6)),
+                (S, &[3], F32, f32_bytes(&[1.0, 0.5, 2.0])),
+            ]),
+        ),
+        (
+            "40+scale-wrong-count",
+            crafted_gguf(&[
+                (W, &[64, 2, 3], NVFP4, nvfp4(6)),
+                (S, &[2], F32, f32_bytes(&[1.0, 0.5])),
+            ]),
+        ),
+        (
+            "40+scale-f16",
+            crafted_gguf(&[
+                (W, &[64, 2], NVFP4, nvfp4(2)),
+                (S, &[1], F16, vec![0x00, 0x3C]),
+            ]),
+        ),
+        (
+            "40+scale-empty",
+            crafted_gguf(&[(W, &[64, 2], NVFP4, nvfp4(2)), (S, &[0], F32, Vec::new())]),
+        ),
+        // A `.scale` beside a weight that is not NVFP4.
+        (
+            "42+scale",
+            crafted_gguf(&[
+                (W, &[64, 2], Q2_0, patterned(36)),
+                (S, &[1], F32, f32_bytes(&[0.5])),
+            ]),
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(label, bytes)| (format!("{GGUF_NEW_TYPES}{label}"), bytes))
+        .collect()
+}
+
+/// Label prefix of the crafted `ModelOpt` `NVFP4` inputs.
+const MODELOPT: &str = "modelopt-nvfp4";
+
+/// One `ModelOpt` tensor for [`modelopt_inputs`]: `(dtype, shape, bytes)`.
+type Part<'a> = (&'a str, &'a [usize], &'a [u8]);
+
+/// Crafted `ModelOpt` `NVFP4` layers (`U8` weight `[rows, cols / 2]`,
+/// `F8_E4M3` `weight_scale` `[rows, cols / 16]`, `F32` `weight_scale_2`), well
+/// formed and not: every companion with the wrong shape, dtype or count, a
+/// column count that is no whole block, and scales that are not finite.
+fn modelopt_inputs() -> Vec<(String, Vec<u8>)> {
+    use common::builders::build_safetensors_raw;
+    const W: &str = "mlp.down_proj.weight";
+    const S1: &str = "mlp.down_proj.weight_scale";
+    const S2: &str = "mlp.down_proj.weight_scale_2";
+    let weight = patterned(128);
+    let scales = vec![0x38u8; 16];
+    let global = f32_bytes(&[0.01]);
+    let layer = |w: Part<'_>, s1: Part<'_>, s2: Part<'_>| {
+        build_safetensors_raw(&[
+            (W, w.0, w.1, w.2),
+            (S1, s1.0, s1.1, s1.2),
+            (S2, s2.0, s2.1, s2.2),
+            ("mlp.down_proj.input_scale", "F32", &[], &global),
+        ])
+    };
+    let ok_w: Part<'_> = ("U8", &[4, 32], &weight);
+    let ok_s1: Part<'_> = ("F8_E4M3", &[4, 4], &scales);
+    let ok_s2: Part<'_> = ("F32", &[], &global);
+    let two = f32_bytes(&[0.01, 0.02]);
+    let nan = f32_bytes(&[f32::NAN]);
+    let s1_f32 = f32_bytes(&[1.0; 16]);
+    let nan_scales = vec![0xFFu8; 16]; // `float8_e4m3fn` NaN
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("ok", layer(ok_w, ok_s1, ok_s2)),
+        ("scale2-two-values", layer(ok_w, ok_s1, ("F32", &[2], &two))),
+        (
+            "scale2-bf16",
+            layer(ok_w, ok_s1, ("BF16", &[], &[0x80, 0x3F])),
+        ),
+        ("scale2-nan", layer(ok_w, ok_s1, ("F32", &[], &nan))),
+        ("scale1-f32", layer(ok_w, ("F32", &[4, 4], &s1_f32), ok_s2)),
+        (
+            "scale1-nan",
+            layer(ok_w, ("F8_E4M3", &[4, 4], &nan_scales), ok_s2),
+        ),
+        (
+            "scale1-wrong-shape",
+            layer(ok_w, ("F8_E4M3", &[4, 3], &scales[..12]), ok_s2),
+        ),
+        // Shape and byte count disagree.
+        (
+            "scale1-short-data",
+            layer(ok_w, ("F8_E4M3", &[4, 4], &scales[..8]), ok_s2),
+        ),
+        // 62 values per row: not a whole 16-value block.
+        (
+            "odd-cols",
+            layer(("U8", &[4, 31], &weight[..124]), ok_s1, ok_s2),
+        ),
+        (
+            "one-dim",
+            layer(("U8", &[128], &weight), ("F8_E4M3", &[16], &scales), ok_s2),
+        ),
+        (
+            "three-dim",
+            layer(
+                ("U8", &[2, 2, 32], &weight),
+                ("F8_E4M3", &[2, 2, 4], &scales),
+                ok_s2,
+            ),
+        ),
+        (
+            "zero-rows",
+            layer(("U8", &[0, 32], &[]), ("F8_E4M3", &[0, 4], &[]), ok_s2),
+        ),
+        (
+            "no-scale2",
+            build_safetensors_raw(&[
+                (W, "U8", &[4, 32], &weight),
+                (S1, "F8_E4M3", &[4, 4], &scales),
+            ]),
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(label, bytes)| (format!("{MODELOPT}-{label}"), bytes))
+        .collect()
+}
 
 /// The adversarial input battery: `(label, bytes)`.
 fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
@@ -231,6 +503,15 @@ fn adversarial_inputs() -> Vec<(String, Vec<u8>)> {
         }
     }
 
+    // Crafted inputs for the formats Phase 7.10 added.
+    for (label, bytes) in modelopt_inputs() {
+        push_with_near_misses(&mut inputs, &label, bytes);
+    }
+    #[cfg(feature = "gguf")]
+    for (label, bytes) in new_gguf_type_inputs() {
+        push_with_near_misses(&mut inputs, &label, bytes);
+    }
+
     // No `.gguf` file is committed, so without this nothing in the battery
     // parses as `GGUF` and every method called on a parsed `GGUF` result goes
     // unexercised. Generate one from the FP8 fixture, with its near-misses.
@@ -274,6 +555,33 @@ fn battery_includes_a_parseable_gguf() {
         .filter(|(_, bytes)| anamnesis::parse_gguf_bytes(bytes.clone()).is_ok())
         .count();
     assert!(parsed >= 1, "no generated GGUF input parses");
+}
+
+/// The same guard for the Phase 7.10 inputs: the well-formed ones must parse,
+/// or the methods pass (dequantisation, the `NVFP4` scale fold) never reaches
+/// them.
+#[test]
+fn battery_includes_parseable_phase_7_10_inputs() {
+    let inputs = adversarial_inputs();
+    let modelopt = inputs
+        .iter()
+        .filter(|(label, _)| label.starts_with(MODELOPT) && label.ends_with("@whole"))
+        .filter_map(|(_, bytes)| anamnesis::parse_bytes(bytes.clone()).ok())
+        .filter(|model| model.header.scheme == anamnesis::QuantScheme::Nvfp4)
+        .count();
+    assert!(
+        modelopt >= 2,
+        "only {modelopt} crafted ModelOpt inputs parse as NVFP4"
+    );
+    #[cfg(feature = "gguf")]
+    {
+        let gguf = inputs
+            .iter()
+            .filter(|(label, _)| label.starts_with(GGUF_NEW_TYPES) && label.ends_with("@whole"))
+            .filter(|(_, bytes)| anamnesis::parse_gguf_bytes(bytes.clone()).is_ok())
+            .count();
+        assert!(gguf >= 10, "only {gguf} crafted GGUF 40/41/42 inputs parse");
+    }
 }
 
 /// The label prefix used for inputs derived from a fixture path.
@@ -702,6 +1010,83 @@ fn methods_on_parsed_results_never_panic() {
                     let _ = pth.tensors();
                     let _ = pth.to_safetensors_bytes();
                 });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernels called directly (Phase 7.10)
+// ---------------------------------------------------------------------------
+
+/// The public kernels added in Phase 7.10, called the way a binding might:
+/// with a data length and a declared element count that need not agree.
+/// Every combination must be a clean `Ok`/`Err`, including counts at
+/// `usize::MAX`, where the output size overflows.
+#[cfg(feature = "gguf")]
+#[test]
+fn new_gguf_kernels_never_panic_on_mismatched_inputs() {
+    use anamnesis::{Bf16Out, F16Out, F32Out, GgufType, dequantize_gguf, dequantize_gguf_blocks};
+
+    let counts = [
+        0usize,
+        1,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        256,
+        usize::MAX / 2,
+        usize::MAX,
+    ];
+    for dtype in [GgufType::NVFP4, GgufType::Q1_0, GgufType::Q2_0] {
+        for len in [0usize, 1, 17, 18, 35, 36, 37, 72, 144] {
+            let data = patterned(len);
+            for n in counts {
+                let label = format!("{dtype} len {len} n {n}");
+                assert_no_panic(&format!("dequantize_gguf<BF16> / {label}"), || {
+                    dequantize_gguf::<Bf16Out>(&data, dtype, n)
+                });
+                assert_no_panic(&format!("dequantize_gguf<F32> / {label}"), || {
+                    dequantize_gguf::<F32Out>(&data, dtype, n)
+                });
+                assert_no_panic(&format!("dequantize_gguf_blocks<F16> / {label}"), || {
+                    dequantize_gguf_blocks::<F16Out, _>(&data, dtype, n, |_| Ok(()))
+                });
+            }
+        }
+    }
+}
+
+/// `dequantize_nvfp4` (the `ModelOpt` kernel) with shapes and slices that
+/// disagree, products that overflow, and scales that are not finite.
+#[cfg(feature = "nvfp4")]
+#[test]
+fn modelopt_nvfp4_kernel_never_panics_on_mismatched_inputs() {
+    use anamnesis::{Bf16Out, F32Out, dequantize_nvfp4};
+
+    let dims = [0usize, 1, 2, 4, 15, 16, 17, 32, usize::MAX / 2, usize::MAX];
+    for weight_len in [0usize, 1, 7, 8, 64] {
+        let weight = patterned(weight_len);
+        for scales_len in [0usize, 1, 4, 8] {
+            let scales = patterned(scales_len);
+            for global in [0.01_f32, 0.0, f32::NAN, f32::INFINITY] {
+                for rows in dims {
+                    for cols in dims {
+                        let label = format!(
+                            "weight {weight_len} scales {scales_len} global {global} \
+                             rows {rows} cols {cols}"
+                        );
+                        assert_no_panic(&format!("dequantize_nvfp4<BF16> / {label}"), || {
+                            dequantize_nvfp4::<Bf16Out>(&weight, &scales, global, rows, cols)
+                        });
+                        assert_no_panic(&format!("dequantize_nvfp4<F32> / {label}"), || {
+                            dequantize_nvfp4::<F32Out>(&weight, &scales, global, rows, cols)
+                        });
+                    }
+                }
             }
         }
     }

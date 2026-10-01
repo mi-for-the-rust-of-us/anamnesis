@@ -1429,6 +1429,70 @@ impl ParsedModel {
                     detail: "BnB dequantization requires the `bnb` feature".into(),
                 });
             }
+            #[cfg(feature = "nvfp4")]
+            QuantScheme::Nvfp4 => {
+                let (scale_entry, scale_2_entry) =
+                    crate::parse::safetensors::nvfp4_companions(index, &entry.name).ok_or_else(
+                        || AnamnesisError::Parse {
+                            reason: format!(
+                                "NVFP4 `{}`: `_scale` or `_scale_2` companion not found",
+                                entry.name
+                            ),
+                        },
+                    )?;
+                if scale_entry.dtype != Dtype::F8E4M3 {
+                    return Err(AnamnesisError::Parse {
+                        reason: format!(
+                            "NVFP4 `{}_scale` is {}, expected F8_E4M3",
+                            entry.name, scale_entry.dtype
+                        ),
+                    });
+                }
+                // One value, not the first of several: `read_scalar_scale`
+                // reads the leading bytes only.
+                if scale_2_entry.num_elements() != 1 {
+                    return Err(AnamnesisError::Parse {
+                        reason: format!(
+                            "NVFP4 `{}_scale_2` has {} values, expected 1",
+                            entry.name,
+                            scale_2_entry.num_elements()
+                        ),
+                    });
+                }
+                let scale_data =
+                    self.tensor_data(scale_entry.data_offsets.0, scale_entry.data_offsets.1)?;
+                let scale_2_data =
+                    self.tensor_data(scale_2_entry.data_offsets.0, scale_2_entry.data_offsets.1)?;
+                let global_scale =
+                    Self::read_scalar_scale(scale_2_data, scale_2_entry.dtype, &entry.name)?;
+                // The stored shape counts bytes; two values per byte.
+                let (rows, packed_cols) = Self::shape_to_rows_cols(&entry.shape)?;
+                let cols = packed_cols
+                    .checked_mul(2)
+                    .ok_or_else(|| AnamnesisError::Parse {
+                        reason: format!("NVFP4 `{}` column count overflows", entry.name),
+                    })?;
+                let out = crate::remember::nvfp4::dequantize_nvfp4::<E>(
+                    weight_data,
+                    scale_data,
+                    global_scale,
+                    rows,
+                    cols,
+                )?;
+                TensorDequant::Owned(entry.name.clone(), out, vec![rows, cols])
+            }
+            #[cfg(not(feature = "nvfp4"))]
+            QuantScheme::Nvfp4 => {
+                return Err(AnamnesisError::Unsupported {
+                    format: "safetensors NVFP4".into(),
+                    detail: format!(
+                        "`{}` is NVIDIA ModelOpt NVFP4 (U8 weights with F8_E4M3 \
+                         weight_scale and weight_scale_2); dequantising it requires \
+                         the `nvfp4` feature",
+                        entry.name
+                    ),
+                });
+            }
             QuantScheme::Unquantized => {
                 // Shouldn't have a quantized-role tensor in an
                 // unquantized model; the orchestrator resolves this

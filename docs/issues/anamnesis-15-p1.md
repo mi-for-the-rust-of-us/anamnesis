@@ -8,7 +8,12 @@
   since anamnesis's table was written, and one of them (`NVFP4 = 40`) is already
   on 100+ Hub repositories. This is a **read-side** coverage gap, distinct from
   the encode work in Phase 8.5.
-- **Outcome:** (pending)
+- **Outcome:** Fixed by Phase 7.10 on branch `phase-7.10-gguf-types` (to ship
+  as v0.7.10): the three types parse and dequantise (`3259ab8`, `34fa177`),
+  cross-validated against ggml's own C (`41fcf30`), `NVFP4`'s per-tensor scale
+  is folded by `remember` / `convert` (`6c523d3`), and the suggested CI check
+  exists (`0d00874`). The closing reply is drafted in
+  [`anamnesis-15-p2.md`](anamnesis-15-p2.md).
 - **Lesson / Leverage angle:** The GGUF type enum is a moving upstream target
   that anamnesis tracks by hand, with no mechanism that notices drift. The issue
   proposes one, because the next three types will land the same way.

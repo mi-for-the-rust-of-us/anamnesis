@@ -43,7 +43,8 @@ $suites = @(
     @{ Target = "cross_validation_awq";         What = "AWQ INT4, per-group, BF16 + F32";                              Oracle = "AutoAWQ unpack_awq + reverse_awq_order" }
     @{ Target = "cross_validation_bnb";         What = "BitsAndBytes NF4 / FP4 / INT8, BF16 + F32";                    Oracle = "bitsandbytes dequantize_4bit" }
     @{ Target = "cross_validation_bnb_encode";  What = "BitsAndBytes NF4 + INT8 encode (byte-exact on disk)"; Oracle = "bitsandbytes on-disk bytes" }
-    @{ Target = "cross_validation_gguf";        What = "all 22 GGUF block-quant kernels, BF16 + F32"; Oracle = "gguf-py (mirrors ggml-quants.c)" }
+    @{ Target = "cross_validation_nvfp4";       What = "NVIDIA ModelOpt NVFP4 safetensors, BF16 + F32"; Oracle = "modelopt NVFP4QTensor.dequantize" }
+    @{ Target = "cross_validation_gguf";        What = "all 25 GGUF block-quant kernels + the NVFP4 scale fold, BF16 + F32"; Oracle = "gguf-py and ggml's own C (ggml-quants.c)" }
     @{ Target = "cross_validation_ollama";      What = "GGUF Q8_0 from a real Ollama blob";                Oracle = "gguf-py" }
     @{ Target = "cross_validation_npz";         What = "NPZ / NPY parsing";                                Oracle = "NumPy" }
     @{ Target = "cross_validation_pth";         What = "PyTorch .pth (pickle + tensor recovery)";          Oracle = "torch.load" }
@@ -87,8 +88,8 @@ What this proves, and what it does not
 
 PROVES: anamnesis's dequantisation output matches goldens committed to this
 repository, byte for byte. Since v0.7.4 that includes a full-width F32
-comparison with no tolerance at all for *every* dequantising family: all 22
-GGUF kernels, plus FP8, GPTQ, AWQ and BitsAndBytes. That matters because a
+comparison with no tolerance at all for *every* dequantising family: all 25
+GGUF kernels, plus FP8, GPTQ, AWQ, BitsAndBytes and NVIDIA NVFP4. That matters because a
 BF16 comparison discards 16 mantissa bits, and it is what caught a 1-ULP
 defect in the BnB INT8 kernel that five releases of BF16 testing had passed.
 

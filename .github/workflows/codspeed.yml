@@ -107,7 +107,7 @@ jobs:
       # Required-features by target: ab and dequant need gptq/awq/bnb/gguf, parsing
       # needs npz/pth/gguf, convert needs gguf. `parallel` is on by default.
       - name: Build the benchmark targets
-        run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth
+        run: cargo codspeed build --features gptq,awq,bnb,gguf,npz,pth,nvfp4
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1

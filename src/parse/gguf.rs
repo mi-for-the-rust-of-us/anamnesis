@@ -140,8 +140,11 @@ const READER_BUF_SIZE: usize = 64 * 1024;
 
 /// Total number of [`GgufType`] variants — used to size the per-dtype
 /// dedup bitmap in [`ParsedGguf::inspect`]. Must be kept in sync with
-/// the match arms of `GgufType::inspect_index`.
-const GGUF_TYPE_COUNT: usize = 32;
+/// the match arms of `GgufType::inspect_index`: nothing in the type system
+/// ties the two together, and a variant whose index falls outside the bitmap
+/// would panic `inspect` on any file containing it. The
+/// `inspect_index_is_dense_and_in_bounds` test pins the invariant.
+const GGUF_TYPE_COUNT: usize = 35;
 
 // ---------------------------------------------------------------------------
 // GgufType
@@ -151,7 +154,11 @@ const GGUF_TYPE_COUNT: usize = 32;
 ///
 /// The enum is `#[non_exhaustive]` because new `ggml_type` values are added
 /// over time (e.g., the `IQ*` family appeared after the original `K`-quants,
-/// and `MXFP4` was added in 2024).
+/// `MXFP4` was added in 2024, and `NVFP4`, `Q1_0` and `Q2_0` followed in
+/// 2026). The variants track the live entries of `ggml.h`'s `enum ggml_type`:
+/// `tests/gguf_type_snapshot.rs` holds the parser to a checked-in snapshot of
+/// that enum (`tests/fixtures/ggml_types.txt`), and the weekly
+/// `ggml-drift.yml` workflow holds the snapshot to upstream `master`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 #[allow(non_camel_case_types)]
@@ -220,6 +227,19 @@ pub enum GgufType {
     TQ2_0,
     /// 32-element, 4-bit microscaling FP (`GGML_TYPE_MXFP4 = 39`).
     MXFP4,
+    /// 64-element, 4-bit `E2M1` with four `UE4M3` sub-block scales
+    /// (`GGML_TYPE_NVFP4 = 40`).
+    ///
+    /// A second, per-tensor `F32` scale usually sits beside the weight as a
+    /// separate `<stem>.scale` tensor. Dequantising the block alone does not
+    /// apply it; `ParsedGguf::remember` and `convert` do (see there).
+    NVFP4,
+    /// 128-element, 1-bit sign quantisation with an `f16` scale
+    /// (`GGML_TYPE_Q1_0 = 41`).
+    Q1_0,
+    /// 64-element, 2-bit quantisation over `{-1, 0, +1, +2}` with an `f16`
+    /// scale (`GGML_TYPE_Q2_0 = 42`).
+    Q2_0,
 }
 
 impl GgufType {
@@ -261,6 +281,9 @@ impl GgufType {
             Self::TQ1_0 => 34,
             Self::TQ2_0 => 35,
             Self::MXFP4 => 39,
+            Self::NVFP4 => 40,
+            Self::Q1_0 => 41,
+            Self::Q2_0 => 42,
         }
     }
 
@@ -270,8 +293,9 @@ impl GgufType {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if the value does not match
     /// any known `ggml_type`. Reserved or removed discriminants (4, 5, 31–33,
-    /// 36–38) also produce this error.
-    fn from_u32(value: u32) -> crate::Result<Self> {
+    /// 36–38) also produce this error, as does everything from 43 upwards
+    /// (43 is upstream's `GGML_TYPE_COUNT` sentinel, not a type).
+    pub(crate) fn from_u32(value: u32) -> crate::Result<Self> {
         let ty = match value {
             0 => Self::F32,
             1 => Self::F16,
@@ -305,6 +329,9 @@ impl GgufType {
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
+            40 => Self::NVFP4,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
             other => {
                 return Err(AnamnesisError::Unsupported {
                     format: "GGUF".into(),
@@ -319,7 +346,8 @@ impl GgufType {
     ///
     /// Unquantised scalar types return `1`. Legacy quantised types return
     /// `32`. K-quants and most `IQ*`/`TQ*` types return `256`. `IQ4_NL` and
-    /// `MXFP4` return `32`.
+    /// `MXFP4` return `32`, `NVFP4` and `Q2_0` return `64`, and `Q1_0`
+    /// returns `128`.
     #[must_use]
     pub const fn block_size(self) -> usize {
         match self {
@@ -339,6 +367,8 @@ impl GgufType {
             | Self::Q8_1
             | Self::IQ4_NL
             | Self::MXFP4 => 32,
+            Self::NVFP4 | Self::Q2_0 => 64,
+            Self::Q1_0 => 128,
             Self::Q2_K
             | Self::Q3_K
             | Self::Q4_K
@@ -371,7 +401,8 @@ impl GgufType {
     /// (`IQ3_XXS` at 98 bytes, `IQ3_S` at 110 bytes), the two 1-bit
     /// `IQ*` variants (`IQ1_S` at 50 bytes, `IQ1_M` at 56 bytes), the
     /// two ternary `TQ*` variants (`TQ1_0` at 54 bytes, `TQ2_0` at 66
-    /// bytes), and the microscaling `MXFP4` variant (17 bytes). The
+    /// bytes), the microscaling `MXFP4` variant (17 bytes), `NVFP4`
+    /// (36 bytes), and the low-bit `Q1_0` and `Q2_0` (18 bytes each). The
     /// return type is kept as `Option<usize>` for API stability — every
     /// arm currently returns `Some(_)`, so callers can `.unwrap_or(0)`
     /// or unwrap defensively without ever exercising the `None` branch.
@@ -449,6 +480,15 @@ impl GgufType {
             // ggml in 2024). e (E8M0 byte exponent, 1 B) + qs (4-bit packed,
             // 16 B) = 17 B per block.
             Self::MXFP4 => Some(17),
+            // NVFP4 (64-element block): d (UE4M3 scale per 16-element
+            // sub-block, u8[4], 4 B) + qs (4-bit packed E2M1, 32 B) = 36 B.
+            Self::NVFP4 => Some(36),
+            // Q1_0 (128-element block): d (f16, 2 B) + qs (1 bit per
+            // element, u8[16], 16 B) = 18 B.
+            Self::Q1_0 => Some(18),
+            // Q2_0 (64-element block): d (f16, 2 B) + qs (2 bits per
+            // element, u8[16], 16 B) = 18 B.
+            Self::Q2_0 => Some(18),
         }
     }
 
@@ -506,6 +546,9 @@ impl GgufType {
             Self::TQ1_0 => 29,
             Self::TQ2_0 => 30,
             Self::MXFP4 => 31,
+            Self::NVFP4 => 32,
+            Self::Q1_0 => 33,
+            Self::Q2_0 => 34,
         }
     }
 
@@ -586,9 +629,122 @@ impl fmt::Display for GgufType {
             Self::TQ1_0 => "TQ1_0",
             Self::TQ2_0 => "TQ2_0",
             Self::MXFP4 => "MXFP4",
+            Self::NVFP4 => "NVFP4",
+            Self::Q1_0 => "Q1_0",
+            Self::Q2_0 => "Q2_0",
         };
         f.write_str(s)
     }
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 second-level scales
+// ---------------------------------------------------------------------------
+
+/// How one `NVFP4` weight is paired with its per-tensor scale tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Nvfp4ScalePair {
+    /// Index of the `<stem>.scale` tensor in the same tensor list.
+    pub(crate) scale: usize,
+    /// Weight elements each scale value covers: the whole tensor for a
+    /// one-element scale, one expert's slab for a per-expert scale. Always a
+    /// non-zero multiple of the `NVFP4` block size (64), so a dequantised
+    /// block never straddles two scales.
+    pub(crate) slab: usize,
+}
+
+/// Pairs every `NVFP4` weight with the per-tensor scale `ggml` keeps beside it.
+///
+/// NVIDIA's `NVFP4` scales twice: each 16-element sub-block carries a `UE4M3`
+/// scale inside the block, which the kernel applies, and the whole tensor
+/// carries a second `F32` scale, which `convert_hf_to_gguf.py` writes as a
+/// separate `<stem>.scale` tensor (`weight_scale_2` in the source checkpoint).
+/// llama.cpp applies it at inference time, multiplying each matmul result by it
+/// (`llama-graph.cpp`, `build_lora_mm`; loaded as an optional
+/// `"<stem>.scale"` in `llama-model.cpp`), so the model's weight is the
+/// dequantised block times that factor. On `zeta-2.1-NVFP4.gguf` the factors
+/// run from about `9e-5` to `2e-3`: leaving them out is not a rounding
+/// difference.
+///
+/// The pairing is deliberately narrow, because llama.cpp also uses `*.scale`
+/// for unrelated per-architecture scales. A tensor `<stem>.weight` is paired
+/// with `<stem>.scale` only when the weight is `NVFP4`, the scale is `F32`, and
+/// the scale is either
+///
+/// - a single element, scaling the whole weight, or
+/// - one-dimensional with one value per slice of the weight's outermost
+///   dimension (the expert axis of a mixture-of-experts tensor, `{n_expert}`
+///   upstream), each slice being a whole number of 64-element blocks.
+///
+/// Anything else is left alone, scale and weight alike. Shapes are in `GGUF`
+/// order (innermost first). Both `inspect` and the `convert` hub decide with
+/// this one function, so the size `inspect` reports and the tensors `remember`
+/// writes cannot disagree about which scales were folded away.
+///
+/// Returns a map from weight index to its pair; empty, after one pass and no
+/// allocation, for a file with no `NVFP4` tensor.
+pub(crate) fn nvfp4_scale_pairs<'a, I>(tensors: I) -> HashMap<usize, Nvfp4ScalePair>
+where
+    I: IntoIterator<Item = (&'a str, GgufType, &'a [usize])>,
+    I::IntoIter: Clone,
+{
+    let tensors = tensors.into_iter();
+    let mut pairs = HashMap::new();
+    // One allocation-free pass first: every `GGUF` without `NVFP4` (all of
+    // them before Phase 7.10) stops here, on `inspect`'s per-file path.
+    if !tensors
+        .clone()
+        .any(|(_, dtype, _)| dtype == GgufType::NVFP4)
+    {
+        return pairs;
+    }
+    let all: Vec<(&str, GgufType, &[usize])> = tensors.collect();
+    let by_name: HashMap<&str, usize> = all
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, _, _))| (name, i))
+        .collect();
+    for (i, &(name, dtype, shape)) in all.iter().enumerate() {
+        if dtype != GgufType::NVFP4 {
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".weight") else {
+            continue;
+        };
+        let Some(&scale) = by_name.get(format!("{stem}.scale").as_str()) else {
+            continue;
+        };
+        let Some(&(_, scale_dtype, scale_shape)) = all.get(scale) else {
+            continue;
+        };
+        if scale_dtype != GgufType::F32 {
+            continue;
+        }
+        if let Some(slab) = nvfp4_scale_slab(shape, scale_shape) {
+            pairs.insert(i, Nvfp4ScalePair { scale, slab });
+        }
+    }
+    pairs
+}
+
+/// The number of weight elements each scale value covers, or `None` when the
+/// scale's shape is not one `nvfp4_scale_pairs` folds.
+fn nvfp4_scale_slab(weight_shape: &[usize], scale_shape: &[usize]) -> Option<usize> {
+    let weight_elements = checked_num_elements(weight_shape)?;
+    let scale_elements = checked_num_elements(scale_shape)?;
+    let slab = if scale_elements == 1 {
+        weight_elements
+    } else {
+        // Per-expert: a 1-D scale with one value per slice of the outermost
+        // weight dimension, on a weight with an axis to slice along.
+        let (&outer, _) = weight_shape.split_last()?;
+        if scale_shape.len() != 1 || weight_shape.len() < 2 || scale_elements != outer {
+            return None;
+        }
+        weight_elements.checked_div(outer)?
+    };
+    let block = GgufType::NVFP4.block_size();
+    (slab != 0 && slab.is_multiple_of(block)).then_some(slab)
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,12 +1489,18 @@ impl ParsedGguf {
     /// pick a width. It is the per-tensor counterpart of `ConvertOptions`'s
     /// `output_dtype` on the whole-file path.
     ///
+    /// For an `NVFP4` tensor the result is the block decode only, exactly
+    /// `ggml`'s `dequantize_row_nvfp4`: the per-tensor `<stem>.scale` that
+    /// usually accompanies it is a separate tensor, and this method sees one
+    /// tensor. Multiply by it yourself, or use `remember` / `convert`, which
+    /// fold it in.
+    ///
     /// # Errors
     ///
     /// Returns [`AnamnesisError::Unsupported`] if the dtype is a
     /// recognised scalar (non-block-quant) type for which dequantisation
     /// is structurally meaningless — every block-quantised `GgufType`
-    /// has a dedicated kernel after Phase 4.5 step 6.
+    /// has a dedicated kernel.
     ///
     /// Returns [`AnamnesisError::Parse`] if the element count overflows
     /// `usize`, the mmap slice is out of bounds, or the underlying
@@ -2712,7 +2874,20 @@ fn build_inspect_info(
     // O(n × d) to O(n). `dtypes` still records first-occurrence order.
     let mut seen = [false; GGUF_TYPE_COUNT];
     let mut dtypes: Vec<GgufType> = Vec::new();
-    for info in tensor_infos {
+    // `NVFP4` per-tensor scales that `remember` / `convert` fold into their
+    // weights and then leave out of the output (see `nvfp4_scale_pairs`). They
+    // are excluded from `dequantized_size` by the same rule, so the figure a
+    // host gates on is the one the hub is charged. Empty, and never probed
+    // per tensor, for a file without `NVFP4`.
+    let folded_scales: std::collections::HashSet<usize> = nvfp4_scale_pairs(
+        tensor_infos
+            .iter()
+            .map(|info| (info.name.as_str(), info.dtype, info.shape.as_slice())),
+    )
+    .into_values()
+    .map(|pair| pair.scale)
+    .collect();
+    for (i, info) in tensor_infos.iter().enumerate() {
         if let Some(byte_len) = info.byte_len {
             total_bytes = total_bytes.saturating_add(byte_len);
         } else {
@@ -2728,7 +2903,10 @@ fn build_inspect_info(
             let n_elements = saturating_num_elements_u64(&info.shape);
             dequantized_size =
                 dequantized_size.saturating_add(n_elements.saturating_mul(out_bytes));
-        } else if let Some(byte_len) = info.byte_len {
+        } else if let Some(byte_len) = info
+            .byte_len
+            .filter(|_| folded_scales.is_empty() || !folded_scales.contains(&i))
+        {
             dequantized_size = dequantized_size.saturating_add(byte_len);
         }
         let idx = info.dtype.inspect_index();
@@ -2927,7 +3105,32 @@ mod tests {
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 32, "one discriminant per `GgufType` variant");
+        assert_eq!(accepted, 35, "one discriminant per `GgufType` variant");
+    }
+
+    /// `inspect_index` must map the variants onto `0..GGUF_TYPE_COUNT`
+    /// one-to-one. `build_inspect_info` indexes a `[bool; GGUF_TYPE_COUNT]`
+    /// with it, so an index at or past the bound would panic `inspect` on any
+    /// file containing that type, and nothing in the type system ties the two
+    /// together. `from_u32` reaches every variant (pinned by the round-trip
+    /// test above), so walking its accepted discriminants walks the enum.
+    #[test]
+    fn inspect_index_is_dense_and_in_bounds() {
+        let mut seen = [false; GGUF_TYPE_COUNT];
+        let mut variants = 0;
+        for disc in 0..64 {
+            if let Ok(ty) = GgufType::from_u32(disc) {
+                let idx = ty.inspect_index();
+                assert!(idx < GGUF_TYPE_COUNT, "{ty}: index {idx} out of bounds");
+                assert!(!seen[idx], "{ty}: index {idx} reused");
+                seen[idx] = true;
+                variants += 1;
+            }
+        }
+        assert_eq!(
+            variants, GGUF_TYPE_COUNT,
+            "GGUF_TYPE_COUNT != variant count"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -3575,12 +3778,27 @@ mod tests {
         assert_eq!(GgufType::TQ2_0.type_size(), Some(66));
         assert_eq!(GgufType::TQ2_0.byte_size_for_n_elements(256).unwrap(), 66);
 
-        // Microscaling FP4 landed in Phase 4.5 step 6 — the final block
-        // type, closing the GGUF coverage gap. Every `GgufType` variant
-        // now returns `Some(_)` from `type_size()`.
+        // Microscaling FP4 landed in Phase 4.5 step 6. Every `GgufType`
+        // variant returns `Some(_)` from `type_size()`.
         assert_eq!(GgufType::MXFP4.block_size(), 32);
         assert_eq!(GgufType::MXFP4.type_size(), Some(17));
         assert_eq!(GgufType::MXFP4.byte_size_for_n_elements(64).unwrap(), 34);
+
+        // Phase 7.10 (issue #15): the first block sizes other than 32 and
+        // 256. Layouts from `ggml-common.h` at llama.cpp `37b53fd`.
+        assert_eq!(GgufType::NVFP4.block_size(), 64);
+        assert_eq!(GgufType::NVFP4.type_size(), Some(36));
+        assert_eq!(GgufType::NVFP4.byte_size_for_n_elements(128).unwrap(), 72);
+        assert_eq!(GgufType::Q1_0.block_size(), 128);
+        assert_eq!(GgufType::Q1_0.type_size(), Some(18));
+        assert_eq!(GgufType::Q1_0.byte_size_for_n_elements(256).unwrap(), 36);
+        assert_eq!(GgufType::Q2_0.block_size(), 64);
+        assert_eq!(GgufType::Q2_0.type_size(), Some(18));
+        assert_eq!(GgufType::Q2_0.byte_size_for_n_elements(128).unwrap(), 36);
+        assert!(matches!(
+            GgufType::Q1_0.byte_size_for_n_elements(64),
+            Err(AnamnesisError::Parse { .. })
+        ));
     }
 
     #[test]
@@ -3591,6 +3809,9 @@ mod tests {
         assert!(GgufType::Q4_0.is_quantized());
         assert!(GgufType::Q4_K.is_quantized());
         assert!(GgufType::IQ4_XS.is_quantized());
+        assert!(GgufType::NVFP4.is_quantized());
+        assert!(GgufType::Q1_0.is_quantized());
+        assert!(GgufType::Q2_0.is_quantized());
     }
 
     #[test]
@@ -3615,6 +3836,9 @@ mod tests {
         assert_eq!(GgufType::Q4_K.to_string(), "Q4_K");
         assert_eq!(GgufType::IQ4_XS.to_string(), "IQ4_XS");
         assert_eq!(GgufType::BF16.to_string(), "BF16");
+        assert_eq!(GgufType::NVFP4.to_string(), "NVFP4");
+        assert_eq!(GgufType::Q1_0.to_string(), "Q1_0");
+        assert_eq!(GgufType::Q2_0.to_string(), "Q2_0");
     }
 
     // -----------------------------------------------------------------

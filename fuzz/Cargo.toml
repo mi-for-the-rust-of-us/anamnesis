@@ -15,10 +15,10 @@ tempfile = "3"
 
 [dependencies.anamnesis]
 path = ".."
-# `gptq` / `awq` / `bnb` make the dequant kernels reachable from the
+# `gptq` / `awq` / `bnb` / `nvfp4` make the dequant kernels reachable from the
 # safetensors and `convert_bytes` targets, which run `remember` / the hub on
 # attacker-shaped tensors.
-features = ["npz", "pth", "gguf", "gptq", "awq", "bnb"]
+features = ["npz", "pth", "gguf", "gptq", "awq", "bnb", "nvfp4"]
 
 # Own workspace so it is not absorbed into the parent; the published
 # `anamnesis` crate excludes `/fuzz` entirely (see the root `Cargo.toml`).

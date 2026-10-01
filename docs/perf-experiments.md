@@ -53,6 +53,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 17 | Phase 7.7 `clippy::chunks_exact_to_as_chunks` across the six suppressed sites in `src/` | **Unpredictable per site, and v0.7.6's figures were mostly instrument error.** 2 migrations are wins (`GPTQ` -9.87 %, `BnB` `INT8` -3 to -6 % at `F16`), 3 are measured losses (`AWQ` **+30 % aarch64 / ~+45 % x86-64**, `write_scratch` **+32 %** on `BnB` `INT8` `BF16`, `FP8` +3-5 %), 1 is unmeasurable. Identical source changes to near-identical kernels gave opposite answers, so **no site may be migrated on a sibling's number**. Secondary finding, larger than the primary one: **a static instruction count is not a proxy for wall clock** — `AWQ`'s counts fell at every `aarch64` width while its wall clock rose ~30 % | Shipped (v0.7.7, Phase 7.7) |
 | 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width on x86-64 and server `aarch64`, and the inline is not the lever.** x86-64 2.02x-3.11x across seven kernels, server `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.09x-1.63x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely. **Apple Silicon is a third regime** (one M3 Pro, issue #11): `F16` 0.94x-2.59x with `bnb_int8` *faster* at `F16` than at `BF16`, and `F32` 0.51x-1.07x, strictly faster than `BF16` in four of seven families | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
 | 19 | v0.7.8 close-out: sharing cold validation code between sibling kernels | **A refactor with no intended perf effect cost `gptq_int4_bf16` +69 % and `bnb_nf4` +4.5 to +6.5 %, and was reverted on those two paths.** Moving `GPTQ`'s entry validation into a shared helper: +69.4 / +68.8 / +75.2 / +73.8 / +71.1 % across five paired runs, `F32` / `F16` flat, not rescued by `#[inline]`. Adding a `checked_add` to `BnB`'s per-block `read_f32_le` and routing `dequantize_bnb4` through shared helpers: +4.50 % / +5.34 % (medians of 10); either change alone still regressed (+6.12 / +6.54 %, or +7.32 / +1.04 %), only reverting both is flat. Everything else in the release measured flat across all 21 arms (10 runs, every median within +/-1.5 %). **Code that is not in the hot loop can still decide the hot loop's codegen** | Reverted on `GPTQ` and plain `NF4` only (v0.7.8); what stays shared is the `GPTQ` / `AWQ` scale unpack, the `BnB` double-quant recovery and the encode-side helpers, which measured flat |
+| 20 | Phase 7.10: naming every `GgufType` in the dequant dispatcher instead of a wildcard arm | **A safety refactor cost `gguf_q4k_f16` +5.17 %, and the wildcard was kept.** Replacing the dispatcher's `_` arm with the eight scalar types by name (so a new variant could not compile without a kernel decision) moved `Q4_K` at `F16` by +5.17 % (10/10 flagged); `#[inline(never)]` on the three new kernels did not help (+5.21 %); restoring the wildcard measured -0.15 %, and the shipped code +0.46 %. The compile-time guarantee moved into an exhaustive test-only `match` | Wildcard kept; guard is a test (Phase 7.10 B2) |
 
 ---
 
@@ -1834,3 +1835,67 @@ too, so neither kernel keeps a single-caller helper. The shared helpers stay whe
 they measured flat: the per-group scale unpack (`GPTQ` and `AWQ`), the `BnB`
 double-quant recovery and the encode side, which no benchmark times.
 
+## Experiment 20: naming every variant in a dispatch `match` (Phase 7.10)
+
+**Hypothesis (implicit, and wrong).** Issue #15 was a wildcard arm doing its
+job too well: `dispatch_streaming` in `remember/gguf.rs` matched the 24 block
+types by name and sent everything else to `Unsupported`, so the three types
+upstream `ggml` added (`NVFP4`, `Q1_0`, `Q2_0`) would have been refused as "not
+a block-quantised type" as soon as the parser learned them. Phase 7.10 added
+their kernels and, as hardening, replaced the `_` arm with the eight scalar
+types named one by one, so that a future variant could not compile without a
+decision in the dispatcher. A `match` arm is not a per-element operation, so the
+change was assumed to be free.
+
+**Method.** `benches/ab.rs` (tango, paired, x86-64, ~2 % floor), every
+candidate compared against `cargo export` of the v0.7.9 release commit
+(`00d58c2`), **10 runs per variant, filtered to `{gguf,fp8_tensor}_*`**, with
+the `FP8` arms as the untouched control. RAM at its rated 3200 MT/s (see the
+note below). `gguf_q4k_*` is the only `GGUF` family the paired harness carries,
+so this measures the `Q4_K` kernel's path through the dispatcher and not the
+other 23.
+
+**Results** (median, min / max, flagged runs):
+
+| Variant | `gguf_q4k_bf16` | `gguf_q4k_f16` | `gguf_q4k_f32` |
+|---|---|---|---|
+| B1 only: the three enum variants, no `remember/` change (`3259ab8`) | +0.58 % | **-0.14 %** (-1.25 / +1.64, 0/10) | -0.60 % |
+| B2 as written: three kernels, scalar types named, no wildcard | +0.22 % | **+5.17 %** (+4.03 / +6.75, **10/10**) | -0.90 % |
+| same, with the three new kernels `#[inline(never)]` | +0.06 % | **+5.21 %** (+3.98 / +7.44, **10/10**) | +0.21 % |
+| three kernels, wildcard restored | +0.49 % | **-0.15 %** (-1.04 / +0.93, 0/10) | -0.62 % |
+| as committed: wildcard + test-only exhaustive classification | +0.10 % | **+0.46 %** (-0.48 / +1.05, 0/10) | -0.33 % |
+
+The `FP8` control medians stayed within +/-1.1 % in every variant.
+
+**What it says.** The cost is the shape of the `match`, not the new kernels:
+keeping them out of line changed nothing, and putting the wildcard back removed
+all of it. The `Q4_K` kernel's source is identical across all five rows. In the
+`F16` instantiation the dispatcher is one function with every kernel inlined
+(about 18 000 lines of assembly at v0.7.9), and naming the scalar types changes
+how LLVM lowers its switch; a normalised diff of that function against the
+baseline differs almost everywhere, from the jump-table bounds onwards, even
+with `#[inline(never)]`, where the frame also grew from 2 536 to 2 552 bytes. As
+in Experiment 19, only one output width moved, and it is the width already
+known to be fragile (Experiment 18). The mechanism inside the register
+allocator was not chased further.
+
+Two transferable points. First, Experiment 19's rule holds for a single `match`
+arm: **a change to a kernel's dispatcher is a change to the kernel**, and gets
+the paired harness. Second, a correctness guarantee does not have to live in
+the hot function. The exhaustiveness the dispatcher gave up now lives in
+`kernel_classification`, a `#[cfg(test)]` exhaustive `match` that a new variant
+fails to compile against, and `every_quantized_type_has_a_kernel`, which proves
+every type it calls quantised reaches a kernel at all three output widths.
+Deleting the `NVFP4` arm from the dispatcher was checked to fail that test with
+exactly the issue-#15 message.
+
+**A note on the measurement conditions.** These runs were taken on the day a
+BIOS reset (an unclean restart during a Windows feature update) had silently
+dropped the RAM from 3200 to 2133 MT/s. Every number above was taken after XMP
+was restored, and that was checked before each batch. The dequant kernels are
+bandwidth-bound; a paired comparison cancels a constant slowdown, but an
+absolute figure taken at 2133 would not have been comparable with anything in
+this file.
+
+**Outcome.** The wildcard stays, with a comment citing this entry. The
+guarantee moved to the tests at no runtime cost.

@@ -4,7 +4,8 @@
 //!
 //! One `criterion` benchmark group per kernel family
 //! (`FP8`, `GPTQ` 4-bit, `AWQ` 4-bit, `BnB` `NF4`, `BnB` `INT8`,
-//! `GGUF` `Q4_K`), measured on synthetic tensors sized like a real
+//! `GGUF` `Q4_K`, and since Phase 7.10 `GGUF` `NVFP4` / `Q1_0` / `Q2_0`
+//! and `ModelOpt` `NVFP4`), measured on synthetic tensors sized like a real
 //! transformer layer (`4096 × 11008`). Plus one real-world group on
 //! the `Ollama`-distributed `llama3.2:1b` `Q8_0` slice the
 //! [`cross_validation_ollama`](../tests/cross_validation_ollama.rs) test
@@ -19,7 +20,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo bench --features gptq,awq,bnb,gguf --bench dequant
+//! cargo bench --features gptq,awq,bnb,gguf,nvfp4 --bench dequant
 //! ```
 //!
 //! Reports land in `target/criterion/`; HTML index at
@@ -53,7 +54,8 @@ use anamnesis::{
     Dtype, F16Out, F32Out, GgufType, dequantize_awq, dequantize_awq_to_bf16, dequantize_bnb_int8,
     dequantize_bnb_int8_to_bf16, dequantize_bnb4, dequantize_bnb4_to_bf16, dequantize_fp8,
     dequantize_fp8_to_bf16, dequantize_gguf, dequantize_gguf_to_bf16, dequantize_gptq,
-    dequantize_gptq_to_bf16, dequantize_per_tensor_fp8, dequantize_per_tensor_fp8_to_bf16,
+    dequantize_gptq_to_bf16, dequantize_nvfp4, dequantize_nvfp4_to_bf16, dequantize_per_tensor_fp8,
+    dequantize_per_tensor_fp8_to_bf16,
 };
 
 use common::synth_bytes;
@@ -543,6 +545,170 @@ fn bench_gguf_q4_k(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// GGUF — NVFP4 (Phase 7.10)
+// ---------------------------------------------------------------------------
+
+fn bench_gguf_nvfp4(c: &mut Criterion) {
+    let n_elements: usize = LAYER_ELEMENTS;
+    // NVFP4 block layout: 36 bytes per 64-element block.
+    let raw = synth_bytes((n_elements / 64) * 36);
+
+    let mut group = c.benchmark_group("dequant_gguf_nvfp4");
+    group.throughput(Throughput::Elements(n_elements as u64));
+    group.bench_function("synthetic_4096x11008", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf_to_bf16(black_box(&raw), GgufType::NVFP4, n_elements)
+                .expect("gguf nvfp4 dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::NVFP4, n_elements)
+                .expect("gguf nvfp4 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F16Out>(black_box(&raw), GgufType::NVFP4, n_elements)
+                .expect("gguf nvfp4 dequant f16");
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// GGUF — Q1_0 (Phase 7.10)
+// ---------------------------------------------------------------------------
+
+fn bench_gguf_q1_0(c: &mut Criterion) {
+    let n_elements: usize = LAYER_ELEMENTS;
+    // Q1_0 block layout: 18 bytes per 128-element block.
+    let raw = synth_bytes((n_elements / 128) * 18);
+
+    let mut group = c.benchmark_group("dequant_gguf_q1_0");
+    group.throughput(Throughput::Elements(n_elements as u64));
+    group.bench_function("synthetic_4096x11008", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf_to_bf16(black_box(&raw), GgufType::Q1_0, n_elements)
+                .expect("gguf q1_0 dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::Q1_0, n_elements)
+                .expect("gguf q1_0 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F16Out>(black_box(&raw), GgufType::Q1_0, n_elements)
+                .expect("gguf q1_0 dequant f16");
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// GGUF — Q2_0 (Phase 7.10)
+// ---------------------------------------------------------------------------
+
+fn bench_gguf_q2_0(c: &mut Criterion) {
+    let n_elements: usize = LAYER_ELEMENTS;
+    // Q2_0 block layout: 18 bytes per 64-element block.
+    let raw = synth_bytes((n_elements / 64) * 18);
+
+    let mut group = c.benchmark_group("dequant_gguf_q2_0");
+    group.throughput(Throughput::Elements(n_elements as u64));
+    group.bench_function("synthetic_4096x11008", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf_to_bf16(black_box(&raw), GgufType::Q2_0, n_elements)
+                .expect("gguf q2_0 dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::Q2_0, n_elements)
+                .expect("gguf q2_0 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F16Out>(black_box(&raw), GgufType::Q2_0, n_elements)
+                .expect("gguf q2_0 dequant f16");
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 — NVIDIA ModelOpt safetensors (Phase 7.10)
+// ---------------------------------------------------------------------------
+
+fn bench_nvfp4_modelopt(c: &mut Criterion) {
+    // Two `E2M1` values per byte, one `F8_E4M3` scale per 16 values, and a
+    // per-tensor `F32` scale of the magnitude real checkpoints carry.
+    let weight = synth_bytes(LAYER_ELEMENTS / 2);
+    let scales = synth_bytes(LAYER_ELEMENTS / 16);
+    let global: f32 = 0.002;
+
+    let mut group = c.benchmark_group("dequant_nvfp4_modelopt");
+    group.throughput(Throughput::Elements(LAYER_ELEMENTS as u64));
+    group.bench_function("synthetic_4096x11008", |b| {
+        b.iter(|| {
+            let out = dequantize_nvfp4_to_bf16(
+                black_box(&weight),
+                black_box(&scales),
+                global,
+                LAYER_ROWS,
+                LAYER_COLS,
+            )
+            .expect("nvfp4 modelopt dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_nvfp4::<F32Out>(
+                black_box(&weight),
+                black_box(&scales),
+                global,
+                LAYER_ROWS,
+                LAYER_COLS,
+            )
+            .expect("nvfp4 modelopt dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_nvfp4::<F16Out>(
+                black_box(&weight),
+                black_box(&scales),
+                global,
+                LAYER_ROWS,
+                LAYER_COLS,
+            )
+            .expect("nvfp4 modelopt dequant f16");
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // GGUF Q8_0 — real-world Ollama-distributed fixture (llama3.2:1b)
 // ---------------------------------------------------------------------------
 
@@ -592,6 +758,10 @@ criterion_group!(
     bench_bnb_nf4,
     bench_bnb_int8,
     bench_gguf_q4_k,
+    bench_gguf_nvfp4,
+    bench_gguf_q1_0,
+    bench_gguf_q2_0,
+    bench_nvfp4_modelopt,
     bench_gguf_q8_0_ollama,
 );
 criterion_main!(benches);

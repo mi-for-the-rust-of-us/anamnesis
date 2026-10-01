@@ -18,6 +18,8 @@ pub mod gguf;
 pub mod gptq;
 #[cfg(feature = "npz")]
 pub mod npz;
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
 pub mod output;
 #[cfg(feature = "pth")]
 pub mod pth;
@@ -45,6 +47,8 @@ pub use gguf::{
 pub use gptq::{dequantize_gptq, dequantize_gptq_to_bf16};
 #[cfg(feature = "npz")]
 pub use npz::{npz_to_safetensors, npz_to_safetensors_bytes};
+#[cfg(feature = "nvfp4")]
+pub use nvfp4::{dequantize_nvfp4, dequantize_nvfp4_to_bf16};
 pub use output::{Bf16Out, F16Out, F32Out, OutputElement};
 #[cfg(feature = "pth")]
 pub use pth::{pth_to_safetensors, pth_to_safetensors_bytes};

@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GGUF` `NVFP4`, `Q1_0` and `Q2_0`** (`ggml_type` 40, 41 and 42), parsed
+  and dequantised ([#15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)).
+  Upstream `ggml` added the three types after anamnesis's table was written,
+  and `NVFP4` is already on 100+ Hub repositories. They are the first block
+  sizes other than 32 and 256: `NVFP4` is 64 elements in 36 bytes (four
+  `UE4M3` scales, one per 16 elements, over a 4-bit `E2M1` codebook), `Q1_0`
+  128 elements in 18 bytes (one sign bit each), `Q2_0` 64 elements in 18
+  bytes (a 2-bit code each). `GgufType` gains `NVFP4`, `Q1_0` and `Q2_0`; it
+  is `#[non_exhaustive]`, so this is not a breaking change.
+- **Cross-validated against ggml's own C.** `gguf-py` cannot quantise any of
+  the three types or dequantise `Q1_0` and `Q2_0`, so their goldens come from
+  `ggml-quants.c` itself at llama.cpp `37b53fd`, through a small harness in
+  `tests/fixtures/gguf_reference/ggml_ref/`. Every kernel matches at 0 `ULP` in
+  `BF16` and bit for bit in `F32`, including on a slice of the real
+  `zeta-2.1-NVFP4.gguf` the issue was found on. The fixture generator now
+  checks **every** `GGUF` golden against that C; all 22 earlier ones agree.
+- **NVIDIA `NVFP4` checkpoints in safetensors**, as `TensorRT` Model Optimizer
+  (`modelopt`) exports them (`nvidia/Llama-3.1-8B-Instruct-NVFP4` and the
+  like), dequantised behind a new zero-dependency **`nvfp4`** feature. Bit-exact
+  at `F32` and `BF16` against `modelopt`'s own `NVFP4QTensor.dequantize` on a
+  real layer, and about 21× faster than it on one thread. `QuantScheme::Nvfp4`
+  is new (the enum is `#[non_exhaustive]`), and `dequantize_nvfp4` /
+  `dequantize_nvfp4_to_bf16` are exported under the feature. Without the
+  feature such a checkpoint is recognised and refused by name.
+- **`ConvertStats::folded_scales`**, the number of `NVFP4` per-tensor scales
+  folded into their weights (see *Changed*). Both `amn remember` and
+  `amn convert` print it.
+- **A weekly check that the `GGUF` type table still matches upstream.**
+  `tests/gguf_type_snapshot.rs` holds the parser to a checked-in snapshot of
+  `ggml.h`'s `enum ggml_type`, and `.github/workflows/ggml-drift.yml` compares
+  that snapshot with llama.cpp `master` every Monday, failing with the
+  difference. Issue #15 is what this class of drift looked like before: a
+  user's file refused outright.
+
+### Changed
+
+- **`NVFP4` weights are written with their per-tensor scale applied.** NVIDIA's
+  format scales twice: inside each block, and once per tensor through a
+  separate `F32` `<stem>.scale` tensor that llama.cpp multiplies in at
+  inference time. `remember` and `convert` now fold that scale into the
+  dequantised weight and leave the folded `.scale` out of the output, so the
+  file holds the model's actual weights and nothing a consumer could apply
+  twice. On `zeta-2.1-NVFP4.gguf` the scales are 9.3e-5 to 2.3e-3; without
+  them every weight would have been 400 to 11 000 times too large. The folded
+  weights track zed-industries' original `BF16` checkpoint with a
+  least-squares scale of 0.995 to 0.998 and a correlation of 0.9955. Only a
+  `.scale` that matches an `NVFP4` weight exactly (one value, or one per
+  expert) is folded; `dequantize_gguf` and `ParsedGguf::dequantize_tensor_as`
+  stay the raw block decode, as their docs now say.
+- **The streaming `GGUF` sink can receive 64- and 128-element blocks.** The
+  per-call length was always `block_size × E::BYTES`; it was only ever 32 or
+  256 elements before. A sink that hard-coded either length was relying on
+  something the contract never promised.
+
+### Fixed
+
+- **safetensors tensors named like a scale are no longer dropped.** A tensor
+  ending in `_scale` (or, under their features, `.scales`, `.weight.absmax`,
+  `.SCB`) was treated as a quantisation companion by its name alone, and
+  companions are consumed by dequantisation, never written. So a model's own
+  parameters with such a name, CLIP's or SigLIP's `logit_scale`, a
+  `layer_scale`, a leftover `input_scale`, silently vanished from `remember`
+  and `convert` output, and `inspect` under-reported the size to match
+  (`google/siglip-base-patch16-224` lost its `logit_scale` this way). A scale is
+  now a companion only when a quantised tensor exists for it under a name its
+  scheme uses. Real `FP8`, `GPTQ`, `AWQ` and `BnB` checkpoints are unaffected:
+  their scales are all still recognised.
+- **NVIDIA `ModelOpt` `NVFP4` safetensors are no longer misread.** With the
+  `bnb` feature, `inspect` reported them as fine-grained `FP8` at half their
+  real size and `remember` failed with `unsupported scale dtype: F8_E4M3`;
+  without it they read as unquantised, and `remember` copied the packed 4-bit
+  bytes into its output as if they were weights.
+- **A `GGUF` file holding any `NVFP4`, `Q1_0` or `Q2_0` tensor is no longer
+  refused** with `unknown ggml_type discriminant 40` (or 41, 42). The rejection
+  came while reading the tensor-info table, so not even `amn inspect` could
+  run on such a file ([#15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)).
+
 ## [0.7.9] - 2026-10-01
 
 ### Security

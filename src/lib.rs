@@ -18,10 +18,12 @@
 //! | `AWQ` (`INT4`, per-group, activation-aware) | `awq` | 4.7–5.7× |
 //! | `BitsAndBytes` `NF4`/`FP4` (lookup + per-block absmax) | `bnb` | 18–54× |
 //! | `BitsAndBytes` `INT8` (`LLM.int8()`, per-row absmax) | `bnb` | 1.2× |
+//! | NVIDIA `NVFP4` (`ModelOpt`: 4-bit `E2M1`, `E4M3` per 16 values, per-tensor `F32`) | `nvfp4` | 21× (vs `modelopt`) |
 //!
 //! All schemes produce **bit-exact** output (0 ULP difference) against the
 //! canonical quantization libraries' own dequantization code —
-//! `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), `AutoAWQ`
+//! `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), NVIDIA's
+//! `modelopt` (`NVFP4QTensor.dequantize`), `AutoAWQ`
 //! (`unpack_awq` + `reverse_awq_order`), `GPTQModel` (`dequantize_weight`
 //! plus its v1→v2 zero-point conversion), and `PyTorch`'s native `fp8`
 //! cast — verified on real-model fixtures. Hand-rolled reference
@@ -45,7 +47,7 @@
 //! | `BitsAndBytes` `INT8` encode | `bnb` | byte-exact vs `bitsandbytes`' on-disk bytes on every fixture |
 //!
 //! Subsequent encode-kernel families (`FP8`, `GGUF` legacy / `K-quants`
-//! / `IQ` / `TQ` / `MXFP4`) land in Phase 8.5 and reuse the
+//! / `IQ` / `TQ` / `MXFP4` / `NVFP4`) land in Phase 8.5 and reuse the
 //! `lethe::round_trip` harness introduced here.
 //!
 //! # Format Conversion Pipeline (Phase 6, v0.6.0)
@@ -57,7 +59,7 @@
 //! - `write_gguf` / `write_gguf_to_writer` / `GgufWriteTensor` — the
 //!   format-symmetric inverse of `parse_gguf`. Phase 6 emits scalar
 //!   dtypes only (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`); quantised
-//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`) lands in Phase 8.5 through
+//!   emit (`Q*`, `IQ*`, `TQ*`, `MXFP4`, `NVFP4`) lands in Phase 8.5 through
 //!   the same writer scaffold. Behind the `gguf` feature.
 //! - `npz_to_safetensors` / `npz_to_safetensors_bytes` — lossless
 //!   `NPZ → safetensors` conversion. Every `NpzDtype` variant maps
@@ -126,7 +128,7 @@
 //!    `benches/parsing.rs`) — throughput baselines per kernel family
 //!    plus a real-world bench on the Ollama-cached `llama3.2:1b`
 //!    `Q8_0` slice. Run via `cargo bench --features
-//!    gptq,awq,bnb,gguf,npz,pth`. See
+//!    gptq,awq,bnb,gguf,npz,pth,nvfp4`. See
 //!    `benches/README.md` for run commands + machine-spec baselines.
 //! 2. **`dhat-rs` peak-heap assertions** (`tests/peak_heap_gptq.rs`,
 //!    `tests/peak_heap_awq.rs`, `tests/peak_heap_bnb_dq.rs`) — three
@@ -402,8 +404,8 @@
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`] always-on; `remember::gptq`, `remember::awq`,
-//! `remember::bnb` feature-gated independently under `gptq` / `awq` /
-//! `bnb`).
+//! `remember::bnb`, `remember::nvfp4` feature-gated independently under
+//! `gptq` / `awq` / `bnb` / `nvfp4`).
 //!
 //! The [`lethe`] module mirrors that layout on the encode side. Phase 5
 //! ships `lethe::bnb` (feature-gated behind `bnb`) plus the
@@ -554,6 +556,8 @@ pub use remember::{
 };
 #[cfg(feature = "gptq")]
 pub use remember::{dequantize_gptq, dequantize_gptq_to_bf16};
+#[cfg(feature = "nvfp4")]
+pub use remember::{dequantize_nvfp4, dequantize_nvfp4_to_bf16};
 #[cfg(feature = "npz")]
 pub use remember::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]

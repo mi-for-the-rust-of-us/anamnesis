@@ -10,18 +10,26 @@
 //! functions.
 //!
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
-//! 256 super-blocks for K-quants) extracted from a real model tensor.
+//! 256 super-blocks for K-quants) extracted from a real model tensor, or
+//! synthesised from a seeded random tensor where no practical real source
+//! exists.
 //!
-//! Coverage: **22 of 22** production kernels from 4 real models + 3 synthetic
-//! fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`,
-//! `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`,
-//! `MXFP4`). `TQ1_0` / `TQ2_0` / `MXFP4` are synthetic-fixture cross-validated
-//! — only ~15 BitNet-derivative GGUFs ship the `TQ*` types on `HuggingFace`,
-//! and mainstream `MXFP4` only ships inside the 11 GB `gpt-oss-20b` upload;
-//! Python `gguf.quants.quantize()` implements all three encode sides, so a
-//! deterministic random tensor is the practical fixture source. `Q8_1` and
-//! `Q8_K` are not shipped by any real model — they are internal `llama.cpp`
-//! activation quant types, already covered by unit tests.
+//! Coverage: **25 of 25** production kernels, from 5 real models plus 6
+//! synthetic fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
+//! `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
+//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`), plus the `NVFP4` per-tensor scale
+//! fold through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
+//! model; they are internal `llama.cpp` activation quant types, covered by unit
+//! tests.
+//!
+//! Where the goldens come from. Most are `gguf-py`'s `dequantize`. `TQ1_0` /
+//! `TQ2_0` / `MXFP4` are synthetic because only ~15 BitNet-derivative GGUFs ship
+//! the `TQ*` types and mainstream `MXFP4` only ships inside the 11 GB
+//! `gpt-oss-20b` upload; `gguf-py` quantises all three. `gguf-py` cannot
+//! quantise `NVFP4`, `Q1_0` or `Q2_0`, nor dequantise the last two, so their
+//! synthetic fixtures come from ggml's own C at llama.cpp `37b53fd`
+//! (`fixtures/gguf_reference/ggml_ref/`). Since Phase 7.10 the generator also
+//! checks **every** golden against that C, bit for bit, and all of them agree.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -492,6 +500,131 @@ fn cross_validate_synthetic_mxfp4() {
         GgufType::MXFP4,
         0,
     );
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4, Q1_0, Q2_0 (Phase 7.10, issue #15)
+// ---------------------------------------------------------------------------
+//
+// `gguf-py` has no quantiser for any of the three and no dequantiser for Q1_0
+// or Q2_0, so the synthetic fixtures are quantised AND dequantised by ggml's own
+// C (`quantize_row_*_ref` / `dequantize_row_*` at llama.cpp `37b53fd`, through
+// `fixtures/gguf_reference/ggml_ref/`). For NVFP4 the generator also requires
+// gguf-py's dequantisation to agree with the C bit for bit. `zeta21_nvfp4` is a
+// real tensor, `output.weight` of `distaste447/zeta-2.1-NVFP-GGUF`, the file
+// issue #15 was found on.
+
+#[test]
+fn cross_validate_zeta21_nvfp4() {
+    run_cross_validation(
+        "zeta-2.1 NVFP4 (real model)",
+        include_bytes!("fixtures/gguf_reference/zeta21_nvfp4.bin"),
+        GgufType::NVFP4,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_synthetic_nvfp4() {
+    run_cross_validation(
+        "Synthetic NVFP4 (seed=42, ggml C)",
+        include_bytes!("fixtures/gguf_reference/synthetic_nvfp4.bin"),
+        GgufType::NVFP4,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_synthetic_q1_0() {
+    run_cross_validation(
+        "Synthetic Q1_0 (seed=42, ggml C)",
+        include_bytes!("fixtures/gguf_reference/synthetic_q1_0.bin"),
+        GgufType::Q1_0,
+        0,
+    );
+}
+
+#[test]
+fn cross_validate_synthetic_q2_0() {
+    run_cross_validation(
+        "Synthetic Q2_0 (seed=42, ggml C)",
+        include_bytes!("fixtures/gguf_reference/synthetic_q2_0.bin"),
+        GgufType::Q2_0,
+        0,
+    );
+}
+
+/// The real slice again, with its tensor's per-tensor scale folded in, through
+/// the public `convert_bytes` path that `remember` shares.
+///
+/// The golden is gguf-py's dequantisation times `output.scale` as an `f32`
+/// (and ggml's C times the same scale agreed, at generation time). Rebuilding
+/// the `weight` + `scale` pair as a `GGUF` and converting it checks the fold on
+/// real data, at full `F32` width with no tolerance and at `BF16` with none.
+#[test]
+fn cross_validate_zeta21_nvfp4_folded_through_convert() {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+
+    let fixture = parse_gguf_fixture(
+        include_bytes!("fixtures/gguf_reference/zeta21_nvfp4_folded.bin"),
+        GgufType::NVFP4,
+    );
+    let scale: [u8; 4] = *include_bytes!("fixtures/gguf_reference/zeta21_nvfp4_folded.scale");
+
+    // 65 536 elements as 4096 × 16 (`GGUF` order), the real tensor's row width.
+    let weight_dims = [4096_u64, 16];
+    let scale_dims = [1_u64];
+    let mut data = fixture.raw_data.clone();
+    let scale_offset = data.len().div_ceil(32) * 32;
+    data.resize(scale_offset, 0);
+    data.extend_from_slice(&scale);
+    let bytes = raw_gguf(
+        &[],
+        &[
+            RawTensorInfo {
+                name: "output.weight",
+                dims: &weight_dims,
+                ggml_type: 40,
+                offset: 0,
+            },
+            RawTensorInfo {
+                name: "output.scale",
+                dims: &scale_dims,
+                ggml_type: 0,
+                offset: scale_offset as u64,
+            },
+        ],
+        32,
+        &data,
+    );
+
+    for (dtype, golden) in [
+        (anamnesis::Dtype::F32, &fixture.expected_f32),
+        (anamnesis::Dtype::BF16, &fixture.expected_bf16),
+    ] {
+        let options = anamnesis::ConvertOptions::new().with_output_dtype(dtype);
+        let (st, stats) =
+            anamnesis::convert_bytes(&bytes, anamnesis::ConvertTarget::Safetensors, &options)
+                .unwrap();
+        assert_eq!(stats.folded_scales, 1, "{dtype:?}");
+        let st = safetensors::SafeTensors::deserialize(&st).unwrap();
+        assert!(
+            st.tensor("output.scale").is_err(),
+            "the folded scale is not written"
+        );
+        let weight = st.tensor("output.weight").unwrap();
+        let mismatches = weight
+            .data()
+            .iter()
+            .zip(golden.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        assert_eq!(
+            mismatches, 0,
+            "{dtype:?}: {mismatches} bytes differ from the golden"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

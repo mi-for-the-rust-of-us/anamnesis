@@ -23,7 +23,7 @@ checked into `tests/fixtures/`.
 
 | File | Scope | Run command |
 |---|---|---|
-| `dequant.rs` | Dequantisation kernels (decode side) — `FP8` per-tensor / fine-grained, `GPTQ` `INT4`, `AWQ` `INT4`, `BnB` `NF4`, `BnB` `INT8`, `GGUF` `Q4_K`, plus the real-world `GGUF` `Q8_0` slice from the `Ollama`-distributed `llama3.2:1b` fixture. Each family carries `_f32` and `_f16` arms beside its `BF16` one since **v0.7.7** — 22 ids in total | `cargo bench --features gptq,awq,bnb,gguf --bench dequant` |
+| `dequant.rs` | Dequantisation kernels (decode side) — `FP8` per-tensor / fine-grained, `GPTQ` `INT4`, `AWQ` `INT4`, `BnB` `NF4`, `BnB` `INT8`, `GGUF` `Q4_K`, and since **v0.7.10** `GGUF` `NVFP4` / `Q1_0` / `Q2_0` and `ModelOpt` `NVFP4`, plus the real-world `GGUF` `Q8_0` slice from the `Ollama`-distributed `llama3.2:1b` fixture. Each family carries `_f32` and `_f16` arms beside its `BF16` one since **v0.7.7** — 34 ids in total | `cargo bench --features gptq,awq,bnb,gguf,nvfp4 --bench dequant` |
 | `parsing.rs` | Header / metadata-only parses for the four supported tensor formats vs an `fs::read` baseline at the same fixture | `cargo bench --features npz,pth,gguf --bench parsing` |
 | `convert.rs` | **Whole-model, multi-threaded** paths — in-memory `convert_bytes()` and `FP8` safetensors → `BF16` `remember_to_bytes`, each at **1 and 4 threads**. The two *file-writing* groups sit behind the `bench-fileio` feature and are **not run in CI**; see below | `cargo bench --features gguf --bench convert` |
 | `ab.rs` | **Paired A/B harness** (`tango-bench`) — the instrument that decides whether a kernel change is faster. Loads both versions and interleaves them, so drift cancels. Not a `criterion` bench and not part of the statistical run | see [A/B comparisons](#ab-comparisons) |
@@ -120,10 +120,10 @@ whose difference carries whatever drifted in between. `ab.rs` measures the
 cargo install cargo-export                     # once
 
 # on the baseline commit
-cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf
+cargo export target/benchmarks -- bench --bench=ab --features gptq,awq,bnb,gguf,nvfp4
 
 # on the candidate code
-cargo bench --bench=ab --features gptq,awq,bnb,gguf --     compare target/benchmarks/ab --noise-threshold 2.5
+cargo bench --bench=ab --features gptq,awq,bnb,gguf,nvfp4 --     compare target/benchmarks/ab --noise-threshold 2.5
 ```
 
 Pass `--noise-threshold 2.5`: the default is 1 %, below this harness's measured
@@ -139,7 +139,7 @@ while the paired deltas stay within ±2 %. It answers "is A faster than B", not
 ### Full statistical run (default)
 
 ```sh
-cargo bench --features gptq,awq,bnb,gguf,npz,pth
+cargo bench --features gptq,awq,bnb,gguf,npz,pth,nvfp4
 ```
 
 Runs **all four** bench targets (`ab.rs`, `convert.rs`, `dequant.rs`,
@@ -157,7 +157,7 @@ the HTML index.
 ### Quick sanity / smoke
 
 ```sh
-cargo bench --features gptq,awq,bnb,gguf,npz,pth -- --quick
+cargo bench --features gptq,awq,bnb,gguf,npz,pth,nvfp4 -- --quick
 ```
 
 `--quick` forces `criterion` into reduced-sample mode (≤10 samples,

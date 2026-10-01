@@ -1,0 +1,3 @@
+# Raw little-endian fixture values. Without this, a file with no NUL byte is
+# taken for text, and core.autocrlf would rewrite any 0x0A byte in it.
+tests/fixtures/**/*.scale binary
