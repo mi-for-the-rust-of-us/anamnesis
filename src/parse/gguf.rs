@@ -155,7 +155,10 @@ const GGUF_TYPE_COUNT: usize = 35;
 /// The enum is `#[non_exhaustive]` because new `ggml_type` values are added
 /// over time (e.g., the `IQ*` family appeared after the original `K`-quants,
 /// `MXFP4` was added in 2024, and `NVFP4`, `Q1_0` and `Q2_0` followed in
-/// 2026). The variants track the live entries of `ggml.h`'s `enum ggml_type`.
+/// 2026). The variants track the live entries of `ggml.h`'s `enum ggml_type`:
+/// `tests/gguf_type_snapshot.rs` holds the parser to a checked-in snapshot of
+/// that enum (`tests/fixtures/ggml_types.txt`), and the weekly
+/// `ggml-drift.yml` workflow holds the snapshot to upstream `master`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 #[allow(non_camel_case_types)]

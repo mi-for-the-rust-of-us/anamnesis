@@ -1,0 +1,49 @@
+name: Upstream ggml types
+
+# Compares `tests/fixtures/ggml_types.txt` with the live `GGML_TYPE_*` entries
+# of llama.cpp's `ggml.h` on `master`, and fails, naming the difference, when
+# upstream has added or removed a type.
+#
+# Why it exists: anamnesis tracks `enum ggml_type` by hand. Upstream added
+# `NVFP4` (40), `Q1_0` (41) and `Q2_0` (42), and nothing noticed until a user's
+# NVFP4 file was refused outright (issue #15, fixed in Phase 7.10). The offline
+# half of the check is `tests/gguf_type_snapshot.rs`, which holds the parser to
+# the snapshot; this job holds the snapshot to upstream.
+#
+# Scheduled, never on pushes or pull requests: upstream moves on its own clock,
+# and a type added there must not turn an unrelated PR red. A failure here is a
+# to-do (teach the parser the new type, with its block layout and a kernel,
+# then refresh the snapshot), not a regression in this repository.
+on:
+  schedule:
+    - cron: "41 6 * * 1" # Mondays 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ggml-types:
+    name: "Upstream ggml types"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Compare the snapshot with ggml.h on master
+        run: |
+          set -euo pipefail
+          # Resolve master to a commit first, so the report names exactly what
+          # was compared and the snapshot can be refreshed from it.
+          commit="$(git ls-remote https://github.com/ggml-org/llama.cpp refs/heads/master | cut -f1)"
+          echo "llama.cpp master is ${commit}"
+          curl -fsSL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${commit}/ggml/include/ggml.h" \
+            | scripts/ggml-types.sh > upstream.txt
+          grep -v '^#' tests/fixtures/ggml_types.txt > snapshot.txt
+          if diff -u snapshot.txt upstream.txt; then
+            echo "The parser's type table matches llama.cpp ${commit}."
+          else
+            echo "::error title=ggml_type drift::llama.cpp ${commit} has a different set of GGML_TYPE_* entries from tests/fixtures/ggml_types.txt (diff above: '+' lines are new upstream). Teach the GGUF parser the new type(s), then regenerate the snapshot from that commit."
+            exit 1
+          fi
