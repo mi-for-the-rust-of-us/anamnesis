@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use anamnesis::{AnamnesisError, ConvertOptions, ConvertTarget, QuantScheme, TargetDtype};
+use anamnesis::{ConvertOptions, ConvertTarget, QuantScheme, TargetDtype};
 
 /// Writes a safetensors file byte for byte: `(name, dtype, shape, bytes)`.
 fn safetensors(tensors: &[(&str, &str, &[usize], Vec<u8>)]) -> Vec<u8> {
@@ -150,12 +150,11 @@ fn real_companions_are_still_consumed() {
     );
 }
 
-#[test]
-fn modelopt_nvfp4_is_recognised_and_refused() {
-    // One layer laid out as NVIDIA ModelOpt exports NVFP4 (shapes scaled down
-    // from nvidia/Llama-3.1-8B-Instruct-FP4: U8 [rows, cols/2], F8_E4M3
-    // [rows, cols/16], F32 scalars).
-    let input = safetensors(&[
+/// One layer laid out as NVIDIA `ModelOpt` exports `NVFP4` (shapes scaled down
+/// from `nvidia/Llama-3.1-8B-Instruct-NVFP4`: `U8` `[rows, cols / 2]`,
+/// `F8_E4M3` `[rows, cols / 16]`, `F32` scalars), next to a plain norm.
+fn modelopt_layer() -> Vec<u8> {
+    safetensors(&[
         ("mlp.down_proj.weight", "U8", &[4, 32], (0..128).collect()),
         (
             "mlp.down_proj.weight_scale",
@@ -171,7 +170,14 @@ fn modelopt_nvfp4_is_recognised_and_refused() {
             &[2],
             vec![0x80, 0x3F, 0x80, 0x3F],
         ),
-    ]);
+    ])
+}
+
+/// Recognised in every build, whatever the features: never misread as
+/// fine-grained `FP8`, nor as unquantised, and sized at two values per byte.
+#[test]
+fn modelopt_nvfp4_is_recognised_in_every_build() {
+    let input = modelopt_layer();
     let header = anamnesis::parse_safetensors_header(&input).unwrap();
     assert_eq!(
         header.scheme,
@@ -185,10 +191,20 @@ fn modelopt_nvfp4_is_recognised_and_refused() {
     // Two values per packed byte: 128 bytes -> 256 values -> 512 B of BF16,
     // plus the 4 B norm.
     assert_eq!(info.dequantized_size, 256 * 2 + 4);
+}
 
+/// Without the `nvfp4` feature it is refused by name, never passed through.
+#[cfg(not(feature = "nvfp4"))]
+#[test]
+fn modelopt_nvfp4_without_the_feature_is_refused() {
+    use anamnesis::AnamnesisError;
+
+    let input = modelopt_layer();
+    let model = anamnesis::parse_bytes(input.clone()).unwrap();
     let refused = |result: anamnesis::Result<_>| match result {
         Err(AnamnesisError::Unsupported { detail, .. }) => {
             assert!(detail.contains("ModelOpt NVFP4"), "{detail}");
+            assert!(detail.contains("`nvfp4` feature"), "{detail}");
         }
         Err(other) => panic!("expected Unsupported, got {other:?}"),
         Ok(()) => panic!("a ModelOpt NVFP4 checkpoint must not convert"),
@@ -197,5 +213,26 @@ fn modelopt_nvfp4_is_recognised_and_refused() {
     refused(
         anamnesis::convert_bytes(&input, ConvertTarget::Safetensors, &ConvertOptions::new())
             .map(|_| ()),
+    );
+}
+
+/// With the feature it is dequantised: the weight comes out at its logical
+/// shape, the three companions are consumed, the norm passes through, and
+/// `inspect` reports exactly the bytes written. Values are cross-validated
+/// against `modelopt` in `tests/cross_validation_nvfp4.rs`.
+#[cfg(feature = "nvfp4")]
+#[test]
+fn modelopt_nvfp4_with_the_feature_is_dequantised() {
+    let model = anamnesis::parse_bytes(modelopt_layer()).unwrap();
+    let written = model.remember_to_bytes(TargetDtype::BF16).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&written).unwrap();
+    let mut names = st.names();
+    names.sort_unstable();
+    assert_eq!(names, ["mlp.down_proj.weight", "model.norm.weight"]);
+    assert_eq!(st.tensor("mlp.down_proj.weight").unwrap().shape(), [4, 64]);
+    let total: usize = st.tensors().iter().map(|(_, v)| v.data().len()).sum();
+    assert_eq!(
+        model.inspect().dequantized_size,
+        u64::try_from(total).unwrap()
     );
 }

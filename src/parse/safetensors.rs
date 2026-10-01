@@ -354,11 +354,10 @@ pub enum QuantScheme {
     BnbInt8,
     /// NVIDIA `NVFP4` as `TensorRT` Model Optimizer exports it: `U8` weights
     /// packing two 4-bit `E2M1` values per byte, an `F8_E4M3` `weight_scale`
-    /// per 16 values and an `F32` `weight_scale_2` per tensor. **Recognised so
-    /// it is reported correctly, not yet dequantised**: `remember` and
-    /// `convert` refuse it with [`AnamnesisError::Unsupported`]. (`NVFP4` in a
-    /// `GGUF` file is supported.) Until Phase 7.10 it was misread as
-    /// fine-grained `FP8`.
+    /// per 16 values and an `F32` `weight_scale_2` per tensor. Recognised in
+    /// every build; dequantised with the `nvfp4` feature, and refused by name
+    /// ([`AnamnesisError::Unsupported`]) without it. Until Phase 7.10 it was
+    /// misread as fine-grained `FP8`, or as unquantised without `bnb`.
     Nvfp4,
 }
 
@@ -373,7 +372,7 @@ impl fmt::Display for QuantScheme {
             Self::Awq => "AWQ",
             Self::Bnb4 => "BitsAndBytes NF4/FP4 (4-bit, per-block absmax)",
             Self::BnbInt8 => "BitsAndBytes INT8 (LLM.int8(), per-row absmax)",
-            Self::Nvfp4 => "NVIDIA NVFP4 (ModelOpt), not yet supported",
+            Self::Nvfp4 => "NVIDIA NVFP4 (ModelOpt), 16-value blocks",
         };
         f.write_str(s)
     }
@@ -929,6 +928,19 @@ pub(crate) fn scale_for<'a>(
     tensors
         .named(&format!("{weight_name}_scale_inv"))
         .or_else(|| tensors.named(&format!("{weight_name}_scale")))
+}
+
+/// The two scale tensors of a `ModelOpt` `NVFP4` weight: its per-block
+/// `{weight_name}_scale` and per-tensor `{weight_name}_scale_2`.
+#[cfg(feature = "nvfp4")]
+pub(crate) fn nvfp4_companions<'a>(
+    tensors: &impl NameLookup<'a>,
+    weight_name: &str,
+) -> Option<(&'a TensorEntry, &'a TensorEntry)> {
+    Some((
+        tensors.named(&format!("{weight_name}_scale"))?,
+        tensors.named(&format!("{weight_name}_scale_2"))?,
+    ))
 }
 
 /// The `GPTQ` companions of a `.qweight`: `.scales`, `.qzeros`, optional

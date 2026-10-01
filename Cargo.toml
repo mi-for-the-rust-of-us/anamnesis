@@ -59,7 +59,7 @@ exclude = ["/fuzz", "/tests", "/__reports__", "/docs/archive", "/docs/investigat
 # `--bin` errored. Both keys now sit in `[package]` where Cargo reads
 # them.
 [package.metadata.docs.rs]
-features = ["npz", "pth", "gguf", "awq", "gptq", "bnb", "ollama"]
+features = ["npz", "pth", "gguf", "awq", "gptq", "bnb", "nvfp4", "ollama"]
 
 # Production release artefacts (the `anamnesis` / `amn` CLI binaries, and any
 # release build of the library) abort on panic. The untrusted-input DoS analysis
@@ -119,6 +119,9 @@ bench-fileio = []
 gptq = []
 awq = []
 bnb = []
+# NVIDIA ModelOpt NVFP4 safetensors dequantisation (Phase 7.10). Without it
+# such a checkpoint is still recognised, and refused by name.
+nvfp4 = []
 npz = ["dep:flate2"]
 pth = ["dep:flate2"]
 gguf = []

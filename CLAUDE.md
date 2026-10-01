@@ -18,7 +18,7 @@ Before every commit, run and fix any issues from:
 ## Documentation Checks
 
 Rustdoc is checked in CI by the `docs` job in `.github/workflows/ci.yml`, which
-runs **twelve feature combinations** with `RUSTDOCFLAGS="-D warnings"` and
+runs **thirteen feature combinations** with `RUSTDOCFLAGS="-D warnings"` and
 `--document-private-items`. Both halves are load-bearing, and each was added
 because the missing half had already let breakage through:
 
@@ -43,6 +43,7 @@ foreach ($c in @(
     "--no-default-features --features bnb",
     "--no-default-features --features gptq",
     "--no-default-features --features awq",
+    "--no-default-features --features nvfp4",
     "--no-default-features --features cli",
     "--no-default-features --features ollama",
     "--features cli,gguf,npz,pth")) {

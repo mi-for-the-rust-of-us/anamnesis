@@ -18,10 +18,12 @@
 //! | `AWQ` (`INT4`, per-group, activation-aware) | `awq` | 4.7–5.7× |
 //! | `BitsAndBytes` `NF4`/`FP4` (lookup + per-block absmax) | `bnb` | 18–54× |
 //! | `BitsAndBytes` `INT8` (`LLM.int8()`, per-row absmax) | `bnb` | 1.2× |
+//! | NVIDIA `NVFP4` (`ModelOpt`: 4-bit `E2M1`, `E4M3` per 16 values, per-tensor `F32`) | `nvfp4` | 21× (vs `modelopt`) |
 //!
 //! All schemes produce **bit-exact** output (0 ULP difference) against the
 //! canonical quantization libraries' own dequantization code —
-//! `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), `AutoAWQ`
+//! `bitsandbytes` (`dequantize_4bit` / `int8_vectorwise_dequant`), NVIDIA's
+//! `modelopt` (`NVFP4QTensor.dequantize`), `AutoAWQ`
 //! (`unpack_awq` + `reverse_awq_order`), `GPTQModel` (`dequantize_weight`
 //! plus its v1→v2 zero-point conversion), and `PyTorch`'s native `fp8`
 //! cast — verified on real-model fixtures. Hand-rolled reference
@@ -402,8 +404,8 @@
 //!
 //! The [`remember`] module contains one submodule per quantization family
 //! ([`remember::fp8`] always-on; `remember::gptq`, `remember::awq`,
-//! `remember::bnb` feature-gated independently under `gptq` / `awq` /
-//! `bnb`).
+//! `remember::bnb`, `remember::nvfp4` feature-gated independently under
+//! `gptq` / `awq` / `bnb` / `nvfp4`).
 //!
 //! The [`lethe`] module mirrors that layout on the encode side. Phase 5
 //! ships `lethe::bnb` (feature-gated behind `bnb`) plus the
@@ -554,6 +556,8 @@ pub use remember::{
 };
 #[cfg(feature = "gptq")]
 pub use remember::{dequantize_gptq, dequantize_gptq_to_bf16};
+#[cfg(feature = "nvfp4")]
+pub use remember::{dequantize_nvfp4, dequantize_nvfp4_to_bf16};
 #[cfg(feature = "npz")]
 pub use remember::{npz_to_safetensors, npz_to_safetensors_bytes};
 #[cfg(feature = "pth")]
