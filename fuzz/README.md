@@ -227,3 +227,23 @@ writer for `fuzz_convert_bytes`). `fuzz_convert_bytes` 1.08 M runs, coverage
 3286 (up from 2525 above, the fold path), RSS 447 MB; `fuzz_gguf_limits`
 0.96 M runs, coverage 868, RSS 389 MB. **No crash, no timeout, no new
 artifact.**
+
+**Re-run after the safetensors fixes and ModelOpt `NVFP4` (`912d51a`,
+`3393058`)**, same settings, built from a worktree pinned to `3393058` rather
+than the working tree (an earlier attempt compiled a half-edited tree and two
+targets never ran; those results were discarded). The safetensors targets and
+`fuzz_convert_bytes` were seeded with the scale-classification cases (orphan
+scales, real companions, a `ModelOpt` layout) and with the real `NVFP4` fixture
+`tests/fixtures/nvfp4_reference/llama31_8b_nvfp4_q_proj.safetensors`.
+
+| Target | Runs | Coverage | RSS | Result |
+|---|---:|---:|---:|---|
+| `fuzz_safetensors` | 0.54 M | 2054 | 123 MB | clean |
+| `fuzz_safetensors_bytes` | 1.47 M | 2184 | 464 MB | clean |
+| `fuzz_safetensors_limits` | 0.34 M | 2509 | 427 MB | clean |
+| `fuzz_convert_bytes` | 0.17 M | 4895 | 422 MB | clean |
+
+**≈2.5 M executions, no crash, no timeout, no new artifact.** Executions per
+second are lower than in the runs above because the 37 KB real fixture is in
+every corpus; `fuzz_convert_bytes` reaching coverage 4895 (3286 before) is the
+`NVFP4` dequantisation path.
