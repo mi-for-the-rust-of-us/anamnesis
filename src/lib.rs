@@ -128,7 +128,7 @@
 //!    `benches/parsing.rs`) — throughput baselines per kernel family
 //!    plus a real-world bench on the Ollama-cached `llama3.2:1b`
 //!    `Q8_0` slice. Run via `cargo bench --features
-//!    gptq,awq,bnb,gguf,npz,pth`. See
+//!    gptq,awq,bnb,gguf,npz,pth,nvfp4`. See
 //!    `benches/README.md` for run commands + machine-spec baselines.
 //! 2. **`dhat-rs` peak-heap assertions** (`tests/peak_heap_gptq.rs`,
 //!    `tests/peak_heap_awq.rs`, `tests/peak_heap_bnb_dq.rs`) — three

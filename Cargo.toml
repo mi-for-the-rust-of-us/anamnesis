@@ -254,12 +254,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 [[bench]]
 name = "ab"
 harness = false
-required-features = ["gptq", "awq", "bnb", "gguf"]
+required-features = ["gptq", "awq", "bnb", "gguf", "nvfp4"]
 
 [[bench]]
 name = "dequant"
 harness = false
-required-features = ["gptq", "awq", "bnb", "gguf"]
+required-features = ["gptq", "awq", "bnb", "gguf", "nvfp4"]
 
 # Phase 6.5: parser throughput benchmarks vs raw `fs::read` baseline.
 [[bench]]
