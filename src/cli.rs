@@ -845,6 +845,19 @@ fn run_remember_gguf(
             .unwrap_or("(output)")
     );
     println!("  {} tensors", info.tensor_count);
+    // Said out loud because the output then holds fewer tensors than the input:
+    // each folded `<stem>.scale` now lives inside its `NVFP4` weight. The count
+    // comes from the rule the hub applies (`nvfp4_scale_pairs`), not a guess.
+    let folded = crate::parse::gguf::nvfp4_scale_pairs(
+        parsed
+            .tensor_info()
+            .iter()
+            .map(|t| (t.name.as_str(), t.dtype, t.shape.as_slice())),
+    )
+    .len();
+    if folded > 0 {
+        println!("  {folded} NVFP4 per-tensor scales folded into their weights");
+    }
 
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
     // caller's `--threads`, clamped to at least 1 by the builder. Before v0.7.6
@@ -975,6 +988,12 @@ fn run_convert(
         // v0.7.3 that is a caller choice, and a line claiming BF16 while the
         // file holds F32 would be worse than no line at all.
         println!("  {} dequantized to {dequant_dtype}", stats.dequantized);
+    }
+    if stats.folded_scales > 0 {
+        println!(
+            "  {} NVFP4 per-tensor scales folded into their weights",
+            stats.folded_scales
+        );
     }
     if stats.quantized > 0 {
         println!(

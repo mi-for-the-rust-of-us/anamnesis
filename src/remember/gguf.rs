@@ -2251,6 +2251,20 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 /// exactly as it is on the safetensors path. `GGUF` shapes are
 /// most-significant-first and are reversed into row-major (`NumPy`) order on the
 /// way out.
+///
+/// **`NVFP4` weights come out with their per-tensor scale applied** (Phase
+/// 7.10). NVIDIA's format scales twice: inside each block, which the kernel
+/// handles, and once per tensor through a separate `F32` `<stem>.scale` tensor
+/// that llama.cpp multiplies in at inference time. Both methods here multiply
+/// it into the dequantised weight and leave the folded `.scale` out of the
+/// output, so the file holds the model's actual weights and nothing a consumer
+/// could apply a second time. On `zeta-2.1-NVFP4.gguf` the folded output tracks
+/// the original `BF16` checkpoint with a least-squares scale of 0.995 to 0.998;
+/// unfolded, the weights would have been 400 to 11 000 times too large. Only a
+/// `.scale` that matches an `NVFP4` weight exactly (one value, or one per
+/// expert) is folded; any other `*.scale` tensor passes through untouched.
+/// [`dequantize_tensor_as`](Self::dequantize_tensor_as) works on one tensor and
+/// does **not** fold: it is the raw `dequantize_row_nvfp4` result.
 impl crate::ParsedGguf {
     /// Dequantizes every quantised tensor to `target` and writes a standard
     /// `.safetensors` file.

@@ -275,6 +275,13 @@ pub struct ConvertStats {
     pub quantized: usize,
     /// Tensors written in their incoming dtype.
     pub passthrough: usize,
+    /// `GGUF` `NVFP4` per-tensor scales folded into their weights while
+    /// dequantising, and therefore not written (Phase 7.10). Each one is a
+    /// `<stem>.scale` tensor whose factor now lives in `<stem>.weight`; see
+    /// `ParsedGguf::remember` (a plain span: `ParsedGguf` exists only with the
+    /// `gguf` feature, and this struct exists in every build). Always `0` for
+    /// other formats.
+    pub folded_scales: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +312,9 @@ pub(crate) struct Hub {
     pub(crate) st_metadata: Option<HashMap<String, String>>,
     /// Tensors dequantised while reading.
     pub(crate) dequantized: usize,
+    /// `NVFP4` per-tensor scales folded into their weights and left out of
+    /// `tensors` (a `GGUF` source only; `0` for every other reader).
+    pub(crate) folded_scales: usize,
     /// `GGUF` key/value metadata carried from a `GGUF` source so a
     /// dequantise-in-place `gguf → gguf` keeps the architecture / tokenizer KV
     /// that makes the output loadable — a re-emitted file with no KV is a bare
@@ -957,6 +967,7 @@ fn hub_from_model(
         tensors,
         st_metadata: model.header.metadata.clone(),
         dequantized,
+        folded_scales: 0,
         #[cfg(feature = "gguf")]
         gguf_metadata: HashMap::new(),
     })
@@ -1199,6 +1210,7 @@ fn hub_from_npz(
         tensors,
         st_metadata: None,
         dequantized: 0,
+        folded_scales: 0,
         #[cfg(feature = "gguf")]
         gguf_metadata: HashMap::new(),
     })
@@ -1240,6 +1252,7 @@ fn hub_from_pth(parsed: &crate::ParsedPth) -> crate::Result<Hub> {
         tensors,
         st_metadata: None,
         dequantized: 0,
+        folded_scales: 0,
         #[cfg(feature = "gguf")]
         gguf_metadata: HashMap::new(),
     })
@@ -1319,6 +1332,16 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     // here — `ParsedGguf::tensors` filters them — which preserves the skip this
     // reader has always had.
     let views: Vec<crate::GgufTensor<'_>> = parsed.tensors().collect();
+
+    // `NVFP4` weights whose per-tensor scale is folded in below, and the scale
+    // tensors that are then left out of the hub (Phase 7.10). The same rule
+    // `inspect` applies to `dequantized_size`; see `nvfp4_scale_pairs`.
+    let scale_pairs = crate::parse::gguf::nvfp4_scale_pairs(
+        views.iter().map(|view| (view.name, view.dtype, view.shape)),
+    );
+    let folded: std::collections::HashSet<usize> =
+        scale_pairs.values().map(|pair| pair.scale).collect();
+
     let work_bytes: u64 = views.iter().fold(0u64, |acc, view| {
         acc.saturating_add(u64::try_from(view.data.len()).unwrap_or(u64::MAX))
     });
@@ -1328,7 +1351,10 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     // its stored bytes for a passthrough one. The same figures
     // `GgufInspectInfo::dequantized_size` reports.
     let mut hub_bytes: u64 = 0;
-    for view in &views {
+    for (i, view) in views.iter().enumerate() {
+        if folded.contains(&i) {
+            continue;
+        }
         let bytes = if view.dtype.is_quantized() {
             let n_elements = crate::parse::utils::checked_num_elements(view.shape)
                 .and_then(|n| n.checked_mul(E::BYTES))
@@ -1359,12 +1385,17 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     // `ParsedGguf` is `Sync` (asserted in `tests/parallel_contract.rs`), and the
     // closure below reads only the shared-immutable view it is handed, writing
     // solely into the `HubTensor` it returns.
-    let tensors: Vec<HubTensor> = crate::parallel::map_indexed(
+    let tensors: Vec<Option<HubTensor>> = crate::parallel::map_indexed(
         &views,
         threads,
         work_bytes,
         cancel,
-        |_, tensor| {
+        |i, tensor| {
+            if folded.contains(&i) {
+                // A scale now carried by its weight; writing it as well would
+                // let a consumer apply it twice.
+                return Ok(None);
+            }
             let mut shape: Vec<usize> = tensor.shape.to_vec();
             shape.reverse();
 
@@ -1376,8 +1407,27 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
                             tensor.name, tensor.shape
                         ),
                     })?;
-                let data = crate::dequantize_gguf::<E>(&tensor.data, tensor.dtype, n_elements)?;
-                Ok(HubTensor {
+                let data = match scale_pairs.get(&i) {
+                    Some(pair) => {
+                        let scale_view =
+                            views.get(pair.scale).ok_or_else(|| AnamnesisError::Parse {
+                                reason: format!(
+                                    "GGUF tensor `{}`: scale tensor index {} out of range",
+                                    tensor.name, pair.scale
+                                ),
+                            })?;
+                        let scales: Vec<f32> = scale_view
+                            .data
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&word| f32::from_le_bytes(word))
+                            .collect();
+                        dequantize_nvfp4_scaled::<E>(&tensor.data, n_elements, &scales, pair.slab)?
+                    }
+                    None => crate::dequantize_gguf::<E>(&tensor.data, tensor.dtype, n_elements)?,
+                };
+                Ok(Some(HubTensor {
                     name: tensor.name.to_owned(),
                     shape,
                     // The tensor describes itself with the same dtype the
@@ -1385,20 +1435,21 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
                     // restated here, so the two cannot drift.
                     dtype: E::DTYPE,
                     data,
-                })
+                }))
             } else {
-                Ok(HubTensor {
+                Ok(Some(HubTensor {
                     name: tensor.name.to_owned(),
                     shape,
                     dtype: gguf_type_to_hub(tensor.dtype)?,
                     // Copy the mmap-borrowed slice so the hub outlives the
                     // `ParsedGguf`, reporting a refused allocation as an error.
                     data: crate::limits::owned_copy(&tensor.data, "GGUF tensor")?,
-                })
+                }))
             }
         },
         |_| on_tensor(),
     )?;
+    let tensors: Vec<HubTensor> = tensors.into_iter().flatten().collect();
 
     // Counted from the inputs rather than incremented during the dispatch, so no
     // counter is shared across workers. Derived from the source dtype, not the
@@ -1419,8 +1470,88 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
         tensors,
         st_metadata: None,
         dequantized,
+        folded_scales: folded.len(),
         gguf_metadata,
     })
+}
+
+/// Dequantises one `NVFP4` weight and folds its per-tensor scale in.
+///
+/// The weight is decoded a 64-element block at a time at `f32`, each value is
+/// multiplied by the scale covering it (`scales[element / slab]`), and the
+/// product is narrowed to `E` by the same `OutputElement::write_scratch` every
+/// kernel uses. One `f32` multiply and one narrowing, so the result is
+/// `gguf-py`'s `dequantize(...) * np.float32(scale)` rounded once to `E`.
+///
+/// Streaming on purpose: the largest tensor in a real `NVFP4` model has
+/// hundreds of millions of elements, and a whole-tensor `f32` intermediate
+/// would be gigabytes the hub's limit charge never accounted for. Peak heap is
+/// the output buffer alone, the figure `check_materialised` was charged.
+///
+/// `slab` comes from `nvfp4_scale_pairs`, which guarantees a non-zero multiple
+/// of the 64-element block, so no block straddles two scales.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the output size overflows `usize`, if
+/// the weight's bytes do not match its element count, or if a block falls
+/// beyond the last scale value.
+#[cfg(feature = "gguf")]
+fn dequantize_nvfp4_scaled<E: crate::OutputElement>(
+    data: &[u8],
+    n_elements: usize,
+    scales: &[f32],
+    slab: usize,
+) -> crate::Result<Vec<u8>> {
+    use crate::remember::output::MAX_OUTPUT_BYTES;
+    // The `NVFP4` block, `GgufType::NVFP4.block_size()`.
+    const QK: usize = 64;
+    let out_len = n_elements
+        .checked_mul(E::BYTES)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "NVFP4 output size {n_elements}×{} overflows usize",
+                E::BYTES
+            ),
+        })?;
+    let mut out: Vec<u8> = Vec::with_capacity(out_len);
+    let mut folded_block = [0.0_f32; QK];
+    let mut narrowed = [0u8; QK * MAX_OUTPUT_BYTES];
+    let mut done: usize = 0;
+    crate::dequantize_gguf_blocks::<crate::F32Out, _>(
+        data,
+        crate::GgufType::NVFP4,
+        n_elements,
+        |block| {
+            let words = block.as_chunks::<4>().0;
+            if words.len() != QK {
+                return Err(AnamnesisError::Parse {
+                    reason: format!("NVFP4 block of {} values, expected {QK}", words.len()),
+                });
+            }
+            let scale = done
+                .checked_div(slab)
+                .and_then(|k| scales.get(k).copied())
+                .ok_or_else(|| AnamnesisError::Parse {
+                    reason: format!(
+                        "NVFP4 element {done} has no scale ({} values of {slab} elements each)",
+                        scales.len()
+                    ),
+                })?;
+            for (dst, &word) in folded_block.iter_mut().zip(words) {
+                *dst = f32::from_le_bytes(word) * scale;
+            }
+            // INDEX: `E::BYTES <= MAX_OUTPUT_BYTES` is proven at compile time in
+            // `remember::output` (`OutputElement` is sealed), so the range fits.
+            #[allow(clippy::indexing_slicing)]
+            let bytes = &mut narrowed[..QK * E::BYTES];
+            E::write_scratch(&folded_block, bytes);
+            out.extend_from_slice(bytes);
+            done += QK;
+            Ok(())
+        },
+    )?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,6 +1628,7 @@ fn safetensors_stats(hub: &Hub) -> ConvertStats {
         dequantized: hub.dequantized,
         quantized: 0,
         passthrough: hub.tensors.len().saturating_sub(hub.dequantized),
+        folded_scales: hub.folded_scales,
     }
 }
 
@@ -1582,6 +1714,7 @@ fn write_gguf_target(
         quantized: 0,
         // As above: dequantised tensors are not passthrough.
         passthrough: tensors.len().saturating_sub(hub.dequantized),
+        folded_scales: hub.folded_scales,
     })
 }
 
@@ -1632,6 +1765,7 @@ fn write_bnb_nf4_target(
         dequantized: hub.dequantized,
         quantized: stats.quantized,
         passthrough: stats.passthrough,
+        folded_scales: hub.folded_scales,
     })
 }
 
