@@ -113,7 +113,7 @@ of the convention that does the most work, and the part most easily skipped:
 | [anamnesis-11-p1.md](anamnesis-11-p1.md) | anamnesis #11: `BnB` `INT8` at `F16` is ~5 % faster on x86-64 and ~21 % slower on `aarch64`; asks for an Apple Silicon measurement | Posted |
 | [anamnesis-12-p1.md](anamnesis-12-p1.md) | anamnesis #12: accepting the contributed M3 Pro study, answering the `__reports__/` placement question the contributor asked twice, and closing #11 | Posted |
 | [anamnesis-15-p1.md](anamnesis-15-p1.md) | anamnesis #15: GGUF parse refuses the whole file on `ggml_type` 40/41/42 (`NVFP4`, `Q1_0`, `Q2_0`); 160-byte reproducer with a type-39 control | Posted |
-| [anamnesis-15-p2.md](anamnesis-15-p2.md) | anamnesis #15: closing reply. All three types parse and dequantise; `NVFP4`'s second-level scale is folded; the drift check exists; the reproducer's `Q1_0` case is half a block; `ModelOpt` `NVFP4` safetensors supported too | Draft |
+| [anamnesis-15-p2.md](anamnesis-15-p2.md) | anamnesis #15: closing reply. All three types parse and dequantise; `NVFP4`'s second-level scale is folded; the drift check exists; the reproducer's `Q1_0` case is half a block; `ModelOpt` `NVFP4` safetensors supported too | Posted (2026-10-01; issue closed) |
 
 A second issue, `target.<triple>.rustflags` not reaching `-Zbuild-std` units,
 was drafted and **abandoned before filing**. The evidence was confounded (two

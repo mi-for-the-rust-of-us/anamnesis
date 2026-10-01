@@ -1,16 +1,19 @@
-# anamnesis #15, reply 2 (Draft)
+# anamnesis #15, reply 2
 
 - **Target issue:** https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15
-- **Status:** Draft, **not posted**. Post once v0.7.10 is on crates.io, and
-  close the issue with it; until then the "available in" line below is a
-  promise, not a fact.
+- **Status:** Posted 2026-10-01, after v0.7.10 reached crates.io:
+  https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15#issuecomment-5932371637
+  The issue was closed as completed with it.
 - **Context:** The closing reply to [reply 1](anamnesis-15-p1.md). Phase 7.10
   implemented the issue's step 2 (parse **and** dequantise all three types),
   took up its CI suggestion, and found two things the issue did not know: that
   real `NVFP4` checkpoints carry a second, per-tensor scale beside each weight,
   and that `NVFP4` also ships as NVIDIA `ModelOpt` safetensors, which anamnesis
   misread.
-- **Outcome:** (pending: posting, and the v0.7.10 release)
+- **Outcome:** Fixed in v0.7.10 (2026-10-01); issue closed. The text below is
+  what was posted, unchanged except for one sentence about the drift job's
+  triggers, corrected before posting when the job gained path-filtered
+  `push` / `pull_request` triggers.
 - **Lesson / Leverage angle:** The issue's own reproducer had a latent flaw: its
   64-element tensor is half a `Q1_0` block (128), so after the fix `t41.gguf` is
   refused for a different, correct reason. Worth saying on the thread rather
