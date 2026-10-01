@@ -195,3 +195,26 @@ audit's proofs of concept had been found by fuzzing before: each returns `Ok`
 from the parse, so only a resource limit could have flagged it. They are
 pinned as tests instead (`tests/security_regressions.rs`,
 `tests/peak_heap_npz_declared_size.rs`) and a few feed `tests/no_panic.rs`.
+
+**Phase 7.10 campaign (issue #15, 2026-10-01)**, WSL2 Ubuntu, nightly +
+`cargo-fuzz` 0.13.1, 180 s per target, `-rss_limit_mb=2048 -timeout=10`, on
+`0d00874`: the parser now accepts `ggml_type` 40, 41 and 42 (`NVFP4`, `Q1_0`,
+`Q2_0`), and dequantises them through a new 64/128-element block runner. Each
+GGUF-reaching target was seeded with one valid 256-element file per new type
+(behind an all-`0xFF` limits prefix for `fuzz_gguf_limits`, and one seed per
+writer for `fuzz_convert_bytes`), so the run starts inside the new code rather
+than waiting to stumble on the discriminants. The seeds stay local, like the
+rest of `corpus/`; `tests/gguf_new_types.rs` builds the same one-tensor layout
+(with zero data) as permanent tests.
+
+| Target | Runs | Coverage | RSS | Result |
+|---|---:|---:|---:|---|
+| `fuzz_gguf` | 5.3 M | 729 | 188 MB | clean |
+| `fuzz_gguf_bytes` | 5.3 M | 801 | 382 MB | clean |
+| `fuzz_gguf_front_matter` | 7.3 M | 666 | 178 MB | clean |
+| `fuzz_gguf_limits` | 1.1 M | 817 | 403 MB | clean |
+| `fuzz_convert_bytes` | 1.4 M | 2525 | 423 MB | clean |
+
+**≈20.5 M executions, no crash, no timeout, no RSS overrun.** The seeds were
+also run end to end through the CLI (`amn inspect`, `amn remember`), which
+reports each type's size and writes a `BF16` tensor of 256 elements.
