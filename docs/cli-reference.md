@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- Last updated: 2026-09-26, anamnesis v0.7.8 -->
+<!-- Last updated: 2026-10-01, anamnesis v0.7.10 -->
 
 Every subcommand, flag, and output shape for the `anamnesis` / `amn` CLI. The
 [README](../README.md) has the quick tour; this is the complete reference.
@@ -21,8 +21,15 @@ behaviour). Add features for the formats and capabilities you need:
 | `gguf` | GGUF parsing, dequantization & writing |
 | `npz` | NumPy `.npz` parsing & conversion |
 | `gptq` / `awq` / `bnb` | GPTQ / AWQ / BitsAndBytes dequantization (and BnB-NF4 encode for `bnb`) |
+| `nvfp4` | NVIDIA `ModelOpt` NVFP4 safetensors dequantization (without it such a file is recognised and refused by name; `GGUF` `NVFP4` needs only `gguf`) |
 | `ollama` | the `ollama:` URL scheme (see below) |
 | `indicatif` | a progress bar during `remember` |
+
+For every format at once:
+
+```sh
+cargo install anamnesis --features cli,pth,npz,gguf,bnb,awq,gptq,nvfp4
+```
 
 `amn --version` and `amn --help` (and `amn <command> --help`) are always
 available.

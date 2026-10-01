@@ -44,8 +44,13 @@ cargo install anamnesis --features cli,pth,gguf
 ```
 
 Installs both `anamnesis` and `amn` (short alias). Pick the formats and schemes
-you need via feature flags (`gptq`, `awq`, `bnb`, `npz`, `pth`, `gguf`, `ollama`,
-`indicatif`); the full list is in the [CLI Reference](docs/cli-reference.md#install).
+you need via feature flags (`gptq`, `awq`, `bnb`, `nvfp4`, `npz`, `pth`, `gguf`,
+`ollama`, `indicatif`); the full list is in the [CLI Reference](docs/cli-reference.md#install).
+For every format at once:
+
+```sh
+cargo install anamnesis --features cli,pth,npz,gguf,bnb,awq,gptq,nvfp4
+```
 
 ## CLI Commands
 
