@@ -252,6 +252,11 @@ pub enum TensorRole {
 /// FP8 rules are checked first (suffix `_scale_inv` / `_scale`, then dtype).
 /// GPTQ rules (`.qweight`, `.qzeros`, `.scales`, `.g_idx`) are checked when
 /// the `gptq` feature is enabled.
+///
+/// The verdict is per tensor and by name, so a `Scale` here is provisional:
+/// `mark_modelopt_nvfp4` then claims the layers only a whole-file view can
+/// recognise, and `demote_orphan_scales` returns every scale no quantised
+/// tensor owns to `Passthrough`.
 fn classify_tensor(name: &str, dtype: Dtype) -> TensorRole {
     // FP8 scale companions (suffix-based, always active)
     if name.ends_with("_scale_inv") || name.ends_with("_scale") {
@@ -347,6 +352,14 @@ pub enum QuantScheme {
     Bnb4,
     /// `BitsAndBytes` `INT8` quantization (`LLM.int8()` with per-row absmax).
     BnbInt8,
+    /// NVIDIA `NVFP4` as `TensorRT` Model Optimizer exports it: `U8` weights
+    /// packing two 4-bit `E2M1` values per byte, an `F8_E4M3` `weight_scale`
+    /// per 16 values and an `F32` `weight_scale_2` per tensor. **Recognised so
+    /// it is reported correctly, not yet dequantised**: `remember` and
+    /// `convert` refuse it with [`AnamnesisError::Unsupported`]. (`NVFP4` in a
+    /// `GGUF` file is supported.) Until Phase 7.10 it was misread as
+    /// fine-grained `FP8`.
+    Nvfp4,
 }
 
 impl fmt::Display for QuantScheme {
@@ -360,6 +373,7 @@ impl fmt::Display for QuantScheme {
             Self::Awq => "AWQ",
             Self::Bnb4 => "BitsAndBytes NF4/FP4 (4-bit, per-block absmax)",
             Self::BnbInt8 => "BitsAndBytes INT8 (LLM.int8(), per-row absmax)",
+            Self::Nvfp4 => "NVIDIA NVFP4 (ModelOpt), not yet supported",
         };
         f.write_str(s)
     }
@@ -382,6 +396,16 @@ fn detect_scheme(entries: &[TensorEntry], index: &NameIndex<'_>) -> QuantScheme 
     let has_quantized = entries.iter().any(|e| e.role == TensorRole::Quantized);
     if !has_quantized {
         return QuantScheme::Unquantized;
+    }
+
+    // NVIDIA ModelOpt NVFP4, marked by `mark_modelopt_nvfp4`. Checked first: its
+    // `U8` weights would otherwise read as `BnB` 4-bit, and its 2-D `F8_E4M3`
+    // `weight_scale` as a fine-grained FP8 block scale.
+    if entries
+        .iter()
+        .any(|e| e.role == TensorRole::Quantized && is_modelopt_nvfp4_weight(e, index))
+    {
+        return QuantScheme::Nvfp4;
     }
 
     // GPTQ / AWQ: both use `.qweight` tensors. Distinguish by packing direction.
@@ -642,7 +666,8 @@ impl SafetensorsHeader {
         // CAST: usize → u64, element and byte counts fit in u64
         #[allow(clippy::as_conversions)]
         let (elements, bytes) = (entry.num_elements() as u64, entry.byte_len() as u64);
-        if self.scheme == QuantScheme::Bnb4 && entry.dtype == Dtype::U8 {
+        if matches!(self.scheme, QuantScheme::Bnb4 | QuantScheme::Nvfp4) && entry.dtype == Dtype::U8
+        {
             return bytes.saturating_mul(2);
         }
         if entry.dtype != Dtype::I32 {
@@ -1192,6 +1217,120 @@ pub fn parse_safetensors_header_with_limits(
     build_header_from_metadata(header_size, &metadata, limits)
 }
 
+/// Whether `entry` is a `ModelOpt` `NVFP4` weight: a `U8` `X.weight` with an
+/// `F8_E4M3` `X.weight_scale` and an `X.weight_scale_2` beside it.
+fn is_modelopt_nvfp4_weight(entry: &TensorEntry, index: &NameIndex<'_>) -> bool {
+    entry.dtype == Dtype::U8
+        && entry.name.ends_with(".weight")
+        && index
+            .named(&format!("{}_scale", entry.name))
+            .is_some_and(|s| s.dtype == Dtype::F8E4M3)
+        && index.named(&format!("{}_scale_2", entry.name)).is_some()
+}
+
+/// Gives a `ModelOpt` `NVFP4` layer its roles, whatever the enabled features.
+///
+/// Name-by-name classification cannot see this layout: a `U8` `.weight` is a
+/// `BnB` 4-bit weight only under the `bnb` feature and a passthrough without
+/// it, and `weight_scale_2` matches no suffix. Without the `bnb` feature, a
+/// `ModelOpt` checkpoint therefore read as *unquantised*, and `remember` would
+/// have copied the packed `U8` bytes into its output as if they were weights.
+/// This pass marks each layer's `.weight` as quantised and its `weight_scale`,
+/// `weight_scale_2` and `input_scale` as companions, so the scheme is detected
+/// as [`QuantScheme::Nvfp4`] and refused, never passed through.
+fn mark_modelopt_nvfp4(entries: &mut [TensorEntry]) {
+    // Names to positions once, so a header of thousands of layers stays linear
+    // (the quadratic companion lookup Phase 7.9 removed, audit finding M-7).
+    let (weights, companions): (Vec<usize>, Vec<usize>) = {
+        let index = NameIndex::new(entries);
+        let position: std::collections::HashMap<&str, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.as_str(), i))
+            .collect();
+        let mut weights = Vec::new();
+        let mut companions = Vec::new();
+        for (i, entry) in entries.iter().enumerate() {
+            if !is_modelopt_nvfp4_weight(entry, &index) {
+                continue;
+            }
+            weights.push(i);
+            let stem = entry.name.strip_suffix(".weight").unwrap_or(&entry.name);
+            for name in [
+                format!("{}_scale", entry.name),
+                format!("{}_scale_2", entry.name),
+                format!("{stem}.input_scale"),
+            ] {
+                companions.extend(position.get(name.as_str()).copied());
+            }
+        }
+        (weights, companions)
+    };
+    for (positions, role) in [
+        (weights, TensorRole::Quantized),
+        (companions, TensorRole::Scale),
+    ] {
+        for i in positions {
+            if let Some(entry) = entries.get_mut(i) {
+                entry.role = role;
+            }
+        }
+    }
+}
+
+/// Turns every [`TensorRole::Scale`] tensor that no quantised tensor in the
+/// file can own back into [`TensorRole::Passthrough`].
+///
+/// `classify_tensor` decides a scale by its **name** alone (`*_scale`,
+/// `*_scale_inv`, and under their features `.scales`, `.weight.absmax`,
+/// `.SCB`), because it sees one tensor at a time. A companion is consumed by
+/// dequantisation and never written, so a misclassified tensor was silently
+/// dropped: until Phase 7.10 a plain `BF16` model with CLIP's `logit_scale`, a
+/// `layer_scale`, or a leftover `input_scale` lost them on `remember` and
+/// `convert`, and `inspect` under-reported its size to match.
+///
+/// A scale is kept as a companion only when a quantised tensor exists for it,
+/// under one of the names the schemes actually use:
+///
+/// - its name without `_scale_inv` / `_scale` (the `FP8` weight scale
+///   `X.weight_scale`, exactly the lookup `scale_for` performs);
+/// - its module (`BnB` 4-bit: `X.weight.absmax` belongs to `X.weight`);
+/// - its module's `.weight` (`BnB` `INT8` `X.SCB`, and the `FP8` activation
+///   scale `X.input_scale` of a quantised `X.weight`);
+/// - its module's `.qweight` (`GPTQ` / `AWQ` `X.scales`).
+///
+/// Everything else passes through, so a file with no quantised tensor at all
+/// keeps every tensor it has.
+fn demote_orphan_scales(entries: &mut [TensorEntry]) {
+    let quantized: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.role == TensorRole::Quantized)
+        .map(|e| e.name.as_str())
+        .collect();
+    let owned = |name: &str| -> bool {
+        let fp8_weight = name
+            .strip_suffix("_scale_inv")
+            .or_else(|| name.strip_suffix("_scale"));
+        if fp8_weight.is_some_and(|w| quantized.contains(w)) {
+            return true;
+        }
+        name.rsplit_once('.').is_some_and(|(module, _)| {
+            quantized.contains(module)
+                || quantized.contains(format!("{module}.weight").as_str())
+                || quantized.contains(format!("{module}.qweight").as_str())
+        })
+    };
+    let orphans: Vec<bool> = entries
+        .iter()
+        .map(|e| e.role == TensorRole::Scale && !owned(&e.name))
+        .collect();
+    for (entry, orphan) in entries.iter_mut().zip(orphans) {
+        if orphan {
+            entry.role = TensorRole::Passthrough;
+        }
+    }
+}
+
 /// Builds a [`SafetensorsHeader`] from a pre-parsed
 /// `safetensors::tensor::Metadata`.
 ///
@@ -1227,6 +1366,9 @@ fn build_header_from_metadata(
             role,
         });
     }
+
+    mark_modelopt_nvfp4(&mut entries);
+    demote_orphan_scales(&mut entries);
 
     // Sort by name for deterministic ordering (HashMap iteration is arbitrary).
     entries.sort_by(|a, b| a.name.cmp(&b.name));

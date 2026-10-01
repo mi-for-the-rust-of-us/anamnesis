@@ -1429,6 +1429,17 @@ impl ParsedModel {
                     detail: "BnB dequantization requires the `bnb` feature".into(),
                 });
             }
+            QuantScheme::Nvfp4 => {
+                return Err(AnamnesisError::Unsupported {
+                    format: "safetensors NVFP4".into(),
+                    detail: format!(
+                        "`{}` is NVIDIA ModelOpt NVFP4 (U8 weights with F8_E4M3 \
+                         weight_scale and weight_scale_2), which is recognised but \
+                         not dequantised yet; NVFP4 in a GGUF file is supported",
+                        entry.name
+                    ),
+                });
+            }
             QuantScheme::Unquantized => {
                 // Shouldn't have a quantized-role tensor in an
                 // unquantized model; the orchestrator resolves this

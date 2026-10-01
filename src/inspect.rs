@@ -324,6 +324,7 @@ impl fmt::Display for InspectInfo {
             QuantScheme::Gptq | QuantScheme::Awq => "GPTQ/AWQ",
             QuantScheme::Bnb4 => "BnB NF4/FP4",
             QuantScheme::BnbInt8 => "BnB INT8",
+            QuantScheme::Nvfp4 => "NVFP4",
             QuantScheme::Unquantized => "unquantized",
             QuantScheme::FineGrainedFp8
             | QuantScheme::PerChannelFp8
