@@ -10,14 +10,33 @@ name: Upstream ggml types
 # half of the check is `tests/gguf_type_snapshot.rs`, which holds the parser to
 # the snapshot; this job holds the snapshot to upstream.
 #
-# Scheduled, never on pushes or pull requests: upstream moves on its own clock,
-# and a type added there must not turn an unrelated PR red. A failure here is a
-# to-do (teach the parser the new type, with its block layout and a kernel,
-# then refresh the snapshot), not a regression in this repository.
+# Scheduled weekly, and otherwise run only when the check itself changes:
+# upstream moves on its own clock, and a type added there must not turn an
+# unrelated PR red. A failure on the schedule is a to-do (teach the parser the
+# new type, with its block layout and a kernel, then refresh the snapshot), not
+# a regression in this repository.
+#
+# The `paths:` triggers exist because GitHub runs `schedule` and
+# `workflow_dispatch` only from the default branch, so a workflow that has
+# never been merged has never run anywhere. With them, the push or pull
+# request that adds or edits this file, the extraction script or the snapshot
+# runs the job on the spot, and a broken check is caught by the change that
+# broke it rather than by a silent Monday.
 on:
   schedule:
     - cron: "41 6 * * 1" # Mondays 06:41 UTC
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ggml-drift.yml"
+      - "scripts/ggml-types.sh"
+      - "tests/fixtures/ggml_types.txt"
+  pull_request:
+    paths:
+      - ".github/workflows/ggml-drift.yml"
+      - "scripts/ggml-types.sh"
+      - "tests/fixtures/ggml_types.txt"
 
 permissions:
   contents: read
@@ -37,9 +56,18 @@ jobs:
           # Resolve master to a commit first, so the report names exactly what
           # was compared and the snapshot can be refreshed from it.
           commit="$(git ls-remote https://github.com/ggml-org/llama.cpp refs/heads/master | cut -f1)"
+          if [ -z "${commit}" ]; then
+            echo "::error title=ggml_type drift::Could not resolve llama.cpp master; nothing was compared."
+            exit 1
+          fi
           echo "llama.cpp master is ${commit}"
-          curl -fsSL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${commit}/ggml/include/ggml.h" \
-            | scripts/ggml-types.sh > upstream.txt
+          # An empty extraction would read as "every type was removed"; say
+          # what it really means instead.
+          if ! curl -fsSL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${commit}/ggml/include/ggml.h" \
+            | scripts/ggml-types.sh > upstream.txt || [ ! -s upstream.txt ]; then
+            echo "::error title=ggml_type drift::Extracted no GGML_TYPE_* entries from ggml.h at llama.cpp ${commit}. The header moved or its format changed: the check needs updating, not the parser."
+            exit 1
+          fi
           grep -v '^#' tests/fixtures/ggml_types.txt > snapshot.txt
           if diff -u snapshot.txt upstream.txt; then
             echo "The parser's type table matches llama.cpp ${commit}."

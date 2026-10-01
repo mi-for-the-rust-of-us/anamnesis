@@ -92,8 +92,9 @@ block decode, as its documentation now says.
 snapshot of `ggml.h`'s live `GGML_TYPE_*` entries at a pinned commit; a test
 holds the parser to it exactly (every snapshot entry parses under upstream's
 name, everything else is refused), and a weekly workflow diffs the snapshot
-against llama.cpp `master` and fails naming the new types. It is scheduled only,
-so upstream churn cannot turn an unrelated pull request red.
+against llama.cpp `master` and fails naming the new types. Apart from that
+schedule it runs only on changes to the check itself, so upstream churn cannot
+turn an unrelated pull request red.
 
 **`NVFP4` in safetensors, too.** NVIDIA's `ModelOpt` exports the same format as
 safetensors (`nvidia/Llama-3.1-8B-Instruct-NVFP4`), and anamnesis was misreading
