@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn per_tensor_empty() {
         let output = dequantize_per_tensor_fp8_to_bf16(&[], 1.0).unwrap();
-        assert!(output.is_empty());
+        assert_eq!(output, Vec::<u8>::new());
     }
 
     #[test]

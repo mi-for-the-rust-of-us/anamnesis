@@ -1646,7 +1646,7 @@ mod tests {
     fn shape_scalar() {
         let header = "{'descr': '<f4', 'fortran_order': False, 'shape': (), }";
         let shape = extract_shape(header).unwrap();
-        assert!(shape.is_empty());
+        assert_eq!(shape, Vec::<usize>::new());
     }
 
     #[test]
@@ -2650,7 +2650,7 @@ mod tests {
         let info = inspect_npz_from_reader(std::io::Cursor::new(&buf)).unwrap();
         assert!(info.tensors.is_empty());
         assert_eq!(info.total_bytes, 0);
-        assert!(info.dtypes.is_empty());
+        assert_eq!(info.dtypes, Vec::<NpzDtype>::new());
     }
 
     /// `inspect_npz_from_reader` summarises a Fortran-order archive rather than

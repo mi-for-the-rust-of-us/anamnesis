@@ -4995,7 +4995,7 @@ mod tests {
         // equal-but-wrong outputs.
         assert_eq!(reader_info.tensor_count, 0);
         assert_eq!(reader_info.total_bytes, 0);
-        assert!(reader_info.dtypes.is_empty());
+        assert_eq!(reader_info.dtypes, Vec::<PthDtype>::new());
         assert!(!reader_info.big_endian);
     }
 

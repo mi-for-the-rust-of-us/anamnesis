@@ -414,7 +414,7 @@ mod tests {
             |_| {},
         )
         .expect("an uncancelled empty run succeeds");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<usize>::new());
     }
 
     fn fail_at(idx: usize) -> AnamnesisError {
@@ -617,7 +617,7 @@ mod tests {
     fn degenerate_inputs() {
         let empty: Vec<usize> = Vec::new();
         let out = map_indexed(&empty, 8, BIG, None, |_, &v| Ok(v), |_| {}).expect("empty map");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<usize>::new());
 
         let one = vec![42usize];
         let out = map_indexed(&one, 8, BIG, None, |_, &v| Ok(v + 1), |_| {}).expect("single map");

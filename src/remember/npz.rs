@@ -138,7 +138,7 @@ mod tests {
         let bytes = npz_to_safetensors_bytes(&tensors).unwrap();
         // safetensors with zero tensors is still a valid file (header `{}`).
         let parsed = safetensors::SafeTensors::deserialize(&bytes).unwrap();
-        assert!(parsed.names().is_empty());
+        assert_eq!(parsed.names(), Vec::<&str>::new());
     }
 
     #[test]

@@ -2454,7 +2454,7 @@ mod tests {
     #[test]
     fn zero_elements_returns_empty() {
         let out = dequantize_gguf_to_bf16(&[], GgufType::Q4_0, 0).unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
     }
 
     #[test]
@@ -4029,20 +4029,17 @@ mod tests {
     /// Zero-element tensors stay zero-length at every output width.
     #[test]
     fn empty_tensor_is_empty_for_every_output_type() {
-        assert!(
-            dequantize_gguf::<Bf16Out>(&[], GgufType::Q8_0, 0)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            dequantize_gguf::<Bf16Out>(&[], GgufType::Q8_0, 0).unwrap(),
+            Vec::<u8>::new()
         );
-        assert!(
-            dequantize_gguf::<F32Out>(&[], GgufType::Q8_0, 0)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            dequantize_gguf::<F32Out>(&[], GgufType::Q8_0, 0).unwrap(),
+            Vec::<u8>::new()
         );
-        assert!(
-            dequantize_gguf::<F16Out>(&[], GgufType::Q8_0, 0)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            dequantize_gguf::<F16Out>(&[], GgufType::Q8_0, 0).unwrap(),
+            Vec::<u8>::new()
         );
     }
 

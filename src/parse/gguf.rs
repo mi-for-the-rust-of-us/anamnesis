@@ -3906,7 +3906,7 @@ mod tests {
         assert_eq!(info.version, 3);
         assert_eq!(info.tensor_count, 0);
         assert_eq!(info.total_bytes, 0);
-        assert!(info.dtypes.is_empty());
+        assert_eq!(info.dtypes, Vec::<GgufType>::new());
         assert_eq!(info.alignment, 32);
     }
 

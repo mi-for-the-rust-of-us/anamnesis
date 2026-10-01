@@ -68,7 +68,7 @@ fn safetensors_owned_paths_match_mmap() {
         .expect("remember reader");
     assert_eq!(d_path, d_bytes, "bytes-path dequant differs from mmap");
     assert_eq!(d_path, d_reader, "reader-path dequant differs from mmap");
-    assert!(!d_path.is_empty());
+    assert_ne!(d_path, Vec::<u8>::new());
 }
 
 #[test]

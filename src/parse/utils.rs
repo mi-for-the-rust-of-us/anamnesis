@@ -344,6 +344,6 @@ mod tests {
     fn byteswap_empty() {
         let mut data: Vec<u8> = vec![];
         byteswap_inplace(&mut data, 4);
-        assert!(data.is_empty());
+        assert_eq!(data, Vec::<u8>::new());
     }
 }
