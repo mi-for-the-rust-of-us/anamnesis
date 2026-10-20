@@ -18,7 +18,16 @@ all-features = true
 # To accept one deliberately, add it to `ignore` with the reason, e.g.
 # `{ id = "RUSTSEC-0000-0000", reason = "..." }`.
 yanked = "deny"
-ignore = []
+ignore = [
+    # `zip` is a dev-dependency only (test fixture writer + differential oracle
+    # for the vendored `src/parse/zip.rs` reader, Phase 6.12), never built by
+    # `cargo install`. All three advisories need `ZipArchive::extract` or
+    # `ZipStreamReader::extract`, which nothing in the repository calls. Remove
+    # once `zip` is bumped to >= 9.0.0 or dropped.
+    { id = "RUSTSEC-2026-0367", reason = "dev-only zip; extraction API unused" },
+    { id = "RUSTSEC-2026-0368", reason = "dev-only zip; extraction API unused" },
+    { id = "RUSTSEC-2026-0369", reason = "dev-only zip; extraction API unused" },
+]
 
 [licenses]
 # Permissive licences only, matching the crate's own MIT OR Apache-2.0.
