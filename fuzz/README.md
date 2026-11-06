@@ -268,3 +268,14 @@ reports `F8_E4M3`, and `amn remember` writes a 600-element `BF16` tensor.
 | `fuzz_convert_bytes` | 0.41 M | 5169 | 437 MB | clean |
 
 **≈16.9 M executions, no crash, no timeout, no RSS overrun, no new artifact.**
+
+**Re-run after the `F8_E4M3` scale fold (`65319ea`)**, same settings, on a
+clean tree. `F8_E4M3` weights now have their `<stem>.scale` folded in like
+`NVFP4`'s, through a new per-slab fold that hostile input reaches through
+`convert_bytes`, so the two targets that cover it were re-run, the earlier
+scaled seed now taking the fold path and a per-expert seed added (three
+427-element experts, slabs that straddle the kernel's 256-element runs; one
+seed per writer for `fuzz_convert_bytes`). `fuzz_convert_bytes` 0.33 M runs,
+coverage 5305 (up from 5169 above, the fold path), RSS 438 MB;
+`fuzz_gguf_limits` 0.67 M runs, coverage 894, RSS 373 MB. **No crash, no
+timeout, no new artifact.**
