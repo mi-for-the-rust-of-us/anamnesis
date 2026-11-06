@@ -22,4 +22,7 @@ set -euo pipefail
 grep -E '^[[:space:]]*GGML_TYPE_[A-Z0-9_]+[[:space:]]*=[[:space:]]*[0-9]+' "${1:--}" |
   sed -E 's/^[[:space:]]*(GGML_TYPE_[A-Z0-9_]+)[[:space:]]*=[[:space:]]*([0-9]+).*/\1 = \2/' |
   grep -v '^GGML_TYPE_COUNT ' |
-  sort -t= -k2 -n
+  # The separator is its own argument on purpose: uutils `sort` (the default
+  # on ubuntu-26.04 runners) reads `-t=` as `-t` with an empty value and
+  # refuses it, which silently disabled this check on 2026-11-02.
+  sort -t '=' -k2,2n

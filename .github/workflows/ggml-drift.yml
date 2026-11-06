@@ -61,11 +61,21 @@ jobs:
             exit 1
           fi
           echo "llama.cpp master is ${commit}"
+          # Download, extraction and an empty result fail separately, so the
+          # message names the real cause: on 2026-11-02 a runner-image change
+          # broke the script itself and the job blamed the header.
+          if ! curl -fsSL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${commit}/ggml/include/ggml.h" -o ggml.h; then
+            echo "::error title=ggml_type drift::Could not download ggml.h at llama.cpp ${commit}. The header moved, or GitHub is unreachable: the check needs updating, not the parser."
+            exit 1
+          fi
+          if ! scripts/ggml-types.sh ggml.h > upstream.txt; then
+            echo "::error title=ggml_type drift::scripts/ggml-types.sh failed on the runner (see the tool error above). The check is broken, not the parser; nothing was compared."
+            exit 1
+          fi
           # An empty extraction would read as "every type was removed"; say
           # what it really means instead.
-          if ! curl -fsSL "https://raw.githubusercontent.com/ggml-org/llama.cpp/${commit}/ggml/include/ggml.h" \
-            | scripts/ggml-types.sh > upstream.txt || [ ! -s upstream.txt ]; then
-            echo "::error title=ggml_type drift::Extracted no GGML_TYPE_* entries from ggml.h at llama.cpp ${commit}. The header moved or its format changed: the check needs updating, not the parser."
+          if [ ! -s upstream.txt ]; then
+            echo "::error title=ggml_type drift::Extracted no GGML_TYPE_* entries from ggml.h at llama.cpp ${commit}. The header's format changed: the check needs updating, not the parser."
             exit 1
           fi
           grep -v '^#' tests/fixtures/ggml_types.txt > snapshot.txt
