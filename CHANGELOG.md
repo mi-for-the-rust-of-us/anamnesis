@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GGUF` `F8_E4M3`** (`ggml_type` 43), parsed and dequantised. Upstream
+  `ggml` added it at llama.cpp `1b6935b`, and until now a `GGUF` holding one
+  `F8_E4M3` tensor was refused while its tensor-info table was read, so not
+  even `inspect` could open it. One `OCP` `E4M3FN` byte per element with no
+  scale; `0x7F` and `0xFF` decode to `NaN`, and there are no infinities.
+  `GgufType` gains `F8_E4M3`; it is `#[non_exhaustive]`, so this is not a
+  breaking change.
+- **Cross-validated on every code.** The fixture holds all 256 `E4M3FN` codes,
+  and its golden is `dequantize_row_f8_e4m3` from ggml's own C at `1b6935b`;
+  `gguf-py` agrees with it bit for bit. anamnesis matches at 0 `ULP` in `BF16`
+  and bit for bit in `F32`. The one difference is the sign of `NaN`: ggml
+  returns a positive `NaN` for both `NaN` codes, anamnesis keeps the sign, as
+  its safetensors `FP8` path and PyTorch do. `OCP` leaves that choice to the
+  implementation.
+
+### Changed
+
+- **`GgufType::F8_E4M3` is classed as quantised**, although upstream files it
+  as a scalar: `remember` and `convert` widen it to `BF16` / `F16` / `F32` like
+  every other sub-16-bit type, matching how anamnesis already treats a
+  safetensors `F8_E4M3` tensor. Writing `F8_E4M3` into a `GGUF` is planned for
+  Phase 8.5.
+- **`dequantize_gguf_blocks` delivers `F8_E4M3` in runs of 256 elements**, with
+  a shorter last run, instead of one sink call per one-element block. One call
+  per element measured 20 to 46 % slower. Every call is still a whole number of
+  blocks; a sink that requires exactly `block_size() × E::BYTES` bytes per call
+  is not correct for this type.
+
 ## [0.7.10] - 2026-10-01
 
 ### Added
