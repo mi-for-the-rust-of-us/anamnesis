@@ -306,6 +306,9 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
     let (q1a, q1b, q1c) = (q1.clone(), q1.clone(), q1);
     let q2 = gguf_q2_0_fixture();
     let (q2a, q2b, q2c) = (q2.clone(), q2.clone(), q2);
+    // `GGUF` `F8_E4M3`: one byte per element, so any bytes are a valid tensor.
+    let f8 = synth_bytes(LAYER_ROWS * LAYER_COLS);
+    let (f8a, f8b, f8c) = (f8.clone(), f8.clone(), f8);
     let mo = nvfp4_modelopt_fixture();
     let (mo1, mo2, mo3) = (mo.clone(), mo.clone(), mo);
 
@@ -721,6 +724,45 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
                         LAYER_ROWS * LAYER_COLS,
                     )
                     .expect("gguf q2_0 f16"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_bf16", move |b| {
+            let r = f8a.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf_to_bf16(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_f32", move |b| {
+            let r = f8b.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F32Out>(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3 f32"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_f16", move |b| {
+            let r = f8c.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F16Out>(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3 f16"),
                 )
             })
         }),

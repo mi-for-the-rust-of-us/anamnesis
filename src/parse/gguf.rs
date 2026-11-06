@@ -144,7 +144,7 @@ const READER_BUF_SIZE: usize = 64 * 1024;
 /// ties the two together, and a variant whose index falls outside the bitmap
 /// would panic `inspect` on any file containing it. The
 /// `inspect_index_is_dense_and_in_bounds` test pins the invariant.
-const GGUF_TYPE_COUNT: usize = 35;
+const GGUF_TYPE_COUNT: usize = 36;
 
 // ---------------------------------------------------------------------------
 // GgufType
@@ -154,8 +154,8 @@ const GGUF_TYPE_COUNT: usize = 35;
 ///
 /// The enum is `#[non_exhaustive]` because new `ggml_type` values are added
 /// over time (e.g., the `IQ*` family appeared after the original `K`-quants,
-/// `MXFP4` was added in 2024, and `NVFP4`, `Q1_0` and `Q2_0` followed in
-/// 2026). The variants track the live entries of `ggml.h`'s `enum ggml_type`:
+/// `MXFP4` was added in 2024, and `NVFP4`, `Q1_0`, `Q2_0` and `F8_E4M3`
+/// followed in 2026). The variants track the live entries of `ggml.h`'s `enum ggml_type`:
 /// `tests/gguf_type_snapshot.rs` holds the parser to a checked-in snapshot of
 /// that enum (`tests/fixtures/ggml_types.txt`), and the weekly
 /// `ggml-drift.yml` workflow holds the snapshot to upstream `master`.
@@ -240,6 +240,12 @@ pub enum GgufType {
     /// 64-element, 2-bit quantisation over `{-1, 0, +1, +2}` with an `f16`
     /// scale (`GGML_TYPE_Q2_0 = 42`).
     Q2_0,
+    /// One `OCP` `FP8` `E4M3FN` byte per element, with no scale
+    /// (`GGML_TYPE_F8_E4M3 = 43`). Upstream `ggml` files it as a scalar
+    /// type, but anamnesis widens it on [`dequantize_gguf`](crate::dequantize_gguf)
+    /// like every other sub-16-bit type, matching how it treats a safetensors
+    /// `F8_E4M3` tensor, so [`is_quantized`](Self::is_quantized) returns `true`.
+    F8_E4M3,
 }
 
 impl GgufType {
@@ -284,6 +290,7 @@ impl GgufType {
             Self::NVFP4 => 40,
             Self::Q1_0 => 41,
             Self::Q2_0 => 42,
+            Self::F8_E4M3 => 43,
         }
     }
 
@@ -293,8 +300,8 @@ impl GgufType {
     ///
     /// Returns [`AnamnesisError::Unsupported`] if the value does not match
     /// any known `ggml_type`. Reserved or removed discriminants (4, 5, 31–33,
-    /// 36–38) also produce this error, as does everything from 43 upwards
-    /// (43 is upstream's `GGML_TYPE_COUNT` sentinel, not a type).
+    /// 36–38) also produce this error, as does everything from 44 upwards
+    /// (44 is upstream's `GGML_TYPE_COUNT` sentinel, not a type).
     pub(crate) fn from_u32(value: u32) -> crate::Result<Self> {
         let ty = match value {
             0 => Self::F32,
@@ -332,6 +339,7 @@ impl GgufType {
             40 => Self::NVFP4,
             41 => Self::Q1_0,
             42 => Self::Q2_0,
+            43 => Self::F8_E4M3,
             other => {
                 return Err(AnamnesisError::Unsupported {
                     format: "GGUF".into(),
@@ -344,7 +352,7 @@ impl GgufType {
 
     /// Number of elements per storage block.
     ///
-    /// Unquantised scalar types return `1`. Legacy quantised types return
+    /// Unquantised scalar types and `F8_E4M3` return `1`. Legacy quantised types return
     /// `32`. K-quants and most `IQ*`/`TQ*` types return `256`. `IQ4_NL` and
     /// `MXFP4` return `32`, `NVFP4` and `Q2_0` return `64`, and `Q1_0`
     /// returns `128`.
@@ -358,7 +366,8 @@ impl GgufType {
             | Self::I8
             | Self::I16
             | Self::I32
-            | Self::I64 => 1,
+            | Self::I64
+            | Self::F8_E4M3 => 1,
             Self::Q4_0
             | Self::Q4_1
             | Self::Q5_0
@@ -392,7 +401,7 @@ impl GgufType {
     /// layout is not yet hard-coded in this crate.
     ///
     /// Returns `Some` for every recognised `GgufType`: scalar types
-    /// (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`), legacy block-wise
+    /// (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`), `F8_E4M3` (1 byte), legacy block-wise
     /// quantised types (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1`),
     /// K-quant super-blocks (`Q2_K`–`Q8_K`), the non-linear 4-bit `IQ*`
     /// variants (`IQ4_NL` at 18 bytes, `IQ4_XS` at 136 bytes), the
@@ -415,6 +424,8 @@ impl GgufType {
     pub const fn type_size(self) -> Option<usize> {
         match self {
             Self::I8 => Some(1),
+            // F8_E4M3: one E4M3FN byte per element, no block header.
+            Self::F8_E4M3 => Some(1),
             Self::F16 | Self::BF16 | Self::I16 => Some(2),
             Self::F32 | Self::I32 => Some(4),
             Self::F64 | Self::I64 => Some(8),
@@ -493,7 +504,9 @@ impl GgufType {
     }
 
     /// Returns `true` if this type is a quantised block format (as opposed
-    /// to a scalar float or integer type).
+    /// to a scalar float or integer type), or `F8_E4M3`: anamnesis widens
+    /// `FP8` to the output dtype rather than passing it through, in `GGUF` as
+    /// in safetensors, although upstream `ggml` files it as a scalar.
     #[must_use]
     pub const fn is_quantized(self) -> bool {
         !matches!(
@@ -549,6 +562,7 @@ impl GgufType {
             Self::NVFP4 => 32,
             Self::Q1_0 => 33,
             Self::Q2_0 => 34,
+            Self::F8_E4M3 => 35,
         }
     }
 
@@ -632,6 +646,7 @@ impl fmt::Display for GgufType {
             Self::NVFP4 => "NVFP4",
             Self::Q1_0 => "Q1_0",
             Self::Q2_0 => "Q2_0",
+            Self::F8_E4M3 => "F8_E4M3",
         };
         f.write_str(s)
     }
@@ -3105,7 +3120,7 @@ mod tests {
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 35, "one discriminant per `GgufType` variant");
+        assert_eq!(accepted, 36, "one discriminant per `GgufType` variant");
     }
 
     /// `inspect_index` must map the variants onto `0..GGUF_TYPE_COUNT`
@@ -3799,6 +3814,12 @@ mod tests {
             GgufType::Q1_0.byte_size_for_n_elements(64),
             Err(AnamnesisError::Parse { .. })
         ));
+
+        // `F8_E4M3` (llama.cpp `1b6935b`): one byte per element, so any
+        // element count is a whole number of blocks.
+        assert_eq!(GgufType::F8_E4M3.block_size(), 1);
+        assert_eq!(GgufType::F8_E4M3.type_size(), Some(1));
+        assert_eq!(GgufType::F8_E4M3.byte_size_for_n_elements(7).unwrap(), 7);
     }
 
     #[test]
@@ -3812,6 +3833,8 @@ mod tests {
         assert!(GgufType::NVFP4.is_quantized());
         assert!(GgufType::Q1_0.is_quantized());
         assert!(GgufType::Q2_0.is_quantized());
+        // Upstream files it as a scalar; anamnesis widens it like other `FP8`.
+        assert!(GgufType::F8_E4M3.is_quantized());
     }
 
     #[test]
@@ -3839,6 +3862,7 @@ mod tests {
         assert_eq!(GgufType::NVFP4.to_string(), "NVFP4");
         assert_eq!(GgufType::Q1_0.to_string(), "Q1_0");
         assert_eq!(GgufType::Q2_0.to_string(), "Q2_0");
+        assert_eq!(GgufType::F8_E4M3.to_string(), "F8_E4M3");
     }
 
     // -----------------------------------------------------------------

@@ -11,6 +11,9 @@
 //! not a whole `Q1_0` block (128), so here every tensor has 256 elements,
 //! a multiple of every block size. The 64-element `Q1_0` case is pinned
 //! separately, because it must now fail for the right reason.
+//!
+//! Discriminant 43 (`F8_E4M3`) arrived upstream at llama.cpp `1b6935b`, after
+//! the issue, and is walked through the same entry points.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -45,13 +48,15 @@ fn reproducer(ggml_type: u32, elements: u64, data_len: usize) -> Vec<u8> {
 }
 
 /// `(discriminant, variant, name, block size, bytes per block)` for the
-/// control and the three types issue #15 added. Layouts from llama.cpp
-/// `ggml-common.h` at `37b53fd`.
-const CASES: [(u32, GgufType, &str, u64, u64); 4] = [
+/// control, the three types issue #15 added, and `F8_E4M3`. Layouts from
+/// llama.cpp `ggml-common.h` at `37b53fd`, and `ggml.c`'s type traits at
+/// `1b6935b` for `F8_E4M3`.
+const CASES: [(u32, GgufType, &str, u64, u64); 5] = [
     (39, GgufType::MXFP4, "MXFP4", 32, 17),
     (40, GgufType::NVFP4, "NVFP4", 64, 36),
     (41, GgufType::Q1_0, "Q1_0", 128, 18),
     (42, GgufType::Q2_0, "Q2_0", 64, 18),
+    (43, GgufType::F8_E4M3, "F8_E4M3", 1, 1),
 ];
 
 #[test]
@@ -92,10 +97,11 @@ fn every_entry_point_parses_the_new_types() {
 
 #[test]
 fn reserved_and_sentinel_discriminants_are_still_refused() {
-    // 36 is commented out upstream, 43 is `GGML_TYPE_COUNT` (a sentinel, not a
-    // type), and 255 is simply unknown. All three must fail closed, naming
-    // the discriminant, exactly as 40-42 used to.
-    for disc in [36_u32, 43, 255] {
+    // 36 is commented out upstream, 44 is `GGML_TYPE_COUNT` (a sentinel, not a
+    // type; it was 43 until `F8_E4M3` took that value), and 255 is simply
+    // unknown. All three must fail closed, naming the discriminant, exactly as
+    // 40-43 used to.
+    for disc in [36_u32, 44, 255] {
         let bytes = reproducer(disc, N, 1024);
         let err = anamnesis::parse_gguf_bytes(bytes).unwrap_err();
         match err {

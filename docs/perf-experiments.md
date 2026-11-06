@@ -54,6 +54,7 @@ perf-claim change**. This file catalogs what's been tested.
 | 18 | Phase 7.7 what `F16` output actually costs, and whether the `aarch64` inlining failure explains it | **`F16` costs 2x-3x `BF16` at the SAME output width on x86-64 and server `aarch64`, and the inline is not the lever.** x86-64 2.02x-3.11x across seven kernels, server `aarch64` 2.10x-2.93x. Two mechanisms, same magnitude: x86-64 inlines the narrowing but `vcvtps2ph` takes a 128-bit source (**4 lanes** vs `BF16`'s **8**); `aarch64` does not inline it at all. Since x86-64 has the inline and still pays, the conversion is the cost, not the call. `F32` measured in passing at 1.09x-1.63x, *cheaper* than its 2x byte ratio, because it skips the narrowing entirely. **Apple Silicon is a third regime** (one M3 Pro, issue #11): `F16` 0.94x-2.59x with `bnb_int8` *faster* at `F16` than at `BF16`, and `F32` 0.51x-1.07x, strictly faster than `BF16` in four of seven families | Documented on `F16Out` / `F32Out` (v0.7.7, Phase 7.7); no fix attempted |
 | 19 | v0.7.8 close-out: sharing cold validation code between sibling kernels | **A refactor with no intended perf effect cost `gptq_int4_bf16` +69 % and `bnb_nf4` +4.5 to +6.5 %, and was reverted on those two paths.** Moving `GPTQ`'s entry validation into a shared helper: +69.4 / +68.8 / +75.2 / +73.8 / +71.1 % across five paired runs, `F32` / `F16` flat, not rescued by `#[inline]`. Adding a `checked_add` to `BnB`'s per-block `read_f32_le` and routing `dequantize_bnb4` through shared helpers: +4.50 % / +5.34 % (medians of 10); either change alone still regressed (+6.12 / +6.54 %, or +7.32 / +1.04 %), only reverting both is flat. Everything else in the release measured flat across all 21 arms (10 runs, every median within +/-1.5 %). **Code that is not in the hot loop can still decide the hot loop's codegen** | Reverted on `GPTQ` and plain `NF4` only (v0.7.8); what stays shared is the `GPTQ` / `AWQ` scale unpack, the `BnB` double-quant recovery and the encode-side helpers, which measured flat |
 | 20 | Phase 7.10: naming every `GgufType` in the dequant dispatcher instead of a wildcard arm | **A safety refactor cost `gguf_q4k_f16` +5.17 %, and the wildcard was kept.** Replacing the dispatcher's `_` arm with the eight scalar types by name (so a new variant could not compile without a kernel decision) moved `Q4_K` at `F16` by +5.17 % (10/10 flagged); `#[inline(never)]` on the three new kernels did not help (+5.21 %); restoring the wildcard measured -0.15 %, and the shipped code +0.46 %. The compile-time guarantee moved into an exhaustive test-only `match` | Wildcard kept; guard is a test (Phase 7.10 B2) |
+| 21 | Phase 7.11: `GGUF` `F8_E4M3` (one-element blocks), sink-call granularity and inlining | **One sink call per element cost 20-46 %, and inlining the new kernel moved an untouched one.** Runs of 256 elements beat the literal one-element-per-call shape by -25.9 % (`BF16`), -18.6 % (`F32`), -45.6 % (`F16`), 10/10 each. Inlined into the dispatcher, the kernel put `gguf_q1_0_f32` into a bimodal +2.5 % (median of 20, 14/20 flagged; identical code 0.00 %, 2/10); `#[inline(never)]` took every `GGUF` arm to -1.6 %…0.0 % and kept the kernel's whole gain | Runs of 256 + `#[inline(never)]` shipped |
 
 ---
 
@@ -1899,3 +1900,76 @@ this file.
 
 **Outcome.** The wildcard stays, with a comment citing this entry. The
 guarantee moved to the tests at no runtime cost.
+
+## Experiment 21: `GGUF` `F8_E4M3`, one-element blocks and an inlining side effect (Phase 7.11)
+
+**Question.** Upstream `ggml` added `GGML_TYPE_F8_E4M3 = 43`: one `OCP`
+`E4M3FN` byte per element, no scale, `blck_size = 1`. The public streaming
+contract of `dequantize_gguf_blocks` promised one sink call per block, which for
+this type is one call per element. Two shapes were built and timed: **A**, the
+contract taken literally (`run_block_kernel` with `QK = 1`), and **B**, runs of
+256 elements (the K-quant super-block length) with a shorter last run. Then,
+because any change inside a kernel module gets the paired check, B was compared
+against the parent commit on every other `GGUF` family.
+
+**Method.** `benches/ab.rs` (tango, paired, x86-64, ~2 % floor), new arms
+`gguf_f8_e4m3_{bf16,f32,f16}` on the synthetic 4096 x 11008 layer, 10 runs per
+comparison, `fp8_tensor_*` as the untouched control. B was compared against an
+export of A; the shipped candidate against an export of the parent `c80f707`
+filtered to `{gguf_q4k,gguf_nvfp4,gguf_q1_0,gguf_q2_0,fp8_tensor}_*`. RAM at its
+rated 3200 MT/s, checked before the first batch.
+
+**Results, B against A** (median, min / max, flagged):
+
+| Arm | B inlined | B `#[inline(never)]` (shipped) |
+|---|---|---|
+| `gguf_f8_e4m3_bf16` | -25.94 % (-26.64 / -23.32, 10/10) | -27.97 % (-28.67 / -19.64, 10/10) |
+| `gguf_f8_e4m3_f32` | -18.62 % (-20.27 / -13.10, 10/10) | -20.20 % (-21.12 / -19.01, 10/10) |
+| `gguf_f8_e4m3_f16` | -45.61 % (-46.76 / -43.89, 10/10) | -45.68 % (-46.34 / -44.70, 10/10) |
+
+In absolute terms B's `BF16` arm takes about 55 ms against A's 74 ms; the
+safetensors per-tensor `FP8` kernel (`fp8_tensor_bf16`, the same decode plus a
+scale multiply, with its own vectorised tile loop) takes about 39 ms, so there
+is head-room left that this phase did not chase.
+
+**Results, against the parent, `gguf_q1_0_f32`** (the one arm that moved):
+
+| Candidate | Median | Min / max | Flagged |
+|---|---|---|---|
+| B inlined, batch 1 (all families) | +2.66 % | -4.84 / +5.44 | 7/10 |
+| B inlined, batch 2 (`q1_0` only) | +1.23 % | -13.05 / +5.25 | 7/10 |
+| parent against parent (identical code) | 0.00 % | -1.36 / +2.84 | 2/10 |
+| B `#[inline(never)]`, batch 3 | -1.39 % | -4.42 / +0.29 | 3/10, all faster |
+| B `#[inline(never)]`, final sweep | -0.91 % | -11.21 / +0.64 | 2/10 |
+
+Inlined, the reading was bimodal: about half the runs at +2.4 % to +5.4 %, the
+rest at 0 to -13 %, and flags in both directions. Its combined median over 20
+runs is about +2.5 %, at the instrument's floor, but the identical-code row
+shows this arm does not normally behave that way. In the final sweep with the
+kernel out of line, every other arm's median was between -1.62 % and 0.00 %
+(`q4k`, `nvfp4`, `q1_0`, `q2_0` at all three widths) and the `FP8` control
+within -0.66 % / -0.41 % / -0.46 %.
+
+**What it says.** First, granularity is not free for a cheap decode: with one
+byte in and two out, a per-element sink call is the dominant cost, and the
+contract gained a stated exception for block-size-1 types rather than paying
+it. Second, Experiment 20's conclusion holds in a new form. There,
+`#[inline(never)]` on the new kernels did nothing, because the cost was the
+shape of the `match`; here the `match` shape is unchanged (the wildcard stays,
+one named arm is added) and the cost came from the kernel's body being inlined
+into the dispatcher, so keeping it out of line removed it. The `Q1_0` kernel's
+source is identical in every row. The call is once per tensor, so the
+out-of-line call costs nothing measurable.
+
+**A third question, from clippy.** `clippy::chunks_exact_to_as_chunks` asks
+for `data.as_chunks::<F8_E4M3_RUN>()` instead of `chunks_exact`. It is the
+loop's only chunked stream, so this was the whole of the lint's advice, not a
+partial migration. Against the `chunks_exact` shape (10 runs, same method):
+`BF16` **+3.76 %** (+2.62 / +4.50, 10/10), `F32` -2.49 % (-2.91 / -1.26, 5/10),
+`F16` +0.24 % (-1.34 / +1.49, 0/10), `fp8_tensor` control within ±0.5 %. One
+width faster, the default width slower, which is Experiment 17's lesson again;
+reverted under a `MEASURED-REVERT` comment.
+
+**Outcome.** Shipped: runs of 256 over `chunks_exact`, `#[inline(never)]`,
+comments at both attributes citing this entry, and the streaming contract
+documenting the exception with a test that pins the run lengths.

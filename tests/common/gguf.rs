@@ -45,6 +45,7 @@ pub fn gguf_type_from_disc(disc: u32) -> GgufType {
         40 => GgufType::NVFP4,
         41 => GgufType::Q1_0,
         42 => GgufType::Q2_0,
+        43 => GgufType::F8_E4M3,
         other => panic!("unknown ggml_type discriminant: {other}"),
     }
 }
