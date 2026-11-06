@@ -7,7 +7,7 @@
 A framework-agnostic Rust **library and CLI** for tensor-file work: parse
 `.safetensors`, `.gguf`, `.npz`, and PyTorch `.pth`; **dequantize** quantized
 weights back to bit-exact `BF16` (FP8 · GPTQ · AWQ · BitsAndBytes · NVIDIA NVFP4 ·
-all 25 GGUF block types); inspect any format header-only without loading weights; and convert
+all 26 GGUF quantised types); inspect any format header-only without loading weights; and convert
 between formats, all hardened for untrusted input.
 
 *Published on crates.io; pre-1.0, so the API may still evolve; see [CHANGELOG](CHANGELOG.md) and [ROADMAP](ROADMAP.md).*
@@ -213,7 +213,7 @@ Found an input that breaks this contract? Please report it privately, as
 | Format | Inspect | Parse | Dequantize → BF16 | Quantize | Convert to |
 |---|:---:|:---:|---|---|---|
 | **safetensors** | ✓ | ✓ | ✓ FP8 · GPTQ · AWQ · BitsAndBytes · NVFP4 | ✓ BnB-NF4 (Lethe) | safetensors · gguf · bnb-nf4 |
-| **GGUF** | ✓ | ✓ | ✓ all 25 block types | n/a | safetensors · gguf · bnb-nf4 |
+| **GGUF** | ✓ | ✓ | ✓ all 26 quantised types | n/a | safetensors · gguf · bnb-nf4 |
 | **NPZ** | ✓ | ✓ | n/a *(already full precision)* | n/a | safetensors · gguf · bnb-nf4 |
 | **PyTorch `.pth`** | ✓ | ✓ | n/a | n/a | safetensors · gguf · bnb-nf4 |
 

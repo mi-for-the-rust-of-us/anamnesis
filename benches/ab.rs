@@ -86,12 +86,13 @@
 //!
 //! # Coverage, and how to extend it
 //!
-//! All eleven synthetic-layer dequant families `dequant.rs` covers, at all
-//! three [`OutputElement`](anamnesis::OutputElement) widths: **33 arms**. The
+//! All twelve synthetic-layer dequant families `dequant.rs` covers, at all
+//! three [`OutputElement`](anamnesis::OutputElement) widths: **36 arms**. The
 //! four Phase 7.10 families (`GGUF` `NVFP4`, `Q1_0`, `Q2_0` and `ModelOpt`
 //! `NVFP4`) are what pulls `nvfp4` into the required features: a baseline
 //! exported before v0.7.10 has none of their arms, so compare those only
-//! against a baseline that does.
+//! against a baseline that does. Likewise `GGUF` `F8_E4M3` (Phase 7.11) has
+//! no arm in a baseline exported before v0.7.11.
 //!
 //! The `AWQ` / `GPTQ` pairing is the load-bearing one. Those two kernels are
 //! structurally identical apart from `AWQ`'s `AWQ_ORDER` scatter, they received
@@ -105,7 +106,7 @@
 //!
 //! # Running a subset
 //!
-//! A full pass is ~33 arms. When iterating on one kernel, filter — but **keep at
+//! A full pass is ~36 arms. When iterating on one kernel, filter — but **keep at
 //! least one untouched family in the filter as a control**:
 //!
 //! ```text

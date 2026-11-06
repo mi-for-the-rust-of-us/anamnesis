@@ -4,8 +4,8 @@
 //!
 //! One `criterion` benchmark group per kernel family
 //! (`FP8`, `GPTQ` 4-bit, `AWQ` 4-bit, `BnB` `NF4`, `BnB` `INT8`,
-//! `GGUF` `Q4_K`, and since Phase 7.10 `GGUF` `NVFP4` / `Q1_0` / `Q2_0`
-//! and `ModelOpt` `NVFP4`), measured on synthetic tensors sized like a real
+//! `GGUF` `Q4_K`, since Phase 7.10 `GGUF` `NVFP4` / `Q1_0` / `Q2_0`
+//! and `ModelOpt` `NVFP4`, and since Phase 7.11 `GGUF` `F8_E4M3`), measured on synthetic tensors sized like a real
 //! transformer layer (`4096 × 11008`). Plus one real-world group on
 //! the `Ollama`-distributed `llama3.2:1b` `Q8_0` slice the
 //! [`cross_validation_ollama`](../tests/cross_validation_ollama.rs) test
@@ -653,6 +653,42 @@ fn bench_gguf_q2_0(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// GGUF — F8_E4M3 (Phase 7.11)
+// ---------------------------------------------------------------------------
+
+fn bench_gguf_f8_e4m3(c: &mut Criterion) {
+    let n_elements: usize = LAYER_ELEMENTS;
+    // F8_E4M3: one byte per element, so any bytes are a valid tensor.
+    let raw = synth_bytes(n_elements);
+
+    let mut group = c.benchmark_group("dequant_gguf_f8_e4m3");
+    group.throughput(Throughput::Elements(n_elements as u64));
+    group.bench_function("synthetic_4096x11008", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf_to_bf16(black_box(&raw), GgufType::F8_E4M3, n_elements)
+                .expect("gguf f8_e4m3 dequant");
+            black_box(out);
+        });
+    });
+    // Width arms; see "Output-width arms" near the top of this file.
+    group.bench_function("synthetic_4096x11008_f32", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F32Out>(black_box(&raw), GgufType::F8_E4M3, n_elements)
+                .expect("gguf f8_e4m3 dequant f32");
+            black_box(out);
+        });
+    });
+    group.bench_function("synthetic_4096x11008_f16", |b| {
+        b.iter(|| {
+            let out = dequantize_gguf::<F16Out>(black_box(&raw), GgufType::F8_E4M3, n_elements)
+                .expect("gguf f8_e4m3 dequant f16");
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // NVFP4 — NVIDIA ModelOpt safetensors (Phase 7.10)
 // ---------------------------------------------------------------------------
 
@@ -761,6 +797,7 @@ criterion_group!(
     bench_gguf_nvfp4,
     bench_gguf_q1_0,
     bench_gguf_q2_0,
+    bench_gguf_f8_e4m3,
     bench_nvfp4_modelopt,
     bench_gguf_q8_0_ollama,
 );

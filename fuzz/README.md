@@ -247,3 +247,24 @@ scales, real companions, a `ModelOpt` layout) and with the real `NVFP4` fixture
 second are lower than in the runs above because the 37 KB real fixture is in
 every corpus; `fuzz_convert_bytes` reaching coverage 4895 (3286 before) is the
 `NVFP4` dequantisation path.
+
+**Phase 7.11 campaign (`GGUF` `F8_E4M3`, 2026-11-06)**, WSL2 Ubuntu, nightly +
+`cargo-fuzz` 0.13.1, 180 s per target, `-rss_limit_mb=2048 -timeout=10`, on
+`e97b263` (a clean tree): the parser now accepts `ggml_type` 43, and a new
+kernel dequantises it in 256-element runs with a ragged tail. Each
+GGUF-reaching target was seeded with a valid 600-element type-43 file (every
+code, two full runs and a short one) and the same file with a `.scale` beside
+the weight, which the `NVFP4` fold must leave alone (behind an all-`0xFF`
+limits prefix for `fuzz_gguf_limits`, and one seed per writer for
+`fuzz_convert_bytes`). The seed was also run through the CLI: `amn inspect`
+reports `F8_E4M3`, and `amn remember` writes a 600-element `BF16` tensor.
+
+| Target | Runs | Coverage | RSS | Result |
+|---|---:|---:|---:|---|
+| `fuzz_gguf` | 4.8 M | 811 | 184 MB | clean |
+| `fuzz_gguf_bytes` | 5.1 M | 825 | 378 MB | clean |
+| `fuzz_gguf_front_matter` | 6.0 M | 698 | 173 MB | clean |
+| `fuzz_gguf_limits` | 0.74 M | 880 | 383 MB | clean |
+| `fuzz_convert_bytes` | 0.41 M | 5169 | 437 MB | clean |
+
+**≈16.9 M executions, no crash, no timeout, no RSS overrun, no new artifact.**
