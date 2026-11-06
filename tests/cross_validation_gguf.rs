@@ -27,9 +27,10 @@
 //! the `TQ*` types and mainstream `MXFP4` only ships inside the 11 GB
 //! `gpt-oss-20b` upload; `gguf-py` quantises all three. `gguf-py` cannot
 //! quantise `NVFP4`, `Q1_0` or `Q2_0`, nor dequantise the last two, so their
-//! synthetic fixtures come from ggml's own C at llama.cpp `37b53fd`
-//! (`fixtures/gguf_reference/ggml_ref/`). Since Phase 7.10 the generator also
-//! checks **every** golden against that C, bit for bit, and all of them agree.
+//! synthetic fixtures come from ggml's own C (`fixtures/gguf_reference/ggml_ref/`,
+//! at llama.cpp `37b53fd` for Phase 7.10 and `1b6935b` since `F8_E4M3`). Since
+//! Phase 7.10 the generator also checks **every** golden against that C, bit for
+//! bit, and all of them agree. `F8_E4M3`'s fixture is exhaustive: all 256 codes.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -550,6 +551,30 @@ fn cross_validate_synthetic_q2_0() {
         "Synthetic Q2_0 (seed=42, ggml C)",
         include_bytes!("fixtures/gguf_reference/synthetic_q2_0.bin"),
         GgufType::Q2_0,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F8_E4M3 (ggml_type 43, llama.cpp `1b6935b`)
+// ---------------------------------------------------------------------------
+
+/// Every one of the 256 `E4M3FN` codes, tiled to 1061 elements (four
+/// 256-element runs and a 37-element tail, the two paths the kernel has). The
+/// golden is `dequantize_row_f8_e4m3` from ggml's C, and gguf-py's
+/// dequantisation agreed with it bit for bit when the fixture was made.
+///
+/// The two `NaN` codes (`0x7F`, `0xFF`) are where anamnesis and ggml differ in
+/// a bit that is not part of the contract: ggml returns a positive `NaN` for
+/// both, anamnesis keeps the sign, as the safetensors `FP8` path does. The
+/// comparison treats any two `NaN`s as equal, so that difference is invisible
+/// here; every other code must match exactly.
+#[test]
+fn cross_validate_exhaustive_f8_e4m3() {
+    run_cross_validation(
+        "Exhaustive F8_E4M3 (all 256 codes, ggml C)",
+        include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3.bin"),
+        GgufType::F8_E4M3,
         0,
     );
 }

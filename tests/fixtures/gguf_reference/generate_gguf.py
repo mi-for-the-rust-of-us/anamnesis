@@ -46,13 +46,15 @@ Models (download via ``hf-fm download-file --flat --output-dir models/``):
 ggml's C reference (Phase 7.10). `gguf-py` has no quantiser for NVFP4, Q1_0 or
 Q2_0 and no dequantiser for Q1_0 or Q2_0, so those fixtures come from ggml's own
 C (`quantize_row_*_ref` / `dequantize_row_*`), through the small `ggml_ref/`
-harness built by `ggml_ref/build.sh` at a pinned llama.cpp commit. When that
+harness built by `ggml_ref/build.sh` at a pinned llama.cpp commit (`1b6935b`
+since F8_E4M3, which takes every one of its 256 codes through
+`dequantize_row_f8_e4m3`; it was `37b53fd` before). When that
 binary is present, EVERY fixture is also checked against it: the `gguf-py`
 golden must equal ggml's C dequantisation of the same bytes, bit for bit, or the
 generator stops. Set `GGML_REF` to the binary if it is not at the default path.
 
 Usage:
-  pip install "git+https://github.com/ggml-org/llama.cpp@37b53fd4545847188fdad29e38ba57875efc8228#subdirectory=gguf-py" numpy
+  pip install "git+https://github.com/ggml-org/llama.cpp@1b6935b227b9f9aa89deea8016c0e208f547446f#subdirectory=gguf-py" numpy
   tests/fixtures/gguf_reference/ggml_ref/build.sh      # Linux / WSL
   python generate_gguf.py                  # every fixture
   python generate_gguf.py --only a,b       # only the named fixtures
@@ -186,6 +188,14 @@ C_REF_FIXTURES = [
 # the tensor's own `.scale`, which is written beside the fixture as 4 bytes.
 FOLDED_FIXTURES = [
     ("zeta21_nvfp4_folded", "zeta-2.1-NVFP4.gguf"),
+]
+
+# One byte per element with no scale (ggml_type 43), so the whole format is
+# 256 codes: the fixture is every code, tiled. 1061 = 4 × 256 + 37 elements, so
+# a kernel that works in 256-element runs meets both full runs and a ragged
+# tail. Golden = ggml's C; gguf-py's dequantisation must agree.
+EXHAUSTIVE_FIXTURES = [
+    ("exhaustive_f8_e4m3", GGMLQuantizationType.F8_E4M3, 4 * 256 + 37),
 ]
 
 GGML_REF = Path(os.environ.get("GGML_REF", "~/.cache/anamnesis-ggml-ref/ggml_ref")).expanduser()
@@ -459,6 +469,29 @@ def generate_c_ref_fixture(name: str, target_type: GGMLQuantizationType) -> None
     )
 
 
+def generate_exhaustive_fixture(name: str, target_type: GGMLQuantizationType, n: int) -> None:
+    """Every code of a one-byte, scale-free type, tiled to `n` elements.
+
+    The raw bytes need no quantiser: they are the codes 0..255 in order,
+    repeated. The golden is ggml's C (`to_float`), and gguf-py's dequantisation
+    must agree with it bit for bit, NaN codes included (both return +NaN).
+    """
+    raw = np.resize(np.arange(256, dtype=np.uint8), n)
+    raw_bytes = raw.tobytes()
+    f32 = np.frombuffer(ggml_ref("dequantize", target_type, n, raw_bytes), dtype=np.float32).copy()
+    py = dequantize(raw, target_type).astype(np.float32).reshape(-1)
+    assert np.array_equal(py.view(np.uint32), f32.view(np.uint32)), (
+        f"{name}: gguf-py and ggml's C disagree"
+    )
+    output_path = Path(__file__).parent / f"{name}.bin"
+    write_fixture_v2(output_path, target_type.value, n, raw_bytes, f32)
+    print(
+        f"  {name}: all 256 codes via ggml C, {target_type.name} "
+        f"(disc={target_type.value}), {n} elements, "
+        f"fixture={output_path.stat().st_size} B, gguf-py == C"
+    )
+
+
 def generate_folded_fixture(name: str, gguf_path: Path) -> None:
     """The `zeta21_nvfp4` slice with its tensor's per-tensor scale folded in.
 
@@ -540,6 +573,15 @@ if __name__ == "__main__":
                   f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
             continue
         generate_c_ref_fixture(name, target_type)
+
+    for name, target_type, n in EXHAUSTIVE_FIXTURES:
+        if only is not None and name not in only:
+            continue
+        if not GGML_REF.exists():
+            print(f"\n  SKIP {name}: needs the ggml C reference "
+                  f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
+            continue
+        generate_exhaustive_fixture(name, target_type, n)
 
     for name, filename in FOLDED_FIXTURES:
         if only is not None and name not in only:

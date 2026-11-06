@@ -6,7 +6,8 @@
 # Usage: tests/fixtures/gguf_reference/ggml_ref/build.sh
 #   Prints the path of the built binary on its last line.
 #   Needs git, cmake, gcc and g++ (Linux or WSL; it is how the Phase 7.10
-#   fixtures were made, under WSL2 Ubuntu 24.04).
+#   fixtures were made, under WSL2 Ubuntu 24.04). Pinned at 37b53fd until
+#   F8_E4M3 (ggml_type 43) needed 1b6935b; every golden was re-checked there.
 #
 # The checkout and build live OUTSIDE the repository, in $GGML_REF_DIR
 # (default ~/.cache/anamnesis-ggml-ref), so nothing here is ever packaged.
@@ -16,7 +17,7 @@
 # reference is the portable C exactly as written.
 set -euo pipefail
 
-COMMIT=37b53fd4545847188fdad29e38ba57875efc8228
+COMMIT=1b6935b227b9f9aa89deea8016c0e208f547446f
 OUT="${GGML_REF_DIR:-$HOME/.cache/anamnesis-ggml-ref}"
 SRC="$OUT/llama.cpp"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
