@@ -653,63 +653,81 @@ impl fmt::Display for GgufType {
 }
 
 // ---------------------------------------------------------------------------
-// NVFP4 second-level scales
+// Per-tensor scales of the scaled low-precision types (NVFP4, F8_E4M3)
 // ---------------------------------------------------------------------------
 
-/// How one `NVFP4` weight is paired with its per-tensor scale tensor.
+/// Whether `dtype` is one of the types whose weight upstream `ggml` stores
+/// beside a separate per-tensor scale: `NVFP4` (Phase 7.10) and `F8_E4M3`
+/// (Phase 7.11). llama.cpp calls these "scaled low precision"
+/// (`is_scaled_low_precision` in `llama-graph.cpp`).
+const fn takes_tensor_scale(dtype: GgufType) -> bool {
+    matches!(dtype, GgufType::NVFP4 | GgufType::F8_E4M3)
+}
+
+/// How one scaled low-precision weight is paired with its per-tensor scale
+/// tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Nvfp4ScalePair {
+pub(crate) struct TensorScalePair {
     /// Index of the `<stem>.scale` tensor in the same tensor list.
     pub(crate) scale: usize,
     /// Weight elements each scale value covers: the whole tensor for a
     /// one-element scale, one expert's slab for a per-expert scale. Always a
-    /// non-zero multiple of the `NVFP4` block size (64), so a dequantised
-    /// block never straddles two scales.
+    /// non-zero multiple of the weight type's block size (64 for `NVFP4`, 1
+    /// for `F8_E4M3`), so a dequantised block never straddles two scales.
     pub(crate) slab: usize,
 }
 
-/// Pairs every `NVFP4` weight with the per-tensor scale `ggml` keeps beside it.
+/// Pairs every scaled low-precision weight (`NVFP4`, `F8_E4M3`) with the
+/// per-tensor scale `ggml` keeps beside it.
 ///
-/// NVIDIA's `NVFP4` scales twice: each 16-element sub-block carries a `UE4M3`
-/// scale inside the block, which the kernel applies, and the whole tensor
-/// carries a second `F32` scale, which `convert_hf_to_gguf.py` writes as a
-/// separate `<stem>.scale` tensor (`weight_scale_2` in the source checkpoint).
-/// llama.cpp applies it at inference time, multiplying each matmul result by it
-/// (`llama-graph.cpp`, `build_lora_mm`; loaded as an optional
-/// `"<stem>.scale"` in `llama-model.cpp`), so the model's weight is the
-/// dequantised block times that factor. On `zeta-2.1-NVFP4.gguf` the factors
-/// run from about `9e-5` to `2e-3`: leaving them out is not a rounding
-/// difference.
+/// Both types keep a second, per-tensor `F32` factor outside the weight, which
+/// the converter writes as a separate `<stem>.scale` tensor and llama.cpp
+/// applies at inference time, multiplying each matmul result by it
+/// (`llama-graph.cpp`, `build_lora_mm`; loaded as an optional `"<stem>.scale"`
+/// in `llama-model.cpp`), so the model's weight is the dequantised value times
+/// that factor.
+///
+/// - **`NVFP4`** scales twice: each 16-element sub-block carries a `UE4M3`
+///   scale inside the block, which the kernel applies, and the whole tensor
+///   carries `weight_scale_2` from the source checkpoint as `<stem>.scale`. On
+///   `zeta-2.1-NVFP4.gguf` the factors run from about `9e-5` to `2e-3`: leaving
+///   them out is not a rounding difference.
+/// - **`F8_E4M3`** has no scale inside the element, so its whole scale is the
+///   checkpoint's per-tensor `weight_scale`, which the converter keeps as
+///   `<stem>.scale` when it preserves an `FP8` weight (`conversion/base.py` at
+///   llama.cpp `1b6935b`; it omits the tensor when every value is 1).
 ///
 /// The pairing is deliberately narrow, because llama.cpp also uses `*.scale`
 /// for unrelated per-architecture scales. A tensor `<stem>.weight` is paired
-/// with `<stem>.scale` only when the weight is `NVFP4`, the scale is `F32`, and
-/// the scale is either
+/// with `<stem>.scale` only when the weight is `NVFP4` or `F8_E4M3`, the scale
+/// is `F32`, and the scale is either
 ///
 /// - a single element, scaling the whole weight, or
 /// - one-dimensional with one value per slice of the weight's outermost
 ///   dimension (the expert axis of a mixture-of-experts tensor, `{n_expert}`
-///   upstream), each slice being a whole number of 64-element blocks.
+///   upstream), each slice being a whole number of the weight's blocks.
 ///
-/// Anything else is left alone, scale and weight alike. Shapes are in `GGUF`
-/// order (innermost first). Both `inspect` and the `convert` hub decide with
-/// this one function, so the size `inspect` reports and the tensors `remember`
-/// writes cannot disagree about which scales were folded away.
+/// Anything else is left alone, scale and weight alike. `<stem>.input_scale`,
+/// the activation scale both converters may also write, is never paired: it
+/// scales the input, not the weight. Shapes are in `GGUF` order (innermost
+/// first). Both `inspect` and the `convert` hub decide with this one function,
+/// so the size `inspect` reports and the tensors `remember` writes cannot
+/// disagree about which scales were folded away.
 ///
 /// Returns a map from weight index to its pair; empty, after one pass and no
-/// allocation, for a file with no `NVFP4` tensor.
-pub(crate) fn nvfp4_scale_pairs<'a, I>(tensors: I) -> HashMap<usize, Nvfp4ScalePair>
+/// allocation, for a file with neither type.
+pub(crate) fn tensor_scale_pairs<'a, I>(tensors: I) -> HashMap<usize, TensorScalePair>
 where
     I: IntoIterator<Item = (&'a str, GgufType, &'a [usize])>,
     I::IntoIter: Clone,
 {
     let tensors = tensors.into_iter();
     let mut pairs = HashMap::new();
-    // One allocation-free pass first: every `GGUF` without `NVFP4` (all of
+    // One allocation-free pass first: every `GGUF` with neither type (all of
     // them before Phase 7.10) stops here, on `inspect`'s per-file path.
     if !tensors
         .clone()
-        .any(|(_, dtype, _)| dtype == GgufType::NVFP4)
+        .any(|(_, dtype, _)| takes_tensor_scale(dtype))
     {
         return pairs;
     }
@@ -720,7 +738,7 @@ where
         .map(|(i, &(name, _, _))| (name, i))
         .collect();
     for (i, &(name, dtype, shape)) in all.iter().enumerate() {
-        if dtype != GgufType::NVFP4 {
+        if !takes_tensor_scale(dtype) {
             continue;
         }
         let Some(stem) = name.strip_suffix(".weight") else {
@@ -735,16 +753,20 @@ where
         if scale_dtype != GgufType::F32 {
             continue;
         }
-        if let Some(slab) = nvfp4_scale_slab(shape, scale_shape) {
-            pairs.insert(i, Nvfp4ScalePair { scale, slab });
+        if let Some(slab) = tensor_scale_slab(dtype, shape, scale_shape) {
+            pairs.insert(i, TensorScalePair { scale, slab });
         }
     }
     pairs
 }
 
 /// The number of weight elements each scale value covers, or `None` when the
-/// scale's shape is not one `nvfp4_scale_pairs` folds.
-fn nvfp4_scale_slab(weight_shape: &[usize], scale_shape: &[usize]) -> Option<usize> {
+/// scale's shape is not one `tensor_scale_pairs` folds for a `dtype` weight.
+fn tensor_scale_slab(
+    dtype: GgufType,
+    weight_shape: &[usize],
+    scale_shape: &[usize],
+) -> Option<usize> {
     let weight_elements = checked_num_elements(weight_shape)?;
     let scale_elements = checked_num_elements(scale_shape)?;
     let slab = if scale_elements == 1 {
@@ -758,7 +780,7 @@ fn nvfp4_scale_slab(weight_shape: &[usize], scale_shape: &[usize]) -> Option<usi
         }
         weight_elements.checked_div(outer)?
     };
-    let block = GgufType::NVFP4.block_size();
+    let block = dtype.block_size();
     (slab != 0 && slab.is_multiple_of(block)).then_some(slab)
 }
 
@@ -2889,12 +2911,12 @@ fn build_inspect_info(
     // O(n × d) to O(n). `dtypes` still records first-occurrence order.
     let mut seen = [false; GGUF_TYPE_COUNT];
     let mut dtypes: Vec<GgufType> = Vec::new();
-    // `NVFP4` per-tensor scales that `remember` / `convert` fold into their
-    // weights and then leave out of the output (see `nvfp4_scale_pairs`). They
-    // are excluded from `dequantized_size` by the same rule, so the figure a
-    // host gates on is the one the hub is charged. Empty, and never probed
-    // per tensor, for a file without `NVFP4`.
-    let folded_scales: std::collections::HashSet<usize> = nvfp4_scale_pairs(
+    // `NVFP4` / `F8_E4M3` per-tensor scales that `remember` / `convert` fold
+    // into their weights and then leave out of the output (see
+    // `tensor_scale_pairs`). They are excluded from `dequantized_size` by the
+    // same rule, so the figure a host gates on is the one the hub is charged.
+    // Empty, and never probed per tensor, for a file with neither type.
+    let folded_scales: std::collections::HashSet<usize> = tensor_scale_pairs(
         tensor_infos
             .iter()
             .map(|info| (info.name.as_str(), info.dtype, info.shape.as_slice())),

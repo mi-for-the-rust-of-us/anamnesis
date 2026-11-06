@@ -198,6 +198,15 @@ EXHAUSTIVE_FIXTURES = [
     ("exhaustive_f8_e4m3", GGMLQuantizationType.F8_E4M3, 4 * 256 + 37),
 ]
 
+# F8_E4M3 with a per-expert scale folded in, as `remember` / `convert` write it
+# (Phase 7.11): every code, over three experts of 7 x 61 = 427 elements, so no
+# expert slab is a multiple of the kernel's 256-element run. Golden = ggml's C
+# decode times each expert's `f32` scale; the scales are written beside the
+# fixture as `<name>.scale` (three little-endian `f32`).
+F8_FOLDED_FIXTURES = [
+    ("exhaustive_f8_e4m3_folded", 427, (3.0e-4, 0.0123, 1.75)),
+]
+
 GGML_REF = Path(os.environ.get("GGML_REF", "~/.cache/anamnesis-ggml-ref/ggml_ref")).expanduser()
 
 
@@ -496,7 +505,7 @@ def generate_folded_fixture(name: str, gguf_path: Path) -> None:
     """The `zeta21_nvfp4` slice with its tensor's per-tensor scale folded in.
 
     `remember` / `convert` multiply an NVFP4 weight by its `<stem>.scale` (see
-    `nvfp4_scale_pairs` in src/parse/gguf.rs). The golden here is gguf-py's
+    `tensor_scale_pairs` in src/parse/gguf.rs). The golden here is gguf-py's
     dequantisation times that scale as an `f32`, which is what folding must
     produce; the C reference, times the same scale, must agree. The scale is
     written beside the fixture as `<name>.scale` (4 bytes, little-endian f32)
@@ -530,6 +539,35 @@ def generate_folded_fixture(name: str, gguf_path: Path) -> None:
     print(
         f"  {name}: tensor={tensor.name} x {scale_name}={float(scale):.9g}, "
         f"{SLICE_ELEMENTS} elements, fixture={output_path.stat().st_size} B, {c_note}"
+    )
+
+
+def generate_f8_folded_fixture(name: str, slab: int, scales: tuple[float, ...]) -> None:
+    """Every `F8_E4M3` code over `len(scales)` expert slabs, each scale folded in.
+
+    The golden is ggml's C (`to_float`) times `np.float32(scale)` per slab, one
+    `f32` multiply, which is what folding must produce; gguf-py's
+    dequantisation must agree with the C decode first.
+    """
+    target_type = GGMLQuantizationType.F8_E4M3
+    n = slab * len(scales)
+    raw = np.resize(np.arange(256, dtype=np.uint8), n)
+    raw_bytes = raw.tobytes()
+    decoded = np.frombuffer(ggml_ref("dequantize", target_type, n, raw_bytes), dtype=np.float32)
+    py = dequantize(raw, target_type).astype(np.float32).reshape(-1)
+    assert np.array_equal(py.view(np.uint32), decoded.view(np.uint32)), (
+        f"{name}: gguf-py and ggml's C disagree"
+    )
+    per_element = np.repeat(np.asarray(scales, dtype=np.float32), slab)
+    f32 = (decoded * per_element).astype(np.float32)
+    output_path = Path(__file__).parent / f"{name}.bin"
+    write_fixture_v2(output_path, target_type.value, n, raw_bytes, f32)
+    (Path(__file__).parent / f"{name}.scale").write_bytes(
+        struct.pack(f"<{len(scales)}f", *scales)
+    )
+    print(
+        f"  {name}: all 256 codes x {len(scales)} expert scales {scales}, slab {slab}, "
+        f"{n} elements, fixture={output_path.stat().st_size} B, gguf-py == C"
     )
 
 
@@ -582,6 +620,15 @@ if __name__ == "__main__":
                   f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
             continue
         generate_exhaustive_fixture(name, target_type, n)
+
+    for name, slab, scales in F8_FOLDED_FIXTURES:
+        if only is not None and name not in only:
+            continue
+        if not GGML_REF.exists():
+            print(f"\n  SKIP {name}: needs the ggml C reference "
+                  f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
+            continue
+        generate_f8_folded_fixture(name, slab, scales)
 
     for name, filename in FOLDED_FIXTURES:
         if only is not None and name not in only:

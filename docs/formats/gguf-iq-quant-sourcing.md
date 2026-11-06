@@ -73,6 +73,7 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `Q1_0` | `synthetic_q1_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
 | `Q2_0` | `synthetic_q2_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
 | `F8_E4M3` | `exhaustive_f8_e4m3.bin` | **exhaustive**: all 256 codes tiled to 1061 elements, golden from ggml's C; `gguf-py`'s dequantise agrees | already (no download) |
+| `F8_E4M3` (scales folded) | `exhaustive_f8_e4m3_folded.bin` + `.scale` | all 256 codes over three 427-element experts, golden = ggml's C decode times each expert's scale, as `remember` writes it | already (no download) |
 
 ### Pending kernels
 

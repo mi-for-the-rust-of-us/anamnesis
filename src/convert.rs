@@ -275,8 +275,9 @@ pub struct ConvertStats {
     pub quantized: usize,
     /// Tensors written in their incoming dtype.
     pub passthrough: usize,
-    /// `GGUF` `NVFP4` per-tensor scales folded into their weights while
-    /// dequantising, and therefore not written (Phase 7.10). Each one is a
+    /// `GGUF` per-tensor scales folded into their weights while dequantising,
+    /// and therefore not written: `NVFP4`'s (Phase 7.10) and `F8_E4M3`'s
+    /// (Phase 7.11). Each one is a
     /// `<stem>.scale` tensor whose factor now lives in `<stem>.weight`; see
     /// `ParsedGguf::remember` (a plain span: `ParsedGguf` exists only with the
     /// `gguf` feature, and this struct exists in every build). Always `0` for
@@ -312,8 +313,9 @@ pub(crate) struct Hub {
     pub(crate) st_metadata: Option<HashMap<String, String>>,
     /// Tensors dequantised while reading.
     pub(crate) dequantized: usize,
-    /// `NVFP4` per-tensor scales folded into their weights and left out of
-    /// `tensors` (a `GGUF` source only; `0` for every other reader).
+    /// `NVFP4` / `F8_E4M3` per-tensor scales folded into their weights and
+    /// left out of `tensors` (a `GGUF` source only; `0` for every other
+    /// reader).
     pub(crate) folded_scales: usize,
     /// `GGUF` key/value metadata carried from a `GGUF` source so a
     /// dequantise-in-place `gguf → gguf` keeps the architecture / tokenizer KV
@@ -1333,10 +1335,11 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
     // reader has always had.
     let views: Vec<crate::GgufTensor<'_>> = parsed.tensors().collect();
 
-    // `NVFP4` weights whose per-tensor scale is folded in below, and the scale
-    // tensors that are then left out of the hub (Phase 7.10). The same rule
-    // `inspect` applies to `dequantized_size`; see `nvfp4_scale_pairs`.
-    let scale_pairs = crate::parse::gguf::nvfp4_scale_pairs(
+    // `NVFP4` (Phase 7.10) and `F8_E4M3` (Phase 7.11) weights whose per-tensor
+    // scale is folded in below, and the scale tensors that are then left out of
+    // the hub. The same rule `inspect` applies to `dequantized_size`; see
+    // `tensor_scale_pairs`.
+    let scale_pairs = crate::parse::gguf::tensor_scale_pairs(
         views.iter().map(|view| (view.name, view.dtype, view.shape)),
     );
     let folded: std::collections::HashSet<usize> =
@@ -1423,7 +1426,33 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
                             .iter()
                             .map(|&word| f32::from_le_bytes(word))
                             .collect();
-                        dequantize_nvfp4_scaled::<E>(&tensor.data, n_elements, &scales, pair.slab)?
+                        // EXHAUSTIVE: `tensor_scale_pairs` pairs only `NVFP4`
+                        // and `F8_E4M3` weights; the wildcard is that
+                        // invariant failing, reported rather than assumed.
+                        #[allow(clippy::wildcard_enum_match_arm)]
+                        match tensor.dtype {
+                            crate::GgufType::NVFP4 => dequantize_nvfp4_scaled::<E>(
+                                &tensor.data,
+                                n_elements,
+                                &scales,
+                                pair.slab,
+                            )?,
+                            crate::GgufType::F8_E4M3 => dequantize_f8_e4m3_scaled::<E>(
+                                &tensor.data,
+                                n_elements,
+                                &scales,
+                                pair.slab,
+                            )?,
+                            other => {
+                                return Err(AnamnesisError::Parse {
+                                    reason: format!(
+                                        "GGUF tensor `{}`: per-tensor scale paired with \
+                                         {other}, which has no scaled dequantisation",
+                                        tensor.name
+                                    ),
+                                });
+                            }
+                        }
                     }
                     None => crate::dequantize_gguf::<E>(&tensor.data, tensor.dtype, n_elements)?,
                 };
@@ -1488,7 +1517,7 @@ pub(crate) fn hub_from_gguf<E: crate::OutputElement>(
 /// would be gigabytes the hub's limit charge never accounted for. Peak heap is
 /// the output buffer alone, the figure `check_materialised` was charged.
 ///
-/// `slab` comes from `nvfp4_scale_pairs`, which guarantees a non-zero multiple
+/// `slab` comes from `tensor_scale_pairs`, which guarantees a non-zero multiple
 /// of the 64-element block, so no block straddles two scales.
 ///
 /// # Errors
@@ -1551,6 +1580,97 @@ fn dequantize_nvfp4_scaled<E: crate::OutputElement>(
             Ok(())
         },
     )?;
+    Ok(out)
+}
+
+/// Dequantises one `F8_E4M3` weight and folds its per-tensor scale in
+/// (Phase 7.11).
+///
+/// The same contract as [`dequantize_nvfp4_scaled`]: the public kernel decodes
+/// at `f32`, each value is multiplied by the scale covering it, and the product
+/// is narrowed to `E` once, so the result is ggml's `dequantize_row_f8_e4m3`
+/// times `np.float32(scale)` rounded once to `E`.
+///
+/// One difference in shape, on purpose. `F8_E4M3`'s block is a single element
+/// and the kernel delivers it in runs of up to 256, while a per-expert slab may
+/// be any whole number of elements, so a run could straddle two scales. The
+/// kernel is therefore called once per slab, on that slab's bytes alone (one
+/// byte per element), and every run it hands back lies inside one scale.
+///
+/// Streaming, like the `NVFP4` fold: peak heap is the output buffer alone.
+///
+/// # Errors
+///
+/// Returns [`AnamnesisError::Parse`] if the output size overflows `usize`, if
+/// the weight's bytes do not match its element count, if the scales do not
+/// cover the weight in whole slabs, or if the kernel hands back a run longer
+/// than the fold's buffer.
+#[cfg(feature = "gguf")]
+fn dequantize_f8_e4m3_scaled<E: crate::OutputElement>(
+    data: &[u8],
+    n_elements: usize,
+    scales: &[f32],
+    slab: usize,
+) -> crate::Result<Vec<u8>> {
+    use crate::remember::output::MAX_OUTPUT_BYTES;
+    // The longest run `dequantize_gguf_blocks` hands an `F8_E4M3` sink
+    // (`F8_E4M3_RUN` in `remember::gguf`). A longer one is refused below rather
+    // than indexed, so the two constants cannot drift into a panic.
+    const RUN: usize = 256;
+    let out_len = n_elements
+        .checked_mul(E::BYTES)
+        .ok_or_else(|| AnamnesisError::Parse {
+            reason: format!(
+                "F8_E4M3 output size {n_elements}×{} overflows usize",
+                E::BYTES
+            ),
+        })?;
+    if data.len() != n_elements {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "F8_E4M3 weight of {} bytes for {n_elements} elements (expected one byte each)",
+                data.len()
+            ),
+        });
+    }
+    if slab == 0 || slab.checked_mul(scales.len()) != Some(n_elements) {
+        return Err(AnamnesisError::Parse {
+            reason: format!(
+                "F8_E4M3 scales do not cover the weight ({} values of {slab} elements \
+                 for {n_elements} elements)",
+                scales.len()
+            ),
+        });
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(out_len);
+    let mut folded_run = [0.0_f32; RUN];
+    let mut narrowed = [0u8; RUN * MAX_OUTPUT_BYTES];
+    for (slab_bytes, &scale) in data.chunks_exact(slab).zip(scales) {
+        crate::dequantize_gguf_blocks::<crate::F32Out, _>(
+            slab_bytes,
+            crate::GgufType::F8_E4M3,
+            slab,
+            |run| {
+                let words = run.as_chunks::<4>().0;
+                let too_long = || AnamnesisError::Parse {
+                    reason: format!(
+                        "F8_E4M3 run of {} values, longer than the fold's {RUN}",
+                        words.len()
+                    ),
+                };
+                let dst = folded_run.get_mut(..words.len()).ok_or_else(too_long)?;
+                for (value, &word) in dst.iter_mut().zip(words) {
+                    *value = f32::from_le_bytes(word) * scale;
+                }
+                let bytes = narrowed
+                    .get_mut(..words.len() * E::BYTES)
+                    .ok_or_else(too_long)?;
+                E::write_scratch(dst, bytes);
+                out.extend_from_slice(bytes);
+                Ok(())
+            },
+        )?;
+    }
     Ok(out)
 }
 

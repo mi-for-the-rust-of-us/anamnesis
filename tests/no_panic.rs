@@ -270,11 +270,28 @@ fn new_gguf_type_inputs() -> Vec<(String, Vec<u8>)> {
                 (S, &[1], F32, f32_bytes(&[0.5])),
             ]),
         ),
+        // F8_E4M3 scales fold like NVFP4's (Phase 7.11): one value, one per
+        // expert over slabs that straddle the kernel's 256-element runs, and a
+        // scale with one value too many, which the fold must leave alone.
         (
             "43+scale",
             crafted_gguf(&[
                 (W, &[600], F8_E4M3, patterned(600)),
                 (S, &[1], F32, f32_bytes(&[0.5])),
+            ]),
+        ),
+        (
+            "43+scale-per-expert",
+            crafted_gguf(&[
+                (W, &[7, 61, 3], F8_E4M3, patterned(1281)),
+                (S, &[3], F32, f32_bytes(&[0.5, f32::NAN, f32::INFINITY])),
+            ]),
+        ),
+        (
+            "43+scale-extra",
+            crafted_gguf(&[
+                (W, &[7, 61, 3], F8_E4M3, patterned(1281)),
+                (S, &[4], F32, f32_bytes(&[0.5, 1.0, 2.0, 4.0])),
             ]),
         ),
     ];

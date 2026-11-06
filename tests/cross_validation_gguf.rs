@@ -17,8 +17,8 @@
 //! Coverage: **26 of 26** production kernels, from 5 real models, 6
 //! synthetic fixtures and one exhaustive one (`F8_E4M3`, all 256 codes) (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
 //! `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
-//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`, `F8_E4M3`), plus the `NVFP4` per-tensor scale
-//! fold through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
+//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`, `F8_E4M3`), plus the `NVFP4` and
+//! `F8_E4M3` per-tensor scale folds through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
 //! model; they are internal `llama.cpp` activation quant types, covered by unit
 //! tests.
 //!
@@ -648,6 +648,95 @@ fn cross_validate_zeta21_nvfp4_folded_through_convert() {
         assert_eq!(
             mismatches, 0,
             "{dtype:?}: {mismatches} bytes differ from the golden"
+        );
+    }
+}
+
+/// Every `F8_E4M3` code over three experts, each with its own per-tensor scale
+/// folded in, through the public `convert_bytes` path that `remember` shares
+/// (Phase 7.11).
+///
+/// The golden is ggml's C decode times each expert's `f32` scale (and
+/// `gguf-py`'s decode agreed with the C at generation time). Each expert is
+/// 7 × 61 = 427 elements, so no expert boundary falls on the kernel's
+/// 256-element runs: a fold that let a run straddle two scales fails here. Any
+/// two `NaN`s compare equal, as everywhere in this file; every other value
+/// must match exactly, at `F32` and at `BF16`.
+#[test]
+fn cross_validate_exhaustive_f8_e4m3_folded_through_convert() {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+
+    let fixture = parse_gguf_fixture(
+        include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3_folded.bin"),
+        GgufType::F8_E4M3,
+    );
+    let scales: &[u8] = include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3_folded.scale");
+    assert_eq!(scales.len(), 3 * 4, "three f32 expert scales");
+
+    let weight_dims = [7_u64, 61, 3];
+    let scale_dims = [3_u64];
+    let mut data = fixture.raw_data.clone();
+    let scale_offset = data.len().div_ceil(32) * 32;
+    data.resize(scale_offset, 0);
+    data.extend_from_slice(scales);
+    let bytes = raw_gguf(
+        &[],
+        &[
+            RawTensorInfo {
+                name: "blk.0.ffn_up_exps.weight",
+                dims: &weight_dims,
+                ggml_type: 43,
+                offset: 0,
+            },
+            RawTensorInfo {
+                name: "blk.0.ffn_up_exps.scale",
+                dims: &scale_dims,
+                ggml_type: 0,
+                offset: scale_offset as u64,
+            },
+        ],
+        32,
+        &data,
+    );
+
+    let f32_is_nan = |w: &[u8]| f32::from_le_bytes([w[0], w[1], w[2], w[3]]).is_nan();
+    let bf16_is_nan = |w: &[u8]| {
+        let bits = u16::from_le_bytes([w[0], w[1]]);
+        bits & 0x7F80 == 0x7F80 && bits & 0x007F != 0
+    };
+    for (dtype, golden, width) in [
+        (anamnesis::Dtype::F32, &fixture.expected_f32, 4_usize),
+        (anamnesis::Dtype::BF16, &fixture.expected_bf16, 2),
+    ] {
+        let options = anamnesis::ConvertOptions::new().with_output_dtype(dtype);
+        let (st, stats) =
+            anamnesis::convert_bytes(&bytes, anamnesis::ConvertTarget::Safetensors, &options)
+                .unwrap();
+        assert_eq!(stats.folded_scales, 1, "{dtype:?}");
+        let st = safetensors::SafeTensors::deserialize(&st).unwrap();
+        assert!(
+            st.tensor("blk.0.ffn_up_exps.scale").is_err(),
+            "the folded scale is not written"
+        );
+        let weight = st.tensor("blk.0.ffn_up_exps.weight").unwrap();
+        assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        let is_nan = |w: &[u8]| {
+            if width == 4 {
+                f32_is_nan(w)
+            } else {
+                bf16_is_nan(w)
+            }
+        };
+        let mismatches = weight
+            .data()
+            .chunks_exact(width)
+            .zip(golden.chunks_exact(width))
+            .filter(|(a, e)| a != e && !(is_nan(a) && is_nan(e)))
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "{dtype:?}: {mismatches} of {} values differ from the golden",
+            fixture.n_elements
         );
     }
 }

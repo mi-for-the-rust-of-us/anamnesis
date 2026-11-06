@@ -178,7 +178,7 @@ Every `NVFP4` weight scales twice. Each 16-element sub-block carries a scale ins
 $ amn remember zeta-2.1-NVFP4.gguf -o zeta-bf16.safetensors
 Converting zeta-2.1-NVFP4.gguf → zeta-bf16.safetensors
   740 tensors
-  225 NVFP4 per-tensor scales folded into their weights
+  225 per-tensor scales folded into their weights
   Output: zeta-bf16.safetensors
 ```
 
@@ -193,6 +193,6 @@ If you call the library per tensor instead (`ParsedGguf::dequantize_tensor_as`),
 - A `Q4_K_M` file is a mix of block types, and the tensors GGUF left in `F32` simply pass through untouched.
 - Dequantization trades size for compatibility (here 99 MB → 257 MB), so check the numbers up front.
 - `amn convert --out-dtype f32` (v0.7.3) and `amn remember --to f32` (v0.7.4) skip the `BF16` narrowing entirely when you need the reference `float32`, at twice the bytes and ~1.5× the time.
-- An `NVFP4` weight comes with a second, per-tensor scale; `remember` and `convert` fold it in, so the file you load holds the model's actual weights (v0.7.10).
+- An `NVFP4` weight comes with a second, per-tensor scale; `remember` and `convert` fold it in, so the file you load holds the model's actual weights (v0.7.10). A scaled `F8_E4M3` weight gets the same treatment (v0.7.11).
 
 For the safety angle — what to do when the file came from somewhere you don't trust — see [Inspect before you parse (untrusted input)](inspect-before-you-parse.md) and the FAQ on [parsing untrusted input](../FAQ.md#parsing-untrusted-input). For the other input formats (FP8 / GPTQ / AWQ / BitsAndBytes safetensors), the same `amn remember` command applies — only the source scheme differs. And to change *container* rather than just recover precision — GGUF → `bnb-nf4`, or writing a scalar GGUF with your own metadata — see [Convert a model between formats](convert-between-formats.md).

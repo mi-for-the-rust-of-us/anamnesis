@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scale; `0x7F` and `0xFF` decode to `NaN`, and there are no infinities.
   `GgufType` gains `F8_E4M3`; it is `#[non_exhaustive]`, so this is not a
   breaking change.
+- **`F8_E4M3` weights are written with their per-tensor scale applied**, as
+  `NVFP4` weights have been since v0.7.10. llama.cpp's converter keeps a
+  per-tensor-scaled `FP8` weight as `F8_E4M3` and writes its `weight_scale`
+  beside it as `<stem>.scale` (one value, or one per expert), which llama.cpp
+  multiplies in at inference time. `remember` and `convert` now fold it into
+  the weight under the same narrow rule as `NVFP4`'s, leave it out of the
+  output, and count it in `ConvertStats::folded_scales`; `inspect` reports
+  the size of that output. Without the fold, such a file's weights would
+  have been written without their scale. Cross-validated on all 256 codes
+  over three experts against ggml's C decode times each expert's scale.
+  The CLI line now reads "N per-tensor scales folded into their weights",
+  without naming `NVFP4`.
 - **Cross-validated on every code.** The fixture holds all 256 `E4M3FN` codes,
   and its golden is `dequantize_row_f8_e4m3` from ggml's own C at `1b6935b`;
   `gguf-py` agrees with it bit for bit. anamnesis matches at 0 `ULP` in `BF16`
