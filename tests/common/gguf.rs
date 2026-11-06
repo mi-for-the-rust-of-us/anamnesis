@@ -13,7 +13,7 @@ use super::bf16::compare_bf16;
 
 /// Maps a `ggml_type` discriminant to a [`GgufType`].
 ///
-/// Maps all 27 block types. The 25 production kernels are cross-validated by
+/// Maps all 28 quantised types. The 26 production kernels are cross-validated by
 /// `cross_validation_gguf.rs`; `Q8_1` and `Q8_K` (intermediate formats with no
 /// shipped models) are covered by unit tests instead.
 pub fn gguf_type_from_disc(disc: u32) -> GgufType {

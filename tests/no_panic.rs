@@ -22,7 +22,8 @@
 //! `ggml_type` 40, 41 and 42 (with every shape of `NVFP4` per-tensor `.scale`
 //! the fold applies or must leave alone), crafted and real `ModelOpt` `NVFP4`
 //! safetensors, and the new public kernels called directly with lengths and
-//! shapes that disagree.
+//! shapes that disagree. Phase 7.11 added `ggml_type` 43 (`F8_E4M3`) to both
+//! the crafted files and the direct kernel calls.
 //!
 //! Two boundaries are deliberate, not omissions:
 //! - **`SIGBUS` is out of scope by nature.** The `parse*` path/mmap variants map
@@ -599,7 +600,7 @@ fn battery_includes_parseable_phase_7_10_inputs() {
             .filter(|(label, _)| label.starts_with(GGUF_NEW_TYPES) && label.ends_with("@whole"))
             .filter(|(_, bytes)| anamnesis::parse_gguf_bytes(bytes.clone()).is_ok())
             .count();
-        assert!(gguf >= 10, "only {gguf} crafted GGUF 40/41/42 inputs parse");
+        assert!(gguf >= 10, "only {gguf} crafted GGUF 40-43 inputs parse");
     }
 }
 

@@ -14,10 +14,10 @@
 //! synthesised from a seeded random tensor where no practical real source
 //! exists.
 //!
-//! Coverage: **25 of 25** production kernels, from 5 real models plus 6
-//! synthetic fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
+//! Coverage: **26 of 26** production kernels, from 5 real models, 6
+//! synthetic fixtures and one exhaustive one (`F8_E4M3`, all 256 codes) (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
 //! `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
-//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`), plus the `NVFP4` per-tensor scale
+//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`, `F8_E4M3`), plus the `NVFP4` per-tensor scale
 //! fold through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
 //! model; they are internal `llama.cpp` activation quant types, covered by unit
 //! tests.

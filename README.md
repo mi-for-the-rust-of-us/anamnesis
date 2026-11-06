@@ -234,7 +234,7 @@ methodology: **[Validation & tested models](docs/validation.md)**.
 
 Representative measured results (release build, `target-cpu=native`, best-of-5):
 
-- **Dequantization:** 2.7–54× faster than the reference Python/PyTorch path, bit-exact (0 ULP) across FP8 / GPTQ / AWQ / BnB / NVFP4 / 25 GGUF block types.
+- **Dequantization:** 2.7–54× faster than the reference Python/PyTorch path, bit-exact (0 ULP) across FP8 / GPTQ / AWQ / BnB / NVFP4 / 26 GGUF quantised types.
 - **PyTorch `.pth` parsing:** **11–31× faster** than `torch.load()` on torchvision models; **NPZ** at **3.6 GB/s** (17.7× the `npyz` crate).
 - **Conversion:** `npz → safetensors` 6.75×, `pth → safetensors` 5.18×, `safetensors → BnB-NF4` 2.67× vs the Python ecosystem default.
 - **Multi-threaded dequant:** whole-model `remember` / `convert` run **~3–4× faster** across CPU cores via the default-on `parallel` feature (`std::thread::scope`, no new dependency), giving byte-identical output at any thread count, with a modest `min(cores, 4)` default (opt out with `default-features = false`, or tune with `--threads`). Since v0.7.2 the `GGUF`-input path is parallelised too, at **~1.9×** on the reader stage, lower than the safetensors path because the conversion hub owns one buffer per tensor, [measured and explained here](docs/perf-experiments.md).

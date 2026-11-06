@@ -32,8 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safetensors `F8_E4M3` tensor. Writing `F8_E4M3` into a `GGUF` is planned for
   Phase 8.5.
 - **`dequantize_gguf_blocks` delivers `F8_E4M3` in runs of 256 elements**, with
-  a shorter last run, instead of one sink call per one-element block. One call
-  per element measured 20 to 46 % slower. Every call is still a whole number of
+  a shorter last run, instead of one sink call per one-element block. The runs
+  measured 20 to 46 % faster than one call per element. Every call is still a whole number of
   blocks; a sink that requires exactly `block_size() × E::BYTES` bytes per call
   is not correct for this type.
 

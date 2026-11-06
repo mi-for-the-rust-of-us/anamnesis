@@ -16,13 +16,16 @@
 //!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`, `MXFP4`.
 //! - **64-element blocks**: `NVFP4`, `Q2_0`.
 //! - **128-element blocks**: `Q1_0`.
+//! - **One-element blocks**, decoded in 256-element runs: `F8_E4M3`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
 //!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 //!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`.
 //!
 //! Every block-quantised `GgufType` variant has a dedicated kernel. Phase 4.5
 //! closed the original set with `MXFP4`; Phase 7.10 added `NVFP4`, `Q1_0` and
-//! `Q2_0` after upstream `ggml` introduced them (issue #15). The dispatcher's
+//! `Q2_0` after upstream `ggml` introduced them (issue #15), and Phase 7.11
+//! added `F8_E4M3`, which upstream files as a scalar but anamnesis widens like
+//! every other `FP8` tensor. The dispatcher's
 //! only `Unsupported` path is for the eight scalar types, which are
 //! reinterpret-only and never reach the dequantisation layer. A test-only
 //! exhaustive classification (`kernel_classification`) makes sure a future
@@ -37,7 +40,8 @@
 //!   supplies a sink closure that receives one block's worth of output at
 //!   a time, so peak heap is O(one scratch buffer) regardless of tensor
 //!   size. Use this for dequantising 70 B-parameter models on modest RAM.
-//!   **The block length depends on the output type** (`QK × E::BYTES`);
+//!   **The block length depends on the output type** (`QK × E::BYTES`;
+//!   `F8_E4M3` arrives in 256-element runs instead of one-element blocks);
 //!   see that function's docs for the table.
 //!
 //! [`dequantize_gguf_to_bf16`] and [`dequantize_gguf_blocks_to_bf16`] are
@@ -64,9 +68,10 @@
 //!
 //! **Pass 2 is the *only* place the output width appears.** That is why
 //! the 24 kernel bodies that predate v0.7.3 are byte-identical to their
-//! pre-v0.7.3 form, and why the three added in Phase 7.10 follow the same
-//! shape: all 27 fill an `[f32; QK]` scratch and never name an output type.
-//! Only their signatures thread `E` through to the shared runner.
+//! pre-v0.7.3 form, and why the three added in Phase 7.10 and `F8_E4M3` in
+//! Phase 7.11 follow the same shape: all 28 fill an `[f32; QK]` scratch (a
+//! 256-element run for `F8_E4M3`) and never name an output type. Only their
+//! signatures thread `E` through.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
 //! `dequantize_row_*` reference implementations, and cross-validated against
@@ -77,10 +82,10 @@
 //! Little-endian, `n_elements × E::BYTES` bytes. `BF16` and `F16` round to
 //! nearest even; `F32` performs no conversion at all, so its output is the
 //! `f32` the kernel computed and therefore the reference's own value.
-//! `tests/cross_validation_gguf.rs` checks all 25 production kernels at
+//! `tests/cross_validation_gguf.rs` checks all 26 production kernels at
 //! both widths, the `F32` comparison being bit-exact with no tolerance,
 //! against `gguf-py` and, for the types `gguf-py` cannot produce (`NVFP4`,
-//! `Q1_0`, `Q2_0`), against ggml's own C.
+//! `Q1_0`, `Q2_0`) and for `F8_E4M3`'s exhaustive table, against ggml's own C.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;
@@ -760,7 +765,8 @@ where
 ///
 /// The `E = Bf16Out` spelling of [`dequantize_gguf_blocks`], kept as the name
 /// every caller before v0.7.3 used. The sink receives 64 B per legacy block and
-/// 512 B per K-quant super-block, unchanged.
+/// 512 B per K-quant super-block, unchanged; the 64- and 128-element blocks
+/// and `F8_E4M3`'s 256-element runs are in that function's table.
 ///
 /// # Errors
 ///
