@@ -312,7 +312,8 @@ def upgrade_existing_fixtures() -> int:
     The v1 fixtures already carry the raw quantised block bytes, which is all
     the reference needs. That matters because ``models/`` is gitignored and
     holds multi-GB downloads: this path lets the F32 goldens be produced from a
-    clean checkout with nothing but ``pip install gguf numpy``.
+    clean checkout with nothing but the pinned gguf-py (see the module
+    docstring) and numpy.
 
     Every upgrade re-derives the BF16 golden and **asserts it reproduces the
     stored one byte for byte**. If the installed ``gguf`` version dequantised

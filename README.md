@@ -270,8 +270,11 @@ That runs the `cross_validation_*` suites and prints which reference produced
 each family's goldens (`gguf-py`, `bitsandbytes`, `AutoAWQ`, `GPTQModel`,
 PyTorch, NumPy). Be clear on what it establishes: it checks anamnesis against
 goldens **committed to this repository**, and does not re-derive them. The
-script explains how to do that stronger check, which for `GGUF` needs nothing
-but `pip install gguf numpy` and no model download.
+script explains how to do that stronger check: for `GGUF`, regenerate the
+fixtures with `gguf-py` pinned to llama.cpp `1b6935b` (the PyPI release
+predates `Q2_0` and `F8_E4M3`) and confirm `git` sees no change. The
+synthetic fixtures need nothing more; the real-model ones need their source
+models, and the types `gguf-py` cannot quantise need ggml's C harness.
 
 ## Documentation
 
