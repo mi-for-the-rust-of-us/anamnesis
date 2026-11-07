@@ -12,13 +12,15 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor, or
 //! synthesised from a seeded random tensor where no practical real source
-//! exists.
+//! exists. The exception is the exhaustive `F8_E4M3` table: all 256 codes,
+//! tiled to 1061 elements (3 × 427 for its per-expert folded twin).
 //!
-//! Coverage: **26 of 26** production kernels, from 5 real models, 6
-//! synthetic fixtures and one exhaustive one (`F8_E4M3`, all 256 codes) (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
-//! `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
-//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`, `F8_E4M3`), plus the `NVFP4` and
-//! `F8_E4M3` per-tensor scale folds through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
+//! Coverage: **26 of 26** production kernels (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`,
+//! `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,
+//! `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`,
+//! `F8_E4M3`), from 6 real models, 6 synthetic fixtures and the exhaustive
+//! `F8_E4M3` one, plus the `NVFP4` and `F8_E4M3` per-tensor scale folds
+//! through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
 //! model; they are internal `llama.cpp` activation quant types, covered by unit
 //! tests.
 //!
@@ -31,7 +33,9 @@
 //! synthetic fixtures come from ggml's own C (`fixtures/gguf_reference/ggml_ref/`,
 //! at llama.cpp `37b53fd` for Phase 7.10 and `1b6935b` since `F8_E4M3`). Since
 //! Phase 7.10 the generator also checks **every** golden against that C, bit for
-//! bit, and all of them agree. `F8_E4M3`'s fixture is exhaustive: all 256 codes.
+//! bit, and all of them agree. `F8_E4M3` has a real slice of
+//! `RedHatAI/Llama-3.2-1B-Instruct-FP8` and the exhaustive table, both from
+//! ggml's C with `gguf-py` required to agree.
 
 #![cfg(feature = "gguf")]
 #![allow(

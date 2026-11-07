@@ -115,7 +115,7 @@ Converting SmolLM2-135M-Instruct-Q4_K_M.gguf -> SmolLM2-135M-Instruct-Q4_K_M-f32
 
 Note the derived filename ends in `-f32`, not `-bf16`: it tracks the dtype, so a file never claims a width it does not hold.
 
-`f32` output performs **no narrowing at all**, so the values are the `f32` that `gguf-py` itself produces — verified bit-exactly against it on every kernel it implements, with no tolerance (the two it does not, `Q1_0` and `Q2_0`, are checked against ggml's own C instead). Two things to expect. The file is twice the size (**513 MB against 257 MB** here), and the conversion runs about **1.5–1.6× slower**, because doubling the output bytes costs real bandwidth. That is the price of the precision, not a defect.
+`f32` output performs **no narrowing at all**, so the values are the `f32` that `gguf-py` itself produces — verified bit-exactly against it on every kernel, with no tolerance (`gguf-py` implements all of them since llama.cpp `1b6935b`; `Q1_0` and `Q2_0`, which it lacked before, also match ggml's own C). Two things to expect. The file is twice the size (**513 MB against 257 MB** here), and the conversion runs about **1.5–1.6× slower**, because doubling the output bytes costs real bandwidth. That is the price of the precision, not a defect.
 
 There is also `--out-dtype f16`, which buys 3 significand bits over `bf16` at the same 2 bytes — but pays for them with a much narrower exponent range, overflowing to infinity above 65504 where `bf16` matches `f32`'s range. It is not simply the better 2-byte choice.
 

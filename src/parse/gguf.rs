@@ -1526,8 +1526,9 @@ impl ParsedGguf {
     /// pick a width. It is the per-tensor counterpart of `ConvertOptions`'s
     /// `output_dtype` on the whole-file path.
     ///
-    /// For an `NVFP4` tensor the result is the block decode only, exactly
-    /// `ggml`'s `dequantize_row_nvfp4`: the per-tensor `<stem>.scale` that
+    /// For an `NVFP4` or `F8_E4M3` tensor the result is the decode only,
+    /// exactly `ggml`'s `dequantize_row_nvfp4` or `dequantize_row_f8_e4m3`:
+    /// the per-tensor `<stem>.scale` that
     /// usually accompanies it is a separate tensor, and this method sees one
     /// tensor. Multiply by it yourself, or use `remember` / `convert`, which
     /// fold it in.

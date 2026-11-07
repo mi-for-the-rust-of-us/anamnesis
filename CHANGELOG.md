@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and bit for bit in `F32`. The one difference is the sign of `NaN`: ggml
   returns a positive `NaN` for both `NaN` codes, anamnesis keeps the sign, as
   its safetensors `FP8` path and PyTorch do. `OCP` leaves that choice to the
-  implementation.
+  implementation. Real weights match too: the 256 × 256
+  `RedHatAI/Llama-3.2-1B-Instruct-FP8` slice equals ggml's C at 0 `ULP`.
 
 ### Changed
 
@@ -49,9 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Phase 8.5.
 - **`dequantize_gguf_blocks` delivers `F8_E4M3` in runs of 256 elements**, with
   a shorter last run, instead of one sink call per one-element block. The runs
-  measured 20 to 46 % faster than one call per element. Every call is still a whole number of
-  blocks; a sink that requires exactly `block_size() × E::BYTES` bytes per call
-  is not correct for this type.
+  took 20 to 46 % less time than one call per element. Every call is still a
+  whole number of blocks; a sink that requires exactly
+  `block_size() × E::BYTES` bytes per call is not correct for this type.
 - **The `GGUF` speed table in `docs/validation.md` is re-measured in full**
   (2026-11-07), with a new `F8_E4M3` row on real weights (25.7 µs against
   `gguf-py`'s 1292.8 µs, 50.3×) and first `gguf-py` ratios for `Q1_0` and

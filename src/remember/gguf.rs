@@ -690,15 +690,15 @@ pub fn dequantize_gguf_to_bf16(
 /// | [`F16Out`](crate::remember::output::F16Out) | 64 B | 128 B | 256 B | 512 B |
 /// | [`F32Out`](crate::remember::output::F32Out) | 128 B | 256 B | 512 B | 1024 B |
 ///
-/// The 64- and 128-element rows arrived in Phase 7.10. A sink that assumed
+/// The 64- and 128-element columns arrived in Phase 7.10. A sink that assumed
 /// one of the two older lengths was already relying on something this
 /// contract never promised; derive the length from `block_size()` and
 /// `E::BYTES`.
 ///
 /// **`F8_E4M3` is the exception: its block is a single element**, and one
-/// sink call per element would cost a quarter to a half of its throughput
-/// (measured, `benches/ab.rs`). It is delivered in runs of 256 elements, the
-/// 256-element row above, and the last run is shorter when the element count
+/// sink call per element would take 25 to 84 % longer (measured,
+/// `benches/ab.rs`). It is delivered in runs of 256 elements, the
+/// 256-element column above, and the last run is shorter when the element count
 /// is not a multiple of 256. Every call is still a whole number of blocks, so a
 /// sink that takes `block.len() / E::BYTES` values is correct for every type;
 /// one that requires exactly `block_size() × E::BYTES` bytes is not.
@@ -1151,7 +1151,8 @@ where
 // `c80f707`; the same arm against identical code: median 0.00 %, 2/10
 // flagged). Out of line, every `GGUF` arm sits at -1.6 % to 0.0 % against the
 // same parent and this kernel keeps its whole gain over a one-element-per-call
-// shape. The call happens once per tensor. `docs/perf-experiments.md`
+// shape. The call happens once per tensor (once per expert slab when a
+// scale is folded). `docs/perf-experiments.md`
 // Experiment 21.
 #[allow(clippy::indexing_slicing)]
 #[inline(never)]
@@ -1199,7 +1200,7 @@ where
         let tail_scratch = &mut scratch[..tail.len()];
         let tail_out = &mut run_out[..tail.len() * E::BYTES];
         // VECTORIZED: scalar fallback — ragged tail, runtime trip count below
-        // `F8_E4M3_RUN`, at most once per tensor.
+        // `F8_E4M3_RUN`, at most once per call.
         for (&byte, dst) in tail.iter().zip(tail_scratch.iter_mut()) {
             *dst = f32::from_bits(e4m3_to_f32_bits(byte));
         }
@@ -2359,11 +2360,17 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 /// output, so the file holds the model's actual weights and nothing a consumer
 /// could apply a second time. On `zeta-2.1-NVFP4.gguf` the folded output tracks
 /// the original `BF16` checkpoint with a least-squares scale of 0.995 to 0.998;
-/// unfolded, the weights would have been 400 to 11 000 times too large. Only a
-/// `.scale` that matches an `NVFP4` weight exactly (one value, or one per
-/// expert) is folded; any other `*.scale` tensor passes through untouched.
+/// unfolded, the weights would have been 400 to 11 000 times too large.
+///
+/// **So do scaled `F8_E4M3` weights** (Phase 7.11). llama.cpp's converter
+/// keeps a per-tensor-scaled `FP8` weight as `F8_E4M3` and writes its
+/// `weight_scale` beside it as `<stem>.scale`, the layout `NVFP4` uses, and
+/// both methods fold it the same way. Only a `.scale` that matches an `NVFP4`
+/// or `F8_E4M3` weight exactly (one value, or one per expert) is folded; any
+/// other `*.scale` tensor passes through untouched.
 /// [`dequantize_tensor_as`](Self::dequantize_tensor_as) works on one tensor and
-/// does **not** fold: it is the raw `dequantize_row_nvfp4` result.
+/// does **not** fold: it is the raw `dequantize_row_nvfp4` or
+/// `dequantize_row_f8_e4m3` result.
 impl crate::ParsedGguf {
     /// Dequantizes every quantised tensor to `target` and writes a standard
     /// `.safetensors` file.

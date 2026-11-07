@@ -269,7 +269,7 @@ That is deliberate. A passthrough tensor is copied, never decoded, so widening i
 
 ### Is anamnesis still bit-exact against PyTorch at `f32`?
 
-Yes, and as of v0.7.4 that is tested rather than assumed. Every kernel family is cross-validated at full `f32` width against the canonical library's own output, compared bit for bit with no tolerance: `FP8` against PyTorch, `GPTQ` against GPTQModel, `AWQ` against AutoAWQ, `BnB` against bitsandbytes, NVIDIA `NVFP4` safetensors against `modelopt`, and `GGUF` against `gguf-py`, and since Phase 7.10 also against ggml's own C: that is the only reference for `Q1_0` and `Q2_0`, and every other `GGUF` golden is checked against it too.
+Yes, and as of v0.7.4 that is tested rather than assumed. Every kernel family is cross-validated at full `f32` width against the canonical library's own output, compared bit for bit with no tolerance: `FP8` against PyTorch, `GPTQ` against GPTQModel, `AWQ` against AutoAWQ, `BnB` against bitsandbytes, NVIDIA `NVFP4` safetensors against `modelopt`, and `GGUF` against `gguf-py`, and since Phase 7.10 also against ggml's own C: that was the only reference for `Q1_0` and `Q2_0` until `gguf-py` gained their dequantisers at llama.cpp `1b6935b`, it is where the `F8_E4M3` goldens come from, and every other `GGUF` golden is checked against it too.
 
 This mattered more than it sounds, because exactness at `BF16` never implied exactness at `f32`. Rounding the reference to `BF16` before comparing discards 16 mantissa bits, and in these fixtures 38 to 98 percent of values carry bits `BF16` cannot represent, most families sitting above 77 percent. The comparison was throwing away most of the available signal.
 
