@@ -25,7 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output, and count it in `ConvertStats::folded_scales`; `inspect` reports
   the size of that output. Without the fold, such a file's weights would
   have been written without their scale. Cross-validated on all 256 codes
-  over three experts against ggml's C decode times each expert's scale.
+  over three experts against ggml's C decode times each expert's scale, and on
+  real weights: the `RedHatAI/Llama-3.2-1B-Instruct-FP8` slice the `FP8`
+  suite already carries, with its own `weight_scale`, matches ggml's C decode
+  times the scale and `PyTorch`'s `weight.float() * scale.float()`, which
+  agree bit for bit.
   The CLI line now reads "N per-tensor scales folded into their weights",
   without naming `NVFP4`.
 - **Cross-validated on every code.** The fixture holds all 256 `E4M3FN` codes,
@@ -48,6 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured 20 to 46 % faster than one call per element. Every call is still a whole number of
   blocks; a sink that requires exactly `block_size() × E::BYTES` bytes per call
   is not correct for this type.
+- **The `GGUF` speed table in `docs/validation.md` is re-measured in full**
+  (2026-11-07), with a new `F8_E4M3` row on real weights (25.7 µs against
+  `gguf-py`'s 1292.8 µs, 50.3×) and first `gguf-py` ratios for `Q1_0` and
+  `Q2_0`, which `gguf-py` dequantises since llama.cpp `1b6935b`. It now
+  publishes best-of-5 medians for both sides rather than one pass, because a
+  single pass could land in a state where a process's first few fixtures run
+  about 2× slow; a paired check confirmed the drift from the 2026-10-01
+  figures is the session, not the code. Both timers now skip fixtures that
+  are not 65 536 elements.
 
 ## [0.7.10] - 2026-10-01
 

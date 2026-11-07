@@ -44,7 +44,8 @@ Models (download via ``hf-fm download-file --flat --output-dir models/``):
     folded fixture (Phase 7.10, issue #15). Pass `--revision` to hf-fm.
 
 ggml's C reference (Phase 7.10). `gguf-py` has no quantiser for NVFP4, Q1_0 or
-Q2_0 and no dequantiser for Q1_0 or Q2_0, so those fixtures come from ggml's own
+Q2_0, and had no dequantiser for Q1_0 or Q2_0 at 37b53fd (it has since 1b6935b,
+and must then agree with the C), so those fixtures come from ggml's own
 C (`quantize_row_*_ref` / `dequantize_row_*`), through the small `ggml_ref/`
 harness built by `ggml_ref/build.sh` at a pinned llama.cpp commit (`1b6935b`
 since F8_E4M3, which takes every one of its 256 codes through
@@ -205,6 +206,19 @@ EXHAUSTIVE_FIXTURES = [
 # fixture as `<name>.scale` (three little-endian `f32`).
 F8_FOLDED_FIXTURES = [
     ("exhaustive_f8_e4m3_folded", 427, (3.0e-4, 0.0123, 1.75)),
+]
+
+# Real F8_E4M3 weights (Phase 7.11): the 256 x 256 slice of
+# RedHatAI/Llama-3.2-1B-Instruct-FP8 `model.layers.0.mlp.down_proj.weight` that
+# `fp8_reference/llama_static_per_tensor.bin` already carries, with its
+# per-tensor `weight_scale`. That is the weight llama.cpp's converter keeps as
+# GGUF F8_E4M3, writing the scale as `<stem>.scale`. Two fixtures come out:
+# `<name>` (golden = ggml's C decode) and `<name>_folded` (golden = that decode
+# times the scale as `f32`, which must also equal PyTorch's own F32 golden in
+# the source fixture), plus `<name>_folded.scale`. 65 536 elements, like every
+# speed-table fixture.
+REAL_F8_FIXTURES = [
+    ("llama32_f8_e4m3", "fp8_reference/llama_static_per_tensor.bin"),
 ]
 
 GGML_REF = Path(os.environ.get("GGML_REF", "~/.cache/anamnesis-ggml-ref/ggml_ref")).expanduser()
@@ -542,6 +556,58 @@ def generate_folded_fixture(name: str, gguf_path: Path) -> None:
     )
 
 
+def read_fp8_fixture(path: Path) -> dict:
+    """Reads an `fp8_reference` v2 container ("AMNF")."""
+    data = path.read_bytes()
+    assert data[:4] == b"AMNF" and struct.unpack_from("<I", data, 4)[0] == 2, f"{path}: not AMNF v2"
+    scheme, scale_dtype, rows, cols, w_len, s_len, b_len, f_len = struct.unpack_from("<8I", data, 8)
+    off = 40
+    weight = data[off:off + w_len]
+    off += w_len
+    scale = data[off:off + s_len]
+    off += s_len + b_len
+    expected_f32 = np.frombuffer(data[off:off + f_len], dtype=np.float32)
+    return {"scheme": scheme, "scale_dtype": scale_dtype, "rows": rows, "cols": cols,
+            "weight": weight, "scale": scale, "expected_f32": expected_f32}
+
+
+def generate_real_f8_fixtures(name: str, source: str) -> None:
+    """A real F8_E4M3 slice, unscaled and with its per-tensor scale folded in."""
+    target_type = GGMLQuantizationType.F8_E4M3
+    fx = read_fp8_fixture(Path(__file__).parent.parent / source)
+    assert fx["scheme"] == 1, f"{source}: not a per-tensor FP8 fixture"
+    n = fx["rows"] * fx["cols"]
+    assert n == SLICE_ELEMENTS and len(fx["weight"]) == n, f"{source}: expected {SLICE_ELEMENTS} bytes"
+    # scale_dtype: 0 = F32, 1 = BF16, 2 = F16, as `fp8_reference/generate.py`
+    # writes it; the converter widens it to F32 (`scale.float()`), exactly.
+    if fx["scale_dtype"] == 0:
+        scale = np.frombuffer(fx["scale"], dtype=np.float32)[0]
+    elif fx["scale_dtype"] == 1:
+        scale = np.frombuffer(fx["scale"], dtype=np.uint16).astype(np.uint32)[0] << 16
+        scale = np.array([scale], dtype=np.uint32).view(np.float32)[0]
+    else:
+        scale = np.float32(np.frombuffer(fx["scale"], dtype=np.float16)[0])
+    scale = np.float32(scale)
+
+    raw_bytes = fx["weight"]
+    decoded = np.frombuffer(ggml_ref("dequantize", target_type, n, raw_bytes), dtype=np.float32).copy()
+    py = dequantize(np.frombuffer(raw_bytes, dtype=np.uint8), target_type).astype(np.float32).reshape(-1)
+    assert np.array_equal(py.view(np.uint32), decoded.view(np.uint32)), f"{name}: gguf-py and ggml's C disagree"
+    folded = (decoded * scale).astype(np.float32)
+    assert np.array_equal(folded.view(np.uint32), fx["expected_f32"].view(np.uint32)), (
+        f"{name}: ggml's C decode x scale differs from PyTorch's F32 golden in {source}"
+    )
+
+    here = Path(__file__).parent
+    write_fixture_v2(here / f"{name}.bin", target_type.value, n, raw_bytes, decoded)
+    write_fixture_v2(here / f"{name}_folded.bin", target_type.value, n, raw_bytes, folded)
+    (here / f"{name}_folded.scale").write_bytes(struct.pack("<f", scale))
+    print(
+        f"  {name} (+ _folded): {source}, {n} elements, {len(set(raw_bytes))} distinct codes, "
+        f"scale={float(scale):.9g}; gguf-py == C, C x scale == PyTorch F32"
+    )
+
+
 def generate_f8_folded_fixture(name: str, slab: int, scales: tuple[float, ...]) -> None:
     """Every `F8_E4M3` code over `len(scales)` expert slabs, each scale folded in.
 
@@ -620,6 +686,15 @@ if __name__ == "__main__":
                   f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
             continue
         generate_exhaustive_fixture(name, target_type, n)
+
+    for name, source in REAL_F8_FIXTURES:
+        if only is not None and name not in only:
+            continue
+        if not GGML_REF.exists():
+            print(f"\n  SKIP {name}: needs the ggml C reference "
+                  f"(tests/fixtures/gguf_reference/ggml_ref/build.sh)")
+            continue
+        generate_real_f8_fixtures(name, source)
 
     for name, slab, scales in F8_FOLDED_FIXTURES:
         if only is not None and name not in only:

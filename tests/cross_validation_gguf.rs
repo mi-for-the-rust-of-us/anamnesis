@@ -26,7 +26,8 @@
 //! `TQ2_0` / `MXFP4` are synthetic because only ~15 BitNet-derivative GGUFs ship
 //! the `TQ*` types and mainstream `MXFP4` only ships inside the 11 GB
 //! `gpt-oss-20b` upload; `gguf-py` quantises all three. `gguf-py` cannot
-//! quantise `NVFP4`, `Q1_0` or `Q2_0`, nor dequantise the last two, so their
+//! quantise `NVFP4`, `Q1_0` or `Q2_0`, and could not dequantise the last two
+//! at `37b53fd` (it can since `1b6935b`, and agrees with the C), so their
 //! synthetic fixtures come from ggml's own C (`fixtures/gguf_reference/ggml_ref/`,
 //! at llama.cpp `37b53fd` for Phase 7.10 and `1b6935b` since `F8_E4M3`). Since
 //! Phase 7.10 the generator also checks **every** golden against that C, bit for
@@ -507,8 +508,8 @@ fn cross_validate_synthetic_mxfp4() {
 // NVFP4, Q1_0, Q2_0 (Phase 7.10, issue #15)
 // ---------------------------------------------------------------------------
 //
-// `gguf-py` has no quantiser for any of the three and no dequantiser for Q1_0
-// or Q2_0, so the synthetic fixtures are quantised AND dequantised by ggml's own
+// `gguf-py` has no quantiser for any of the three, and had no dequantiser for
+// Q1_0 or Q2_0 at `37b53fd` (it has since `1b6935b`), so the synthetic fixtures are quantised AND dequantised by ggml's own
 // C (`quantize_row_*_ref` / `dequantize_row_*` at llama.cpp `37b53fd`, through
 // `fixtures/gguf_reference/ggml_ref/`). For NVFP4 the generator also requires
 // gguf-py's dequantisation to agree with the C bit for bit. `zeta21_nvfp4` is a
@@ -645,6 +646,95 @@ fn cross_validate_zeta21_nvfp4_folded_through_convert() {
             .filter(|(a, b)| a != b)
             .count();
         assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        assert_eq!(
+            mismatches, 0,
+            "{dtype:?}: {mismatches} bytes differ from the golden"
+        );
+    }
+}
+
+/// Real `F8_E4M3` weights: the 256 × 256 slice of
+/// `RedHatAI/Llama-3.2-1B-Instruct-FP8` `model.layers.0.mlp.down_proj.weight`
+/// (213 distinct codes, no `NaN`), the kind of weight llama.cpp's converter
+/// keeps as `F8_E4M3`. Golden: ggml's C, with `gguf-py` agreeing.
+#[test]
+fn cross_validate_llama32_f8_e4m3() {
+    run_cross_validation(
+        "Llama-3.2-1B-Instruct-FP8 F8_E4M3 (real, ggml C)",
+        include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3.bin"),
+        GgufType::F8_E4M3,
+        0,
+    );
+}
+
+/// The same real slice with its per-tensor `weight_scale` folded in, through
+/// the public `convert_bytes` path that `remember` shares, as a file written by
+/// llama.cpp's converter would be (`<stem>.weight` + `F32` `<stem>.scale`).
+///
+/// The golden is ggml's C decode times the scale as an `f32`, and at generation
+/// time it was also required to equal, bit for bit, `PyTorch`'s own `F32` golden
+/// for this slice (`fp8_reference/llama_static_per_tensor.bin`,
+/// `weight.float() * scale.float()`): two independent references for the fold
+/// on real data.
+#[test]
+fn cross_validate_llama32_f8_e4m3_folded_through_convert() {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+
+    let fixture = parse_gguf_fixture(
+        include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3_folded.bin"),
+        GgufType::F8_E4M3,
+    );
+    let scale: [u8; 4] = *include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3_folded.scale");
+
+    // 256 × 256, `GGUF` order (innermost first).
+    let weight_dims = [256_u64, 256];
+    let scale_dims = [1_u64];
+    let mut data = fixture.raw_data.clone();
+    let scale_offset = data.len().div_ceil(32) * 32;
+    data.resize(scale_offset, 0);
+    data.extend_from_slice(&scale);
+    let bytes = raw_gguf(
+        &[],
+        &[
+            RawTensorInfo {
+                name: "blk.0.ffn_down.weight",
+                dims: &weight_dims,
+                ggml_type: 43,
+                offset: 0,
+            },
+            RawTensorInfo {
+                name: "blk.0.ffn_down.scale",
+                dims: &scale_dims,
+                ggml_type: 0,
+                offset: scale_offset as u64,
+            },
+        ],
+        32,
+        &data,
+    );
+
+    for (dtype, golden) in [
+        (anamnesis::Dtype::F32, &fixture.expected_f32),
+        (anamnesis::Dtype::BF16, &fixture.expected_bf16),
+    ] {
+        let options = anamnesis::ConvertOptions::new().with_output_dtype(dtype);
+        let (st, stats) =
+            anamnesis::convert_bytes(&bytes, anamnesis::ConvertTarget::Safetensors, &options)
+                .unwrap();
+        assert_eq!(stats.folded_scales, 1, "{dtype:?}");
+        let st = safetensors::SafeTensors::deserialize(&st).unwrap();
+        assert!(
+            st.tensor("blk.0.ffn_down.scale").is_err(),
+            "the folded scale is not written"
+        );
+        let weight = st.tensor("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        let mismatches = weight
+            .data()
+            .iter()
+            .zip(golden.iter())
+            .filter(|(a, b)| a != b)
+            .count();
         assert_eq!(
             mismatches, 0,
             "{dtype:?}: {mismatches} bytes differ from the golden"

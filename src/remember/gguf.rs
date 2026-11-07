@@ -84,8 +84,8 @@
 //! `f32` the kernel computed and therefore the reference's own value.
 //! `tests/cross_validation_gguf.rs` checks all 26 production kernels at
 //! both widths, the `F32` comparison being bit-exact with no tolerance,
-//! against `gguf-py` and, for the types `gguf-py` cannot produce (`NVFP4`,
-//! `Q1_0`, `Q2_0`) and for `F8_E4M3`'s exhaustive table, against ggml's own C.
+//! against `gguf-py` and, for the types `gguf-py` cannot quantise (`NVFP4`,
+//! `Q1_0`, `Q2_0`) and for every `F8_E4M3` fixture, against ggml's own C.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;

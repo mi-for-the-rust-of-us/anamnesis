@@ -4,7 +4,7 @@ One-page reference for finding HuggingFace GGUF files that ship each of the `IQ*
 
 Phase 4.5 step 7 (`cross-validation extension`) requires a 65 536-element fixture per block type, extracted from a real model tensor where possible and synthesised via the Python `gguf` package where not. **As of step 6 (MXFP4) the last remaining coverage gap was closed** — anamnesis dequantised every GGUF block type shipping on HuggingFace at the time (22 of 22 production kernels). This document tracks where each type comes from and is now a historical reference rather than a live to-do list.
 
-**Phase 7.10 reopened it, briefly.** Upstream `ggml` added `NVFP4` (40), `Q1_0` (41) and `Q2_0` (42) in 2026, and a user's `NVFP4` file was refused outright ([issue #15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)). All three now have kernels and fixtures, so 25 of 25 production kernels were cross-validated. Phase 7.11 added `F8_E4M3` (43), which upstream calls a scalar type and anamnesis dequantises; its fixture is the whole 256-code table, so 26 of 26 are now. `gguf-py` cannot quantise any of the three and cannot dequantise `Q1_0` or `Q2_0`, so their goldens come from ggml's own C through `tests/fixtures/gguf_reference/ggml_ref/`, and the generator now checks every fixture against that C. A weekly CI job (`ggml-drift.yml`) compares upstream's `enum ggml_type` with the parser's, so the next addition is found by CI rather than by a user.
+**Phase 7.10 reopened it, briefly.** Upstream `ggml` added `NVFP4` (40), `Q1_0` (41) and `Q2_0` (42) in 2026, and a user's `NVFP4` file was refused outright ([issue #15](https://github.com/mi-for-the-rust-of-us/anamnesis/issues/15)). All three now have kernels and fixtures, so 25 of 25 production kernels were cross-validated. Phase 7.11 added `F8_E4M3` (43), which upstream calls a scalar type and anamnesis dequantises; its fixture is the whole 256-code table, so 26 of 26 are now. `gguf-py` cannot quantise any of the three and, at `37b53fd`, could not dequantise `Q1_0` or `Q2_0` (it can since `1b6935b`, and agrees with the C), so their goldens come from ggml's own C through `tests/fixtures/gguf_reference/ggml_ref/`, and the generator now checks every fixture against that C. A weekly CI job (`ggml-drift.yml`) compares upstream's `enum ggml_type` with the parser's, so the next addition is found by CI rather than by a user.
 
 ## Contents
 
@@ -73,6 +73,8 @@ Download sizes and tensor counts from remote-header probes performed 2026-04-22.
 | `Q1_0` | `synthetic_q1_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
 | `Q2_0` | `synthetic_q2_0.bin` | **synthetic** via ggml's C only (same seed) | already (no download) |
 | `F8_E4M3` | `exhaustive_f8_e4m3.bin` | **exhaustive**: all 256 codes tiled to 1061 elements, golden from ggml's C; `gguf-py`'s dequantise agrees | already (no download) |
+| `F8_E4M3` | `llama32_f8_e4m3.bin` | **real**: `RedHatAI/Llama-3.2-1B-Instruct-FP8` `layers.0.mlp.down_proj`, the 256 × 256 slice `fp8_reference/llama_static_per_tensor.bin` carries; golden from ggml's C, `gguf-py` agrees | already (no download) |
+| `F8_E4M3` (scale folded) | `llama32_f8_e4m3_folded.bin` + `.scale` | the same slice times its `weight_scale`; ggml's C decode × scale, which also equals `PyTorch`'s own `F32` golden for the slice | already (no download) |
 | `F8_E4M3` (scales folded) | `exhaustive_f8_e4m3_folded.bin` + `.scale` | all 256 codes over three 427-element experts, golden = ggml's C decode times each expert's scale, as `remember` writes it | already (no download) |
 
 ### Pending kernels
@@ -128,7 +130,7 @@ Confirmed 2026-04-22 on `gguf==0.17+`:
 | `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M` | ❌ `NotImplementedError` | ✅ | **real-model source required** |
 | `TQ1_0`, `TQ2_0`, `MXFP4` | ✅ | ✅ | **all three backed by Phase 4.5 step 5 + 6 synthetic fixtures** |
 | `NVFP4` | ❌ | ✅ | synthetic fixture quantised by ggml's C; `gguf-py`'s dequantise must agree (checked at `gguf-py` 0.19.0, llama.cpp `37b53fd`) |
-| `Q1_0`, `Q2_0` | ❌ | ❌ | **ggml's C is the only reference** (`ggml_ref/`) |
+| `Q1_0`, `Q2_0` | ❌ | ✅ since `1b6935b` | quantised by ggml's C (`ggml_ref/`); `gguf-py`'s dequantise was missing at `37b53fd` and agrees with the C since `1b6935b` |
 | `F8_E4M3` | n/a | ✅ | the 256 codes are the whole format, so no quantiser is needed; `gguf-py`'s dequantise must agree with ggml's C (checked at llama.cpp `1b6935b`) |
 
 This asymmetry drove the "synthetic vs real-model" split in the sourcing matrix above. With step 6 landed every variant has a committed fixture.
