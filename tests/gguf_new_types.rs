@@ -11,6 +11,9 @@
 //! not a whole `Q1_0` block (128), so here every tensor has 256 elements,
 //! a multiple of every block size. The 64-element `Q1_0` case is pinned
 //! separately, because it must now fail for the right reason.
+//!
+//! Discriminant 43 (`F8_E4M3`) arrived upstream at llama.cpp `1b6935b`, after
+//! the issue, and is walked through the same entry points.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -45,13 +48,15 @@ fn reproducer(ggml_type: u32, elements: u64, data_len: usize) -> Vec<u8> {
 }
 
 /// `(discriminant, variant, name, block size, bytes per block)` for the
-/// control and the three types issue #15 added. Layouts from llama.cpp
-/// `ggml-common.h` at `37b53fd`.
-const CASES: [(u32, GgufType, &str, u64, u64); 4] = [
+/// control, the three types issue #15 added, and `F8_E4M3`. Layouts from
+/// llama.cpp `ggml-common.h` at `37b53fd`, and `ggml.c`'s type traits at
+/// `1b6935b` for `F8_E4M3`.
+const CASES: [(u32, GgufType, &str, u64, u64); 5] = [
     (39, GgufType::MXFP4, "MXFP4", 32, 17),
     (40, GgufType::NVFP4, "NVFP4", 64, 36),
     (41, GgufType::Q1_0, "Q1_0", 128, 18),
     (42, GgufType::Q2_0, "Q2_0", 64, 18),
+    (43, GgufType::F8_E4M3, "F8_E4M3", 1, 1),
 ];
 
 #[test]
@@ -92,10 +97,11 @@ fn every_entry_point_parses_the_new_types() {
 
 #[test]
 fn reserved_and_sentinel_discriminants_are_still_refused() {
-    // 36 is commented out upstream, 43 is `GGML_TYPE_COUNT` (a sentinel, not a
-    // type), and 255 is simply unknown. All three must fail closed, naming
-    // the discriminant, exactly as 40-42 used to.
-    for disc in [36_u32, 43, 255] {
+    // 36 is commented out upstream, 44 is `GGML_TYPE_COUNT` (a sentinel, not a
+    // type; it was 43 until `F8_E4M3` took that value), and 255 is simply
+    // unknown. All three must fail closed, naming the discriminant, exactly as
+    // 40-43 used to.
+    for disc in [36_u32, 44, 255] {
         let bytes = reproducer(disc, N, 1024);
         let err = anamnesis::parse_gguf_bytes(bytes).unwrap_err();
         match err {
@@ -121,15 +127,16 @@ fn the_issue_64_element_q1_0_fixture_is_not_a_whole_block() {
 }
 
 // ---------------------------------------------------------------------------
-// NVFP4's per-tensor scale (Phase 7.10)
+// Per-tensor scales: NVFP4 (Phase 7.10) and F8_E4M3 (Phase 7.11)
 //
-// NVIDIA's NVFP4 keeps a second, per-tensor `F32` scale beside each weight as
-// `<stem>.scale`, which llama.cpp multiplies in at inference time. `remember`
-// and `convert` fold it into the dequantised weight and leave it out of the
-// output; `inspect` reports the size of that output.
+// NVIDIA's NVFP4, and since Phase 7.11 a preserved F8_E4M3, keeps a second,
+// per-tensor `F32` scale beside each weight as `<stem>.scale`, which llama.cpp
+// multiplies in at inference time. `remember` and `convert` fold it into the
+// dequantised weight and leave it out of the output; `inspect` reports the
+// size of that output.
 // ---------------------------------------------------------------------------
 
-mod nvfp4_scale_folding {
+mod tensor_scale_folding {
     use std::collections::BTreeMap;
 
     use anamnesis::{
@@ -434,6 +441,187 @@ mod nvfp4_scale_folding {
                     "{label}: weight left unscaled"
                 );
             }
+            assert_inspect_matches(&bytes, &out, TargetDtype::F32);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F8_E4M3 (Phase 7.11): the same fold, the same rule
+    // -----------------------------------------------------------------------
+    //
+    // llama.cpp's converter keeps a per-tensor-scaled FP8 weight as GGUF
+    // `F8_E4M3` and writes its `weight_scale` beside it as `<stem>.scale`
+    // (one value, or one per expert), exactly as it does for `NVFP4`.
+
+    /// `n` patterned `F8_E4M3` codes. The two `NaN` codes (`0x7F`, `0xFF`) are
+    /// replaced by zero: a `NaN` payload is not part of the output contract,
+    /// and the exhaustive cross-validation already covers both codes.
+    fn f8(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| match u8::try_from((i * 37 + 11) % 256).unwrap() {
+                0x7F | 0xFF => 0,
+                code => code,
+            })
+            .collect()
+    }
+
+    /// The `F8_E4M3` weight decoded by the kernel alone, at `f32`.
+    fn raw_f8(data: &[u8]) -> Vec<f32> {
+        anamnesis::dequantize_gguf::<F32Out>(data, GgufType::F8_E4M3, data.len())
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&w| f32::from_le_bytes(w))
+            .collect()
+    }
+
+    #[test]
+    fn an_f8_e4m3_one_element_scale_is_folded_into_its_weight() {
+        let weight = f8(600); // two full 256-element runs and a short one
+        let scale = 3.0e-4_f32;
+        let bytes = gguf(&[
+            Tensor {
+                name: "blk.0.attn_q.weight",
+                dims: vec![100, 6],
+                ggml_type: 43,
+                data: weight.clone(),
+            },
+            Tensor {
+                name: "blk.0.attn_q.scale",
+                dims: vec![1],
+                ggml_type: 0,
+                data: f32s(&[scale]),
+            },
+            Tensor {
+                name: "blk.0.attn_q.input_scale",
+                dims: vec![1],
+                ggml_type: 0,
+                data: f32s(&[0.5]),
+            },
+        ]);
+        let expected: Vec<f32> = raw_f8(&weight).iter().map(|&v| v * scale).collect();
+
+        let (st, stats) = convert(&bytes, Dtype::F32);
+        let out = tensors(&st);
+        let want: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(words(&out["blk.0.attn_q.weight"]), want);
+        assert!(
+            !out.contains_key("blk.0.attn_q.scale"),
+            "the folded scale is not written"
+        );
+        assert_eq!(
+            out["blk.0.attn_q.input_scale"],
+            f32s(&[0.5]),
+            "the activation scale passes through untouched"
+        );
+        assert_eq!(
+            (stats.folded_scales, stats.dequantized, stats.tensors),
+            (1, 1, 2)
+        );
+        assert_inspect_matches(&bytes, &out, TargetDtype::F32);
+
+        let (st_bf16, _) = convert(&bytes, Dtype::BF16);
+        let out_bf16 = tensors(&st_bf16);
+        let want: Vec<u8> = expected
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        assert_eq!(out_bf16["blk.0.attn_q.weight"], want);
+        assert_inspect_matches(&bytes, &out_bf16, TargetDtype::BF16);
+
+        let (st, _) = convert(&bytes, Dtype::F16);
+        let out = tensors(&st);
+        let want: Vec<u8> = expected
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        assert_eq!(out["blk.0.attn_q.weight"], want);
+        assert_inspect_matches(&bytes, &out, TargetDtype::F16);
+
+        let remembered = anamnesis::parse_gguf_bytes(bytes)
+            .unwrap()
+            .remember_to_bytes(TargetDtype::BF16)
+            .unwrap();
+        assert_eq!(tensors(&remembered), out_bf16);
+    }
+
+    /// Three experts of 7 × 61 = 427 elements each: no slab is a multiple of
+    /// the kernel's 256-element run, so a run would straddle two scales if the
+    /// fold did not dequantise each expert's slab on its own.
+    #[test]
+    fn an_f8_e4m3_per_expert_scale_scales_each_expert_slab() {
+        let weight = f8(3 * 427);
+        let scales = [3.0e-4_f32, 0.0123, 1.75];
+        let bytes = gguf(&[
+            Tensor {
+                name: "blk.0.ffn_up_exps.weight",
+                dims: vec![7, 61, 3],
+                ggml_type: 43,
+                data: weight.clone(),
+            },
+            Tensor {
+                name: "blk.0.ffn_up_exps.scale",
+                dims: vec![3],
+                ggml_type: 0,
+                data: f32s(&scales),
+            },
+        ]);
+        let expected: Vec<u32> = raw_f8(&weight)
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v * scales[i / 427]).to_bits())
+            .collect();
+        let (st, stats) = convert(&bytes, Dtype::F32);
+        let out = tensors(&st);
+        assert_eq!(words(&out["blk.0.ffn_up_exps.weight"]), expected);
+        assert_eq!(stats.folded_scales, 1);
+        assert_eq!(out.len(), 1);
+        assert_inspect_matches(&bytes, &out, TargetDtype::F32);
+    }
+
+    /// The near-misses that apply to `F8_E4M3` (its block is one element, so
+    /// there is no "slab not whole blocks" case): each leaves the scale and the
+    /// weight alone.
+    #[test]
+    fn f8_e4m3_scales_outside_the_rule_are_not_folded() {
+        let weight = f8(24);
+        let cases = [
+            ("F16 scale", "a.weight", vec![1], 1, vec![0x00, 0x3C]),
+            (
+                "scale matches no axis",
+                "a.weight",
+                vec![2],
+                0,
+                f32s(&[2.0, 2.0]),
+            ),
+            ("weight not named *.weight", "a", vec![1], 0, f32s(&[2.0])),
+        ];
+        for (label, weight_name, scale_dims, scale_type, scale) in cases {
+            let bytes = gguf(&[
+                Tensor {
+                    name: weight_name,
+                    dims: vec![8, 3],
+                    ggml_type: 43,
+                    data: weight.clone(),
+                },
+                Tensor {
+                    name: "a.scale",
+                    dims: scale_dims,
+                    ggml_type: scale_type,
+                    data: scale.clone(),
+                },
+            ]);
+            let (st, stats) = convert(&bytes, Dtype::F32);
+            let out = tensors(&st);
+            assert_eq!(stats.folded_scales, 0, "{label}");
+            assert_eq!(out.len(), 2, "{label}: weight and scale both written");
+            assert_eq!(out["a.scale"], scale, "{label}");
+            let unscaled: Vec<u8> = raw_f8(&weight)
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            assert_eq!(out[weight_name], unscaled, "{label}: weight left unscaled");
             assert_inspect_matches(&bytes, &out, TargetDtype::F32);
         }
     }

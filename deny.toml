@@ -23,7 +23,7 @@ ignore = [
     # for the vendored `src/parse/zip.rs` reader, Phase 6.12), never built by
     # `cargo install`. All four advisories need `ZipArchive::extract` or
     # `ZipStreamReader::extract`, which nothing in the repository calls. Remove
-    # once `zip` is dropped (Phase 7.11).
+    # once `zip` is dropped (Phase 7.12).
     { id = "RUSTSEC-2026-0367", reason = "dev-only zip; extraction API unused" },
     { id = "RUSTSEC-2026-0368", reason = "dev-only zip; extraction API unused" },
     { id = "RUSTSEC-2026-0369", reason = "dev-only zip; extraction API unused" },

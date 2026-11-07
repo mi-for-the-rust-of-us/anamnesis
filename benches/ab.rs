@@ -86,12 +86,13 @@
 //!
 //! # Coverage, and how to extend it
 //!
-//! All eleven synthetic-layer dequant families `dequant.rs` covers, at all
-//! three [`OutputElement`](anamnesis::OutputElement) widths: **33 arms**. The
+//! All twelve synthetic-layer dequant families `dequant.rs` covers, at all
+//! three [`OutputElement`](anamnesis::OutputElement) widths: **36 arms**. The
 //! four Phase 7.10 families (`GGUF` `NVFP4`, `Q1_0`, `Q2_0` and `ModelOpt`
 //! `NVFP4`) are what pulls `nvfp4` into the required features: a baseline
 //! exported before v0.7.10 has none of their arms, so compare those only
-//! against a baseline that does.
+//! against a baseline that does. Likewise `GGUF` `F8_E4M3` (Phase 7.11) has
+//! no arm in a baseline exported before v0.7.11.
 //!
 //! The `AWQ` / `GPTQ` pairing is the load-bearing one. Those two kernels are
 //! structurally identical apart from `AWQ`'s `AWQ_ORDER` scatter, they received
@@ -105,7 +106,7 @@
 //!
 //! # Running a subset
 //!
-//! A full pass is ~33 arms. When iterating on one kernel, filter — but **keep at
+//! A full pass is ~36 arms. When iterating on one kernel, filter — but **keep at
 //! least one untouched family in the filter as a control**:
 //!
 //! ```text
@@ -306,6 +307,9 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
     let (q1a, q1b, q1c) = (q1.clone(), q1.clone(), q1);
     let q2 = gguf_q2_0_fixture();
     let (q2a, q2b, q2c) = (q2.clone(), q2.clone(), q2);
+    // `GGUF` `F8_E4M3`: one byte per element, so any bytes are a valid tensor.
+    let f8 = synth_bytes(LAYER_ROWS * LAYER_COLS);
+    let (f8a, f8b, f8c) = (f8.clone(), f8.clone(), f8);
     let mo = nvfp4_modelopt_fixture();
     let (mo1, mo2, mo3) = (mo.clone(), mo.clone(), mo);
 
@@ -721,6 +725,45 @@ fn dequant_benchmarks() -> impl IntoBenchmarks {
                         LAYER_ROWS * LAYER_COLS,
                     )
                     .expect("gguf q2_0 f16"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_bf16", move |b| {
+            let r = f8a.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf_to_bf16(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_f32", move |b| {
+            let r = f8b.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F32Out>(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3 f32"),
+                )
+            })
+        }),
+        benchmark_fn("gguf_f8_e4m3_f16", move |b| {
+            let r = f8c.clone();
+            b.iter(move || {
+                black_box(
+                    dequantize_gguf::<F16Out>(
+                        black_box(&r),
+                        GgufType::F8_E4M3,
+                        LAYER_ROWS * LAYER_COLS,
+                    )
+                    .expect("gguf f8_e4m3 f16"),
                 )
             })
         }),

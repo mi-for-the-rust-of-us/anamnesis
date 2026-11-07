@@ -2,8 +2,8 @@
 # line, in the form `GGML_TYPE_<NAME> = <discriminant>`. Lines starting with
 # `#` are comments.
 #
-# Source:  https://github.com/ggml-org/llama.cpp/blob/37b53fd4545847188fdad29e38ba57875efc8228/ggml/include/ggml.h
-# Commit:  37b53fd4545847188fdad29e38ba57875efc8228
+# Source:  https://github.com/ggml-org/llama.cpp/blob/1b6935b227b9f9aa89deea8016c0e208f547446f/ggml/include/ggml.h
+# Commit:  1b6935b227b9f9aa89deea8016c0e208f547446f
 #
 # tests/gguf_type_snapshot.rs checks that the GGUF parser accepts exactly these
 # discriminants, under these names, and refuses everything else.
@@ -48,3 +48,4 @@ GGML_TYPE_MXFP4 = 39
 GGML_TYPE_NVFP4 = 40
 GGML_TYPE_Q1_0 = 41
 GGML_TYPE_Q2_0 = 42
+GGML_TYPE_F8_E4M3 = 43

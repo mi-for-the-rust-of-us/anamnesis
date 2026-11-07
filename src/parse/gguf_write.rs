@@ -4,7 +4,8 @@
 //!
 //! Phase 6 ships only the unquantised passthrough scaffold: scalar dtypes
 //! (`F32`, `F16`, `BF16`, `F64`, `I8`–`I64`) round-trip through this writer
-//! byte-exactly. Quantised dtypes (`Q*`, `IQ*`, `TQ*`, `MXFP4`, `NVFP4`) are rejected
+//! byte-exactly. Quantised dtypes (`Q*`, `IQ*`, `TQ*`, `MXFP4`, `NVFP4`, and
+//! `F8_E4M3`, which anamnesis classes as quantised) are rejected
 //! with `AnamnesisError::Unsupported` — emitting those blocks requires the
 //! encode kernels landing in Phase 8.5.
 //!

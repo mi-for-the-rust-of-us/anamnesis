@@ -16,13 +16,16 @@
 //!   `Q5_1`, `Q8_0`, `Q8_1`, `IQ4_NL`, `MXFP4`.
 //! - **64-element blocks**: `NVFP4`, `Q2_0`.
 //! - **128-element blocks**: `Q1_0`.
+//! - **One-element blocks**, decoded in 256-element runs: `F8_E4M3`.
 //! - **K-quants** (256-element super-blocks): `Q2_K`, `Q3_K`, `Q4_K`,
 //!   `Q5_K`, `Q6_K`, `Q8_K`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
 //!   `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`.
 //!
 //! Every block-quantised `GgufType` variant has a dedicated kernel. Phase 4.5
 //! closed the original set with `MXFP4`; Phase 7.10 added `NVFP4`, `Q1_0` and
-//! `Q2_0` after upstream `ggml` introduced them (issue #15). The dispatcher's
+//! `Q2_0` after upstream `ggml` introduced them (issue #15), and Phase 7.11
+//! added `F8_E4M3`, which upstream files as a scalar but anamnesis widens like
+//! every other `FP8` tensor. The dispatcher's
 //! only `Unsupported` path is for the eight scalar types, which are
 //! reinterpret-only and never reach the dequantisation layer. A test-only
 //! exhaustive classification (`kernel_classification`) makes sure a future
@@ -37,7 +40,8 @@
 //!   supplies a sink closure that receives one block's worth of output at
 //!   a time, so peak heap is O(one scratch buffer) regardless of tensor
 //!   size. Use this for dequantising 70 B-parameter models on modest RAM.
-//!   **The block length depends on the output type** (`QK × E::BYTES`);
+//!   **The block length depends on the output type** (`QK × E::BYTES`;
+//!   `F8_E4M3` arrives in 256-element runs instead of one-element blocks);
 //!   see that function's docs for the table.
 //!
 //! [`dequantize_gguf_to_bf16`] and [`dequantize_gguf_blocks_to_bf16`] are
@@ -64,9 +68,10 @@
 //!
 //! **Pass 2 is the *only* place the output width appears.** That is why
 //! the 24 kernel bodies that predate v0.7.3 are byte-identical to their
-//! pre-v0.7.3 form, and why the three added in Phase 7.10 follow the same
-//! shape: all 27 fill an `[f32; QK]` scratch and never name an output type.
-//! Only their signatures thread `E` through to the shared runner.
+//! pre-v0.7.3 form, and why the three added in Phase 7.10 and `F8_E4M3` in
+//! Phase 7.11 follow the same shape: all 28 fill an `[f32; QK]` scratch (a
+//! 256-element run for `F8_E4M3`) and never name an output type. Only their
+//! signatures thread `E` through.
 //!
 //! The formulas are ported verbatim from `ggml-quants.c`'s scalar
 //! `dequantize_row_*` reference implementations, and cross-validated against
@@ -77,10 +82,10 @@
 //! Little-endian, `n_elements × E::BYTES` bytes. `BF16` and `F16` round to
 //! nearest even; `F32` performs no conversion at all, so its output is the
 //! `f32` the kernel computed and therefore the reference's own value.
-//! `tests/cross_validation_gguf.rs` checks all 25 production kernels at
+//! `tests/cross_validation_gguf.rs` checks all 26 production kernels at
 //! both widths, the `F32` comparison being bit-exact with no tolerance,
-//! against `gguf-py` and, for the types `gguf-py` cannot produce (`NVFP4`,
-//! `Q1_0`, `Q2_0`), against ggml's own C.
+//! against `gguf-py` and, for the types `gguf-py` cannot quantise (`NVFP4`,
+//! `Q1_0`, `Q2_0`) and for every `F8_E4M3` fixture, against ggml's own C.
 
 use crate::error::AnamnesisError;
 use crate::parse::gguf::GgufType;
@@ -140,6 +145,11 @@ const QK1_0: usize = 128;
 
 /// Element count per `Q2_0` block (`QK2_0` in `ggml-common.h`).
 const QK2_0: usize = 64;
+
+/// Elements per sink call for `F8_E4M3`, whose block is a single element.
+/// 256 matches the K-quant super-block, so a sink buffer sized for the largest
+/// existing block (`256 × E::BYTES`) also fits an `F8_E4M3` run.
+const F8_E4M3_RUN: usize = 256;
 
 /// `NVFP4` sub-block scales: every `UE4M3` byte decoded to `f32`, already
 /// carrying the `0.5` factor that cancels the doubled [`K_VALUES_MXFP4`]
@@ -567,6 +577,7 @@ where
         GgufType::NVFP4 => dequant_nvfp4::<E, _>(data, sink),
         GgufType::Q1_0 => dequant_q1_0::<E, _>(data, sink),
         GgufType::Q2_0 => dequant_q2_0::<E, _>(data, sink),
+        GgufType::F8_E4M3 => dequant_f8_e4m3::<E, _>(data, sink),
         _ => Err(AnamnesisError::Unsupported {
             format: "GGUF".into(),
             detail: format!(
@@ -679,10 +690,18 @@ pub fn dequantize_gguf_to_bf16(
 /// | [`F16Out`](crate::remember::output::F16Out) | 64 B | 128 B | 256 B | 512 B |
 /// | [`F32Out`](crate::remember::output::F32Out) | 128 B | 256 B | 512 B | 1024 B |
 ///
-/// The 64- and 128-element rows arrived in Phase 7.10. A sink that assumed
+/// The 64- and 128-element columns arrived in Phase 7.10. A sink that assumed
 /// one of the two older lengths was already relying on something this
 /// contract never promised; derive the length from `block_size()` and
 /// `E::BYTES`.
+///
+/// **`F8_E4M3` is the exception: its block is a single element**, and one
+/// sink call per element would take 25 to 84 % longer (measured,
+/// `benches/ab.rs`). It is delivered in runs of 256 elements, the
+/// 256-element column above, and the last run is shorter when the element count
+/// is not a multiple of 256. Every call is still a whole number of blocks, so a
+/// sink that takes `block.len() / E::BYTES` values is correct for every type;
+/// one that requires exactly `block_size() × E::BYTES` bytes is not.
 ///
 /// **A sink that hard-codes `chunks_exact(2)` is correct only for the 2-byte
 /// output types.** Derive the stride from `E::BYTES` rather than assuming it,
@@ -746,7 +765,8 @@ where
 ///
 /// The `E = Bf16Out` spelling of [`dequantize_gguf_blocks`], kept as the name
 /// every caller before v0.7.3 used. The sink receives 64 B per legacy block and
-/// 512 B per K-quant super-block, unchanged.
+/// 512 B per K-quant super-block, unchanged; the 64- and 128-element blocks
+/// and `F8_E4M3`'s 256-element runs are in that function's table.
 ///
 /// # Errors
 ///
@@ -1109,6 +1129,85 @@ where
             }
         }
     })
+}
+
+/// `F8_E4M3` kernel: one `OCP` `E4M3FN` byte per element, no scale
+/// (`GGML_TYPE_F8_E4M3 = 43`, `ggml_f8_e4m3_to_fp32` in `ggml-impl.h`).
+///
+/// The decode is [`e4m3_to_f32_bits`](crate::remember::fp8::e4m3_to_f32_bits),
+/// the one the safetensors `FP8` family uses: subnormals are `M × 2^-9`, and
+/// `0x7F` / `0xFF` are `NaN` (there are no infinities). It keeps `NaN`'s sign
+/// where `ggml` returns a positive `NaN`; `OCP` leaves that to the
+/// implementation, and every other value is identical.
+///
+/// The block is one element, so the sink receives runs of
+/// [`F8_E4M3_RUN`] elements (a shorter one last) rather than one call per
+/// element. Every run is still a whole number of blocks.
+//
+// `#[inline(never)]` IS MEASURED, not stylistic. Inlined into
+// `dispatch_streaming`, this kernel left every other kernel's source
+// unchanged but moved `gguf_q1_0_f32` into a bimodal +2.5 % (median of 20
+// paired runs, range -13.1 % to +5.4 %, 14/20 flagged, tango, x86-64, against
+// `c80f707`; the same arm against identical code: median 0.00 %, 2/10
+// flagged). Out of line, every `GGUF` arm sits at -1.6 % to 0.0 % against the
+// same parent and this kernel keeps its whole gain over a one-element-per-call
+// shape. The call happens once per tensor (once per expert slab when a
+// scale is folded). `docs/perf-experiments.md`
+// Experiment 21.
+#[allow(clippy::indexing_slicing)]
+#[inline(never)]
+fn dequant_f8_e4m3<E, F>(data: &[u8], mut sink: F) -> crate::Result<()>
+where
+    E: OutputElement,
+    F: FnMut(&[u8]) -> crate::Result<()>,
+{
+    use crate::remember::fp8::e4m3_to_f32_bits;
+    let mut scratch = [0.0_f32; F8_E4M3_RUN];
+    let mut run_buf = [[0u8; MAX_OUTPUT_BYTES]; F8_E4M3_RUN];
+    // INDEX: the flattened buffer holds `F8_E4M3_RUN × MAX_OUTPUT_BYTES`
+    // bytes, and `E::BYTES <= MAX_OUTPUT_BYTES` is proven at compile time by
+    // the `const` block in `remember::output` (`OutputElement` is sealed).
+    let run_out = &mut run_buf.as_flattened_mut()[..F8_E4M3_RUN * E::BYTES];
+    // MEASURED-REVERT: clippy::chunks_exact_to_as_chunks. Migrating this split
+    // (the loop's only chunked stream, so the whole of the lint's advice) to
+    // `as_chunks::<F8_E4M3_RUN>()` cost +3.76 % on `gguf_f8_e4m3_bf16`
+    // (median of 10, min +2.62 %, max +4.50 %, 10/10 flagged), against
+    // -2.49 % at `F32` (5/10 flagged) and +0.24 % at `F16` (0/10); synthetic
+    // 4096 × 11008 layer, `benches/ab.rs` (tango, paired), x86-64,
+    // `fp8_tensor` control within ±0.5 %. Reverted because `BF16` is the
+    // default output width (`docs/perf-experiments.md` Experiment 21).
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let runs = data.chunks_exact(F8_E4M3_RUN);
+    let tail = runs.remainder();
+    // VECTORIZED: confirmed AVX2 vpmovzxbd + vpslld + vpand + vpcmpeqd +
+    // vblendvps on %ymm (8-wide) in cargo-show-asm, x86-64 target-cpu=native,
+    // opt-level=3, for all three `E`: the branchless `E4M3` decode, with the
+    // subnormal-table lookup lane-inserted (vpextrb/vpinsrd). The narrowing is
+    // `write_scratch`'s own loop (vpaddd/vpsrld/vpackusdw at `Bf16Out`,
+    // vcvtps2ph at `F16Out`, vmovups at `F32Out`). Measured against the
+    // one-element-per-call shape: -28 % / -20 % / -46 % at BF16 / F32 / F16
+    // (`docs/perf-experiments.md` Experiment 21).
+    for run in runs {
+        for (&byte, dst) in run.iter().zip(scratch.iter_mut()) {
+            *dst = f32::from_bits(e4m3_to_f32_bits(byte));
+        }
+        E::write_scratch(&scratch, run_out);
+        sink(run_out)?;
+    }
+    if !tail.is_empty() {
+        // INDEX: `tail` is the `chunks_exact` remainder, so
+        // `tail.len() < F8_E4M3_RUN` and both sub-slices are in bounds.
+        let tail_scratch = &mut scratch[..tail.len()];
+        let tail_out = &mut run_out[..tail.len() * E::BYTES];
+        // VECTORIZED: scalar fallback — ragged tail, runtime trip count below
+        // `F8_E4M3_RUN`, at most once per call.
+        for (&byte, dst) in tail.iter().zip(tail_scratch.iter_mut()) {
+            *dst = f32::from_bits(e4m3_to_f32_bits(byte));
+        }
+        E::write_scratch(tail_scratch, tail_out);
+        sink(tail_out)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2261,11 +2360,17 @@ fn q3_k_unpack_scales(packed: &[u8; 12]) -> [i8; 16] {
 /// output, so the file holds the model's actual weights and nothing a consumer
 /// could apply a second time. On `zeta-2.1-NVFP4.gguf` the folded output tracks
 /// the original `BF16` checkpoint with a least-squares scale of 0.995 to 0.998;
-/// unfolded, the weights would have been 400 to 11 000 times too large. Only a
-/// `.scale` that matches an `NVFP4` weight exactly (one value, or one per
-/// expert) is folded; any other `*.scale` tensor passes through untouched.
+/// unfolded, the weights would have been 400 to 11 000 times too large.
+///
+/// **So do scaled `F8_E4M3` weights** (Phase 7.11). llama.cpp's converter
+/// keeps a per-tensor-scaled `FP8` weight as `F8_E4M3` and writes its
+/// `weight_scale` beside it as `<stem>.scale`, the layout `NVFP4` uses, and
+/// both methods fold it the same way. Only a `.scale` that matches an `NVFP4`
+/// or `F8_E4M3` weight exactly (one value, or one per expert) is folded; any
+/// other `*.scale` tensor passes through untouched.
 /// [`dequantize_tensor_as`](Self::dequantize_tensor_as) works on one tensor and
-/// does **not** fold: it is the raw `dequantize_row_nvfp4` result.
+/// does **not** fold: it is the raw `dequantize_row_nvfp4` or
+/// `dequantize_row_f8_e4m3` result.
 impl crate::ParsedGguf {
     /// Dequantizes every quantised tensor to `target` and writes a standard
     /// `.safetensors` file.
@@ -3853,7 +3958,8 @@ mod tests {
             | GgufType::MXFP4
             | GgufType::NVFP4
             | GgufType::Q1_0
-            | GgufType::Q2_0 => true,
+            | GgufType::Q2_0
+            | GgufType::F8_E4M3 => true,
             GgufType::F32
             | GgufType::F16
             | GgufType::BF16
@@ -3904,7 +4010,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(kernels, 27, "one kernel per block-quantised type");
+        assert_eq!(kernels, 28, "one kernel per block-quantised type");
     }
 
     /// The scalar types reach the dispatcher's wildcard arm and are refused
@@ -3931,7 +4037,8 @@ mod tests {
     /// under `F32`, so it is asserted per output type rather than documented
     /// and hoped for. `Q8_0` is a 32-element legacy block (34 B in), `Q4_K` a
     /// 256-element super-block (144 B in), and since Phase 7.10 `NVFP4` /
-    /// `Q2_0` are 64-element blocks and `Q1_0` a 128-element one.
+    /// `Q2_0` are 64-element blocks and `Q1_0` a 128-element one. `F8_E4M3`
+    /// (one-element blocks) arrives in runs of 256 with a shorter last run.
     #[test]
     fn streaming_block_length_tracks_the_output_type() {
         fn observed<E: OutputElement>(dtype: GgufType, type_size: usize, n: usize) -> Vec<usize> {
@@ -3971,6 +4078,16 @@ mod tests {
         assert_eq!(observed::<Bf16Out>(GgufType::Q1_0, 18, 256), vec![256, 256]);
         assert_eq!(observed::<F16Out>(GgufType::Q1_0, 18, 256), vec![256, 256]);
         assert_eq!(observed::<F32Out>(GgufType::Q1_0, 18, 256), vec![512, 512]);
+
+        // `F8_E4M3`: one-element blocks in runs of 256, the last run shorter.
+        // 600 = 2 × 256 + 88; an exact multiple has no empty trailing call, and
+        // a tensor shorter than one run is a single short call.
+        let f8 = GgufType::F8_E4M3;
+        assert_eq!(observed::<Bf16Out>(f8, 1, 600), vec![512, 512, 176]);
+        assert_eq!(observed::<F16Out>(f8, 1, 600), vec![512, 512, 176]);
+        assert_eq!(observed::<F32Out>(f8, 1, 600), vec![1024, 1024, 352]);
+        assert_eq!(observed::<Bf16Out>(f8, 1, 256), vec![512]);
+        assert_eq!(observed::<F32Out>(f8, 1, 5), vec![20]);
     }
 
     /// `F32` output is the `f32` the kernel actually computed, and `BF16` is

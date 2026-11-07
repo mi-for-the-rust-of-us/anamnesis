@@ -12,7 +12,7 @@
 // canonical code is ggml's C: `from_float_ref` is `quantize_row_*_ref` and
 // `to_float` is `dequantize_row_*`, straight out of `ggml-quants.c`.
 //
-// Built against llama.cpp 37b53fd by build.sh; driven by generate_gguf.py.
+// Built against llama.cpp at the commit build.sh pins; driven by generate_gguf.py.
 
 #include "ggml.h"
 

@@ -22,7 +22,8 @@
 //! `ggml_type` 40, 41 and 42 (with every shape of `NVFP4` per-tensor `.scale`
 //! the fold applies or must leave alone), crafted and real `ModelOpt` `NVFP4`
 //! safetensors, and the new public kernels called directly with lengths and
-//! shapes that disagree.
+//! shapes that disagree. Phase 7.11 added `ggml_type` 43 (`F8_E4M3`) to both
+//! the crafted files and the direct kernel calls.
 //!
 //! Two boundaries are deliberate, not omissions:
 //! - **`SIGBUS` is out of scope by nature.** The `parse*` path/mmap variants map
@@ -139,7 +140,7 @@ fn crafted_gguf(tensors: &[(&str, &[u64], u32, Vec<u8>)]) -> Vec<u8> {
     raw_gguf(&[], &infos, 32, &data)
 }
 
-/// `ggml_type` discriminants the Phase 7.10 inputs use.
+/// `ggml_type` discriminants the Phase 7.10 inputs use, and `F8_E4M3`.
 #[cfg(feature = "gguf")]
 mod ggml {
     pub const F32: u32 = 0;
@@ -147,9 +148,10 @@ mod ggml {
     pub const NVFP4: u32 = 40;
     pub const Q1_0: u32 = 41;
     pub const Q2_0: u32 = 42;
+    pub const F8_E4M3: u32 = 43;
 }
 
-/// Label prefix of the crafted `GGUF` inputs for `ggml_type` 40, 41 and 42.
+/// Label prefix of the crafted `GGUF` inputs for `ggml_type` 40 to 43.
 #[cfg(feature = "gguf")]
 const GGUF_NEW_TYPES: &str = "gguf-t";
 
@@ -160,7 +162,7 @@ const GGUF_NEW_TYPES: &str = "gguf-t";
 /// overflow.
 #[cfg(feature = "gguf")]
 fn new_gguf_type_inputs() -> Vec<(String, Vec<u8>)> {
-    use ggml::{F16, F32, NVFP4, Q1_0, Q2_0};
+    use ggml::{F8_E4M3, F16, F32, NVFP4, Q1_0, Q2_0};
     const W: &str = "blk.0.attn_q.weight";
     const S: &str = "blk.0.attn_q.scale";
     // NVFP4 and Q2_0 hold 64 values per block, Q1_0 128; 36, 18 and 18 bytes.
@@ -180,6 +182,17 @@ fn new_gguf_type_inputs() -> Vec<(String, Vec<u8>)> {
             crafted_gguf(&[(W, &[128], Q1_0, vec![0xFF; 18])]),
         ),
         ("42-ones", crafted_gguf(&[(W, &[64], Q2_0, vec![0xFF; 18])])),
+        // F8_E4M3: one byte per element, dequantised in 256-element runs, so
+        // 600 elements meet two full runs and a short one. `0xFF` is NaN.
+        ("43", crafted_gguf(&[(W, &[600], F8_E4M3, patterned(600))])),
+        (
+            "43-ones",
+            crafted_gguf(&[(W, &[300], F8_E4M3, vec![0xFF; 300])]),
+        ),
+        (
+            "43-short-data",
+            crafted_gguf(&[(W, &[600], F8_E4M3, patterned(100))]),
+        ),
         // Half a Q1_0 block: issue #15's own reproducer shape.
         (
             "41-half-block",
@@ -255,6 +268,30 @@ fn new_gguf_type_inputs() -> Vec<(String, Vec<u8>)> {
             crafted_gguf(&[
                 (W, &[64, 2], Q2_0, patterned(36)),
                 (S, &[1], F32, f32_bytes(&[0.5])),
+            ]),
+        ),
+        // F8_E4M3 scales fold like NVFP4's (Phase 7.11): one value, one per
+        // expert over slabs that straddle the kernel's 256-element runs, and a
+        // scale with one value too many, which the fold must leave alone.
+        (
+            "43+scale",
+            crafted_gguf(&[
+                (W, &[600], F8_E4M3, patterned(600)),
+                (S, &[1], F32, f32_bytes(&[0.5])),
+            ]),
+        ),
+        (
+            "43+scale-per-expert",
+            crafted_gguf(&[
+                (W, &[7, 61, 3], F8_E4M3, patterned(1281)),
+                (S, &[3], F32, f32_bytes(&[0.5, f32::NAN, f32::INFINITY])),
+            ]),
+        ),
+        (
+            "43+scale-extra",
+            crafted_gguf(&[
+                (W, &[7, 61, 3], F8_E4M3, patterned(1281)),
+                (S, &[4], F32, f32_bytes(&[0.5, 1.0, 2.0, 4.0])),
             ]),
         ),
     ];
@@ -580,7 +617,7 @@ fn battery_includes_parseable_phase_7_10_inputs() {
             .filter(|(label, _)| label.starts_with(GGUF_NEW_TYPES) && label.ends_with("@whole"))
             .filter(|(_, bytes)| anamnesis::parse_gguf_bytes(bytes.clone()).is_ok())
             .count();
-        assert!(gguf >= 10, "only {gguf} crafted GGUF 40/41/42 inputs parse");
+        assert!(gguf >= 10, "only {gguf} crafted GGUF 40-43 inputs parse");
     }
 }
 
@@ -1019,7 +1056,8 @@ fn methods_on_parsed_results_never_panic() {
 // Kernels called directly (Phase 7.10)
 // ---------------------------------------------------------------------------
 
-/// The public kernels added in Phase 7.10, called the way a binding might:
+/// The public kernels added in Phase 7.10 and `F8_E4M3`, called the way a
+/// binding might:
 /// with a data length and a declared element count that need not agree.
 /// Every combination must be a clean `Ok`/`Err`, including counts at
 /// `usize::MAX`, where the output size overflows.
@@ -1037,12 +1075,20 @@ fn new_gguf_kernels_never_panic_on_mismatched_inputs() {
         127,
         128,
         129,
+        255,
         256,
+        257,
+        600,
         usize::MAX / 2,
         usize::MAX,
     ];
-    for dtype in [GgufType::NVFP4, GgufType::Q1_0, GgufType::Q2_0] {
-        for len in [0usize, 1, 17, 18, 35, 36, 37, 72, 144] {
+    for dtype in [
+        GgufType::NVFP4,
+        GgufType::Q1_0,
+        GgufType::Q2_0,
+        GgufType::F8_E4M3,
+    ] {
+        for len in [0usize, 1, 17, 18, 35, 36, 37, 72, 144, 255, 256, 257, 600] {
             let data = patterned(len);
             for n in counts {
                 let label = format!("{dtype} len {len} n {n}");

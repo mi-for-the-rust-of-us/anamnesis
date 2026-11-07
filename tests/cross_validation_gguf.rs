@@ -12,13 +12,15 @@
 //! Each fixture is a 65 536-element slice (2 048 blocks for legacy quants,
 //! 256 super-blocks for K-quants) extracted from a real model tensor, or
 //! synthesised from a seeded random tensor where no practical real source
-//! exists.
+//! exists. The exception is the exhaustive `F8_E4M3` table: all 256 codes,
+//! tiled to 1061 elements (3 × 427 for its per-expert folded twin).
 //!
-//! Coverage: **25 of 25** production kernels, from 5 real models plus 6
-//! synthetic fixtures (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`, `IQ4_NL`, `IQ4_XS`,
-//! `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `TQ1_0`,
-//! `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`), plus the `NVFP4` per-tensor scale
-//! fold through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
+//! Coverage: **26 of 26** production kernels (`Q4_0`–`Q8_0`, `Q2_K`–`Q6_K`,
+//! `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,
+//! `IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0`, `MXFP4`, `NVFP4`, `Q1_0`, `Q2_0`,
+//! `F8_E4M3`), from 6 real models, 6 synthetic fixtures and the exhaustive
+//! `F8_E4M3` one, plus the `NVFP4` and `F8_E4M3` per-tensor scale folds
+//! through `convert_bytes`. `Q8_1` and `Q8_K` are not shipped by any real
 //! model; they are internal `llama.cpp` activation quant types, covered by unit
 //! tests.
 //!
@@ -26,10 +28,14 @@
 //! `TQ2_0` / `MXFP4` are synthetic because only ~15 BitNet-derivative GGUFs ship
 //! the `TQ*` types and mainstream `MXFP4` only ships inside the 11 GB
 //! `gpt-oss-20b` upload; `gguf-py` quantises all three. `gguf-py` cannot
-//! quantise `NVFP4`, `Q1_0` or `Q2_0`, nor dequantise the last two, so their
-//! synthetic fixtures come from ggml's own C at llama.cpp `37b53fd`
-//! (`fixtures/gguf_reference/ggml_ref/`). Since Phase 7.10 the generator also
-//! checks **every** golden against that C, bit for bit, and all of them agree.
+//! quantise `NVFP4`, `Q1_0` or `Q2_0`, and could not dequantise the last two
+//! at `37b53fd` (it can since `1b6935b`, and agrees with the C), so their
+//! synthetic fixtures come from ggml's own C (`fixtures/gguf_reference/ggml_ref/`,
+//! at llama.cpp `37b53fd` for Phase 7.10 and `1b6935b` since `F8_E4M3`). Since
+//! Phase 7.10 the generator also checks **every** golden against that C, bit for
+//! bit, and all of them agree. `F8_E4M3` has a real slice of
+//! `RedHatAI/Llama-3.2-1B-Instruct-FP8` and the exhaustive table, both from
+//! ggml's C with `gguf-py` required to agree.
 
 #![cfg(feature = "gguf")]
 #![allow(
@@ -506,8 +512,8 @@ fn cross_validate_synthetic_mxfp4() {
 // NVFP4, Q1_0, Q2_0 (Phase 7.10, issue #15)
 // ---------------------------------------------------------------------------
 //
-// `gguf-py` has no quantiser for any of the three and no dequantiser for Q1_0
-// or Q2_0, so the synthetic fixtures are quantised AND dequantised by ggml's own
+// `gguf-py` has no quantiser for any of the three, and had no dequantiser for
+// Q1_0 or Q2_0 at `37b53fd` (it has since `1b6935b`), so the synthetic fixtures are quantised AND dequantised by ggml's own
 // C (`quantize_row_*_ref` / `dequantize_row_*` at llama.cpp `37b53fd`, through
 // `fixtures/gguf_reference/ggml_ref/`). For NVFP4 the generator also requires
 // gguf-py's dequantisation to agree with the C bit for bit. `zeta21_nvfp4` is a
@@ -550,6 +556,30 @@ fn cross_validate_synthetic_q2_0() {
         "Synthetic Q2_0 (seed=42, ggml C)",
         include_bytes!("fixtures/gguf_reference/synthetic_q2_0.bin"),
         GgufType::Q2_0,
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F8_E4M3 (ggml_type 43, llama.cpp `1b6935b`)
+// ---------------------------------------------------------------------------
+
+/// Every one of the 256 `E4M3FN` codes, tiled to 1061 elements (four
+/// 256-element runs and a 37-element tail, the two paths the kernel has). The
+/// golden is `dequantize_row_f8_e4m3` from ggml's C, and gguf-py's
+/// dequantisation agreed with it bit for bit when the fixture was made.
+///
+/// The two `NaN` codes (`0x7F`, `0xFF`) are where anamnesis and ggml differ in
+/// a bit that is not part of the contract: ggml returns a positive `NaN` for
+/// both, anamnesis keeps the sign, as the safetensors `FP8` path does. The
+/// comparison treats any two `NaN`s as equal, so that difference is invisible
+/// here; every other code must match exactly.
+#[test]
+fn cross_validate_exhaustive_f8_e4m3() {
+    run_cross_validation(
+        "Exhaustive F8_E4M3 (all 256 codes, ggml C)",
+        include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3.bin"),
+        GgufType::F8_E4M3,
         0,
     );
 }
@@ -623,6 +653,184 @@ fn cross_validate_zeta21_nvfp4_folded_through_convert() {
         assert_eq!(
             mismatches, 0,
             "{dtype:?}: {mismatches} bytes differ from the golden"
+        );
+    }
+}
+
+/// Real `F8_E4M3` weights: the 256 × 256 slice of
+/// `RedHatAI/Llama-3.2-1B-Instruct-FP8` `model.layers.0.mlp.down_proj.weight`
+/// (213 distinct codes, no `NaN`), the kind of weight llama.cpp's converter
+/// keeps as `F8_E4M3`. Golden: ggml's C, with `gguf-py` agreeing.
+#[test]
+fn cross_validate_llama32_f8_e4m3() {
+    run_cross_validation(
+        "Llama-3.2-1B-Instruct-FP8 F8_E4M3 (real, ggml C)",
+        include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3.bin"),
+        GgufType::F8_E4M3,
+        0,
+    );
+}
+
+/// The same real slice with its per-tensor `weight_scale` folded in, through
+/// the public `convert_bytes` path that `remember` shares, as a file written by
+/// llama.cpp's converter would be (`<stem>.weight` + `F32` `<stem>.scale`).
+///
+/// The golden is ggml's C decode times the scale as an `f32`, and at generation
+/// time it was also required to equal, bit for bit, `PyTorch`'s own `F32` golden
+/// for this slice (`fp8_reference/llama_static_per_tensor.bin`,
+/// `weight.float() * scale.float()`): two independent references for the fold
+/// on real data.
+#[test]
+fn cross_validate_llama32_f8_e4m3_folded_through_convert() {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+
+    let fixture = parse_gguf_fixture(
+        include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3_folded.bin"),
+        GgufType::F8_E4M3,
+    );
+    let scale: [u8; 4] = *include_bytes!("fixtures/gguf_reference/llama32_f8_e4m3_folded.scale");
+
+    // 256 × 256, `GGUF` order (innermost first).
+    let weight_dims = [256_u64, 256];
+    let scale_dims = [1_u64];
+    let mut data = fixture.raw_data.clone();
+    let scale_offset = data.len().div_ceil(32) * 32;
+    data.resize(scale_offset, 0);
+    data.extend_from_slice(&scale);
+    let bytes = raw_gguf(
+        &[],
+        &[
+            RawTensorInfo {
+                name: "blk.0.ffn_down.weight",
+                dims: &weight_dims,
+                ggml_type: 43,
+                offset: 0,
+            },
+            RawTensorInfo {
+                name: "blk.0.ffn_down.scale",
+                dims: &scale_dims,
+                ggml_type: 0,
+                offset: scale_offset as u64,
+            },
+        ],
+        32,
+        &data,
+    );
+
+    for (dtype, golden) in [
+        (anamnesis::Dtype::F32, &fixture.expected_f32),
+        (anamnesis::Dtype::BF16, &fixture.expected_bf16),
+    ] {
+        let options = anamnesis::ConvertOptions::new().with_output_dtype(dtype);
+        let (st, stats) =
+            anamnesis::convert_bytes(&bytes, anamnesis::ConvertTarget::Safetensors, &options)
+                .unwrap();
+        assert_eq!(stats.folded_scales, 1, "{dtype:?}");
+        let st = safetensors::SafeTensors::deserialize(&st).unwrap();
+        assert!(
+            st.tensor("blk.0.ffn_down.scale").is_err(),
+            "the folded scale is not written"
+        );
+        let weight = st.tensor("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        let mismatches = weight
+            .data()
+            .iter()
+            .zip(golden.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "{dtype:?}: {mismatches} bytes differ from the golden"
+        );
+    }
+}
+
+/// Every `F8_E4M3` code over three experts, each with its own per-tensor scale
+/// folded in, through the public `convert_bytes` path that `remember` shares
+/// (Phase 7.11).
+///
+/// The golden is ggml's C decode times each expert's `f32` scale (and
+/// `gguf-py`'s decode agreed with the C at generation time). Each expert is
+/// 7 × 61 = 427 elements, so no expert boundary falls on the kernel's
+/// 256-element runs: a fold that let a run straddle two scales fails here. Any
+/// two `NaN`s compare equal, as everywhere in this file; every other value
+/// must match exactly, at `F32` and at `BF16`.
+#[test]
+fn cross_validate_exhaustive_f8_e4m3_folded_through_convert() {
+    use common::gguf::{RawTensorInfo, raw_gguf};
+
+    let fixture = parse_gguf_fixture(
+        include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3_folded.bin"),
+        GgufType::F8_E4M3,
+    );
+    let scales: &[u8] = include_bytes!("fixtures/gguf_reference/exhaustive_f8_e4m3_folded.scale");
+    assert_eq!(scales.len(), 3 * 4, "three f32 expert scales");
+
+    let weight_dims = [7_u64, 61, 3];
+    let scale_dims = [3_u64];
+    let mut data = fixture.raw_data.clone();
+    let scale_offset = data.len().div_ceil(32) * 32;
+    data.resize(scale_offset, 0);
+    data.extend_from_slice(scales);
+    let bytes = raw_gguf(
+        &[],
+        &[
+            RawTensorInfo {
+                name: "blk.0.ffn_up_exps.weight",
+                dims: &weight_dims,
+                ggml_type: 43,
+                offset: 0,
+            },
+            RawTensorInfo {
+                name: "blk.0.ffn_up_exps.scale",
+                dims: &scale_dims,
+                ggml_type: 0,
+                offset: scale_offset as u64,
+            },
+        ],
+        32,
+        &data,
+    );
+
+    let f32_is_nan = |w: &[u8]| f32::from_le_bytes([w[0], w[1], w[2], w[3]]).is_nan();
+    let bf16_is_nan = |w: &[u8]| {
+        let bits = u16::from_le_bytes([w[0], w[1]]);
+        bits & 0x7F80 == 0x7F80 && bits & 0x007F != 0
+    };
+    for (dtype, golden, width) in [
+        (anamnesis::Dtype::F32, &fixture.expected_f32, 4_usize),
+        (anamnesis::Dtype::BF16, &fixture.expected_bf16, 2),
+    ] {
+        let options = anamnesis::ConvertOptions::new().with_output_dtype(dtype);
+        let (st, stats) =
+            anamnesis::convert_bytes(&bytes, anamnesis::ConvertTarget::Safetensors, &options)
+                .unwrap();
+        assert_eq!(stats.folded_scales, 1, "{dtype:?}");
+        let st = safetensors::SafeTensors::deserialize(&st).unwrap();
+        assert!(
+            st.tensor("blk.0.ffn_up_exps.scale").is_err(),
+            "the folded scale is not written"
+        );
+        let weight = st.tensor("blk.0.ffn_up_exps.weight").unwrap();
+        assert_eq!(weight.data().len(), golden.len(), "{dtype:?}");
+        let is_nan = |w: &[u8]| {
+            if width == 4 {
+                f32_is_nan(w)
+            } else {
+                bf16_is_nan(w)
+            }
+        };
+        let mismatches = weight
+            .data()
+            .chunks_exact(width)
+            .zip(golden.chunks_exact(width))
+            .filter(|(a, e)| a != e && !(is_nan(a) && is_nan(e)))
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "{dtype:?}: {mismatches} of {} values differ from the golden",
+            fixture.n_elements
         );
     }
 }

@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`GGUF` `F8_E4M3`** (`ggml_type` 43), parsed and dequantised. Upstream
+  `ggml` added it at llama.cpp `1b6935b`, and until now a `GGUF` holding one
+  `F8_E4M3` tensor was refused while its tensor-info table was read, so not
+  even `inspect` could open it. One `OCP` `E4M3FN` byte per element with no
+  scale; `0x7F` and `0xFF` decode to `NaN`, and there are no infinities.
+  `GgufType` gains `F8_E4M3`; it is `#[non_exhaustive]`, so this is not a
+  breaking change.
+- **`F8_E4M3` weights are written with their per-tensor scale applied**, as
+  `NVFP4` weights have been since v0.7.10. llama.cpp's converter keeps a
+  per-tensor-scaled `FP8` weight as `F8_E4M3` and writes its `weight_scale`
+  beside it as `<stem>.scale` (one value, or one per expert), which llama.cpp
+  multiplies in at inference time. `remember` and `convert` now fold it into
+  the weight under the same narrow rule as `NVFP4`'s, leave it out of the
+  output, and count it in `ConvertStats::folded_scales`; `inspect` reports
+  the size of that output. Without the fold, such a file's weights would
+  have been written without their scale. Cross-validated on all 256 codes
+  over three experts against ggml's C decode times each expert's scale, and on
+  real weights: the `RedHatAI/Llama-3.2-1B-Instruct-FP8` slice the `FP8`
+  suite already carries, with its own `weight_scale`, matches ggml's C decode
+  times the scale and `PyTorch`'s `weight.float() * scale.float()`, which
+  agree bit for bit.
+  The CLI line now reads "N per-tensor scales folded into their weights",
+  without naming `NVFP4`.
+- **Cross-validated on every code.** The fixture holds all 256 `E4M3FN` codes,
+  and its golden is `dequantize_row_f8_e4m3` from ggml's own C at `1b6935b`;
+  `gguf-py` agrees with it bit for bit. anamnesis matches at 0 `ULP` in `BF16`
+  and bit for bit in `F32`. The one difference is the sign of `NaN`: ggml
+  returns a positive `NaN` for both `NaN` codes, anamnesis keeps the sign, as
+  its safetensors `FP8` path and PyTorch do. `OCP` leaves that choice to the
+  implementation. Real weights match too: the 256 × 256
+  `RedHatAI/Llama-3.2-1B-Instruct-FP8` slice equals ggml's C at 0 `ULP`.
+
+### Changed
+
+- **`GgufType::F8_E4M3` is classed as quantised**, although upstream files it
+  as a scalar: `remember` and `convert` widen it to `BF16` / `F16` / `F32` like
+  every other sub-16-bit type, matching how anamnesis already treats a
+  safetensors `F8_E4M3` tensor. Writing `F8_E4M3` into a `GGUF` is planned for
+  Phase 8.5.
+- **`dequantize_gguf_blocks` delivers `F8_E4M3` in runs of 256 elements**, with
+  a shorter last run, instead of one sink call per one-element block. The runs
+  took 20 to 46 % less time than one call per element. Every call is still a
+  whole number of blocks; a sink that requires exactly
+  `block_size() × E::BYTES` bytes per call is not correct for this type.
+- **The `GGUF` speed table in `docs/validation.md` is re-measured in full**
+  (2026-11-07), with a new `F8_E4M3` row on real weights (25.7 µs against
+  `gguf-py`'s 1292.8 µs, 50.3×) and first `gguf-py` ratios for `Q1_0` and
+  `Q2_0`, which `gguf-py` dequantises since llama.cpp `1b6935b`. It now
+  publishes best-of-5 medians for both sides rather than one pass, because a
+  single pass could land in a state where a process's first few fixtures run
+  about 2× slow; a paired check confirmed the drift from the 2026-10-01
+  figures is the session, not the code. Both timers now skip fixtures that
+  are not 65 536 elements.
+
 ## [0.7.10] - 2026-10-01
 
 ### Added

@@ -846,9 +846,10 @@ fn run_remember_gguf(
     );
     println!("  {} tensors", info.tensor_count);
     // Said out loud because the output then holds fewer tensors than the input:
-    // each folded `<stem>.scale` now lives inside its `NVFP4` weight. The count
-    // comes from the rule the hub applies (`nvfp4_scale_pairs`), not a guess.
-    let folded = crate::parse::gguf::nvfp4_scale_pairs(
+    // each folded `<stem>.scale` now lives inside its `NVFP4` / `F8_E4M3`
+    // weight. The count comes from the rule the hub applies
+    // (`tensor_scale_pairs`), not a guess.
+    let folded = crate::parse::gguf::tensor_scale_pairs(
         parsed
             .tensor_info()
             .iter()
@@ -856,7 +857,7 @@ fn run_remember_gguf(
     )
     .len();
     if folded > 0 {
-        println!("  {folded} NVFP4 per-tensor scales folded into their weights");
+        println!("  {folded} per-tensor scales folded into their weights");
     }
 
     // `None` keeps the library's `min(cores, 4)` default; `Some(n)` is the
@@ -991,7 +992,7 @@ fn run_convert(
     }
     if stats.folded_scales > 0 {
         println!(
-            "  {} NVFP4 per-tensor scales folded into their weights",
+            "  {} per-tensor scales folded into their weights",
             stats.folded_scales
         );
     }

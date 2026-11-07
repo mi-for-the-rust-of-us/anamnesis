@@ -51,7 +51,7 @@ SUITES=(
   "cross_validation_bnb:BitsAndBytes NF4 / FP4 / INT8, BF16 + F32:bitsandbytes dequantize_4bit"
   "cross_validation_bnb_encode:BitsAndBytes NF4 + INT8 encode (byte-exact on disk):bitsandbytes on-disk bytes"
   "cross_validation_nvfp4:NVIDIA ModelOpt NVFP4 safetensors, BF16 + F32:modelopt NVFP4QTensor.dequantize"
-  "cross_validation_gguf:all 25 GGUF block-quant kernels + the NVFP4 scale fold, BF16 + F32:gguf-py and ggml's own C (ggml-quants.c)"
+  "cross_validation_gguf:all 26 production GGUF quantised kernels (incl. F8_E4M3) + the NVFP4 and F8_E4M3 scale folds, BF16 + F32:gguf-py and ggml's own C (ggml-quants.c)"
   "cross_validation_ollama:GGUF Q8_0 from a real Ollama blob:gguf-py"
   "cross_validation_npz:NPZ / NPY parsing:NumPy"
   "cross_validation_pth:PyTorch .pth (pickle + tensor recovery):torch.load"
@@ -95,7 +95,7 @@ What this proves, and what it does not
 
 PROVES: anamnesis's dequantisation output matches goldens committed to this
 repository, byte for byte. Since v0.7.4 that includes a full-width F32
-comparison with no tolerance at all for *every* dequantising family: all 25
+comparison with no tolerance at all for *every* dequantising family: all 26
 GGUF kernels, plus FP8, GPTQ, AWQ, BitsAndBytes and NVIDIA NVFP4. That matters because a
 BF16 comparison discards 16 mantissa bits, and it is what caught a 1-ULP
 defect in the BnB INT8 kernel that five releases of BF16 testing had passed.
