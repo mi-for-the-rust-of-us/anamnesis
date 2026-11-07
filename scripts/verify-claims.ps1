@@ -44,7 +44,7 @@ $suites = @(
     @{ Target = "cross_validation_bnb";         What = "BitsAndBytes NF4 / FP4 / INT8, BF16 + F32";                    Oracle = "bitsandbytes dequantize_4bit" }
     @{ Target = "cross_validation_bnb_encode";  What = "BitsAndBytes NF4 + INT8 encode (byte-exact on disk)"; Oracle = "bitsandbytes on-disk bytes" }
     @{ Target = "cross_validation_nvfp4";       What = "NVIDIA ModelOpt NVFP4 safetensors, BF16 + F32"; Oracle = "modelopt NVFP4QTensor.dequantize" }
-    @{ Target = "cross_validation_gguf";        What = "all 26 GGUF quantised kernels (incl. F8_E4M3) + the NVFP4 and F8_E4M3 scale folds, BF16 + F32"; Oracle = "gguf-py and ggml's own C (ggml-quants.c)" }
+    @{ Target = "cross_validation_gguf";        What = "all 26 production GGUF quantised kernels (incl. F8_E4M3) + the NVFP4 and F8_E4M3 scale folds, BF16 + F32"; Oracle = "gguf-py and ggml's own C (ggml-quants.c)" }
     @{ Target = "cross_validation_ollama";      What = "GGUF Q8_0 from a real Ollama blob";                Oracle = "gguf-py" }
     @{ Target = "cross_validation_npz";         What = "NPZ / NPY parsing";                                Oracle = "NumPy" }
     @{ Target = "cross_validation_pth";         What = "PyTorch .pth (pickle + tensor recovery)";          Oracle = "torch.load" }
