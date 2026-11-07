@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.11] - 2026-11-07
 
 ### Added
 
@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 2× slow; a paired check confirmed the drift from the 2026-10-01
   figures is the session, not the code. Both timers now skip fixtures that
   are not 65 536 elements.
+
+### Fixed
+
+- **`scripts/verify-claims.ps1` runs under Windows PowerShell 5.1**, the
+  default PowerShell on Windows. It aborted at cargo's first "Compiling"
+  line, which 5.1 turns into an error record; PowerShell 7 was unaffected.
+- **The "stronger check" `verify-claims` describes now works.** It told the
+  reader to `pip install gguf` and run `generate_gguf.py --upgrade`, but the
+  PyPI `gguf` (0.19.0) predates `Q2_0` and `F8_E4M3`, and `--upgrade` only
+  converts v1 fixtures, of which none are left, so it checked nothing. It
+  now gives the pinned `gguf-py` and full regeneration followed by
+  `git status`, and says which fixtures need source models or ggml's C.
 
 ## [0.7.10] - 2026-10-01
 
